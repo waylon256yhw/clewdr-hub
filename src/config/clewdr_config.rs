@@ -175,12 +175,6 @@ impl Display for ClewdrConfig {
         // one line per field
         let authority = self.address();
         let authority: Authority = authority.to_string().parse().map_err(|_| std::fmt::Error)?;
-        let api_url = Uri::builder()
-            .scheme(Scheme::HTTP)
-            .authority(authority.to_owned())
-            .path_and_query("/v1")
-            .build()
-            .map_err(|_| std::fmt::Error)?;
         let web_url = Uri::builder()
             .scheme(Scheme::HTTP)
             .authority(authority.to_string())
@@ -189,13 +183,11 @@ impl Display for ClewdrConfig {
             .map_err(|_| std::fmt::Error)?;
         write!(
             f,
-            "Claude(Claude and OpenAI format) Endpoint: {}\n\
-            Claude Code(Claude and OpenAI format) Endpoint: {}\n\
+            "Claude Code Endpoint: {}\n\
             API Password: {}\n\
             Web Admin Endpoint: {}\n\
             Web Admin Password: {}\n",
-            api_url.to_string().green().underline(),
-            (web_url.to_string() + "code/v1").green().underline(),
+            (web_url.to_string() + "v1").green().underline(),
             self.password.yellow(),
             web_url.to_string().green().underline(),
             self.admin_password.yellow(),
@@ -220,11 +212,6 @@ impl Display for ClewdrConfig {
         )?;
         writeln!(f, "Skip normal Pro: {}", enabled(self.skip_normal_pro))?;
         writeln!(f, "Skip rate limit: {}", enabled(self.skip_rate_limit))?;
-        writeln!(
-            f,
-            "Web count_tokens: {}",
-            enabled(self.enable_web_count_tokens)
-        )?;
         Ok(())
     }
 }

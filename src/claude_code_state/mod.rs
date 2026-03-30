@@ -1,6 +1,8 @@
 mod chat;
 mod exchange;
 mod organization;
+use std::sync::LazyLock;
+
 use http::{
     HeaderValue, Method,
     header::{COOKIE, ORIGIN, REFERER, USER_AGENT},
@@ -11,13 +13,13 @@ use wreq::RequestBuilder;
 use wreq_util::Emulation;
 
 use crate::{
-    claude_web_state::SUPER_CLIENT,
     config::{CLAUDE_CODE_USER_AGENT, CLAUDE_ENDPOINT, CLEWDR_CONFIG, CookieStatus, Reason},
     error::{ClewdrError, WreqSnafu},
-    middleware::claude::ClaudeApiFormat,
     services::cookie_actor::CookieActorHandle,
     types::claude::Usage,
 };
+
+static SUPER_CLIENT: LazyLock<wreq::Client> = LazyLock::new(wreq::Client::new);
 
 #[derive(Clone)]
 pub struct ClaudeCodeState {
@@ -27,7 +29,6 @@ pub struct ClaudeCodeState {
     pub proxy: Option<wreq::Proxy>,
     pub endpoint: url::Url,
     pub client: wreq::Client,
-    pub api_format: ClaudeApiFormat,
     pub stream: bool,
     pub system_prompt_hash: Option<u64>,
     pub anthropic_beta_header: Option<String>,
@@ -44,7 +45,6 @@ impl ClaudeCodeState {
             proxy: CLEWDR_CONFIG.load().wreq_proxy.to_owned(),
             endpoint: CLEWDR_CONFIG.load().endpoint(),
             client: SUPER_CLIENT.to_owned(),
-            api_format: ClaudeApiFormat::Claude,
             stream: false,
             system_prompt_hash: None,
             anthropic_beta_header: None,

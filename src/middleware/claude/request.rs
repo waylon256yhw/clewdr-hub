@@ -17,60 +17,11 @@ use sha2::{Digest, Sha256};
 use crate::{
     config::{CLAUDE_CODE_BILLING_SALT, CLAUDE_CODE_VERSION, CLEWDR_CONFIG},
     error::ClewdrError,
-    middleware::claude::{ClaudeApiFormat, ClaudeContext},
-    types::{
-        claude::{
-            ContentBlock, CreateMessageParams, Message, MessageContent, Role, Thinking, Usage,
-        },
-        oai::CreateMessageParams as OaiCreateMessageParams,
+    middleware::claude::ClaudeContext,
+    types::claude::{
+        ContentBlock, CreateMessageParams, Message, MessageContent, Role, Thinking, Usage,
     },
 };
-
-/// A custom extractor that unifies different API formats
-///
-/// This extractor processes incoming requests, handling differences between
-/// Claude and OpenAI API formats, and applies preprocessing to ensure consistent
-/// handling throughout the application. It also detects and handles test messages
-/// from client applications.
-///
-/// # Functionality
-///
-/// - Extracts and normalizes message parameters from different API formats
-/// - Detects and processes "thinking mode" requests by modifying model names
-/// - Identifies test messages and handles them appropriately
-/// - Attempts to retrieve responses from cache before processing requests
-/// - Provides format information via the FormatInfo extension
-pub struct ClaudeWebPreprocess(pub CreateMessageParams, pub ClaudeContext);
-
-/// Contains information about the API format and streaming status
-///
-/// This structure is passed through the request pipeline to inform
-/// handlers and response processors about the API format being used
-/// and whether the response should be streamed.
-#[derive(Debug, Clone)]
-pub struct ClaudeWebContext {
-    /// Whether the response should be streamed
-    pub(super) stream: bool,
-    /// The API format being used (Claude or OpenAI)
-    pub(super) api_format: ClaudeApiFormat,
-    /// The stop sequence used for the request
-    pub(super) stop_sequences: Vec<String>,
-    /// User information about input and output tokens
-    pub(super) usage: Usage,
-}
-
-/// Predefined test message in Claude format for connection testing
-///
-/// This is a standard test message sent by clients like SillyTavern
-/// to verify connectivity. The system detects these messages and
-/// responds with a predefined test response to confirm service availability.
-static TEST_MESSAGE_CLAUDE: LazyLock<Message> =
-    LazyLock::new(|| Message::new_blocks(Role::User, vec![ContentBlock::text("Hi")]));
-
-/// Predefined test message in OpenAI format for connection testing
-static TEST_MESSAGE_OAI: LazyLock<Message> = LazyLock::new(|| Message::new_text(Role::User, "Hi"));
-
-struct NormalizeRequest(CreateMessageParams, ClaudeApiFormat);
 
 const CLAUDE_CODE_ENTRYPOINT_ENV: &str = "CLAUDE_CODE_ENTRYPOINT";
 
@@ -212,6 +163,13 @@ fn extract_anthropic_beta_header(headers: &HeaderMap) -> Option<String> {
     }
 }
 
+/// Predefined test message for connection testing
+static TEST_MESSAGE_CLAUDE: LazyLock<Message> =
+    LazyLock::new(|| Message::new_blocks(Role::User, vec![ContentBlock::text("Hi")]));
+
+static TEST_MESSAGE_TEXT: LazyLock<Message> =
+    LazyLock::new(|| Message::new_text(Role::User, "Hi"));
+
 fn sanitize_messages(msgs: Vec<Message>) -> Vec<Message> {
     msgs.into_iter()
         .filter_map(|m| {
@@ -252,89 +210,6 @@ fn sanitize_messages(msgs: Vec<Message>) -> Vec<Message> {
         .collect()
 }
 
-impl<S> FromRequest<S> for NormalizeRequest
-where
-    S: Send + Sync,
-{
-    type Rejection = ClewdrError;
-
-    async fn from_request(req: Request, _: &S) -> Result<Self, Self::Rejection> {
-        let uri = req.uri().to_string();
-        let format = if uri.contains("chat/completions") {
-            ClaudeApiFormat::OpenAI
-        } else {
-            ClaudeApiFormat::Claude
-        };
-        let Json(mut body) = match format {
-            ClaudeApiFormat::OpenAI => {
-                let Json(json) = Json::<OaiCreateMessageParams>::from_request(req, &()).await?;
-                Json(json.into())
-            }
-            ClaudeApiFormat::Claude => Json::<CreateMessageParams>::from_request(req, &()).await?,
-        };
-        if CLEWDR_CONFIG.load().sanitize_messages {
-            // Trim whitespace and drop empty assistant turns when enabled.
-            body.messages = sanitize_messages(body.messages);
-        }
-        if body.model.ends_with("-thinking") {
-            body.model = body.model.trim_end_matches("-thinking").to_string();
-            body.thinking.get_or_insert(Thinking::new(4096));
-        }
-        drop_empty_system(&mut body);
-        Ok(Self(body, format))
-    }
-}
-
-impl<S> FromRequest<S> for ClaudeWebPreprocess
-where
-    S: Send + Sync,
-{
-    type Rejection = ClewdrError;
-
-    async fn from_request(req: Request, _: &S) -> Result<Self, Self::Rejection> {
-        let NormalizeRequest(body, format) = NormalizeRequest::from_request(req, &()).await?;
-
-        // Check for test messages and respond appropriately
-        if !body.stream.unwrap_or_default()
-            && (body.messages == vec![TEST_MESSAGE_CLAUDE.to_owned()]
-                || body.messages == vec![TEST_MESSAGE_OAI.to_owned()])
-        {
-            // Respond with a test message
-            return Err(ClewdrError::TestMessage);
-        }
-
-        // Determine streaming status and API format
-        let stream = body.stream.unwrap_or_default();
-
-        let input_tokens = body.count_tokens();
-        let info = ClaudeWebContext {
-            stream,
-            api_format: format,
-            stop_sequences: body.stop_sequences.to_owned().unwrap_or_default(),
-            usage: Usage {
-                input_tokens,
-                output_tokens: 0, // Placeholder for output token count
-            },
-        };
-
-        Ok(Self(body, ClaudeContext::Web(info)))
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ClaudeCodeContext {
-    /// Whether the response should be streamed
-    pub(super) stream: bool,
-    /// The API format being used (Claude or OpenAI)
-    pub(super) api_format: ClaudeApiFormat,
-    /// The hash of the system messages for caching purposes
-    pub(super) system_prompt_hash: Option<u64>,
-    /// Optional anthropic-beta header forwarded from client request
-    pub(super) anthropic_beta: Option<String>,
-    // Usage information for the request
-    pub(super) usage: Usage,
-}
-
 pub struct ClaudeCodePreprocess(pub CreateMessageParams, pub ClaudeContext);
 
 impl<S> FromRequest<S> for ClaudeCodePreprocess
@@ -345,22 +220,29 @@ where
 
     async fn from_request(req: Request, _: &S) -> Result<Self, Self::Rejection> {
         let anthropic_beta = extract_anthropic_beta_header(req.headers());
-        let NormalizeRequest(mut body, format) = NormalizeRequest::from_request(req, &()).await?;
-        // Handle thinking mode by modifying the model name
+        let Json(mut body) = Json::<CreateMessageParams>::from_request(req, &()).await?;
+
+        if CLEWDR_CONFIG.load().sanitize_messages {
+            body.messages = sanitize_messages(body.messages);
+        }
+        if body.model.ends_with("-thinking") {
+            body.model = body.model.trim_end_matches("-thinking").to_string();
+            body.thinking.get_or_insert(Thinking::new(4096));
+        }
+        drop_empty_system(&mut body);
+
         if body.temperature.is_some() {
-            body.top_p = None; // temperature and top_p cannot be used together in Opus-4.x
+            body.top_p = None;
         }
 
-        // Check for test messages and respond appropriately
+        // Check for test messages
         if !body.stream.unwrap_or_default()
             && (body.messages == vec![TEST_MESSAGE_CLAUDE.to_owned()]
-                || body.messages == vec![TEST_MESSAGE_OAI.to_owned()])
+                || body.messages == vec![TEST_MESSAGE_TEXT.to_owned()])
         {
-            // Respond with a test message
             return Err(ClewdrError::TestMessage);
         }
 
-        // Determine streaming status and API format
         let stream = body.stream.unwrap_or_default();
 
         let mut system_prefixes = vec![ContentBlock::text(claude_code_billing_header(
@@ -399,18 +281,17 @@ where
 
         let input_tokens = body.count_tokens();
 
-        let info = ClaudeCodeContext {
+        let context = ClaudeContext {
             stream,
-            api_format: format,
             system_prompt_hash,
             anthropic_beta,
             usage: Usage {
                 input_tokens,
-                output_tokens: 0, // Placeholder for output token count
+                output_tokens: 0,
             },
         };
 
-        Ok(Self(body, ClaudeContext::Code(info)))
+        Ok(Self(body, context))
     }
 }
 

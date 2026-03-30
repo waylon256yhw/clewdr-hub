@@ -16,7 +16,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, error};
 use wreq::{Response, StatusCode, header::InvalidHeaderValue};
 
-use crate::{config::Reason, types::claude::Message};
+use crate::config::Reason;
 
 #[derive(Debug, IntoStaticStr, snafu::Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -193,9 +193,11 @@ impl IntoResponse for ClewdrError {
             ClewdrError::TestMessage => {
                 return (
                     StatusCode::OK,
-                    Json(Message::from(
-                        "Claude Reverse Proxy is working, please send a real message.",
-                    )),
+                    Json(json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Claude Reverse Proxy is working, please send a real message."}],
+                    })),
                 )
                     .into_response();
             }

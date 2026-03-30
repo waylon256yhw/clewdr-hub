@@ -278,55 +278,6 @@ pub async fn api_auth(AuthBearer(t): AuthBearer) -> StatusCode {
     StatusCode::OK
 }
 
-const MODEL_LIST: [&str; 26] = [
-    "claude-3-7-sonnet-20250219",
-    "claude-3-7-sonnet-20250219-thinking",
-    "claude-sonnet-4-20250514",
-    "claude-sonnet-4-20250514-thinking",
-    "claude-sonnet-4-20250514-1M",
-    "claude-sonnet-4-20250514-1M-thinking",
-    "claude-sonnet-4-5-20250929",
-    "claude-sonnet-4-5-20250929-thinking",
-    "claude-sonnet-4-5-20250929-1M",
-    "claude-sonnet-4-5-20250929-1M-thinking",
-    "claude-sonnet-4-6",
-    "claude-sonnet-4-6-thinking",
-    "claude-sonnet-4-6-1M",
-    "claude-sonnet-4-6-1M-thinking",
-    "claude-opus-4-20250514",
-    "claude-opus-4-20250514-thinking",
-    "claude-opus-4-1-20250805",
-    "claude-opus-4-1-20250805-thinking",
-    "claude-opus-4-5-20251101",
-    "claude-opus-4-5-20251101-thinking",
-    "claude-opus-4-5",
-    "claude-opus-4-5-thinking",
-    "claude-opus-4-6",
-    "claude-opus-4-6-thinking",
-    "claude-opus-4-6-1M",
-    "claude-opus-4-6-1M-thinking",
-];
-
-/// API endpoint to get the list of available models
-/// Retrieves the list of models from the configuration
-pub async fn api_get_models() -> Json<Value> {
-    let data: Vec<Value> = MODEL_LIST
-        .iter()
-        .map(|model| {
-            json!({
-                "id": model,
-                "object": "model",
-                "created": 0,
-                "owned_by": "clewdr",
-            })
-        })
-        .collect::<Vec<_>>();
-    Json(json!({
-        "object": "list",
-        "data": data,
-    }))
-}
-
 // ------------------------------
 // Ephemeral org usage enrichment
 // ------------------------------

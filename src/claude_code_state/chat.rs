@@ -274,7 +274,6 @@ impl ClaudeCodeState {
     pub async fn try_count_tokens(
         &mut self,
         p: CreateMessageParams,
-        for_web: bool,
     ) -> Result<axum::response::Response, ClewdrError> {
         for i in 0..CLEWDR_CONFIG.load().max_retries + 1 {
             if i > 0 {
@@ -284,12 +283,9 @@ impl ClaudeCodeState {
             let p = p.to_owned();
 
             let cookie = state.request_cookie().await?;
-            let web_attempt_allowed = CLEWDR_CONFIG.load().enable_web_count_tokens;
             let cookie_disallows = matches!(cookie.count_tokens_allowed, Some(false));
-            if cookie_disallows || (for_web && !web_attempt_allowed) {
-                if cookie_disallows {
-                    state.persist_count_tokens_allowed(false).await;
-                }
+            if cookie_disallows {
+                state.persist_count_tokens_allowed(false).await;
                 return Ok(Self::local_count_tokens_response(&p));
             }
             let retry = async {
@@ -317,7 +313,7 @@ impl ClaudeCodeState {
                     });
                 };
                 state
-                    .perform_count_tokens(access_token.access_token.to_owned(), p, for_web)
+                    .perform_count_tokens(access_token.access_token.to_owned(), p)
                     .await
             }
             .instrument(tracing::info_span!(
@@ -349,7 +345,6 @@ impl ClaudeCodeState {
         &mut self,
         access_token: String,
         mut p: CreateMessageParams,
-        allow_fallback: bool,
     ) -> Result<axum::response::Response, ClewdrError> {
         p.stream = Some(false);
         let (base_model, requested_1m) = match p.model.strip_suffix("-1M") {
@@ -407,9 +402,6 @@ impl ClaudeCodeState {
 
                     if Self::is_count_tokens_unauthorized(&err) {
                         self.persist_count_tokens_allowed(false).await;
-                        if allow_fallback {
-                            return Ok(Self::local_count_tokens_response(&p));
-                        }
                     }
                     return Err(err);
                 }

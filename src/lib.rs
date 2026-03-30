@@ -7,7 +7,6 @@ use crate::config::CLEWDR_CONFIG;
 
 pub mod api;
 pub mod claude_code_state;
-pub mod claude_web_state;
 pub mod config;
 pub mod error;
 pub mod middleware;

@@ -2,7 +2,7 @@ use axum::{
     Router,
     extract::DefaultBodyLimit,
     http::Method,
-    middleware::{from_extractor, map_response},
+    middleware::from_extractor,
     routing::{delete, get, post},
 };
 use tower::ServiceBuilder;
@@ -10,10 +10,7 @@ use tower_http::{compression::CompressionLayer, cors::CorsLayer};
 
 use crate::{
     api::*,
-    middleware::{
-        RequireAdminAuth, RequireBearerAuth, RequireFlexibleAuth,
-        claude::{add_usage_info, apply_stop_sequences, check_overloaded, to_oai},
-    },
+    middleware::{RequireAdminAuth, RequireFlexibleAuth},
     providers::claude::ClaudeProviders,
     services::cookie_actor::CookieActorHandle,
 };
@@ -26,11 +23,6 @@ pub struct RouterBuilder {
 }
 
 impl RouterBuilder {
-    /// Creates a blank RouterBuilder instance
-    /// Initializes the router with the provided application state
-    ///
-    /// # Arguments
-    /// * `state` - The application state containing client information
     pub async fn new() -> Self {
         let cookie_handle = CookieActorHandle::start()
             .await
@@ -43,44 +35,18 @@ impl RouterBuilder {
         }
     }
 
-    /// Creates a new RouterBuilder instance
-    /// Sets up routes for API endpoints and static file serving
     pub fn with_default_setup(self) -> Self {
         self.route_claude_code_endpoints()
-            .route_claude_web_endpoints()
             .route_admin_endpoints()
-            .route_claude_web_oai_endpoints()
-            .route_claude_code_oai_endpoints()
             .setup_static_serving()
             .with_tower_trace()
             .with_cors()
     }
 
-    /// Sets up routes for v1 endpoints
-    fn route_claude_web_endpoints(mut self) -> Self {
-        let router = Router::new()
-            .route("/v1/messages", post(api_claude_web))
-            .layer(
-                ServiceBuilder::new()
-                    .layer(from_extractor::<RequireFlexibleAuth>())
-                    .layer(CompressionLayer::new())
-                    .layer(map_response(add_usage_info))
-                    .layer(map_response(apply_stop_sequences))
-                    .layer(map_response(check_overloaded)),
-            )
-            .with_state(self.claude_providers.web());
-        self.inner = self.inner.merge(router);
-        self
-    }
-
-    /// Sets up routes for v1 endpoints
     fn route_claude_code_endpoints(mut self) -> Self {
         let router = Router::new()
-            .route("/code/v1/messages", post(api_claude_code))
-            .route(
-                "/code/v1/messages/count_tokens",
-                post(api_claude_code_count_tokens),
-            )
+            .route("/v1/messages", post(api_claude_code))
+            .route("/v1/messages/count_tokens", post(api_claude_code_count_tokens))
             .layer(
                 ServiceBuilder::new()
                     .layer(from_extractor::<RequireFlexibleAuth>())
@@ -91,7 +57,6 @@ impl RouterBuilder {
         self
     }
 
-    /// Sets up routes for API endpoints
     fn route_admin_endpoints(mut self) -> Self {
         let cookie_router = Router::new()
             .route("/cookies", get(api_get_cookies))
@@ -117,41 +82,6 @@ impl RouterBuilder {
         self
     }
 
-    /// Sets up routes for OpenAI compatible endpoints
-    fn route_claude_web_oai_endpoints(mut self) -> Self {
-        let router = Router::new()
-            .route("/v1/chat/completions", post(api_claude_web))
-            .route("/v1/models", get(api_get_models))
-            .layer(
-                ServiceBuilder::new()
-                    .layer(from_extractor::<RequireBearerAuth>())
-                    .layer(CompressionLayer::new())
-                    .layer(map_response(to_oai))
-                    .layer(map_response(apply_stop_sequences))
-                    .layer(map_response(check_overloaded)),
-            )
-            .with_state(self.claude_providers.web());
-        self.inner = self.inner.merge(router);
-        self
-    }
-
-    /// Sets up routes for OpenAI compatible endpoints
-    fn route_claude_code_oai_endpoints(mut self) -> Self {
-        let router = Router::new()
-            .route("/code/v1/chat/completions", post(api_claude_code))
-            .route("/code/v1/models", get(api_get_models))
-            .layer(
-                ServiceBuilder::new()
-                    .layer(from_extractor::<RequireBearerAuth>())
-                    .layer(CompressionLayer::new())
-                    .layer(map_response(to_oai)),
-            )
-            .with_state(self.claude_providers.code());
-        self.inner = self.inner.merge(router);
-        self
-    }
-
-    /// Sets up static file serving
     fn setup_static_serving(mut self) -> Self {
         #[cfg(feature = "embed-resource")]
         {
@@ -173,7 +103,6 @@ impl RouterBuilder {
         self
     }
 
-    /// Adds CORS support to the router
     fn with_cors(mut self) -> Self {
         use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
         use http::header::HeaderName;
@@ -200,8 +129,6 @@ impl RouterBuilder {
         self
     }
 
-    /// Returns the configured router
-    /// Finalizes the router configuration for use with axum
     pub fn build(self) -> Router {
         self.inner.layer(DefaultBodyLimit::max(32 * 1024 * 1024))
     }
