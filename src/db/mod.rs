@@ -1,3 +1,7 @@
+pub mod api_key;
+pub mod models;
+pub mod queries;
+
 use std::path::Path;
 
 use argon2::{
@@ -44,43 +48,71 @@ pub async fn seed_admin(pool: &SqlitePool) -> Result<(), ClewdrError> {
         .fetch_one(pool)
         .await?;
 
-    if count.0 > 0 {
+    if count.0 == 0 {
+        let password = match std::env::var(ADMIN_PASSWORD_ENV) {
+            Ok(p) if !p.trim().is_empty() => {
+                info!("Using admin password from {ADMIN_PASSWORD_ENV} environment variable");
+                p
+            }
+            _ => {
+                let generated = generate_password(16);
+                println!(
+                    "{} {}",
+                    "Generated admin password:".green().bold(),
+                    generated.yellow().bold()
+                );
+                generated
+            }
+        };
+
+        let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
+            .await
+            .map_err(|e| ClewdrError::UnexpectedNone {
+                msg: Box::leak(format!("argon2 task panicked: {e}").into_boxed_str()),
+            })??;
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO users (username, display_name, password_hash, role, policy_id) VALUES (?1, ?2, ?3, 'admin', 1)",
+        )
+        .bind("admin")
+        .bind("Administrator")
+        .bind(&password_hash)
+        .execute(pool)
+        .await?;
+
+        info!("Admin user created");
+    } else {
         info!("Admin user already exists, skipping seed");
-        return Ok(());
     }
 
-    let password = match std::env::var(ADMIN_PASSWORD_ENV) {
-        Ok(p) if !p.trim().is_empty() => {
-            info!("Using admin password from {ADMIN_PASSWORD_ENV} environment variable");
-            p
-        }
-        _ => {
-            let generated = generate_password(16);
+    // Ensure admin has at least one API key (also covers upgrades from pre-Phase-2)
+    let admin_id: Option<(i64,)> =
+        sqlx::query_as("SELECT id FROM users WHERE username = 'admin' AND role = 'admin'")
+            .fetch_optional(pool)
+            .await?;
+
+    if let Some((admin_id,)) = admin_id {
+        let key_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM api_keys WHERE user_id = ?1")
+                .bind(admin_id)
+                .fetch_one(pool)
+                .await?;
+
+        if key_count.0 == 0 {
+            let plaintext_key =
+                queries::create_api_key(pool, admin_id, Some("bootstrap")).await?;
             println!(
                 "{} {}",
-                "Generated admin password:".green().bold(),
-                generated.yellow().bold()
+                "Generated admin API key:".green().bold(),
+                plaintext_key.yellow().bold()
             );
-            generated
+            println!(
+                "{}",
+                "Save this key — it cannot be recovered!".red().bold()
+            );
         }
-    };
+    }
 
-    let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
-        .await
-        .map_err(|e| ClewdrError::UnexpectedNone {
-            msg: Box::leak(format!("argon2 task panicked: {e}").into_boxed_str()),
-        })??;
-
-    sqlx::query(
-        "INSERT OR IGNORE INTO users (username, display_name, password_hash, role, policy_id) VALUES (?1, ?2, ?3, 'admin', 1)",
-    )
-    .bind("admin")
-    .bind("Administrator")
-    .bind(&password_hash)
-    .execute(pool)
-    .await?;
-
-    info!("Admin user created");
     Ok(())
 }
 

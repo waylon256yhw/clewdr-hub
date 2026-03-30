@@ -2,26 +2,22 @@ use axum::{
     Router,
     extract::DefaultBodyLimit,
     http::Method,
-    middleware::from_extractor,
+    middleware::from_extractor_with_state,
     routing::{delete, get, post},
 };
 use sqlx::SqlitePool;
-use tower::ServiceBuilder;
 use tower_http::{compression::CompressionLayer, cors::CorsLayer};
 
 use crate::{
     api::*,
+    config::CLEWDR_CONFIG,
     middleware::{RequireAdminAuth, RequireFlexibleAuth},
-    providers::claude::ClaudeProviders,
     services::cookie_actor::CookieActorHandle,
+    state::{AppState, AuthState},
 };
 
-/// RouterBuilder for the application
 pub struct RouterBuilder {
-    claude_providers: ClaudeProviders,
-    cookie_actor_handle: CookieActorHandle,
-    #[allow(dead_code)]
-    db_pool: SqlitePool,
+    state: AppState,
     inner: Router,
 }
 
@@ -31,10 +27,22 @@ impl RouterBuilder {
             .await
             .expect("Failed to start CookieActor");
         let claude_providers = crate::providers::claude::build_providers(cookie_handle.clone());
+        let config = CLEWDR_CONFIG.load();
+        let pw = config.get_password();
+        let admin_pw = config.get_admin_password();
+        let auth = AuthState {
+            db: db_pool.clone(),
+            legacy_user_password: if pw.is_empty() { None } else { Some(pw.to_owned()) },
+            legacy_admin_password: if admin_pw.is_empty() { None } else { Some(admin_pw.to_owned()) },
+        };
+        let state = AppState {
+            db: db_pool,
+            cookie_actor: cookie_handle,
+            code_provider: claude_providers.code(),
+            auth,
+        };
         RouterBuilder {
-            claude_providers,
-            cookie_actor_handle: cookie_handle,
-            db_pool,
+            state,
             inner: Router::new(),
         }
     }
@@ -51,18 +59,15 @@ impl RouterBuilder {
         let router = Router::new()
             .route("/v1/messages", post(api_claude_code))
             .route("/v1/messages/count_tokens", post(api_claude_code_count_tokens))
-            .layer(
-                ServiceBuilder::new()
-                    .layer(from_extractor::<RequireFlexibleAuth>())
-                    .layer(CompressionLayer::new()),
-            )
-            .with_state(self.claude_providers.code());
+            .layer(CompressionLayer::new())
+            .route_layer(from_extractor_with_state::<RequireFlexibleAuth, _>(self.state.clone()))
+            .with_state(self.state.clone());
         self.inner = self.inner.merge(router);
         self
     }
 
     fn route_admin_endpoints(mut self) -> Self {
-        let cookie_router = Router::new()
+        let admin_router = Router::new()
             .route("/cookies", get(api_get_cookies))
             .route(
                 "/cookie",
@@ -70,18 +75,13 @@ impl RouterBuilder {
                     .post(api_post_cookie)
                     .put(api_put_cookie),
             )
-            .with_state(self.cookie_actor_handle.to_owned());
-        let admin_router = Router::new()
             .route("/auth", get(api_auth))
-            .route("/config", get(api_get_config).post(api_post_config));
+            .route("/config", get(api_get_config).post(api_post_config))
+            .route_layer(from_extractor_with_state::<RequireAdminAuth, _>(self.state.clone()));
         let router = Router::new()
-            .nest(
-                "/api",
-                cookie_router
-                    .merge(admin_router)
-                    .layer(from_extractor::<RequireAdminAuth>()),
-            )
-            .route("/api/version", get(api_version));
+            .nest("/api", admin_router)
+            .route("/api/version", get(api_version))
+            .with_state(self.state.clone());
         self.inner = self.inner.merge(router);
         self
     }

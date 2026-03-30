@@ -1,113 +1,126 @@
+use axum::extract::FromRef;
 use axum::extract::FromRequestParts;
-use axum_auth::AuthBearer;
+use axum::http::request::Parts;
 use tracing::warn;
 
-use crate::{config::CLEWDR_CONFIG, error::ClewdrError};
+use crate::config::CLEWDR_CONFIG;
+use crate::db::api_key::parse_api_key;
+use crate::db::queries::authenticate_api_key;
+use crate::error::ClewdrError;
+use crate::state::AuthState;
 
-/// Middleware guard that ensures requests have valid admin authentication
-///
-/// This extractor checks for a valid admin authorization token in the Bearer Auth header.
-/// It can be used on routes that should only be accessible to administrators.
-///
-/// # Example
-///
-/// ```ignore
-/// async fn admin_only_handler(
-///     _: RequireAdminAuth,
-///     // other extractors...
-/// ) -> impl IntoResponse {
-///     // This handler only executes if admin authentication succeeds
-///     // ...
-/// }
-/// ```ignore
-pub struct RequireAdminAuth;
-impl<S> FromRequestParts<S> for RequireAdminAuth
-where
-    S: Sync,
-{
-    type Rejection = ClewdrError;
-    async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        _: &S,
-    ) -> Result<Self, Self::Rejection> {
-        let AuthBearer(key) = AuthBearer::from_request_parts(parts, &())
-            .await
-            .map_err(|_| ClewdrError::InvalidAuth)?;
-        if !CLEWDR_CONFIG.load().admin_auth(&key) {
-            warn!("Invalid admin key");
-            return Err(ClewdrError::InvalidAuth);
-        }
-        Ok(Self)
+/// Extract the API key/token from request headers.
+/// Tries `x-api-key` first, falls back to `Authorization: Bearer`.
+fn extract_key_from_headers(parts: &Parts) -> Option<String> {
+    if let Some(key) = parts.headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        return Some(key.to_string());
     }
+    if let Some(auth) = parts
+        .headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(token) = auth.strip_prefix("Bearer ") {
+            return Some(token.to_string());
+        }
+    }
+    None
 }
 
-/// Middleware guard that ensures requests have valid OpenAI API authentication
-///
-/// This extractor validates the Bearer token against the configured OpenAI API keys.
-/// It's used to protect OpenAI-compatible API endpoints.
-///
-/// # Example
-///
-/// ```ignore
-/// async fn openai_handler(
-///     _: RequireOaiAuth,
-///     // other extractors...
-/// ) -> impl IntoResponse {
-///     // This handler only executes if OpenAI authentication succeeds
-///     // ...
-/// }
-/// ```ignore
-pub struct RequireBearerAuth;
-impl<S> FromRequestParts<S> for RequireBearerAuth
-where
-    S: Sync,
-{
-    type Rejection = ClewdrError;
-    async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        _: &S,
-    ) -> Result<Self, Self::Rejection> {
-        let AuthBearer(key) = AuthBearer::from_request_parts(parts, &())
-            .await
-            .map_err(|_| ClewdrError::InvalidAuth)?;
-        if !CLEWDR_CONFIG.load().user_auth(&key) {
-            warn!("Invalid Bearer key: {}", key);
-            return Err(ClewdrError::InvalidAuth);
-        }
-        Ok(Self)
-    }
-}
-
-/// Middleware guard that accepts both X-API-Key and Bearer token authentication
-///
-/// This extractor first tries to validate the X-API-Key header, and if not present,
-/// falls back to Bearer token authentication. This is useful for Claude Code CLI
-/// which uses ANTHROPIC_AUTH_TOKEN and may send only Authorization header.
+/// Middleware guard for `/v1/**` routes.
+/// Authenticates via DB-backed API keys (sk-prefixed), with legacy password fallback.
 pub struct RequireFlexibleAuth;
+
 impl<S> FromRequestParts<S> for RequireFlexibleAuth
 where
-    S: Sync,
+    AuthState: FromRef<S>,
+    S: Sync + Send,
 {
     type Rejection = ClewdrError;
+
     async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        _: &S,
+        parts: &mut Parts,
+        state: &S,
     ) -> Result<Self, Self::Rejection> {
-        // Try X-API-Key first
-        if let Some(key) = parts.headers.get("x-api-key").and_then(|v| v.to_str().ok())
-            && CLEWDR_CONFIG.load().user_auth(key)
-        {
-            return Ok(Self);
+        let auth_state = AuthState::from_ref(state);
+        let key = extract_key_from_headers(parts).ok_or(ClewdrError::InvalidAuth)?;
+
+        // 1. Try DB-backed API key auth
+        if let Some((lookup, hash)) = parse_api_key(&key) {
+            match authenticate_api_key(&auth_state.db, &lookup, &hash).await {
+                Ok(Some(authed_user)) => {
+                    parts.extensions.insert(authed_user);
+                    return Ok(Self);
+                }
+                Ok(None) => {} // key not found or hash mismatch, fall through
+                Err(e) => {
+                    warn!("DB error during API key auth: {e}");
+                }
+            }
         }
 
-        // Fall back to Bearer token
-        if let Ok(AuthBearer(key)) = AuthBearer::from_request_parts(parts, &()).await
-            && CLEWDR_CONFIG.load().user_auth(&key)
-        {
+        // 2. Legacy fallback: compare against config password
+        if let Some(ref legacy_pw) = auth_state.legacy_user_password {
+            if key == *legacy_pw {
+                return Ok(Self);
+            }
+        }
+
+        // 3. Also check live config (for hot-reloaded passwords)
+        if CLEWDR_CONFIG.load().user_auth(&key) {
             return Ok(Self);
         }
 
         warn!("No valid authentication found (tried x-api-key and Bearer)");
+        Err(ClewdrError::InvalidAuth)
+    }
+}
+
+/// Middleware guard for `/api/**` admin routes.
+/// Authenticates admin users via DB API keys or legacy admin password.
+pub struct RequireAdminAuth;
+
+impl<S> FromRequestParts<S> for RequireAdminAuth
+where
+    AuthState: FromRef<S>,
+    S: Sync + Send,
+{
+    type Rejection = ClewdrError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let auth_state = AuthState::from_ref(state);
+        let key = extract_key_from_headers(parts).ok_or(ClewdrError::InvalidAuth)?;
+
+        // 1. Try DB-backed API key auth for admin users
+        if let Some((lookup, hash)) = parse_api_key(&key) {
+            match authenticate_api_key(&auth_state.db, &lookup, &hash).await {
+                Ok(Some(authed_user)) if authed_user.role == "admin" => {
+                    parts.extensions.insert(authed_user);
+                    return Ok(Self);
+                }
+                Ok(_) => {} // not found, hash mismatch, or not admin — fall through
+                Err(e) => {
+                    warn!("DB error during admin API key auth: {e}");
+                }
+            }
+        }
+
+        // 2. Legacy fallback: compare against config admin_password
+        if let Some(ref legacy_pw) = auth_state.legacy_admin_password {
+            if key == *legacy_pw {
+                return Ok(Self);
+            }
+        }
+
+        // 3. Also check live config (for hot-reloaded passwords)
+        if CLEWDR_CONFIG.load().admin_auth(&key) {
+            return Ok(Self);
+        }
+
+        warn!("Invalid admin key");
         Err(ClewdrError::InvalidAuth)
     }
 }

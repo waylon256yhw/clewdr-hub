@@ -8,7 +8,6 @@ use axum::{
     extract::{Query, State},
     http::HeaderMap,
 };
-use axum_auth::AuthBearer;
 use moka::sync::Cache;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -19,7 +18,7 @@ use super::error::ApiError;
 use crate::{
     VERSION_INFO,
     claude_code_state::ClaudeCodeState,
-    config::{CLEWDR_CONFIG, CookieStatus},
+    config::CookieStatus,
     services::cookie_actor::CookieActorHandle,
 };
 
@@ -60,12 +59,8 @@ const COOKIE_STATUS_CACHE_KEY: &str = "all_cookies";
 /// * `StatusCode` - HTTP status code indicating success or failure
 pub async fn api_post_cookie(
     State(s): State<CookieActorHandle>,
-    AuthBearer(t): AuthBearer,
     Json(mut c): Json<CookieStatus>,
 ) -> Result<StatusCode, ApiError> {
-    if !CLEWDR_CONFIG.load().admin_auth(&t) {
-        return Err(ApiError::unauthorized());
-    }
     c.reset_time = None;
     if c.supports_claude_1m_sonnet.is_none() {
         c.supports_claude_1m_sonnet = Some(true);
@@ -96,12 +91,8 @@ pub async fn api_post_cookie(
 /// Only updates supports_claude_1m_sonnet / supports_claude_1m_opus on existing cookies
 pub async fn api_put_cookie(
     State(s): State<CookieActorHandle>,
-    AuthBearer(t): AuthBearer,
     Json(mut c): Json<CookieStatus>,
 ) -> Result<StatusCode, ApiError> {
-    if !CLEWDR_CONFIG.load().admin_auth(&t) {
-        return Err(ApiError::unauthorized());
-    }
     if c.supports_claude_1m_sonnet.is_none() {
         c.supports_claude_1m_sonnet = Some(true);
     }
@@ -138,13 +129,8 @@ pub async fn api_put_cookie(
 /// * `Result<(HeaderMap, Json<Value>), ApiError>` - Response with cache headers and cookie status
 pub async fn api_get_cookies(
     State(s): State<CookieActorHandle>,
-    AuthBearer(t): AuthBearer,
     Query(query): Query<CookieStatusQuery>,
 ) -> Result<(HeaderMap, Json<Value>), ApiError> {
-    if !CLEWDR_CONFIG.load().admin_auth(&t) {
-        return Err(ApiError::unauthorized());
-    }
-
     let mut headers = HeaderMap::new();
 
     // Check cache if not force refreshing
@@ -229,13 +215,8 @@ pub async fn api_get_cookies(
 /// * `Result<StatusCode, (StatusCode, Json<serde_json::Value>)>` - Success status or error
 pub async fn api_delete_cookie(
     State(s): State<CookieActorHandle>,
-    AuthBearer(t): AuthBearer,
     Json(c): Json<CookieStatus>,
 ) -> Result<StatusCode, ApiError> {
-    if !CLEWDR_CONFIG.load().admin_auth(&t) {
-        return Err(ApiError::unauthorized());
-    }
-
     match s.delete_cookie(c.to_owned()).await {
         Ok(_) => {
             info!("Cookie deleted successfully: {}", c.cookie);
@@ -270,11 +251,8 @@ pub async fn api_version() -> String {
 ///
 /// # Returns
 /// * `StatusCode` - OK if authorized, UNAUTHORIZED otherwise
-pub async fn api_auth(AuthBearer(t): AuthBearer) -> StatusCode {
-    if !CLEWDR_CONFIG.load().admin_auth(&t) {
-        return StatusCode::UNAUTHORIZED;
-    }
-    info!("Auth token accepted,");
+pub async fn api_auth() -> StatusCode {
+    // Auth is already validated by RequireAdminAuth middleware
     StatusCode::OK
 }
 
