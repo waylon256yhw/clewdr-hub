@@ -5,6 +5,7 @@ use axum::{
     middleware::from_extractor,
     routing::{delete, get, post},
 };
+use sqlx::SqlitePool;
 use tower::ServiceBuilder;
 use tower_http::{compression::CompressionLayer, cors::CorsLayer};
 
@@ -19,11 +20,13 @@ use crate::{
 pub struct RouterBuilder {
     claude_providers: ClaudeProviders,
     cookie_actor_handle: CookieActorHandle,
+    #[allow(dead_code)]
+    db_pool: SqlitePool,
     inner: Router,
 }
 
 impl RouterBuilder {
-    pub async fn new() -> Self {
+    pub async fn new(db_pool: SqlitePool) -> Self {
         let cookie_handle = CookieActorHandle::start()
             .await
             .expect("Failed to start CookieActor");
@@ -31,6 +34,7 @@ impl RouterBuilder {
         RouterBuilder {
             claude_providers,
             cookie_actor_handle: cookie_handle,
+            db_pool,
             inner: Router::new(),
         }
     }

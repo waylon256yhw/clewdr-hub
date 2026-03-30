@@ -8,6 +8,7 @@ use crate::config::CLEWDR_CONFIG;
 pub mod api;
 pub mod claude_code_state;
 pub mod config;
+pub mod db;
 pub mod error;
 pub mod middleware;
 pub mod providers;
@@ -83,4 +84,7 @@ pub struct Args {
     #[arg(short, long)]
     /// Alternative log directory
     pub log_dir: Option<PathBuf>,
+    #[arg(short = 'd', long)]
+    /// Alternative database path
+    pub db: Option<PathBuf>,
 }

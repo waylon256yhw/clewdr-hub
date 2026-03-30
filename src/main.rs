@@ -1,6 +1,6 @@
 use clewdr::{
     self, FIG, IS_DEBUG,
-    config::{CLEWDR_CONFIG, CONFIG_PATH, LOG_DIR},
+    config::{CLEWDR_CONFIG, CONFIG_PATH, DB_PATH, LOG_DIR},
     error::ClewdrError,
     version_info_colored,
 };
@@ -126,11 +126,22 @@ async fn main() -> Result<(), ClewdrError> {
     println!("Config dir: {}", CONFIG_PATH.display().to_string().blue());
     println!("{}", *CLEWDR_CONFIG);
 
+    // initialize database
+    let no_fs = CLEWDR_CONFIG.load().no_fs;
+    let db_path = if no_fs {
+        std::path::PathBuf::from(":memory:")
+    } else {
+        DB_PATH.to_owned()
+    };
+    println!("Database: {}", db_path.display().to_string().blue());
+    let db_pool = clewdr::db::init_pool(&db_path).await?;
+    clewdr::db::seed_admin(&db_pool).await?;
+
     // build axum router
     // create a TCP listener
     let addr = CLEWDR_CONFIG.load().address();
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    let router = clewdr::router::RouterBuilder::new()
+    let router = clewdr::router::RouterBuilder::new(db_pool)
         .await
         .with_default_setup()
         .build();

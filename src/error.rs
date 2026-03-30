@@ -158,6 +158,20 @@ pub enum ClewdrError {
     TimestampError { timestamp: i64 },
     #[snafu(display("Key/Password Invalid"))]
     InvalidAuth,
+    #[snafu(display("Database error: {}", source))]
+    #[snafu(context(false))]
+    SqlxError {
+        #[snafu(implicit)]
+        loc: Location,
+        source: sqlx::Error,
+    },
+    #[snafu(display("Migration error: {}", source))]
+    #[snafu(context(false))]
+    MigrateError {
+        #[snafu(implicit)]
+        loc: Location,
+        source: sqlx::migrate::MigrateError,
+    },
     #[snafu(whatever, display("{}: {}", message, source.as_ref().map_or_else(|| "Unknown error".into(), |e| e.to_string())))]
     Whatever {
         message: String,

@@ -53,6 +53,28 @@ pub static CLEWDR_CONFIG: LazyLock<ArcSwap<ClewdrConfig>> = LazyLock::new(|| {
     ArcSwap::from_pointee(config)
 });
 
+pub static DB_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
+    if let Some(path) = Args::try_parse().ok().and_then(|a| a.db) {
+        path
+    } else {
+        #[cfg(feature = "portable")]
+        {
+            PORTABLE_DIR.join("clewdr.db")
+        }
+        #[cfg(feature = "xdg")]
+        {
+            use etcetera::{AppStrategy, AppStrategyArgs, choose_app_strategy};
+            let strategy = choose_app_strategy(AppStrategyArgs {
+                top_level_domain: "org".to_string(),
+                author: "Xerxes-2".to_string(),
+                app_name: "clewdr".to_string(),
+            })
+            .expect("Failed to choose app strategy");
+            strategy.in_data_dir("clewdr.db")
+        }
+    }
+});
+
 pub static CONFIG_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
     if let Some(path) = Args::try_parse().ok().and_then(|a| a.config) {
         path

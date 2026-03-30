@@ -3,6 +3,9 @@ target/
 /config.toml
 log/
 *.log
+*.db
+*.db-wal
+*.db-shm
 cookie.txt
 .DS_Store
 /*.txt

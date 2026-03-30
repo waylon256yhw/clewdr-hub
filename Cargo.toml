@@ -82,6 +82,10 @@ sha2 = "0.10"
 mimalloc = { version = "0.1", optional = true }
 dhat = { version = "0", optional = true }
 etcetera = { version = "0", optional = true }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+argon2 = { version = "0.5.3", features = ["std"] }
+blake3 = "1.8.3"
+rand = { version = "0.10.0", features = ["std_rng"] }
 
 [target.'cfg(windows)'.dependencies]
 enable-ansi-support = "0.3"
