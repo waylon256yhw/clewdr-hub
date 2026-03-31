@@ -2,10 +2,12 @@ use std::{sync::Arc, time::Instant};
 
 use axum::response::Response;
 use colored::Colorize;
+use sqlx::SqlitePool;
 use tracing::info;
 
 use super::LLMProvider;
 use crate::{
+    billing::BillingContext,
     claude_code_state::ClaudeCodeState,
     error::ClewdrError,
     middleware::claude::ClaudeContext,
@@ -52,12 +54,14 @@ pub struct ClaudeProviderResponse {
 
 struct ClaudeSharedState {
     cookie_actor_handle: CookieActorHandle,
+    db: SqlitePool,
 }
 
 impl ClaudeSharedState {
-    fn new(cookie_actor_handle: CookieActorHandle) -> Self {
+    fn new(cookie_actor_handle: CookieActorHandle, db: SqlitePool) -> Self {
         Self {
             cookie_actor_handle,
+            db,
         }
     }
 }
@@ -68,8 +72,8 @@ pub struct ClaudeProviders {
 }
 
 impl ClaudeProviders {
-    pub fn new(cookie_actor_handle: CookieActorHandle) -> Self {
-        let shared = Arc::new(ClaudeSharedState::new(cookie_actor_handle));
+    pub fn new(cookie_actor_handle: CookieActorHandle, db: SqlitePool) -> Self {
+        let shared = Arc::new(ClaudeSharedState::new(cookie_actor_handle, db));
         let code = Arc::new(ClaudeCodeProvider::new(shared));
         Self { code }
     }
@@ -101,6 +105,17 @@ impl LLMProvider for ClaudeCodeProvider {
         state.system_prompt_hash = request.context.system_prompt_hash;
         state.anthropic_beta_header = request.context.anthropic_beta.clone();
         state.usage = request.context.usage.to_owned();
+
+        // Set billing context for cost tracking
+        state.billing_ctx = Some(BillingContext {
+            db: self.shared.db.clone(),
+            user_id: request.context.user_id,
+            api_key_id: request.context.api_key_id,
+            model_raw: request.context.model_raw.clone(),
+            request_id: request.context.request_id.clone(),
+            started_at: request.context.started_at,
+        });
+
         let ClaudeInvocation {
             params,
             context,
@@ -143,6 +158,6 @@ impl LLMProvider for ClaudeCodeProvider {
     }
 }
 
-pub fn build_providers(cookie_actor_handle: CookieActorHandle) -> ClaudeProviders {
-    ClaudeProviders::new(cookie_actor_handle)
+pub fn build_providers(cookie_actor_handle: CookieActorHandle, db: SqlitePool) -> ClaudeProviders {
+    ClaudeProviders::new(cookie_actor_handle, db)
 }

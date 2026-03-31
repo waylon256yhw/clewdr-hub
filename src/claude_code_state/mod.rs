@@ -13,6 +13,7 @@ use wreq::RequestBuilder;
 use wreq_util::Emulation;
 
 use crate::{
+    billing::BillingContext,
     config::{CLAUDE_CODE_USER_AGENT, CLAUDE_ENDPOINT, CLEWDR_CONFIG, CookieStatus, Reason},
     error::{ClewdrError, WreqSnafu},
     services::cookie_actor::CookieActorHandle,
@@ -33,6 +34,7 @@ pub struct ClaudeCodeState {
     pub system_prompt_hash: Option<u64>,
     pub anthropic_beta_header: Option<String>,
     pub usage: Usage,
+    pub billing_ctx: Option<BillingContext>,
 }
 
 impl ClaudeCodeState {
@@ -49,6 +51,7 @@ impl ClaudeCodeState {
             system_prompt_hash: None,
             anthropic_beta_header: None,
             usage: Usage::default(),
+            billing_ctx: None,
         }
     }
 

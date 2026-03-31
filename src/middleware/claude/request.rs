@@ -292,11 +292,18 @@ where
             usage: Usage {
                 input_tokens,
                 output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
             user_id: auth_user.as_ref().map(|u| u.user_id),
             api_key_id: auth_user.as_ref().map(|u| u.api_key_id),
             max_concurrent: auth_user.as_ref().map(|u| u.max_concurrent),
             rpm_limit: auth_user.as_ref().map(|u| u.rpm_limit),
+            model_raw: body.model.clone(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+            started_at: chrono::Utc::now(),
+            weekly_budget_nanousd: auth_user.as_ref().map(|u| u.weekly_budget_nanousd),
+            monthly_budget_nanousd: auth_user.as_ref().map(|u| u.monthly_budget_nanousd),
         };
 
         Ok(Self(body, context))

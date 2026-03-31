@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use axum::{Extension, extract::State, response::Response};
+use sqlx::SqlitePool;
 
 use crate::{
+    billing::check_quota,
     error::ClewdrError,
     middleware::claude::{ClaudeCodePreprocess, ClaudeContext},
     providers::{
@@ -15,8 +17,20 @@ use crate::{
 pub async fn api_claude_code(
     State(provider): State<Arc<ClaudeCodeProvider>>,
     State(limiter): State<UserLimiterMap>,
+    State(db): State<SqlitePool>,
     ClaudeCodePreprocess(params, context): ClaudeCodePreprocess,
 ) -> Result<(Extension<ClaudeContext>, Response), ClewdrError> {
+    // Quota check (soft cap) before rate limiter
+    if let Some(user_id) = context.user_id {
+        check_quota(
+            &db,
+            user_id,
+            context.weekly_budget_nanousd,
+            context.monthly_budget_nanousd,
+        )
+        .await?;
+    }
+
     // Acquire per-user concurrency permit + RPM check (None for legacy auth)
     let permit = if let (Some(user_id), Some(max_c), Some(rpm)) =
         (context.user_id, context.max_concurrent, context.rpm_limit)
@@ -31,7 +45,6 @@ pub async fn api_claude_code(
         .await?;
 
     // Store permit in response extensions so it lives until body is consumed
-    // (streaming: held until SSE stream ends; non-streaming: dropped after body read)
     let mut response = response;
     if let Some(permit) = permit {
         response.extensions_mut().insert(permit);
@@ -44,7 +57,6 @@ pub async fn api_claude_code_count_tokens(
     State(limiter): State<UserLimiterMap>,
     ClaudeCodePreprocess(mut params, context): ClaudeCodePreprocess,
 ) -> Result<Response, ClewdrError> {
-    // count_tokens shares the same per-user limits
     let _permit = if let (Some(user_id), Some(max_c), Some(rpm)) =
         (context.user_id, context.max_concurrent, context.rpm_limit)
     {

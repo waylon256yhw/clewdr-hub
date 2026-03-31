@@ -137,8 +137,12 @@ async fn main() -> Result<(), ClewdrError> {
     let db_pool = clewdr::db::init_pool(&db_path).await?;
     clewdr::db::seed_admin(&db_pool).await?;
 
+    // Start log rotation background task
+    tokio::spawn(clewdr::services::log_rotation::start_log_rotation(
+        db_pool.clone(),
+    ));
+
     // build axum router
-    // create a TCP listener
     let addr = CLEWDR_CONFIG.load().address();
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let router = clewdr::router::RouterBuilder::new(db_pool)

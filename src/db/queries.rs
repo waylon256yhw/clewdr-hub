@@ -9,10 +9,11 @@ pub async fn authenticate_api_key(
     lookup_key: &str,
     full_key_hash: &[u8; 32],
 ) -> Result<Option<AuthenticatedUser>, sqlx::Error> {
-    let row: Option<(i64, i64, String, String, Vec<u8>, i64, i32, i32)> = sqlx::query_as(
+    let row: Option<(i64, i64, String, String, Vec<u8>, i64, i32, i32, i64, i64)> = sqlx::query_as(
         r#"
         SELECT ak.id, u.id, u.username, u.role, ak.key_hash, u.policy_id,
-               p.max_concurrent, p.rpm_limit
+               p.max_concurrent, p.rpm_limit,
+               p.weekly_budget_nanousd, p.monthly_budget_nanousd
         FROM api_keys ak
         JOIN users u ON ak.user_id = u.id
         JOIN policies p ON u.policy_id = p.id
@@ -26,7 +27,7 @@ pub async fn authenticate_api_key(
     .fetch_optional(pool)
     .await?;
 
-    let Some((ak_id, user_id, username, role, stored_hash, policy_id, max_concurrent, rpm_limit)) =
+    let Some((ak_id, user_id, username, role, stored_hash, policy_id, max_concurrent, rpm_limit, weekly_budget_nanousd, monthly_budget_nanousd)) =
         row
     else {
         return Ok(None);
@@ -49,6 +50,8 @@ pub async fn authenticate_api_key(
         policy_id,
         max_concurrent,
         rpm_limit,
+        weekly_budget_nanousd,
+        monthly_budget_nanousd,
     }))
 }
 

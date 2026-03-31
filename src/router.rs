@@ -26,7 +26,7 @@ impl RouterBuilder {
         let cookie_handle = CookieActorHandle::start()
             .await
             .expect("Failed to start CookieActor");
-        let claude_providers = crate::providers::claude::build_providers(cookie_handle.clone());
+        let claude_providers = crate::providers::claude::build_providers(cookie_handle.clone(), db_pool.clone());
         let config = CLEWDR_CONFIG.load();
         let pw = config.get_password();
         let admin_pw = config.get_admin_password();

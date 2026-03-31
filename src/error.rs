@@ -162,6 +162,8 @@ pub enum ClewdrError {
     UserConcurrencyExceeded,
     #[snafu(display("Request rate limit exceeded"))]
     RpmExceeded,
+    #[snafu(display("Usage quota exceeded"))]
+    QuotaExceeded,
     #[snafu(display("Database error: {}", source))]
     #[snafu(context(false))]
     SqlxError {
@@ -226,7 +228,9 @@ impl IntoResponse for ClewdrError {
             ClewdrError::InvalidCookie { .. } => (StatusCode::BAD_REQUEST, json!(self.to_string())),
             ClewdrError::PathNotFound { .. } => (StatusCode::NOT_FOUND, json!(self.to_string())),
             ClewdrError::InvalidAuth => (StatusCode::UNAUTHORIZED, json!(self.to_string())),
-            ClewdrError::UserConcurrencyExceeded | ClewdrError::RpmExceeded => {
+            ClewdrError::UserConcurrencyExceeded
+            | ClewdrError::RpmExceeded
+            | ClewdrError::QuotaExceeded => {
                 let inner = ClaudeErrorBody {
                     message: json!(self.to_string()),
                     r#type: "rate_limit_error".to_string(),

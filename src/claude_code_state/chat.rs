@@ -417,12 +417,21 @@ impl ClaudeCodeState {
         model_family: ModelFamily,
     ) -> Result<axum::response::Response, ClewdrError> {
         if !self.stream {
-            let (resp, usage_pair) = Self::materialize_non_stream_response(response).await?;
-            let (input, output) = usage_pair.unwrap_or((self.usage.input_tokens as u64, 0));
-            self.persist_usage_totals(input, output, model_family).await;
+            let (resp, billing_usage) = Self::materialize_non_stream_response(response).await?;
+            let bu = billing_usage.unwrap_or_else(|| crate::billing::BillingUsage {
+                input_tokens: self.usage.input_tokens as u64,
+                output_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            });
+            self.persist_usage_totals(bu.input_tokens, bu.output_tokens, model_family)
+                .await;
+            // Billing DB write (awaited for non-streaming)
+            if let Some(ref ctx) = self.billing_ctx {
+                crate::billing::persist_billing_to_db(ctx, bu, false).await;
+            }
             Ok(resp)
         } else {
-            // Stream pass-through while accumulating output token usage from message_delta events
             return self.forward_stream_with_usage(response, model_family).await;
         }
     }
@@ -454,30 +463,75 @@ impl ClaudeCodeState {
 
         let input_tokens = self.usage.input_tokens as u64;
         let output_sum = Arc::new(AtomicU64::new(0));
+        let input_sum = Arc::new(AtomicU64::new(input_tokens));
+        let cache_create_sum = Arc::new(AtomicU64::new(0));
+        let cache_read_sum = Arc::new(AtomicU64::new(0));
         let handle = self.cookie_actor_handle.clone();
         let cookie = self.cookie.clone();
+        let billing_ctx = self.billing_ctx.clone();
 
         let osum = output_sum.clone();
+        let isum = input_sum.clone();
+        let ccsum = cache_create_sum.clone();
+        let crsum = cache_read_sum.clone();
         let stream = response.bytes_stream().eventsource().map_ok(move |event| {
-            // accumulate output tokens from message_delta usage if present
             if let Ok(parsed) =
                 serde_json::from_str::<crate::types::claude::StreamEvent>(&event.data)
             {
                 match parsed {
+                    crate::types::claude::StreamEvent::MessageStart { message } => {
+                        // Capture authoritative input/cache usage from upstream
+                        if let Some(u) = message.usage {
+                            isum.store(u.input_tokens as u64, Ordering::Relaxed);
+                            if let Some(cc) = u.cache_creation_input_tokens {
+                                ccsum.store(cc as u64, Ordering::Relaxed);
+                            }
+                            if let Some(cr) = u.cache_read_input_tokens {
+                                crsum.store(cr as u64, Ordering::Relaxed);
+                            }
+                        }
+                    }
                     crate::types::claude::StreamEvent::MessageDelta { usage: Some(u), .. } => {
-                        osum.fetch_add(u.output_tokens as u64, Ordering::Relaxed);
+                        // usage fields in message_delta are cumulative, use store not add
+                        osum.store(u.output_tokens as u64, Ordering::Relaxed);
+                        // message_delta also carries final input/cache values
+                        if u.input_tokens > 0 {
+                            isum.store(u.input_tokens as u64, Ordering::Relaxed);
+                        }
+                        if let Some(cc) = u.cache_creation_input_tokens {
+                            ccsum.store(cc as u64, Ordering::Relaxed);
+                        }
+                        if let Some(cr) = u.cache_read_input_tokens {
+                            crsum.store(cr as u64, Ordering::Relaxed);
+                        }
                     }
                     crate::types::claude::StreamEvent::MessageStop => {
-                        // on stream completion, persist totals asynchronously
+                        let total_input = isum.load(Ordering::Relaxed);
+                        let total_out = osum.load(Ordering::Relaxed);
+                        let total_cc = ccsum.load(Ordering::Relaxed);
+                        let total_cr = crsum.load(Ordering::Relaxed);
+
+                        // Cookie persistence (existing, unchanged)
                         if let (Some(cookie), handle) = (cookie.clone(), handle.clone()) {
-                            let total_out = osum.load(Ordering::Relaxed);
                             let mut c = cookie.clone();
                             tokio::spawn(async move {
-                                // Update period boundaries if needed, then accumulate
                                 ClaudeCodeState::update_cookie_boundaries_if_due(&mut c, &handle)
                                     .await;
-                                c.add_and_bucket_usage(input_tokens, total_out, family);
+                                c.add_and_bucket_usage(total_input, total_out, family);
                                 let _ = handle.return_cookie(c, None).await;
+                            });
+                        }
+
+                        // Billing persistence
+                        if let Some(ctx) = billing_ctx.clone() {
+                            let usage = crate::billing::BillingUsage {
+                                input_tokens: total_input,
+                                output_tokens: total_out,
+                                cache_creation_tokens: total_cc,
+                                cache_read_tokens: total_cr,
+                            };
+                            tokio::spawn(async move {
+                                crate::billing::persist_billing_to_db(&ctx, usage, true).await;
                             });
                         }
                     }
@@ -501,7 +555,7 @@ impl ClaudeCodeState {
 
     async fn materialize_non_stream_response(
         response: wreq::Response,
-    ) -> Result<(axum::response::Response, Option<(u64, u64)>), ClewdrError> {
+    ) -> Result<(axum::response::Response, Option<crate::billing::BillingUsage>), ClewdrError> {
         let status = response.status();
         let headers = response.headers().clone();
         let bytes = response.bytes().await.context(WreqSnafu {
@@ -523,19 +577,23 @@ impl ClaudeCodeState {
         Ok((response, usage))
     }
 
-    fn extract_usage_from_bytes(bytes: &[u8]) -> Option<(u64, u64)> {
-        // Prefer explicit usage if present
+    fn extract_usage_from_bytes(bytes: &[u8]) -> Option<crate::billing::BillingUsage> {
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes)
             && let Some(usage) = value.get("usage")
         {
-            let input = usage
-                .get("input_tokens")
-                .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n.max(0) as u64)));
-            let output = usage
-                .get("output_tokens")
-                .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n.max(0) as u64)));
-            if let (Some(i), Some(o)) = (input, output) {
-                return Some((i, o));
+            let get_u64 = |key: &str| {
+                usage
+                    .get(key)
+                    .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n.max(0) as u64)))
+            };
+            if let (Some(input), Some(output)) = (get_u64("input_tokens"), get_u64("output_tokens"))
+            {
+                return Some(crate::billing::BillingUsage {
+                    input_tokens: input,
+                    output_tokens: output,
+                    cache_creation_tokens: get_u64("cache_creation_input_tokens").unwrap_or(0),
+                    cache_read_tokens: get_u64("cache_read_input_tokens").unwrap_or(0),
+                });
             }
         }
 
@@ -544,8 +602,12 @@ impl ClaudeCodeState {
             serde_json::from_slice::<crate::types::claude::CreateMessageResponse>(bytes)
         {
             let output_tokens = parsed.count_tokens() as u64;
-            // Input tokens already computed earlier and present in self.usage; only estimate output here
-            return Some((0, output_tokens));
+            return Some(crate::billing::BillingUsage {
+                input_tokens: 0,
+                output_tokens,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            });
         }
         None
     }

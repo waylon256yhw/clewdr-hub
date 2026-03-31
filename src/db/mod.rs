@@ -1,4 +1,5 @@
 pub mod api_key;
+pub mod billing;
 pub mod models;
 pub mod queries;
 

@@ -50,4 +50,6 @@ pub struct AuthenticatedUser {
     pub policy_id: i64,
     pub max_concurrent: i32,
     pub rpm_limit: i32,
+    pub weekly_budget_nanousd: i64,
+    pub monthly_budget_nanousd: i64,
 }

@@ -6,6 +6,7 @@ use colored::Colorize;
 use crate::config::CLEWDR_CONFIG;
 
 pub mod api;
+pub mod billing;
 pub mod claude_code_state;
 pub mod config;
 pub mod db;
