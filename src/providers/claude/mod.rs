@@ -110,6 +110,7 @@ impl LLMProvider for ClaudeCodeProvider {
         state.stream = request.context.stream;
         state.system_prompt_hash = request.context.system_prompt_hash;
         state.usage = request.context.usage.to_owned();
+        state.session_id = request.context.session_id.clone();
 
         // Set billing context for cost tracking
         state.billing_ctx = Some(BillingContext {

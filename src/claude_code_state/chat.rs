@@ -180,7 +180,7 @@ impl ClaudeCodeState {
         let profile = self.stealth_profile.load();
         let headers = stealth::build_stealth_headers(
             &profile,
-            EndpointKind::DirectApi { use_context_1m },
+            EndpointKind::DirectApi { use_context_1m, session_id: self.session_id.clone() },
         );
         let mut url = self.endpoint.join("v1/messages").expect("Url parse error");
         url.set_query(Some("beta=true"));
@@ -619,7 +619,7 @@ impl ClaudeCodeState {
         let profile = self.stealth_profile.load();
         let headers = stealth::build_stealth_headers(
             &profile,
-            EndpointKind::DirectApi { use_context_1m },
+            EndpointKind::DirectApi { use_context_1m, session_id: self.session_id.clone() },
         );
         let mut url = self.endpoint.join("v1/messages/count_tokens").expect("Url parse error");
         url.set_query(Some("beta=true"));

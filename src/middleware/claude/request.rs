@@ -241,6 +241,12 @@ where
             .extensions()
             .get::<crate::db::models::AuthenticatedUser>()
             .cloned();
+        let client_session_id = req
+            .headers()
+            .get("x-claude-code-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let session_id = client_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let Json(mut body) = Json::<CreateMessageParams>::from_request(req, &()).await?;
 
         if CLEWDR_CONFIG.load().sanitize_messages {
@@ -327,6 +333,7 @@ where
             started_at: chrono::Utc::now(),
             weekly_budget_nanousd: auth_user.as_ref().map(|u| u.weekly_budget_nanousd),
             monthly_budget_nanousd: auth_user.as_ref().map(|u| u.monthly_budget_nanousd),
+            session_id,
         };
 
         Ok(Self(body, context))

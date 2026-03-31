@@ -24,4 +24,6 @@ pub struct ClaudeContext {
     pub weekly_budget_nanousd: Option<i64>,
     /// Monthly budget from policy (nanousd)
     pub monthly_budget_nanousd: Option<i64>,
+    /// Session ID for upstream (passthrough from client, or generated fallback)
+    pub session_id: String,
 }

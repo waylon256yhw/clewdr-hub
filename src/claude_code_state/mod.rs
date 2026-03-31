@@ -35,6 +35,7 @@ pub struct ClaudeCodeState {
     pub usage: Usage,
     pub billing_ctx: Option<BillingContext>,
     pub stealth_profile: SharedStealthProfile,
+    pub session_id: String,
 }
 
 impl ClaudeCodeState {
@@ -52,6 +53,7 @@ impl ClaudeCodeState {
             usage: Usage::default(),
             billing_ctx: None,
             stealth_profile,
+            session_id: String::new(),
         }
     }
 

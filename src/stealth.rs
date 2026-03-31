@@ -22,7 +22,7 @@ const CONTEXT_1M_TOKEN: &str = "context-1m-2025-08-07";
 /// Endpoint type determines which headers to send.
 pub enum EndpointKind {
     /// /v1/messages, /v1/messages/count_tokens — full CLI fingerprint
-    DirectApi { use_context_1m: bool },
+    DirectApi { use_context_1m: bool, session_id: String },
     /// /api/oauth/usage — similar to DirectApi but GET
     UsageApi,
     /// /api/bootstrap — browser-like, needs Origin/Referer/Cookie
@@ -113,8 +113,8 @@ pub fn build_stealth_headers(profile: &StealthProfile, kind: EndpointKind) -> He
     let mut headers = HeaderMap::new();
 
     match kind {
-        EndpointKind::DirectApi { use_context_1m } => {
-            insert_cli_headers(&mut headers, profile);
+        EndpointKind::DirectApi { use_context_1m, session_id } => {
+            insert_cli_headers(&mut headers, profile, &session_id);
             let beta = profile.beta_flags_for(use_context_1m);
             headers.insert(
                 HeaderName::from_static("anthropic-beta"),
@@ -122,7 +122,7 @@ pub fn build_stealth_headers(profile: &StealthProfile, kind: EndpointKind) -> He
             );
         }
         EndpointKind::UsageApi => {
-            insert_cli_headers(&mut headers, profile);
+            insert_cli_headers(&mut headers, profile, &Uuid::new_v4().to_string());
             // Usage API only needs oauth beta
             headers.insert(
                 HeaderName::from_static("anthropic-beta"),
@@ -143,7 +143,7 @@ pub fn build_stealth_headers(profile: &StealthProfile, kind: EndpointKind) -> He
 }
 
 /// Insert all CLI-persona headers (shared between DirectApi and UsageApi).
-fn insert_cli_headers(headers: &mut HeaderMap, profile: &StealthProfile) {
+fn insert_cli_headers(headers: &mut HeaderMap, profile: &StealthProfile, session_id: &str) {
     if let Ok(ua) = HeaderValue::from_str(&profile.user_agent()) {
         headers.insert(http::header::USER_AGENT, ua);
     }
@@ -160,11 +160,10 @@ fn insert_cli_headers(headers: &mut HeaderMap, profile: &StealthProfile) {
         HeaderValue::from_static("true"),
     );
 
-    // Session ID (random per request, mimics CC CLI session tracking)
+    // Session ID: passthrough from client or pre-generated fallback
     headers.insert(
         HeaderName::from_static("x-claude-code-session-id"),
-        HeaderValue::from_str(&Uuid::new_v4().to_string())
-            .unwrap_or_else(|_| HeaderValue::from_static("")),
+        HeaderValue::from_str(session_id).unwrap_or_else(|_| HeaderValue::from_static("")),
     );
 
     // Stainless SDK fingerprint
