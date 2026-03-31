@@ -4,6 +4,7 @@ use arc_swap::ArcSwap;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use sqlx::SqlitePool;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::db::billing::get_setting;
 
@@ -157,6 +158,13 @@ fn insert_cli_headers(headers: &mut HeaderMap, profile: &StealthProfile) {
     headers.insert(
         HeaderName::from_static("anthropic-dangerous-direct-browser-access"),
         HeaderValue::from_static("true"),
+    );
+
+    // Session ID (random per request, mimics CC CLI session tracking)
+    headers.insert(
+        HeaderName::from_static("x-claude-code-session-id"),
+        HeaderValue::from_str(&Uuid::new_v4().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("")),
     );
 
     // Stainless SDK fingerprint

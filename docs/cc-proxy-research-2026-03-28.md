@@ -248,3 +248,121 @@ user_{64位hex}_account_{uuid}_session_{uuid}
 1. UA 格式：`claude-code/2.1.76` → `claude-cli/X.Y.Z (external, cli)`
 2. billing header 的 `cch` 值：确认真实生成算法，目前 clewdr 硬编码为固定值
 3. 可选：支持 Stainless 头透传（当下游 CLI 已经发送时不覆盖）
+
+---
+
+## 七、Source Map 泄露补充调研（2026-03-31）
+
+> 数据来源：v2.1.88 npm 包 source map 还原的完整 TypeScript 源码
+> 还原仓库：[ChinaSiro/claude-code-sourcemap](https://github.com/ChinaSiro/claude-code-sourcemap)（4756 文件，1884 个 .ts/.tsx）
+> 补充：[vijaychauhanseo 二进制审计](https://vijaychauhanseo.substack.com/p/i-reverse-engineered-claude-code)（v2.1.85 Mach-O 静态分析）
+
+### 7.1 请求头完整画像（源码级确认）
+
+**文件**：`src/services/api/client.ts`
+
+```typescript
+const defaultHeaders = {
+  'x-app': 'cli',
+  'User-Agent': getUserAgent(),          // claude-cli/{version} (external, cli)
+  'X-Claude-Code-Session-Id': getSessionId(),  // ← v2.1.86 新增
+  // 条件性 headers:
+  // 'x-claude-remote-container-id': ...  // 远程容器模式
+  // 'x-claude-remote-session-id': ...    // 远程会话模式
+  // 'x-client-app': ...                  // SDK 消费者标识
+  // 'x-anthropic-additional-protection': 'true'  // 环境变量开启
+}
+```
+
+**Stainless 头**由 Anthropic SDK 自动注入（不在 client.ts 里），与我们的实现吻合。
+
+**新增 header**：`X-Claude-Code-Session-Id`，在 v2.1.86 引入。值为启动时生成的 UUID，整个 session 内不变。ClewdR 当前未实现——后续需加。
+
+### 7.2 Beta Flags 完整定义（源码级确认）
+
+**文件**：`src/constants/betas.ts`
+
+| 常量名 | 值 | 对外发送？ |
+|--------|-----|-----------|
+| `CLAUDE_CODE_20250219_BETA_HEADER` | `claude-code-20250219` | ✅ 非 Haiku 模型 |
+| `OAUTH_BETA_HEADER` | `oauth-2025-04-20` | ✅ OAuth 订阅者 |
+| `CONTEXT_1M_BETA_HEADER` | `context-1m-2025-08-07` | ✅ 1M 上下文模型 |
+| `INTERLEAVED_THINKING_BETA_HEADER` | `interleaved-thinking-2025-05-14` | ✅ 支持 ISP 的模型 |
+| `REDACT_THINKING_BETA_HEADER` | `redact-thinking-2026-02-12` | ✅ firstParty + 交互模式 |
+| `CONTEXT_MANAGEMENT_BETA_HEADER` | `context-management-2025-06-27` | ✅ Claude 4+ |
+| `PROMPT_CACHING_SCOPE_BETA_HEADER` | `prompt-caching-scope-2026-01-05` | ✅ firstParty |
+| `TOOL_SEARCH_BETA_HEADER_1P` | `advanced-tool-use-2025-11-20` | ✅ firstParty/Foundry |
+| `STRUCTURED_OUTPUTS_BETA_HEADER` | `structured-outputs-2025-12-15` | ⚠️ Statsig gate 控制 |
+| `EFFORT_BETA_HEADER` | `effort-2025-11-24` | ❌ 定义了但未在 getAllModelBetas 使用 |
+| `FAST_MODE_BETA_HEADER` | `fast-mode-2026-02-01` | ❌ 同上 |
+| `TASK_BUDGETS_BETA_HEADER` | `task-budgets-2026-03-13` | ❌ 同上 |
+| `ADVISOR_BETA_HEADER` | `advisor-tool-2026-03-01` | ❌ 同上 |
+| `TOKEN_EFFICIENT_TOOLS_BETA_HEADER` | `token-efficient-tools-2026-03-28` | ❌ ant-only |
+| `SUMMARIZE_CONNECTOR_TEXT_BETA_HEADER` | `summarize-connector-text-2026-03-13` | ❌ ant-only + feature flag |
+| `CLI_INTERNAL_BETA_HEADER` | `cli-internal-2026-02-09` | ❌ ant-only |
+| `AFK_MODE_BETA_HEADER` | `afk-mode-2026-01-31` | ❌ feature flag |
+| `WEB_SEARCH_BETA_HEADER` | `web-search-2025-03-05` | ❌ Vertex/Foundry only |
+| `TOOL_SEARCH_BETA_HEADER_3P` | `tool-search-tool-2025-10-19` | ❌ Vertex/Bedrock only |
+
+**ClewdR 当前 9 项**与外部 OAuth 用户实际发送的完全吻合。`effort-2025-11-24` 在源码中未被
+`getAllModelBetas()` 调用，多余但无害。`structured-outputs-2025-12-15` 由 Statsig gate
+`tengu_tool_pear` 控制，暂无法确认对外部用户是否开启——不加。
+
+### 7.3 Beta Flags 组装逻辑
+
+**文件**：`src/utils/betas.ts` → `getAllModelBetas(model)`
+
+按顺序条件添加：
+1. `claude-code-20250219` — 非 Haiku
+2. `cli-internal-*` — ant 内部员工
+3. `oauth-2025-04-20` — OAuth 订阅者
+4. `context-1m-*` — 模型支持 1M
+5. `interleaved-thinking-*` — 模型支持 ISP
+6. `redact-thinking-*` — firstParty + 非 SDK 交互模式 + settings 未开启 showThinkingSummaries
+7. `summarize-connector-text-*` — ant-only + feature flag
+8. `context-management-*` — firstParty + Claude 4+
+9. `structured-outputs-*` — firstParty + Statsig gate + 特定模型
+10. `token-efficient-tools-*` — ant-only + Statsig gate
+11. `web-search-*` — Vertex/Foundry only
+12. `prompt-caching-scope-*` — firstParty
+13. 环境变量 `ANTHROPIC_BETAS` 追加
+
+### 7.4 metadata.user_id 生成确认
+
+**文件**：`src/services/api/claude.ts`
+
+```typescript
+metadata: {
+  user_id: `user_${dba()}_account_${accountUuid}_session_${sessionId}`
+}
+```
+
+- `dba()` = `getOrCreateUserID()` 生成的设备级匿名 ID（持久化到 `~/.claude.json`）
+- `accountUuid` = OAuth 账号的 organization UUID
+- `sessionId` = 每次启动随机 UUID
+
+ClewdR 的实现 `user_{HMAC(salt, api_key_id)}_account__session_{uuid}` 格式吻合，
+`account_` 部分为空字符串是因为 organization UUID 在代理场景下不应暴露真实值。
+
+### 7.5 Telemetry 与安全机制（不影响代理，仅记录）
+
+源码确认的客户端侧行为（**均不走 API 请求，走 Statsig 侧信道**）：
+
+| 机制 | 说明 | 对代理的影响 |
+|------|------|-------------|
+| `tengu_sysprompt_block` | 每次请求前上报 system prompt 前 20 字符 + SHA-256 hash | **无**——客户端侧 Statsig 调用，代理不触发 |
+| `tengu_off_switch` | 远程 kill switch，OAuth 用户豁免 | **无**——我们走 OAuth |
+| `tengu_model_response_keyword_detected` | 客户端侧 sycophancy 检测 | **无** |
+| `tengu_session_quality_classification` | 会话质量分类 | **无** |
+| IDE 指纹（`clientType`） | 通过环境变量检测 IDE | **无**——服务端不看 |
+| `x-client-request-id` | 每个 fetch 请求带随机 UUID | ClewdR 不发送，可选加 |
+
+### 7.6 ClewdR 待办清单（按优先级）
+
+| 优先级 | 改动 | 当前状态 | 说明 |
+|--------|------|----------|------|
+| **高** | `X-Claude-Code-Session-Id` header | ❌ 缺失 | v2.1.86+ 每个请求携带，缺失是指纹缺陷 |
+| **中** | `x-client-request-id` header | ❌ 缺失 | 每个 fetch 带 UUID，firstParty only，可选 |
+| **低** | `effort-2025-11-24` 从 beta flags 移除 | 多余但无害 | 源码未在 getAllModelBetas 使用 |
+| **低** | `structured-outputs` beta | 待观察 | Statsig gate 控制，外部开启状态未知 |
+| **无** | 版本默认值更新 | 不需要 | 已支持 admin 面板动态配置 |
