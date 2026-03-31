@@ -8,6 +8,7 @@ pub struct RequestLogRow<'a> {
     pub request_type: &'a str,
     pub user_id: Option<i64>,
     pub api_key_id: Option<i64>,
+    pub account_id: Option<i64>,
     pub model_raw: &'a str,
     pub model_normalized: Option<&'a str>,
     pub stream: bool,
@@ -48,7 +49,7 @@ pub async fn insert_request_log(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"INSERT INTO request_logs (
-            request_id, request_type, user_id, api_key_id,
+            request_id, request_type, user_id, api_key_id, account_id,
             model_raw, model_normalized, stream,
             started_at, completed_at, duration_ms,
             status, http_status,
@@ -57,20 +58,21 @@ pub async fn insert_request_log(
             priced_input_nanousd_per_token, priced_output_nanousd_per_token,
             cost_nanousd, error_code, error_message
         ) VALUES (
-            ?1, ?2, ?3, ?4,
-            ?5, ?6, ?7,
-            ?8, ?9, ?10,
-            ?11, ?12,
-            ?13, ?14,
-            ?15, ?16,
-            ?17, ?18,
-            ?19, ?20, ?21
+            ?1, ?2, ?3, ?4, ?5,
+            ?6, ?7, ?8,
+            ?9, ?10, ?11,
+            ?12, ?13,
+            ?14, ?15,
+            ?16, ?17,
+            ?18, ?19,
+            ?20, ?21, ?22
         )"#,
     )
     .bind(r.request_id)
     .bind(r.request_type)
     .bind(r.user_id)
     .bind(r.api_key_id)
+    .bind(r.account_id)
     .bind(r.model_raw)
     .bind(r.model_normalized)
     .bind(r.stream as i32)

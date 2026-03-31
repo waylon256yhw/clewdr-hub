@@ -4,6 +4,7 @@ use sqlx::SqlitePool;
 
 use super::common::{Paginated, PaginationParams};
 use crate::error::ClewdrError;
+use crate::services::cookie_actor::CookieActorHandle;
 
 #[derive(Serialize, sqlx::FromRow)]
 pub struct AccountResponse {
@@ -67,6 +68,7 @@ pub async fn list(
 
 pub async fn create(
     State(db): State<SqlitePool>,
+    State(actor): State<CookieActorHandle>,
     Json(req): Json<CreateAccountRequest>,
 ) -> Result<(StatusCode, Json<AccountResponse>), ClewdrError> {
     let max_slots = req.max_slots.unwrap_or(5);
@@ -80,7 +82,7 @@ pub async fn create(
     .bind(&req.name)
     .bind(req.rr_order)
     .bind(max_slots)
-    .bind(req.cookie_blob.as_bytes())
+    .bind(&req.cookie_blob)
     .bind(&req.organization_uuid)
     .execute(&db)
     .await
@@ -94,6 +96,9 @@ pub async fn create(
     })?
     .last_insert_rowid();
 
+    // Trigger actor reload so the new account is immediately available
+    let _ = actor.reload_from_db().await;
+
     let query = format!("{ACCOUNT_SELECT} WHERE id = ?1");
     let row: AccountResponse = sqlx::query_as(&query)
         .bind(id).fetch_one(&db).await?;
@@ -103,10 +108,10 @@ pub async fn create(
 
 pub async fn update(
     State(db): State<SqlitePool>,
+    State(actor): State<CookieActorHandle>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateAccountRequest>,
 ) -> Result<Json<AccountResponse>, ClewdrError> {
-    // Validate all fields first
     if let Some(slots) = req.max_slots {
         if slots <= 0 { return Err(ClewdrError::BadRequest { msg: "max_slots must be positive" }); }
     }
@@ -158,7 +163,7 @@ pub async fn update(
     }
     if let Some(ref blob) = req.cookie_blob {
         sqlx::query("UPDATE accounts SET cookie_blob = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(blob.as_bytes()).bind(id).execute(&mut *tx).await?;
+            .bind(blob).bind(id).execute(&mut *tx).await?;
     }
     if let Some(ref org) = req.organization_uuid {
         sqlx::query("UPDATE accounts SET organization_uuid = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
@@ -166,6 +171,9 @@ pub async fn update(
     }
 
     tx.commit().await?;
+
+    // Trigger actor reload
+    let _ = actor.reload_from_db().await;
 
     let query = format!("{ACCOUNT_SELECT} WHERE id = ?1");
     let row: AccountResponse = sqlx::query_as(&query)
@@ -176,6 +184,7 @@ pub async fn update(
 
 pub async fn remove(
     State(db): State<SqlitePool>,
+    State(actor): State<CookieActorHandle>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ClewdrError> {
     let result = sqlx::query("DELETE FROM accounts WHERE id = ?1")
@@ -184,6 +193,9 @@ pub async fn remove(
     if result.rows_affected() == 0 {
         return Err(ClewdrError::NotFound { msg: "account not found" });
     }
+
+    // Trigger actor reload
+    let _ = actor.reload_from_db().await;
 
     Ok(StatusCode::NO_CONTENT)
 }

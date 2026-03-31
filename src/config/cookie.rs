@@ -81,6 +81,8 @@ impl<'de> Deserialize<'de> for ClewdrCookie {
 pub struct CookieStatus {
     pub cookie: ClewdrCookie,
     #[serde(default)]
+    pub account_id: Option<i64>,
+    #[serde(default)]
     pub token: Option<TokenInfo>,
     #[serde(default)]
     pub reset_time: Option<i64>,
@@ -168,6 +170,7 @@ impl CookieStatus {
         let cookie = ClewdrCookie::from_str(cookie)?;
         Ok(Self {
             cookie,
+            account_id: None,
             token: None,
             reset_time,
             supports_claude_1m_sonnet: Some(true),
@@ -383,6 +386,75 @@ impl CookieStatus {
             }
             ModelFamily::Other => {}
         }
+    }
+}
+
+/// Parameters for upserting account_runtime_state to DB.
+#[derive(Debug, Clone)]
+pub struct RuntimeStateParams {
+    pub reset_time: Option<i64>,
+    pub supports_claude_1m_sonnet: Option<bool>,
+    pub supports_claude_1m_opus: Option<bool>,
+    pub count_tokens_allowed: Option<bool>,
+    pub session_resets_at: Option<i64>,
+    pub weekly_resets_at: Option<i64>,
+    pub weekly_sonnet_resets_at: Option<i64>,
+    pub weekly_opus_resets_at: Option<i64>,
+    pub resets_last_checked_at: Option<i64>,
+    pub session_has_reset: Option<bool>,
+    pub weekly_has_reset: Option<bool>,
+    pub weekly_sonnet_has_reset: Option<bool>,
+    pub weekly_opus_has_reset: Option<bool>,
+    pub buckets: [UsageBreakdown; 5], // session, weekly, weekly_sonnet, weekly_opus, lifetime
+}
+
+impl CookieStatus {
+    /// Extract runtime state parameters for DB persistence.
+    pub fn to_runtime_params(&self) -> RuntimeStateParams {
+        RuntimeStateParams {
+            reset_time: self.reset_time,
+            supports_claude_1m_sonnet: self.supports_claude_1m_sonnet,
+            supports_claude_1m_opus: self.supports_claude_1m_opus,
+            count_tokens_allowed: self.count_tokens_allowed,
+            session_resets_at: self.session_resets_at,
+            weekly_resets_at: self.weekly_resets_at,
+            weekly_sonnet_resets_at: self.weekly_sonnet_resets_at,
+            weekly_opus_resets_at: self.weekly_opus_resets_at,
+            resets_last_checked_at: self.resets_last_checked_at,
+            session_has_reset: self.session_has_reset,
+            weekly_has_reset: self.weekly_has_reset,
+            weekly_sonnet_has_reset: self.weekly_sonnet_has_reset,
+            weekly_opus_has_reset: self.weekly_opus_has_reset,
+            buckets: [
+                self.session_usage.clone(),
+                self.weekly_usage.clone(),
+                self.weekly_sonnet_usage.clone(),
+                self.weekly_opus_usage.clone(),
+                self.lifetime_usage.clone(),
+            ],
+        }
+    }
+
+    /// Apply runtime state from a DB row onto this CookieStatus.
+    pub fn apply_runtime_state(&mut self, p: &RuntimeStateParams) {
+        self.reset_time = p.reset_time;
+        self.supports_claude_1m_sonnet = p.supports_claude_1m_sonnet;
+        self.supports_claude_1m_opus = p.supports_claude_1m_opus;
+        self.count_tokens_allowed = p.count_tokens_allowed;
+        self.session_resets_at = p.session_resets_at;
+        self.weekly_resets_at = p.weekly_resets_at;
+        self.weekly_sonnet_resets_at = p.weekly_sonnet_resets_at;
+        self.weekly_opus_resets_at = p.weekly_opus_resets_at;
+        self.resets_last_checked_at = p.resets_last_checked_at;
+        self.session_has_reset = p.session_has_reset;
+        self.weekly_has_reset = p.weekly_has_reset;
+        self.weekly_sonnet_has_reset = p.weekly_sonnet_has_reset;
+        self.weekly_opus_has_reset = p.weekly_opus_has_reset;
+        self.session_usage = p.buckets[0].clone();
+        self.weekly_usage = p.buckets[1].clone();
+        self.weekly_sonnet_usage = p.buckets[2].clone();
+        self.weekly_opus_usage = p.buckets[3].clone();
+        self.lifetime_usage = p.buckets[4].clone();
     }
 }
 

@@ -52,6 +52,10 @@ impl ClaudeCodeState {
             let p = p.to_owned();
 
             let cookie = state.request_cookie().await?;
+            // Propagate account_id to billing context
+            if let Some(ref mut ctx) = state.billing_ctx {
+                ctx.account_id = cookie.account_id;
+            }
             let retry = async {
                 match state.check_token() {
                     TokenStatus::None => {

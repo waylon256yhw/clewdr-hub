@@ -116,6 +116,7 @@ impl LLMProvider for ClaudeCodeProvider {
             db: self.shared.db.clone(),
             user_id: request.context.user_id,
             api_key_id: request.context.api_key_id,
+            account_id: None,
             model_raw: request.context.model_raw.clone(),
             request_id: request.context.request_id.clone(),
             started_at: request.context.started_at,

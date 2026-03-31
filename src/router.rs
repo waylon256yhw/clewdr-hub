@@ -3,7 +3,7 @@ use axum::{
     extract::DefaultBodyLimit,
     http::Method,
     middleware::from_extractor_with_state,
-    routing::{delete, get, post},
+    routing::{get, post},
 };
 use sqlx::SqlitePool;
 use tower_http::{compression::CompressionLayer, cors::CorsLayer};
@@ -24,7 +24,7 @@ pub struct RouterBuilder {
 
 impl RouterBuilder {
     pub async fn new(db_pool: SqlitePool) -> Self {
-        let cookie_handle = CookieActorHandle::start()
+        let cookie_handle = CookieActorHandle::start(db_pool.clone())
             .await
             .expect("Failed to start CookieActor");
         let stealth_profile = stealth::init_stealth_profile(&db_pool).await;
@@ -72,13 +72,6 @@ impl RouterBuilder {
 
     fn route_admin_endpoints(mut self) -> Self {
         let legacy_admin_router = Router::new()
-            .route("/cookies", get(api_get_cookies))
-            .route(
-                "/cookie",
-                delete(api_delete_cookie)
-                    .post(api_post_cookie)
-                    .put(api_put_cookie),
-            )
             .route("/auth", get(api_auth))
             .route("/config", get(api_get_config).post(api_post_config))
             .route_layer(from_extractor_with_state::<RequireAdminAuth, _>(self.state.clone()));

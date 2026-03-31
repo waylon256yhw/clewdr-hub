@@ -50,6 +50,8 @@ impl Display for Reason {
 pub struct UselessCookie {
     pub cookie: ClewdrCookie,
     pub reason: Reason,
+    #[serde(default)]
+    pub account_id: Option<i64>,
 }
 
 impl PartialEq<CookieStatus> for UselessCookie {
@@ -73,15 +75,52 @@ impl Hash for UselessCookie {
 }
 
 impl UselessCookie {
-    /// Creates a new UselessCookie instance
-    ///
-    /// # Arguments
-    /// * `cookie` - The cookie that is unusable
-    /// * `reason` - The reason why the cookie is unusable
-    ///
-    /// # Returns
-    /// A new UselessCookie instance
     pub fn new(cookie: ClewdrCookie, reason: Reason) -> Self {
-        Self { cookie, reason }
+        Self {
+            cookie,
+            reason,
+            account_id: None,
+        }
+    }
+
+    pub fn with_account_id(cookie: ClewdrCookie, reason: Reason, account_id: Option<i64>) -> Self {
+        Self {
+            cookie,
+            reason,
+            account_id,
+        }
+    }
+}
+
+impl Reason {
+    pub fn to_db_string(&self) -> String {
+        match self {
+            Reason::NormalPro => "normal_pro".to_string(),
+            Reason::Free => "free".to_string(),
+            Reason::Disabled => "disabled".to_string(),
+            Reason::Banned => "banned".to_string(),
+            Reason::Null => "null".to_string(),
+            Reason::Restricted(ts) => format!("restricted:{ts}"),
+            Reason::TooManyRequest(ts) => format!("too_many_request:{ts}"),
+        }
+    }
+
+    pub fn from_db_string(s: &str) -> Self {
+        match s {
+            "normal_pro" => Reason::NormalPro,
+            "free" => Reason::Free,
+            "disabled" => Reason::Disabled,
+            "banned" => Reason::Banned,
+            "null" => Reason::Null,
+            other => {
+                if let Some(ts) = other.strip_prefix("restricted:") {
+                    Reason::Restricted(ts.parse().unwrap_or(0))
+                } else if let Some(ts) = other.strip_prefix("too_many_request:") {
+                    Reason::TooManyRequest(ts.parse().unwrap_or(0))
+                } else {
+                    Reason::Null
+                }
+            }
+        }
     }
 }

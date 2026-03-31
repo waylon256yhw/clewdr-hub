@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     fmt::{Debug, Display},
     net::{IpAddr, SocketAddr},
 };
@@ -15,7 +14,7 @@ use http::uri::Authority;
 use passwords::PasswordGenerator;
 use serde::{Deserialize, Serialize};
 use tokio::spawn;
-use tracing::error;
+use tracing::{error, warn};
 use url::Url;
 use wreq::Proxy;
 
@@ -23,7 +22,7 @@ use super::{CONFIG_PATH, ENDPOINT_URL};
 use crate::{
     Args,
     config::{
-        CC_CLIENT_ID, CookieStatus, UselessCookie, default_check_update, default_ip,
+        CC_CLIENT_ID, default_check_update, default_ip,
         default_max_retries, default_port, default_skip_cool_down, default_use_real_roles,
     },
     error::ClewdrError,
@@ -54,12 +53,6 @@ fn generate_password() -> String {
 /// A struct representing the configuration of the application
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClewdrConfig {
-    // key configurations
-    #[serde(default)]
-    pub cookie_array: HashSet<CookieStatus>,
-    #[serde(default)]
-    pub wasted_cookie: HashSet<UselessCookie>,
-
     // Server settings, cannot hot reload
     #[serde(default = "default_ip")]
     ip: IpAddr,
@@ -139,8 +132,6 @@ impl Default for ClewdrConfig {
             max_retries: default_max_retries(),
             check_update: default_check_update(),
             auto_update: false,
-            cookie_array: HashSet::new(),
-            wasted_cookie: HashSet::new(),
             password: String::new(),
             admin_password: String::new(),
             proxy: None,
@@ -249,7 +240,7 @@ impl ClewdrConfig {
     pub fn new() -> Self {
         // Load config from TOML then override with environment variables.
         // Use double underscore "__" to map nested keys.
-        let mut config: ClewdrConfig = Figment::from(Toml::file(CONFIG_PATH.as_path()))
+        let config: ClewdrConfig = Figment::from(Toml::file(CONFIG_PATH.as_path()))
             .admerge(Env::prefixed("CLEWDR_").split("__"))
             .extract_lossy()
             .inspect_err(|e| {
@@ -257,18 +248,8 @@ impl ClewdrConfig {
             })
             .unwrap_or_default();
         if let Some(ref f) = Args::try_parse().ok().and_then(|a| a.file) {
-            // load cookies from file
             if f.exists() {
-                if let Ok(cookies) = std::fs::read_to_string(f) {
-                    let cookies = cookies
-                        .lines()
-                        .filter_map(|line| CookieStatus::new(line, None).ok());
-                    config.cookie_array.extend(cookies);
-                } else {
-                    error!("Failed to read cookie file: {}", f.display());
-                }
-            } else {
-                error!("Cookie file not found: {}", f.display());
+                warn!("--file flag is deprecated; manage cookies via admin API instead");
             }
         }
         let config = config.validate();
@@ -321,7 +302,7 @@ impl ClewdrConfig {
         if self.admin_password.trim().is_empty() {
             self.admin_password = generate_password();
         }
-        self.cookie_array = self.cookie_array.into_iter().map(|x| x.reset()).collect();
+
         self.wreq_proxy = self.proxy.to_owned().and_then(|p| {
             Proxy::all(p)
                 .inspect_err(|e| {

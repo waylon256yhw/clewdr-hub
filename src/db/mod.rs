@@ -1,3 +1,4 @@
+pub mod accounts;
 pub mod api_key;
 pub mod billing;
 pub mod models;
