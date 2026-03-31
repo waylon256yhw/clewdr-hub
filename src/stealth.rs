@@ -212,3 +212,13 @@ pub async fn init_stealth_profile(pool: &SqlitePool) -> SharedStealthProfile {
     let _ = GLOBAL_PROFILE.set(shared.clone());
     shared
 }
+
+/// Reload stealth profile from DB and hot-swap into global singleton.
+pub async fn reload_stealth_profile(pool: &SqlitePool) {
+    let profile = StealthProfile::load_from_db(pool).await;
+    warn!(
+        "Stealth profile reloaded: cli={} sdk={} os={}/{}",
+        profile.cli_version, profile.sdk_version, profile.stainless_os, profile.stainless_arch
+    );
+    global_profile().store(Arc::new(profile));
+}

@@ -164,6 +164,10 @@ pub enum ClewdrError {
     RpmExceeded,
     #[snafu(display("Usage quota exceeded"))]
     QuotaExceeded,
+    #[snafu(display("Not found: {}", msg))]
+    NotFound { msg: &'static str },
+    #[snafu(display("Conflict: {}", msg))]
+    Conflict { msg: &'static str },
     #[snafu(display("Database error: {}", source))]
     #[snafu(context(false))]
     SqlxError {
@@ -239,6 +243,8 @@ impl IntoResponse for ClewdrError {
                 return (StatusCode::TOO_MANY_REQUESTS, Json(ClaudeError { error: inner }))
                     .into_response();
             }
+            ClewdrError::NotFound { .. } => (StatusCode::NOT_FOUND, json!(self.to_string())),
+            ClewdrError::Conflict { .. } => (StatusCode::CONFLICT, json!(self.to_string())),
             ClewdrError::BadRequest { .. } => (StatusCode::BAD_REQUEST, json!(self.to_string())),
             ClewdrError::InvalidHeaderValue { .. } => {
                 (StatusCode::BAD_REQUEST, json!(self.to_string()))

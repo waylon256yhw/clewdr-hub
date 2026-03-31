@@ -1,3 +1,4 @@
+pub mod admin;
 mod claude_code;
 mod config;
 mod error;

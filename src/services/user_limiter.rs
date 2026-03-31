@@ -33,6 +33,12 @@ impl UserLimiterMap {
         }
     }
 
+    /// Remove a user's limiter entry (e.g. on user deletion/disable).
+    pub async fn remove(&self, user_id: i64) {
+        let mut map = self.inner.write().await;
+        map.remove(&user_id);
+    }
+
     /// Acquire a per-user concurrency permit and check RPM.
     /// Returns None if user_id/limits are not provided (legacy auth).
     pub async fn acquire(

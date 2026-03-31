@@ -71,7 +71,7 @@ impl RouterBuilder {
     }
 
     fn route_admin_endpoints(mut self) -> Self {
-        let admin_router = Router::new()
+        let legacy_admin_router = Router::new()
             .route("/cookies", get(api_get_cookies))
             .route(
                 "/cookie",
@@ -82,8 +82,13 @@ impl RouterBuilder {
             .route("/auth", get(api_auth))
             .route("/config", get(api_get_config).post(api_post_config))
             .route_layer(from_extractor_with_state::<RequireAdminAuth, _>(self.state.clone()));
+
+        let new_admin_router = crate::api::admin::admin_router()
+            .route_layer(from_extractor_with_state::<RequireAdminAuth, _>(self.state.clone()));
+
         let router = Router::new()
-            .nest("/api", admin_router)
+            .nest("/api", legacy_admin_router)
+            .nest("/api/admin", new_admin_router)
             .route("/api/version", get(api_version))
             .with_state(self.state.clone());
         self.inner = self.inner.merge(router);

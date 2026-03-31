@@ -131,6 +131,11 @@ fn hash_password(password: &str) -> Result<String, ClewdrError> {
     Ok(hash.to_string())
 }
 
+/// Public wrapper for admin API user creation/update.
+pub fn hash_password_public(password: &str) -> Result<String, ClewdrError> {
+    hash_password(password)
+}
+
 fn generate_password(len: usize) -> String {
     const CHARSET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     let mut rng = rand::rng();
