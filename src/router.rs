@@ -12,7 +12,7 @@ use crate::{
     api::*,
     config::CLEWDR_CONFIG,
     middleware::{RequireAdminAuth, RequireFlexibleAuth},
-    services::cookie_actor::CookieActorHandle,
+    services::{cookie_actor::CookieActorHandle, user_limiter::UserLimiterMap},
     state::{AppState, AuthState},
 };
 
@@ -40,6 +40,7 @@ impl RouterBuilder {
             cookie_actor: cookie_handle,
             code_provider: claude_providers.code(),
             auth,
+            user_limiter: UserLimiterMap::new(),
         };
         RouterBuilder {
             state,

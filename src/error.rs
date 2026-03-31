@@ -158,6 +158,10 @@ pub enum ClewdrError {
     TimestampError { timestamp: i64 },
     #[snafu(display("Key/Password Invalid"))]
     InvalidAuth,
+    #[snafu(display("User concurrency limit exceeded"))]
+    UserConcurrencyExceeded,
+    #[snafu(display("Request rate limit exceeded"))]
+    RpmExceeded,
     #[snafu(display("Database error: {}", source))]
     #[snafu(context(false))]
     SqlxError {
@@ -222,6 +226,15 @@ impl IntoResponse for ClewdrError {
             ClewdrError::InvalidCookie { .. } => (StatusCode::BAD_REQUEST, json!(self.to_string())),
             ClewdrError::PathNotFound { .. } => (StatusCode::NOT_FOUND, json!(self.to_string())),
             ClewdrError::InvalidAuth => (StatusCode::UNAUTHORIZED, json!(self.to_string())),
+            ClewdrError::UserConcurrencyExceeded | ClewdrError::RpmExceeded => {
+                let inner = ClaudeErrorBody {
+                    message: json!(self.to_string()),
+                    r#type: "rate_limit_error".to_string(),
+                    code: Some(429),
+                };
+                return (StatusCode::TOO_MANY_REQUESTS, Json(ClaudeError { error: inner }))
+                    .into_response();
+            }
             ClewdrError::BadRequest { .. } => (StatusCode::BAD_REQUEST, json!(self.to_string())),
             ClewdrError::InvalidHeaderValue { .. } => {
                 (StatusCode::BAD_REQUEST, json!(self.to_string()))

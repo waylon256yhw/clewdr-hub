@@ -220,6 +220,10 @@ where
 
     async fn from_request(req: Request, _: &S) -> Result<Self, Self::Rejection> {
         let anthropic_beta = extract_anthropic_beta_header(req.headers());
+        let auth_user = req
+            .extensions()
+            .get::<crate::db::models::AuthenticatedUser>()
+            .cloned();
         let Json(mut body) = Json::<CreateMessageParams>::from_request(req, &()).await?;
 
         if CLEWDR_CONFIG.load().sanitize_messages {
@@ -289,6 +293,10 @@ where
                 input_tokens,
                 output_tokens: 0,
             },
+            user_id: auth_user.as_ref().map(|u| u.user_id),
+            api_key_id: auth_user.as_ref().map(|u| u.api_key_id),
+            max_concurrent: auth_user.as_ref().map(|u| u.max_concurrent),
+            rpm_limit: auth_user.as_ref().map(|u| u.rpm_limit),
         };
 
         Ok(Self(body, context))

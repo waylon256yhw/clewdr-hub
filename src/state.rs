@@ -5,6 +5,7 @@ use sqlx::SqlitePool;
 
 use crate::providers::claude::ClaudeCodeProvider;
 use crate::services::cookie_actor::CookieActorHandle;
+use crate::services::user_limiter::UserLimiterMap;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -12,6 +13,7 @@ pub struct AppState {
     pub cookie_actor: CookieActorHandle,
     pub code_provider: Arc<ClaudeCodeProvider>,
     pub auth: AuthState,
+    pub user_limiter: UserLimiterMap,
 }
 
 #[derive(Clone)]
@@ -42,5 +44,11 @@ impl FromRef<AppState> for AuthState {
 impl FromRef<AppState> for SqlitePool {
     fn from_ref(state: &AppState) -> Self {
         state.db.clone()
+    }
+}
+
+impl FromRef<AppState> for UserLimiterMap {
+    fn from_ref(state: &AppState) -> Self {
+        state.user_limiter.clone()
     }
 }
