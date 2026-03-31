@@ -12,7 +12,6 @@ use crate::config::ClewdrCookie;
 /// Reason why a cookie is considered useless
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Error)]
 pub enum Reason {
-    NormalPro,
     Free,
     Disabled,
     Banned,
@@ -29,7 +28,6 @@ impl Display for Reason {
                 .unwrap_or("Invalid date".to_string())
         };
         match self {
-            Reason::NormalPro => write!(f, "Normal Pro account"),
             Reason::Disabled => write!(f, "Organization Disabled"),
             Reason::Free => write!(f, "Free account"),
             Reason::Banned => write!(f, "Banned"),
@@ -95,7 +93,6 @@ impl UselessCookie {
 impl Reason {
     pub fn to_db_string(&self) -> String {
         match self {
-            Reason::NormalPro => "normal_pro".to_string(),
             Reason::Free => "free".to_string(),
             Reason::Disabled => "disabled".to_string(),
             Reason::Banned => "banned".to_string(),
@@ -107,7 +104,6 @@ impl Reason {
 
     pub fn from_db_string(s: &str) -> Self {
         match s {
-            "normal_pro" => Reason::NormalPro,
             "free" => Reason::Free,
             "disabled" => Reason::Disabled,
             "banned" => Reason::Banned,

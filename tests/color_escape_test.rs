@@ -24,7 +24,6 @@ mod tests {
         // This is used in InvalidCookie errors that go into JSON responses
 
         let test_cases = vec![
-            (Reason::NormalPro, "Normal Pro account"),
             (Reason::Disabled, "Organization Disabled"),
             (Reason::Free, "Free account"),
             (Reason::Banned, "Banned"),

@@ -46,8 +46,6 @@ pub struct KeyOverview {
 pub struct AccountOverview {
     pub total: i64,
     pub active: i64,
-    pub cooldown: i64,
-    pub auth_error: i64,
     pub disabled: i64,
 }
 
@@ -84,11 +82,9 @@ pub async fn overview(
            FROM api_keys"#,
     ).fetch_one(&db).await?;
 
-    let account_stats: (i64, i64, i64, i64, i64) = sqlx::query_as(
+    let account_stats: (i64, i64, i64) = sqlx::query_as(
         r#"SELECT COUNT(*),
                   COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0),
-                  COALESCE(SUM(CASE WHEN status = 'cooldown' THEN 1 ELSE 0 END), 0),
-                  COALESCE(SUM(CASE WHEN status = 'auth_error' THEN 1 ELSE 0 END), 0),
                   COALESCE(SUM(CASE WHEN status = 'disabled' THEN 1 ELSE 0 END), 0)
            FROM accounts"#,
     ).fetch_one(&db).await?;
@@ -125,9 +121,7 @@ pub async fn overview(
         accounts: AccountOverview {
             total: account_stats.0,
             active: account_stats.1,
-            cooldown: account_stats.2,
-            auth_error: account_stats.3,
-            disabled: account_stats.4,
+            disabled: account_stats.2,
         },
         policies: policy_count,
         requests_1h,

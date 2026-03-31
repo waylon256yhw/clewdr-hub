@@ -102,8 +102,6 @@ pub struct ClewdrConfig {
     pub skip_non_pro: bool,
     #[serde(default = "default_skip_cool_down")]
     pub skip_rate_limit: bool,
-    #[serde(default)]
-    pub skip_normal_pro: bool,
 
     // Prompt configurations, can hot reload
     #[serde(default = "default_use_real_roles")]
@@ -152,7 +150,6 @@ impl Default for ClewdrConfig {
             skip_restricted: false,
             skip_non_pro: false,
             skip_rate_limit: default_skip_cool_down(),
-            skip_normal_pro: false,
             claude_code_client_id: None,
             custom_system: None,
             no_fs: false,
@@ -201,7 +198,6 @@ impl Display for ClewdrConfig {
             "Skip first warning: {}",
             enabled(self.skip_first_warning)
         )?;
-        writeln!(f, "Skip normal Pro: {}", enabled(self.skip_normal_pro))?;
         writeln!(f, "Skip rate limit: {}", enabled(self.skip_rate_limit))?;
         Ok(())
     }

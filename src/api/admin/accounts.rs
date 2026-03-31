@@ -14,8 +14,7 @@ pub struct AccountResponse {
     pub max_slots: i64,
     pub status: String,
     pub organization_uuid: Option<String>,
-    pub cooldown_until: Option<String>,
-    pub cooldown_reason: Option<String>,
+    pub invalid_reason: Option<String>,
     pub last_refresh_at: Option<String>,
     pub last_used_at: Option<String>,
     pub last_error: Option<String>,
@@ -44,7 +43,7 @@ pub struct UpdateAccountRequest {
 
 const ACCOUNT_SELECT: &str = r#"
     SELECT id, name, rr_order, max_slots, status,
-           organization_uuid, cooldown_until, cooldown_reason,
+           organization_uuid, invalid_reason,
            last_refresh_at, last_used_at, last_error,
            created_at, updated_at
     FROM accounts
@@ -116,7 +115,7 @@ pub async fn update(
         if slots <= 0 { return Err(ClewdrError::BadRequest { msg: "max_slots must be positive" }); }
     }
     if let Some(ref status) = req.status {
-        if !["active", "cooldown", "auth_error", "disabled"].contains(&status.as_str()) {
+        if !["active", "disabled"].contains(&status.as_str()) {
             return Err(ClewdrError::BadRequest { msg: "invalid status value" });
         }
     }
@@ -158,8 +157,16 @@ pub async fn update(
             .bind(slots).bind(id).execute(&mut *tx).await?;
     }
     if let Some(ref status) = req.status {
-        sqlx::query("UPDATE accounts SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(status).bind(id).execute(&mut *tx).await?;
+        if status == "active" {
+            // Re-activate: clear invalid_reason and stale runtime state
+            sqlx::query("UPDATE accounts SET status = 'active', invalid_reason = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?1")
+                .bind(id).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM account_runtime_state WHERE account_id = ?1")
+                .bind(id).execute(&mut *tx).await?;
+        } else {
+            sqlx::query("UPDATE accounts SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
+                .bind(status).bind(id).execute(&mut *tx).await?;
+        }
     }
     if let Some(ref blob) = req.cookie_blob {
         sqlx::query("UPDATE accounts SET cookie_blob = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")

@@ -225,9 +225,6 @@ impl CookieActor {
             state.valid.retain(|c| c != cookie);
         };
         match reason {
-            Reason::NormalPro => {
-                return;
-            }
             Reason::TooManyRequest(i) | Reason::Restricted(i) => {
                 find_remove(&cookie);
                 let mut cookie = cookie;
@@ -398,12 +395,8 @@ impl CookieActor {
                 mem_cookies.insert(id, cs);
             }
         }
-        let mut mem_invalid: HashMap<i64, UselessCookie> = HashMap::new();
-        for uc in state.invalid.drain() {
-            if let Some(id) = uc.account_id {
-                mem_invalid.insert(id, uc);
-            }
-        }
+        // Drain invalid set — will be rebuilt from DB
+        state.invalid.clear();
 
         // Rebuild from DB
         for row in &accounts {
