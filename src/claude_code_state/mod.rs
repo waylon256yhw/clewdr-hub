@@ -13,7 +13,7 @@ use wreq::RequestBuilder;
 
 use crate::{
     billing::BillingContext,
-    config::{CLAUDE_ENDPOINT, CLEWDR_CONFIG, CookieStatus, Reason},
+    config::{CLAUDE_ENDPOINT, CookieStatus, Reason},
     error::{ClewdrError, WreqSnafu},
     services::cookie_actor::CookieActorHandle,
     stealth::SharedStealthProfile,
@@ -21,6 +21,19 @@ use crate::{
 };
 
 static SUPER_CLIENT: LazyLock<wreq::Client> = LazyLock::new(wreq::Client::new);
+
+fn proxy_from_profile(profile: &SharedStealthProfile) -> Option<wreq::Proxy> {
+    profile
+        .load()
+        .proxy
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(|p| {
+            wreq::Proxy::all(p)
+                .inspect_err(|e| error!("Failed to parse proxy from settings: {e}"))
+                .ok()
+        })
+}
 
 #[derive(Clone)]
 pub struct ClaudeCodeState {
@@ -41,12 +54,13 @@ pub struct ClaudeCodeState {
 impl ClaudeCodeState {
     /// Create a new ClaudeCodeState instance
     pub fn new(cookie_actor_handle: CookieActorHandle, stealth_profile: SharedStealthProfile) -> Self {
+        let proxy = proxy_from_profile(&stealth_profile);
         ClaudeCodeState {
             cookie_actor_handle,
             cookie: None,
             cookie_header_value: HeaderValue::from_static(""),
-            proxy: CLEWDR_CONFIG.load().wreq_proxy.to_owned(),
-            endpoint: CLEWDR_CONFIG.load().endpoint(),
+            proxy,
+            endpoint: crate::config::ENDPOINT_URL.to_owned(),
             client: SUPER_CLIENT.to_owned(),
             stream: false,
             system_prompt_hash: None,
@@ -130,9 +144,9 @@ impl ClaudeCodeState {
             .await?;
         self.cookie = Some(res.to_owned());
         self.cookie_header_value = HeaderValue::from_str(res.cookie.to_string().as_str())?;
-        // Always pull latest proxy/endpoint before building the client
-        self.proxy = CLEWDR_CONFIG.load().wreq_proxy.to_owned();
-        self.endpoint = CLEWDR_CONFIG.load().endpoint();
+        // Always pull latest proxy from stealth profile
+        self.proxy = proxy_from_profile(&self.stealth_profile);
+        self.endpoint = crate::config::ENDPOINT_URL.to_owned();
         let mut client = wreq::Client::builder()
             .cookie_store(true);
         if let Some(ref proxy) = self.proxy {

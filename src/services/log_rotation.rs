@@ -20,12 +20,10 @@ pub async fn start_log_rotation(db: SqlitePool) {
 }
 
 async fn run_rotation(db: &SqlitePool) {
-    let retention_days = get_setting(db, "log_retention_days")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(DEFAULT_RETENTION_DAYS);
+    let retention_days: i64 = match get_setting(db, "log_retention_days").await {
+        Ok(Some(v)) => v.parse().unwrap_or(DEFAULT_RETENTION_DAYS),
+        _ => DEFAULT_RETENTION_DAYS,
+    };
 
     match delete_old_request_logs(db, retention_days).await {
         Ok(count) => {

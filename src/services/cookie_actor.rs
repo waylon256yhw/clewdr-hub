@@ -452,9 +452,9 @@ impl CookieActor {
                     cs.count_tokens_allowed = mem.count_tokens_allowed;
                 }
                 // Cookie changed = credential replacement → use fresh defaults from new()
-            } else if let Some(runtime) = &row.runtime {
-                // New account from DB with persisted runtime state
-                cs.apply_runtime_state(&runtime.to_params());
+            } else if let Some(ref runtime) = row.runtime {
+                let params = runtime.to_params();
+                cs.apply_runtime_state(&params);
             }
 
             // Normalize 1M defaults

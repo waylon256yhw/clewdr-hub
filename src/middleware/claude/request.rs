@@ -1,7 +1,6 @@
 use std::{
     env,
     hash::{DefaultHasher, Hash, Hasher},
-    mem,
     sync::LazyLock,
     vec,
 };
@@ -14,7 +13,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    config::CLEWDR_CONFIG,
     error::ClewdrError,
     middleware::claude::ClaudeContext,
     stealth::{self, StealthProfile},
@@ -188,46 +186,6 @@ static TEST_MESSAGE_CLAUDE: LazyLock<Message> =
 static TEST_MESSAGE_TEXT: LazyLock<Message> =
     LazyLock::new(|| Message::new_text(Role::User, "Hi"));
 
-fn sanitize_messages(msgs: Vec<Message>) -> Vec<Message> {
-    msgs.into_iter()
-        .filter_map(|m| {
-            let role = m.role;
-            let content = match m.content {
-                MessageContent::Text { content } => {
-                    let trimmed = content.trim().to_string();
-                    if role == Role::Assistant && trimmed.is_empty() {
-                        return None;
-                    }
-                    MessageContent::Text { content: trimmed }
-                }
-                MessageContent::Blocks { content } => {
-                    let mut new_blocks: Vec<ContentBlock> = content
-                        .into_iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::Text { text, .. } => {
-                                let t = text.trim().to_string();
-                                if t.is_empty() {
-                                    None
-                                } else {
-                                    Some(ContentBlock::text(t))
-                                }
-                            }
-                            other => Some(other),
-                        })
-                        .collect();
-                    if role == Role::Assistant && new_blocks.is_empty() {
-                        return None;
-                    }
-                    MessageContent::Blocks {
-                        content: mem::take(&mut new_blocks),
-                    }
-                }
-            };
-            Some(Message { role, content })
-        })
-        .collect()
-}
-
 pub struct ClaudeCodePreprocess(pub CreateMessageParams, pub ClaudeContext);
 
 impl<S> FromRequest<S> for ClaudeCodePreprocess
@@ -249,9 +207,6 @@ where
         let session_id = client_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let Json(mut body) = Json::<CreateMessageParams>::from_request(req, &()).await?;
 
-        if CLEWDR_CONFIG.load().sanitize_messages {
-            body.messages = sanitize_messages(body.messages);
-        }
         if body.model.ends_with("-thinking") {
             body.model = body.model.trim_end_matches("-thinking").to_string();
             body.thinking.get_or_insert(Thinking::new(4096));
@@ -275,18 +230,10 @@ where
         // Load stealth profile for billing header generation
         let profile = stealth::global_profile().load();
 
-        let mut system_prefixes = vec![ContentBlock::text(claude_code_billing_header(
+        let system_prefixes = vec![ContentBlock::text(claude_code_billing_header(
             &body.messages,
             &profile,
         ))];
-        if let Some(custom_system) = CLEWDR_CONFIG
-            .load()
-            .custom_system
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-        {
-            system_prefixes.push(ContentBlock::text(custom_system));
-        }
         prepend_system_blocks(&mut body, system_prefixes);
 
         if let Some(system) = body.system.as_mut() {
@@ -390,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn prepend_system_blocks_keeps_billing_before_custom_system() {
+    fn prepend_system_blocks_keeps_billing_before_original() {
         let mut body = CreateMessageParams {
             messages: vec![Message::new_text(Role::User, "hey")],
             model: "claude-sonnet-4-5".to_string(),
@@ -400,10 +347,7 @@ mod tests {
 
         prepend_system_blocks(
             &mut body,
-            vec![
-                ContentBlock::text("billing"),
-                ContentBlock::text("custom system"),
-            ],
+            vec![ContentBlock::text("billing")],
         );
 
         let systems = body.system.unwrap().as_array().cloned().unwrap();
@@ -411,6 +355,6 @@ mod tests {
             .iter()
             .map(|value| value["text"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(texts, vec!["billing", "custom system", "original system"]);
+        assert_eq!(texts, vec!["billing", "original system"]);
     }
 }

@@ -39,6 +39,7 @@ pub struct StealthProfile {
     pub stainless_os: String,
     pub stainless_arch: String,
     pub node_version: String,
+    pub proxy: Option<String>,
 }
 
 impl Default for StealthProfile {
@@ -51,6 +52,7 @@ impl Default for StealthProfile {
             stainless_os: DEFAULT_STAINLESS_OS.into(),
             stainless_arch: DEFAULT_STAINLESS_ARCH.into(),
             node_version: DEFAULT_NODE_VERSION.into(),
+            proxy: None,
         }
     }
 }
@@ -60,31 +62,32 @@ impl StealthProfile {
     pub async fn load_from_db(pool: &SqlitePool) -> Self {
         let mut profile = Self::default();
 
-        async fn read(pool: &SqlitePool, key: &str) -> Option<String> {
-            get_setting(pool, key).await.ok().flatten().filter(|v| !v.is_empty())
+        fn non_empty(v: Result<Option<String>, sqlx::Error>) -> Option<String> {
+            v.ok().flatten().filter(|s| !s.is_empty())
         }
 
-        if let Some(v) = read(pool, "cc_cli_version").await {
+        if let Some(v) = non_empty(get_setting(pool, "cc_cli_version").await) {
             profile.cli_version = v;
         }
-        if let Some(v) = read(pool, "cc_sdk_version").await {
+        if let Some(v) = non_empty(get_setting(pool, "cc_sdk_version").await) {
             profile.sdk_version = v;
         }
-        if let Some(v) = read(pool, "cc_node_version").await {
+        if let Some(v) = non_empty(get_setting(pool, "cc_node_version").await) {
             profile.node_version = v;
         }
-        if let Some(v) = read(pool, "cc_stainless_os").await {
+        if let Some(v) = non_empty(get_setting(pool, "cc_stainless_os").await) {
             profile.stainless_os = v;
         }
-        if let Some(v) = read(pool, "cc_stainless_arch").await {
+        if let Some(v) = non_empty(get_setting(pool, "cc_stainless_arch").await) {
             profile.stainless_arch = v;
         }
-        if let Some(v) = read(pool, "cc_beta_flags").await {
+        if let Some(v) = non_empty(get_setting(pool, "cc_beta_flags").await) {
             profile.beta_flags = v;
         }
-        if let Some(v) = read(pool, "cc_billing_salt").await {
+        if let Some(v) = non_empty(get_setting(pool, "cc_billing_salt").await) {
             profile.billing_salt = v;
         }
+        profile.proxy = non_empty(get_setting(pool, "proxy").await);
 
         profile
     }

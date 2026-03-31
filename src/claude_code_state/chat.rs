@@ -12,7 +12,7 @@ use wreq::Method;
 
 use crate::{
     claude_code_state::{ClaudeCodeState, TokenStatus},
-    config::{CLEWDR_CONFIG, Claude1mChannel, ModelFamily},
+    config::{Claude1mChannel, ModelFamily},
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
     services::cookie_actor::CookieActorHandle,
     stealth::{self, EndpointKind},
@@ -20,6 +20,7 @@ use crate::{
 };
 
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const MAX_RETRIES: usize = 5;
 
 impl ClaudeCodeState {
     /// Attempts to send a chat message to Claude API with retry mechanism
@@ -44,7 +45,7 @@ impl ClaudeCodeState {
         &mut self,
         p: CreateMessageParams,
     ) -> Result<axum::response::Response, ClewdrError> {
-        for i in 0..CLEWDR_CONFIG.load().max_retries + 1 {
+        for i in 0..MAX_RETRIES + 1 {
             if i > 0 {
                 info!("[RETRY] attempt: {}", i.to_string().green());
             }
@@ -273,7 +274,7 @@ impl ClaudeCodeState {
         &mut self,
         p: CreateMessageParams,
     ) -> Result<axum::response::Response, ClewdrError> {
-        for i in 0..CLEWDR_CONFIG.load().max_retries + 1 {
+        for i in 0..MAX_RETRIES + 1 {
             if i > 0 {
                 info!("[TOKENS][RETRY] attempt: {}", i.to_string().green());
             }

@@ -10,7 +10,6 @@ use tower_http::{compression::CompressionLayer, cors::CorsLayer};
 
 use crate::{
     api::*,
-    config::CLEWDR_CONFIG,
     middleware::{RequireAdminAuth, RequireFlexibleAuth},
     services::{cookie_actor::CookieActorHandle, user_limiter::UserLimiterMap},
     state::{AppState, AuthState},
@@ -29,13 +28,8 @@ impl RouterBuilder {
             .expect("Failed to start CookieActor");
         let stealth_profile = stealth::init_stealth_profile(&db_pool).await;
         let claude_providers = crate::providers::claude::build_providers(cookie_handle.clone(), db_pool.clone(), stealth_profile.clone());
-        let config = CLEWDR_CONFIG.load();
-        let pw = config.get_password();
-        let admin_pw = config.get_admin_password();
         let auth = AuthState {
             db: db_pool.clone(),
-            legacy_user_password: if pw.is_empty() { None } else { Some(pw.to_owned()) },
-            legacy_admin_password: if admin_pw.is_empty() { None } else { Some(admin_pw.to_owned()) },
         };
         let state = AppState {
             db: db_pool.clone(),
@@ -71,17 +65,11 @@ impl RouterBuilder {
     }
 
     fn route_admin_endpoints(mut self) -> Self {
-        let legacy_admin_router = Router::new()
-            .route("/auth", get(api_auth))
-            .route("/config", get(api_get_config).post(api_post_config))
-            .route_layer(from_extractor_with_state::<RequireAdminAuth, _>(self.state.clone()));
-
-        let new_admin_router = crate::api::admin::admin_router()
+        let admin_router = crate::api::admin::admin_router()
             .route_layer(from_extractor_with_state::<RequireAdminAuth, _>(self.state.clone()));
 
         let router = Router::new()
-            .nest("/api", legacy_admin_router)
-            .nest("/api/admin", new_admin_router)
+            .nest("/api/admin", admin_router)
             .route("/api/version", get(api_version))
             .with_state(self.state.clone());
         self.inner = self.inner.merge(router);

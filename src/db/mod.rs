@@ -115,6 +115,32 @@ pub async fn seed_admin(pool: &SqlitePool) -> Result<(), ClewdrError> {
         }
     }
 
+    // Migrate proxy from TOML config to DB settings (one-time, guarded by flag)
+    let migrated: Option<(String,)> = sqlx::query_as(
+        "SELECT value FROM settings WHERE key = '_proxy_migrated'"
+    )
+    .fetch_optional(pool)
+    .await?;
+    if migrated.is_none() {
+        if let Some(ref proxy) = crate::config::CLEWDR_CONFIG.load().proxy {
+            if !proxy.is_empty() {
+                sqlx::query(
+                    "INSERT INTO settings (key, value, updated_at) VALUES ('proxy', ?1, CURRENT_TIMESTAMP)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP"
+                )
+                .bind(proxy)
+                .execute(pool)
+                .await?;
+                info!("Migrated proxy setting from config to DB: {proxy}");
+            }
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES ('_proxy_migrated', '1', CURRENT_TIMESTAMP)"
+        )
+        .execute(pool)
+        .await?;
+    }
+
     Ok(())
 }
 

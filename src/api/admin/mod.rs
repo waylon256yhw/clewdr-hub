@@ -1,6 +1,7 @@
 pub mod accounts;
 pub mod common;
 pub mod keys;
+mod me;
 pub mod overview;
 pub mod policies;
 pub mod requests;
@@ -40,4 +41,6 @@ pub fn admin_router() -> Router<AppState> {
         .route("/requests", get(requests::list))
         // Overview
         .route("/overview", get(overview::overview))
+        // Change own password
+        .route("/me/password", put(me::change_password))
 }

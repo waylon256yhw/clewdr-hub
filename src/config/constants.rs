@@ -110,19 +110,6 @@ static PORTABLE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
     }
 });
 
-// Default functions
-/// Default number of maximum retries for API requests
-///
-/// # Returns
-/// * `usize` - The default value of 5
-pub const fn default_max_retries() -> usize {
-    5
-}
-
-/// Default IP address for the server to bind to
-///
-/// # Returns
-/// * `String` - The default localhost IP "127.0.0.1"
 pub fn default_ip() -> IpAddr {
     Ipv4Addr::new(127, 0, 0, 1).into()
 }
@@ -135,28 +122,8 @@ pub fn default_port() -> u16 {
     8484
 }
 
-/// Default setting for using real roles in conversations
-///
-/// # Returns
-/// * `bool` - The default value of true
-pub const fn default_use_real_roles() -> bool {
-    true
-}
-
-/// Default setting for checking updates on startup
-///
-/// # Returns
-/// * `bool` - The default value of true
 pub const fn default_check_update() -> bool {
     true
 }
-/// Default setting for skipping cool down cookies
-///
-/// # Returns
-/// * `bool` - The default value of true
-pub const fn default_skip_cool_down() -> bool {
-    true
-}
-
 /// Default cookie value for testing purposes
 pub const PLACEHOLDER_COOKIE: &str = "sk-ant-sidXX----------------------------SET_YOUR_COOKIE_HERE----------------------------------------AAAAAAAA";

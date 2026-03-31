@@ -127,7 +127,7 @@ pub async fn create(
             return Err(ClewdrError::BadRequest { msg: "password cannot be empty" });
         }
         let pw = pw.clone();
-        let hash = tokio::task::spawn_blocking(move || crate::db::hash_password_public(&pw))
+        let hash: String = tokio::task::spawn_blocking(move || crate::db::hash_password_public(&pw))
             .await
             .map_err(|_| ClewdrError::UnexpectedNone { msg: "password hash task panicked" })??;
         Some(hash)
@@ -206,7 +206,7 @@ pub async fn update(
             return Err(ClewdrError::BadRequest { msg: "password cannot be empty" });
         }
         let pw = pw.clone();
-        let hash = tokio::task::spawn_blocking(move || crate::db::hash_password_public(&pw))
+        let hash: String = tokio::task::spawn_blocking(move || crate::db::hash_password_public(&pw))
             .await
             .map_err(|_| ClewdrError::UnexpectedNone { msg: "password hash task panicked" })??;
         sqlx::query("UPDATE users SET password_hash = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")

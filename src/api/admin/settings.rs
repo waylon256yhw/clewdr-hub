@@ -27,6 +27,7 @@ pub async fn get_all(
 const STEALTH_KEYS: &[&str] = &[
     "cc_cli_version", "cc_sdk_version", "cc_node_version",
     "cc_stainless_os", "cc_stainless_arch", "cc_beta_flags", "cc_billing_salt",
+    "proxy",
 ];
 
 pub async fn update(
