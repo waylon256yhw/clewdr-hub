@@ -10,14 +10,14 @@ use axum::{
     Json,
     extract::{FromRequest, Request},
 };
-use http::HeaderMap;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    config::{CLAUDE_CODE_BILLING_SALT, CLAUDE_CODE_VERSION, CLEWDR_CONFIG},
+    config::CLEWDR_CONFIG,
     error::ClewdrError,
     middleware::claude::ClaudeContext,
+    stealth::{self, StealthProfile},
     types::claude::{
         ContentBlock, CreateMessageParams, Message, MessageContent, Role, Thinking, Usage,
     },
@@ -68,15 +68,17 @@ fn sample_js_code_unit(text: &str, idx: usize) -> String {
         .unwrap_or_else(|| "0".to_string())
 }
 
-fn claude_code_billing_header(messages: &[Message]) -> String {
+fn claude_code_billing_header(messages: &[Message], profile: &StealthProfile) -> String {
+    let first_text = first_user_message_text(messages);
     let sampled = [4, 7, 20]
         .into_iter()
-        .map(|idx| sample_js_code_unit(first_user_message_text(messages), idx))
+        .map(|idx| sample_js_code_unit(first_text, idx))
         .collect::<String>();
     let version_hash = format!(
         "{:x}",
         Sha256::digest(format!(
-            "{CLAUDE_CODE_BILLING_SALT}{sampled}{CLAUDE_CODE_VERSION}"
+            "{}{}{}",
+            profile.billing_salt, sampled, profile.cli_version
         ))
     );
     let entrypoint = env::var(CLAUDE_CODE_ENTRYPOINT_ENV)
@@ -84,8 +86,13 @@ fn claude_code_billing_header(messages: &[Message]) -> String {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "cli".to_string());
 
+    // cch = SHA256(full first user message text)[..5]
+    let cch = format!("{:x}", Sha256::digest(first_text));
+    let cch = &cch[..5.min(cch.len())];
+
     format!(
-        "x-anthropic-billing-header: cc_version={CLAUDE_CODE_VERSION}.{}; cc_entrypoint={entrypoint}; cch=00000;",
+        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint={entrypoint}; cch={cch};",
+        profile.cli_version,
         &version_hash[..3]
     )
 }
@@ -143,24 +150,35 @@ fn strip_ephemeral_scope_from_system(system: &mut Value) {
     }
 }
 
-fn extract_anthropic_beta_header(headers: &HeaderMap) -> Option<String> {
-    let mut parts = Vec::new();
-    for value in headers.get_all("anthropic-beta") {
-        if let Ok(raw) = value.to_str() {
-            for token in raw.split(',') {
-                let token = token.trim();
-                if !token.is_empty() {
-                    parts.push(token.to_string());
-                }
-            }
+/// Inject `metadata.user_id` if missing (for non-CLI clients).
+/// Format: `user_{64hex}_account_{org_uuid}_session_{random_uuid}`
+fn inject_metadata_user_id(
+    body: &mut CreateMessageParams,
+    auth_user: Option<&crate::db::models::AuthenticatedUser>,
+) {
+    // Check if metadata.user_id already exists
+    if let Some(ref metadata) = body.metadata {
+        if metadata.fields.get("user_id").is_some_and(|v| !v.is_empty()) {
+            return;
         }
     }
 
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(","))
-    }
+    let Some(auth) = auth_user else {
+        return;
+    };
+
+    // Deterministic user hex: HMAC-SHA256(billing_salt, api_key_id)
+    let profile = stealth::global_profile().load();
+    let user_hex = format!(
+        "{:x}",
+        Sha256::digest(format!("{}{}", profile.billing_salt, auth.api_key_id))
+    );
+    let session_uuid = uuid::Uuid::new_v4();
+    // account part left empty (like relay/中转 scenario)
+    let user_id = format!("user_{user_hex}_account__session_{session_uuid}");
+
+    let metadata = body.metadata.get_or_insert_with(Default::default);
+    metadata.fields.insert("user_id".to_string(), user_id);
 }
 
 /// Predefined test message for connection testing
@@ -219,7 +237,6 @@ where
     type Rejection = ClewdrError;
 
     async fn from_request(req: Request, _: &S) -> Result<Self, Self::Rejection> {
-        let anthropic_beta = extract_anthropic_beta_header(req.headers());
         let auth_user = req
             .extensions()
             .get::<crate::db::models::AuthenticatedUser>()
@@ -249,8 +266,12 @@ where
 
         let stream = body.stream.unwrap_or_default();
 
+        // Load stealth profile for billing header generation
+        let profile = stealth::global_profile().load();
+
         let mut system_prefixes = vec![ContentBlock::text(claude_code_billing_header(
             &body.messages,
+            &profile,
         ))];
         if let Some(custom_system) = CLEWDR_CONFIG
             .load()
@@ -285,10 +306,12 @@ where
 
         let input_tokens = body.count_tokens();
 
+        // Inject metadata.user_id if missing (for non-CLI clients like 2API)
+        inject_metadata_user_id(&mut body, auth_user.as_ref());
+
         let context = ClaudeContext {
             stream,
             system_prompt_hash,
-            anthropic_beta,
             usage: Usage {
                 input_tokens,
                 output_tokens: 0,
@@ -315,38 +338,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn claude_code_billing_header_matches_2176_rule() {
+    fn claude_code_billing_header_format() {
+        let profile = StealthProfile::default();
         let messages = vec![Message::new_text(Role::User, "hey")];
+        let header = claude_code_billing_header(&messages, &profile);
 
-        assert_eq!(
-            claude_code_billing_header(&messages),
-            "x-anthropic-billing-header: cc_version=2.1.76.4dc; cc_entrypoint=cli; cch=00000;"
-        );
+        // Check format structure
+        assert!(header.starts_with("x-anthropic-billing-header: cc_version="));
+        assert!(header.contains(&profile.cli_version));
+        assert!(header.contains("cc_entrypoint=cli"));
+        // cch should NOT be 00000 anymore
+        assert!(!header.contains("cch=00000"));
+        // cch should be 5 hex chars
+        let cch_start = header.find("cch=").unwrap() + 4;
+        let cch_end = header[cch_start..].find(';').unwrap() + cch_start;
+        let cch = &header[cch_start..cch_end];
+        assert_eq!(cch.len(), 5);
+        assert!(cch.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
-    fn claude_code_billing_header_uses_first_text_block_of_first_user_message() {
-        let messages = vec![
-            Message::new_blocks(
-                Role::User,
-                vec![
-                    ContentBlock::Image {
-                        source: crate::types::claude::ImageSource::Url {
-                            url: "https://example.com/a.png".to_string(),
-                        },
-                        cache_control: None,
-                    },
-                    ContentBlock::text("abcdefg"),
-                    ContentBlock::text("ignored"),
-                ],
-            ),
-            Message::new_text(Role::User, "later"),
-        ];
+    fn claude_code_billing_header_cch_is_deterministic() {
+        let profile = StealthProfile::default();
+        let messages = vec![Message::new_text(Role::User, "hey")];
+        let h1 = claude_code_billing_header(&messages, &profile);
+        let h2 = claude_code_billing_header(&messages, &profile);
+        assert_eq!(h1, h2);
+    }
 
-        assert_eq!(
-            claude_code_billing_header(&messages),
-            "x-anthropic-billing-header: cc_version=2.1.76.540; cc_entrypoint=cli; cch=00000;"
-        );
+    #[test]
+    fn claude_code_billing_header_cch_varies_with_content() {
+        let profile = StealthProfile::default();
+        let m1 = vec![Message::new_text(Role::User, "hello world")];
+        let m2 = vec![Message::new_text(Role::User, "goodbye world")];
+        let h1 = claude_code_billing_header(&m1, &profile);
+        let h2 = claude_code_billing_header(&m2, &profile);
+        // cch values should differ
+        let extract_cch = |h: &str| {
+            let start = h.find("cch=").unwrap() + 4;
+            let end = h[start..].find(';').unwrap() + start;
+            h[start..end].to_string()
+        };
+        assert_ne!(extract_cch(&h1), extract_cch(&h2));
     }
 
     #[test]

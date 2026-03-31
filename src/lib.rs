@@ -16,6 +16,7 @@ pub mod providers;
 pub mod router;
 pub mod services;
 pub mod state;
+pub mod stealth;
 pub mod types;
 pub mod utils;
 

@@ -312,7 +312,8 @@ async fn fetch_usage_percent(
     u32,
     Option<String>,
 )> {
-    let mut state = ClaudeCodeState::from_cookie(handle, cookie).ok()?;
+    let profile = crate::stealth::global_profile().clone();
+    let mut state = ClaudeCodeState::from_cookie(handle, cookie, profile).ok()?;
     let usage = state.fetch_usage_metrics().await.ok()?;
     state.return_cookie(None).await;
     let five = usage

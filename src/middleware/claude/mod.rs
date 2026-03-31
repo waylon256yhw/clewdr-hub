@@ -9,7 +9,6 @@ use crate::types::claude::Usage;
 pub struct ClaudeContext {
     pub stream: bool,
     pub system_prompt_hash: Option<u64>,
-    pub anthropic_beta: Option<String>,
     pub usage: Usage,
     pub user_id: Option<i64>,
     pub api_key_id: Option<i64>,

@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use axum::{
     Json,
     response::{IntoResponse, Sse, sse::Event as SseEvent},
@@ -7,23 +5,21 @@ use axum::{
 use colored::Colorize;
 use eventsource_stream::Eventsource;
 use futures::TryStreamExt;
-use http::header::{ACCEPT, USER_AGENT};
+use http::header::ACCEPT;
 use snafu::{GenerateImplicitData, ResultExt};
 use tracing::{Instrument, error, info, warn};
 use wreq::Method;
 
 use crate::{
     claude_code_state::{ClaudeCodeState, TokenStatus},
-    config::{CLAUDE_CODE_USER_AGENT, CLEWDR_CONFIG, Claude1mChannel, ModelFamily},
+    config::{CLEWDR_CONFIG, Claude1mChannel, ModelFamily},
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
     services::cookie_actor::CookieActorHandle,
+    stealth::{self, EndpointKind},
     types::claude::{CountMessageTokensResponse, CreateMessageParams},
 };
 
-pub(super) const CLAUDE_BETA_BASE: &str = "oauth-2025-04-20";
-const CLAUDE_BETA_CONTEXT_1M_TOKEN: &str = "context-1m-2025-08-07";
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-pub(super) const CLAUDE_API_VERSION: &str = "2023-06-01";
 
 impl ClaudeCodeState {
     /// Attempts to send a chat message to Claude API with retry mechanism
@@ -177,21 +173,17 @@ impl ClaudeCodeState {
         body: &CreateMessageParams,
         use_context_1m: bool,
     ) -> Result<wreq::Response, ClewdrError> {
-        let beta_header = Self::merge_anthropic_beta_header(
-            self.anthropic_beta_header.as_deref(),
-            use_context_1m,
+        let profile = self.stealth_profile.load();
+        let headers = stealth::build_stealth_headers(
+            &profile,
+            EndpointKind::DirectApi { use_context_1m },
         );
+        let mut url = self.endpoint.join("v1/messages").expect("Url parse error");
+        url.set_query(Some("beta=true"));
         self.client
-            .post(
-                self.endpoint
-                    .join("v1/messages")
-                    .expect("Url parse error")
-                    .to_string(),
-            )
+            .post(url.to_string())
             .bearer_auth(access_token)
-            .header(USER_AGENT, CLAUDE_CODE_USER_AGENT)
-            .header("anthropic-beta", beta_header)
-            .header("anthropic-version", CLAUDE_API_VERSION)
+            .headers(headers)
             .json(body)
             .send()
             .await
@@ -251,12 +243,14 @@ impl ClaudeCodeState {
             .access_token
             .to_owned();
 
+        let profile = self.stealth_profile.load();
+        let headers = stealth::build_stealth_headers(&profile, EndpointKind::UsageApi);
+
         self.client
             .request(Method::GET, CLAUDE_USAGE_URL)
             .bearer_auth(access_token)
             .header(ACCEPT, "application/json, text/plain, */*")
-            .header(USER_AGENT, CLAUDE_CODE_USER_AGENT)
-            .header("anthropic-beta", CLAUDE_BETA_BASE)
+            .headers(headers)
             .send()
             .await
             .context(WreqSnafu {
@@ -618,21 +612,17 @@ impl ClaudeCodeState {
         body: &CreateMessageParams,
         use_context_1m: bool,
     ) -> Result<wreq::Response, ClewdrError> {
-        let beta_header = Self::merge_anthropic_beta_header(
-            self.anthropic_beta_header.as_deref(),
-            use_context_1m,
+        let profile = self.stealth_profile.load();
+        let headers = stealth::build_stealth_headers(
+            &profile,
+            EndpointKind::DirectApi { use_context_1m },
         );
+        let mut url = self.endpoint.join("v1/messages/count_tokens").expect("Url parse error");
+        url.set_query(Some("beta=true"));
         self.client
-            .post(
-                self.endpoint
-                    .join("v1/messages/count_tokens")
-                    .expect("Url parse error")
-                    .to_string(),
-            )
+            .post(url.to_string())
             .bearer_auth(access_token)
-            .header(USER_AGENT, CLAUDE_CODE_USER_AGENT)
-            .header("anthropic-beta", beta_header)
-            .header("anthropic-version", CLAUDE_API_VERSION)
+            .headers(headers)
             .json(body)
             .send()
             .await
@@ -641,35 +631,6 @@ impl ClaudeCodeState {
             })?
             .check_claude()
             .await
-    }
-
-    fn merge_anthropic_beta_header(extra: Option<&str>, use_context_1m: bool) -> String {
-        let mut seen = HashSet::new();
-        let mut merged = Vec::new();
-        let mut push = |token: &str| {
-            let trimmed = token.trim();
-            if trimmed.is_empty() {
-                return;
-            }
-            let key = trimmed.to_ascii_lowercase();
-            if !use_context_1m && key == CLAUDE_BETA_CONTEXT_1M_TOKEN {
-                return;
-            }
-            if seen.insert(key) {
-                merged.push(trimmed.to_string());
-            }
-        };
-
-        push(CLAUDE_BETA_BASE);
-        if use_context_1m {
-            push(CLAUDE_BETA_CONTEXT_1M_TOKEN);
-        }
-        if let Some(extra) = extra {
-            for token in extra.split(',') {
-                push(token);
-            }
-        }
-        merged.join(",")
     }
 
     fn auto_1m_probe_channel(model: &str) -> Option<Claude1mChannel> {
@@ -828,7 +789,8 @@ impl ClaudeCodeState {
         cookie: &mut crate::config::CookieStatus,
         handle: &CookieActorHandle,
     ) -> Option<(Option<i64>, Option<i64>, Option<i64>, Option<i64>)> {
-        let mut state = ClaudeCodeState::from_cookie(handle.clone(), cookie.clone()).ok()?;
+        let profile = crate::stealth::global_profile().clone();
+        let mut state = ClaudeCodeState::from_cookie(handle.clone(), cookie.clone(), profile).ok()?;
         let usage = state.fetch_usage_metrics().await.ok()?;
         state.return_cookie(None).await;
         if let Some(updated) = state.cookie.clone() {

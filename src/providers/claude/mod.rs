@@ -12,6 +12,7 @@ use crate::{
     error::ClewdrError,
     middleware::claude::ClaudeContext,
     services::cookie_actor::CookieActorHandle,
+    stealth::SharedStealthProfile,
     types::claude::CreateMessageParams,
     utils::{enabled, print_out_json},
 };
@@ -55,13 +56,15 @@ pub struct ClaudeProviderResponse {
 struct ClaudeSharedState {
     cookie_actor_handle: CookieActorHandle,
     db: SqlitePool,
+    stealth_profile: SharedStealthProfile,
 }
 
 impl ClaudeSharedState {
-    fn new(cookie_actor_handle: CookieActorHandle, db: SqlitePool) -> Self {
+    fn new(cookie_actor_handle: CookieActorHandle, db: SqlitePool, stealth_profile: SharedStealthProfile) -> Self {
         Self {
             cookie_actor_handle,
             db,
+            stealth_profile,
         }
     }
 }
@@ -72,8 +75,8 @@ pub struct ClaudeProviders {
 }
 
 impl ClaudeProviders {
-    pub fn new(cookie_actor_handle: CookieActorHandle, db: SqlitePool) -> Self {
-        let shared = Arc::new(ClaudeSharedState::new(cookie_actor_handle, db));
+    pub fn new(cookie_actor_handle: CookieActorHandle, db: SqlitePool, stealth_profile: SharedStealthProfile) -> Self {
+        let shared = Arc::new(ClaudeSharedState::new(cookie_actor_handle, db, stealth_profile));
         let code = Arc::new(ClaudeCodeProvider::new(shared));
         Self { code }
     }
@@ -100,10 +103,12 @@ impl LLMProvider for ClaudeCodeProvider {
     type Output = ClaudeProviderResponse;
 
     async fn invoke(&self, request: Self::Request) -> Result<Self::Output, ClewdrError> {
-        let mut state = ClaudeCodeState::new(self.shared.cookie_actor_handle.clone());
+        let mut state = ClaudeCodeState::new(
+            self.shared.cookie_actor_handle.clone(),
+            self.shared.stealth_profile.clone(),
+        );
         state.stream = request.context.stream;
         state.system_prompt_hash = request.context.system_prompt_hash;
-        state.anthropic_beta_header = request.context.anthropic_beta.clone();
         state.usage = request.context.usage.to_owned();
 
         // Set billing context for cost tracking
@@ -158,6 +163,6 @@ impl LLMProvider for ClaudeCodeProvider {
     }
 }
 
-pub fn build_providers(cookie_actor_handle: CookieActorHandle, db: SqlitePool) -> ClaudeProviders {
-    ClaudeProviders::new(cookie_actor_handle, db)
+pub fn build_providers(cookie_actor_handle: CookieActorHandle, db: SqlitePool, stealth_profile: SharedStealthProfile) -> ClaudeProviders {
+    ClaudeProviders::new(cookie_actor_handle, db, stealth_profile)
 }

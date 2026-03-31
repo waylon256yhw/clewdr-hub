@@ -21,13 +21,14 @@ use url::Url;
 use crate::{
     claude_code_state::ClaudeCodeState,
     config::{
-        CC_REDIRECT_URI, CC_TOKEN_URL, CLAUDE_CODE_USER_AGENT, CLEWDR_CONFIG, CookieStatus,
+        CC_REDIRECT_URI, CC_TOKEN_URL, CLEWDR_CONFIG, CookieStatus,
         TokenInfo,
     },
     error::{CheckClaudeErr, ClewdrError, UnexpectedNoneSnafu, UrlSnafu, WreqSnafu},
 };
 
-use super::chat::{CLAUDE_API_VERSION, CLAUDE_BETA_BASE};
+const CLAUDE_API_VERSION: &str = "2023-06-01";
+const CLAUDE_BETA_OAUTH: &str = "oauth-2025-04-20";
 
 type ClaudeOauthClient = Client<
     BasicErrorResponse,
@@ -60,7 +61,7 @@ impl<'c> AsyncHttpClient<'c> for OauthClient {
             );
             headers.insert(
                 HeaderName::from_static("anthropic-beta"),
-                HeaderValue::from_static(CLAUDE_BETA_BASE),
+                HeaderValue::from_static(CLAUDE_BETA_OAUTH),
             );
         }
 
@@ -140,9 +141,10 @@ impl ClaudeCodeState {
         auth_url.set_query(None);
 
         let wreq_client = self.get_wreq_client();
+        let ua = self.stealth_profile.load().user_agent();
         let mut authorize_req = wreq_client
             .post(auth_url.to_string())
-            .header(USER_AGENT, CLAUDE_CODE_USER_AGENT)
+            .header(USER_AGENT, ua)
             .json(&query_params);
         if let Some(cookie) = self.cookie.as_ref() {
             authorize_req = authorize_req.header(COOKIE, cookie.cookie.to_string());
