@@ -46,7 +46,7 @@ pub async fn authenticate_api_key(
         user_id,
         username,
         role,
-        api_key_id: ak_id,
+        api_key_id: Some(ak_id),
         policy_id,
         max_concurrent,
         rpm_limit,
@@ -81,12 +81,13 @@ pub async fn create_api_key(
     loop {
         let (plaintext, lookup_key, key_hash) = generate_api_key();
         let result = sqlx::query(
-            "INSERT INTO api_keys (user_id, label, lookup_key, key_hash) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO api_keys (user_id, label, lookup_key, key_hash, plaintext_key) VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .bind(user_id)
         .bind(label)
         .bind(&lookup_key)
         .bind(key_hash.as_slice())
+        .bind(&plaintext)
         .execute(pool)
         .await;
 

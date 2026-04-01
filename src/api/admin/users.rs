@@ -211,8 +211,7 @@ pub async fn update(
             .map_err(|_| ClewdrError::UnexpectedNone { msg: "password hash task panicked" })??;
         sqlx::query("UPDATE users SET password_hash = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
             .bind(&hash).bind(id).execute(&mut *tx).await?;
-        // Revoke web-session keys for this user (force re-login)
-        sqlx::query("DELETE FROM api_keys WHERE user_id = ?1 AND label = 'web-session'")
+        sqlx::query("UPDATE users SET session_version = session_version + 1 WHERE id = ?1")
             .bind(id).execute(&mut *tx).await?;
     }
     if let Some(ref role) = req.role {

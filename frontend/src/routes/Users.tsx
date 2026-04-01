@@ -18,10 +18,7 @@ import {
   Skeleton,
   Alert,
   ScrollArea,
-  CopyButton,
-  Code,
   Tooltip,
-  Drawer,
 } from "@mantine/core";
 import { useForm } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
@@ -29,11 +26,8 @@ import {
   IconPlus,
   IconEdit,
   IconTrash,
-  IconKey,
   IconPlayerPlay,
   IconPlayerPause,
-  IconCopy,
-  IconCheck,
 } from "@tabler/icons-react";
 import {
   listUsers,
@@ -44,14 +38,10 @@ import {
   createPolicy,
   updatePolicy,
   deletePolicy,
-  listKeys,
-  createKey,
-  deleteKey,
   qk,
   ApiError,
   type UserRow,
   type Policy,
-  type KeyRow,
 } from "../api";
 import { formatCost, formatDate } from "../lib/format";
 
@@ -150,118 +140,6 @@ function UserFormModal({
         </Stack>
       </form>
     </Modal>
-  );
-}
-
-// ─── Keys Drawer ───
-
-function KeysDrawer({
-  user,
-  onClose,
-}: {
-  user: UserRow | null;
-  onClose: () => void;
-}) {
-  const queryClient = useQueryClient();
-  const [newKey, setNewKey] = useState<string | null>(null);
-
-  const { data, isLoading, error } = useQuery({
-    queryKey: qk.keys(user?.id),
-    queryFn: () => listKeys(user!.id),
-    enabled: !!user,
-  });
-
-  const createMut = useMutation({
-    mutationFn: () => createKey({ user_id: user!.id, label: "generated" }),
-    onSuccess: (res) => {
-      setNewKey(res.plaintext_key);
-      queryClient.invalidateQueries({ queryKey: qk.keys(user?.id) });
-      queryClient.invalidateQueries({ queryKey: qk.overview });
-    },
-    onError: (e) =>
-      notifications.show({ message: e instanceof ApiError ? e.message : "操作失败", color: "red" }),
-  });
-
-  const deleteMut = useMutation({
-    mutationFn: deleteKey,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: qk.keys(user?.id) });
-      queryClient.invalidateQueries({ queryKey: qk.overview });
-      notifications.show({ message: "Key 已删除", color: "green" });
-    },
-    onError: (e) =>
-      notifications.show({ message: e instanceof ApiError ? e.message : "操作失败", color: "red" }),
-  });
-
-  const handleClose = () => {
-    setNewKey(null);
-    onClose();
-  };
-
-  const keys: KeyRow[] = data?.items ?? [];
-
-  return (
-    <Drawer opened={!!user} onClose={handleClose} title={`API Keys — ${user?.username}`} position="right" size="md">
-      <Stack>
-        <Button leftSection={<IconPlus size={16} />} onClick={() => createMut.mutate()} loading={createMut.isPending}>
-          生成 Key
-        </Button>
-
-        {newKey && (
-          <Alert color="green" title="Key 已生成 — 请立即复制！">
-            <Group gap="xs">
-              <Code>{newKey}</Code>
-              <CopyButton value={newKey}>
-                {({ copied, copy }) => (
-                  <ActionIcon color={copied ? "teal" : "gray"} variant="subtle" onClick={copy}>
-                    {copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
-                  </ActionIcon>
-                )}
-              </CopyButton>
-            </Group>
-            <Text size="xs" c="dimmed" mt="xs">此 Key 仅显示一次，请妥善保存。</Text>
-          </Alert>
-        )}
-
-        {isLoading ? (
-          <Skeleton height={100} />
-        ) : error ? (
-          <Alert color="red">加载 Key 失败: {String(error)}</Alert>
-        ) : keys.length === 0 ? (
-          <Text c="dimmed">暂无 Key。</Text>
-        ) : (
-          <Table>
-            <Table.Thead>
-              <Table.Tr>
-                <Table.Th>Key</Table.Th>
-                <Table.Th>标签</Table.Th>
-                <Table.Th>最后使用</Table.Th>
-                <Table.Th w={50} />
-              </Table.Tr>
-            </Table.Thead>
-            <Table.Tbody>
-              {keys.map((k) => (
-                <Table.Tr key={k.id}>
-                  <Table.Td><Code>sk-{k.lookup_key}****</Code></Table.Td>
-                  <Table.Td>{k.label ?? "—"}</Table.Td>
-                  <Table.Td>{formatDate(k.last_used_at)}</Table.Td>
-                  <Table.Td>
-                    <ActionIcon
-                      variant="subtle"
-                      color="red"
-                      onClick={() => deleteMut.mutate(k.id)}
-                      loading={deleteMut.isPending}
-                    >
-                      <IconTrash size={16} />
-                    </ActionIcon>
-                  </Table.Td>
-                </Table.Tr>
-              ))}
-            </Table.Tbody>
-          </Table>
-        )}
-      </Stack>
-    </Drawer>
   );
 }
 
@@ -370,7 +248,6 @@ function UsersTab({ policies }: { policies: Policy[] }) {
   const [formOpened, setFormOpened] = useState(false);
   const [editing, setEditing] = useState<UserRow | null>(null);
   const [deleting, setDeleting] = useState<UserRow | null>(null);
-  const [keysUser, setKeysUser] = useState<UserRow | null>(null);
 
   const toggleMut = useMutation({
     mutationFn: ({ id, disabled }: { id: number; disabled: boolean }) =>
@@ -447,11 +324,6 @@ function UsersTab({ policies }: { policies: Policy[] }) {
                           <IconEdit size={16} />
                         </ActionIcon>
                       </Tooltip>
-                      <Tooltip label="Keys">
-                        <ActionIcon variant="subtle" onClick={() => setKeysUser(u)}>
-                          <IconKey size={16} />
-                        </ActionIcon>
-                      </Tooltip>
                       <Tooltip label={u.disabled_at ? "启用" : "禁用"}>
                         <ActionIcon
                           variant="subtle"
@@ -489,7 +361,6 @@ function UsersTab({ policies }: { policies: Policy[] }) {
         onConfirm={() => deleteMut.mutate()}
         loading={deleteMut.isPending}
       />
-      <KeysDrawer user={keysUser} onClose={() => setKeysUser(null)} />
     </>
   );
 }

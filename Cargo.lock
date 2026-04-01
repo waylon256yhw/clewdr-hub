@@ -669,6 +669,7 @@ dependencies = [
  "eventsource-stream",
  "figment",
  "futures",
+ "hmac",
  "http",
  "include_dir",
  "itertools 0.14.0",

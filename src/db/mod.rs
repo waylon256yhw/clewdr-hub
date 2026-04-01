@@ -92,32 +92,24 @@ pub async fn seed_admin(pool: &SqlitePool) -> Result<(), ClewdrError> {
         info!("Admin user already exists, skipping seed");
     }
 
-    // Ensure admin has at least one API key (also covers upgrades from pre-Phase-2)
-    let admin_id: Option<(i64,)> =
-        sqlx::query_as("SELECT id FROM users WHERE username = 'admin' AND role = 'admin'")
+    // Ensure session secret exists (for HMAC cookie signing)
+    let existing: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM settings WHERE key = 'session_secret'")
             .fetch_optional(pool)
             .await?;
-
-    if let Some((admin_id,)) = admin_id {
-        let key_count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM api_keys WHERE user_id = ?1")
-                .bind(admin_id)
-                .fetch_one(pool)
-                .await?;
-
-        if key_count.0 == 0 {
-            let plaintext_key =
-                queries::create_api_key(pool, admin_id, Some("bootstrap")).await?;
-            println!(
-                "{} {}",
-                "Generated admin API key:".green().bold(),
-                plaintext_key.yellow().bold()
-            );
-            println!(
-                "{}",
-                "Save this key — it cannot be recovered!".red().bold()
-            );
-        }
+    if existing.is_none() {
+        use base64::Engine;
+        use rand::RngExt;
+        let mut bytes = [0u8; 32];
+        rand::rng().fill(&mut bytes);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        sqlx::query(
+            "INSERT INTO settings (key, value, updated_at) VALUES ('session_secret', ?1, CURRENT_TIMESTAMP)",
+        )
+        .bind(&encoded)
+        .execute(pool)
+        .await?;
+        info!("Generated session secret");
     }
 
     // Migrate proxy from TOML config to DB settings (one-time, guarded by flag)
@@ -147,6 +139,23 @@ pub async fn seed_admin(pool: &SqlitePool) -> Result<(), ClewdrError> {
     }
 
     Ok(())
+}
+
+pub async fn load_session_secret(pool: &SqlitePool) -> Result<[u8; 32], ClewdrError> {
+    use base64::Engine;
+    let row: (String,) =
+        sqlx::query_as("SELECT value FROM settings WHERE key = 'session_secret'")
+            .fetch_one(pool)
+            .await?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&row.0)
+        .map_err(|e| ClewdrError::UnexpectedNone {
+            msg: Box::leak(format!("invalid session_secret base64: {e}").into_boxed_str()),
+        })?;
+    let secret: [u8; 32] = decoded.try_into().map_err(|_| ClewdrError::UnexpectedNone {
+        msg: "session_secret must be 32 bytes",
+    })?;
+    Ok(secret)
 }
 
 fn hash_password(password: &str) -> Result<String, ClewdrError> {

@@ -12,6 +12,7 @@ pub struct KeyResponse {
     pub username: String,
     pub label: Option<String>,
     pub lookup_key: String,
+    pub plaintext_key: Option<String>,
     pub disabled_at: Option<String>,
     pub expires_at: Option<String>,
     pub last_used_at: Option<String>,
@@ -53,7 +54,7 @@ pub async fn list(
         let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM api_keys WHERE user_id = ?1")
             .bind(uid).fetch_one(&db).await?;
         let items: Vec<KeyResponse> = sqlx::query_as(
-            r#"SELECT ak.id, ak.user_id, u.username, ak.label, ak.lookup_key,
+            r#"SELECT ak.id, ak.user_id, u.username, ak.label, ak.lookup_key, ak.plaintext_key,
                       ak.disabled_at, ak.expires_at, ak.last_used_at, ak.last_used_ip, ak.created_at
                FROM api_keys ak JOIN users u ON ak.user_id = u.id
                WHERE ak.user_id = ?1 ORDER BY ak.id LIMIT ?2 OFFSET ?3"#,
@@ -63,7 +64,7 @@ pub async fn list(
         let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM api_keys")
             .fetch_one(&db).await?;
         let items: Vec<KeyResponse> = sqlx::query_as(
-            r#"SELECT ak.id, ak.user_id, u.username, ak.label, ak.lookup_key,
+            r#"SELECT ak.id, ak.user_id, u.username, ak.label, ak.lookup_key, ak.plaintext_key,
                       ak.disabled_at, ak.expires_at, ak.last_used_at, ak.last_used_ip, ak.created_at
                FROM api_keys ak JOIN users u ON ak.user_id = u.id
                ORDER BY ak.id LIMIT ?1 OFFSET ?2"#,

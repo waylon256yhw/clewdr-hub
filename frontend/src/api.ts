@@ -8,20 +8,6 @@ export class ApiError extends Error {
 
 // --- Fetch wrapper ---
 
-const TOKEN_KEY = "clewdr_token";
-
-export function getToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY);
-}
-
-export function setToken(token: string) {
-  localStorage.setItem(TOKEN_KEY, token);
-}
-
-export function clearToken() {
-  localStorage.removeItem(TOKEN_KEY);
-}
-
 interface FetchOptions {
   method?: string;
   body?: unknown;
@@ -37,18 +23,16 @@ export async function apiFetch<T>(path: string, opts?: FetchOptions): Promise<T>
   }
 
   const headers: Record<string, string> = {};
-  const token = getToken();
-  if (token) headers["Authorization"] = `Bearer ${token}`;
   if (opts?.body) headers["Content-Type"] = "application/json";
 
   const res = await fetch(url.toString(), {
     method: opts?.method ?? "GET",
     headers,
+    credentials: "include",
     body: opts?.body ? JSON.stringify(opts.body) : undefined,
   });
 
   if (res.status === 401) {
-    clearToken();
     window.dispatchEvent(new Event("auth:logout"));
     throw new ApiError(401, "登录已过期");
   }
@@ -139,6 +123,7 @@ export interface KeyRow {
   username: string;
   label: string | null;
   lookup_key: string;
+  plaintext_key: string | null;
   disabled_at: string | null;
   expires_at: string | null;
   last_used_at: string | null;
@@ -181,7 +166,6 @@ export interface RequestLog {
 }
 
 export interface LoginResponse {
-  api_key: string;
   user_id: number;
   username: string;
   role: string;

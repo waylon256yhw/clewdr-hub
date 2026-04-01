@@ -28,8 +28,12 @@ impl RouterBuilder {
             .expect("Failed to start CookieActor");
         let stealth_profile = stealth::init_stealth_profile(&db_pool).await;
         let claude_providers = crate::providers::claude::build_providers(cookie_handle.clone(), db_pool.clone(), stealth_profile.clone());
+        let session_secret = crate::db::load_session_secret(&db_pool)
+            .await
+            .expect("Failed to load session secret");
         let auth = AuthState {
             db: db_pool.clone(),
+            session_secret,
         };
         let state = AppState {
             db: db_pool.clone(),

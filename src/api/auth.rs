@@ -1,10 +1,10 @@
-use axum::{Extension, Json, extract::State, http::StatusCode};
+use axum::{Extension, Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
 
 use crate::db::models::AuthenticatedUser;
-use crate::db::queries;
 use crate::error::ClewdrError;
+use crate::session;
+use crate::state::AuthState;
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -14,7 +14,6 @@ pub struct LoginRequest {
 
 #[derive(Serialize)]
 pub struct LoginResponse {
-    pub api_key: String,
     pub user_id: i64,
     pub username: String,
     pub role: String,
@@ -22,17 +21,17 @@ pub struct LoginResponse {
 }
 
 pub async fn login(
-    State(db): State<SqlitePool>,
+    State(auth): State<AuthState>,
     Json(req): Json<LoginRequest>,
-) -> Result<Json<LoginResponse>, ClewdrError> {
-    let row: Option<(i64, String, Option<String>, String, i32)> = sqlx::query_as(
-        "SELECT id, username, password_hash, role, must_change_password FROM users WHERE username = ?1 AND disabled_at IS NULL",
+) -> Result<impl IntoResponse, ClewdrError> {
+    let row: Option<(i64, String, Option<String>, String, i32, i32)> = sqlx::query_as(
+        "SELECT id, username, password_hash, role, must_change_password, session_version FROM users WHERE username = ?1 AND disabled_at IS NULL",
     )
     .bind(&req.username)
-    .fetch_optional(&db)
+    .fetch_optional(&auth.db)
     .await?;
 
-    let Some((user_id, username, password_hash, role, must_change)) = row else {
+    let Some((user_id, username, password_hash, role, must_change, session_version)) = row else {
         return Err(ClewdrError::InvalidAuth);
     };
 
@@ -56,32 +55,30 @@ pub async fn login(
     .await
     .map_err(|_| ClewdrError::InvalidAuth)??;
 
-    let plaintext_key = queries::create_api_key(&db, user_id, Some("web-session")).await?;
+    let cookie_value =
+        session::create_session_cookie(&auth.session_secret, user_id, session_version, None);
+    let set_cookie = session::set_cookie_header(&cookie_value, 86400);
 
-    // Set 24h expiry on web-session keys
-    sqlx::query(
-        "UPDATE api_keys SET expires_at = datetime('now', '+24 hours') WHERE user_id = ?1 AND label = 'web-session' AND expires_at IS NULL"
-    )
-    .bind(user_id)
-    .execute(&db)
-    .await?;
-
-    Ok(Json(LoginResponse {
-        api_key: plaintext_key,
+    let body = LoginResponse {
         user_id,
         username,
         role,
         must_change_password: must_change != 0,
-    }))
+    };
+
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::SET_COOKIE, set_cookie)],
+        Json(body),
+    ))
 }
 
 pub async fn logout(
-    State(db): State<SqlitePool>,
-    Extension(user): Extension<AuthenticatedUser>,
-) -> Result<StatusCode, ClewdrError> {
-    sqlx::query("DELETE FROM api_keys WHERE id = ?1")
-        .bind(user.api_key_id)
-        .execute(&db)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Extension(_user): Extension<AuthenticatedUser>,
+) -> impl IntoResponse {
+    let clear = session::clear_cookie_header();
+    (
+        StatusCode::NO_CONTENT,
+        [(axum::http::header::SET_COOKIE, clear)],
+    )
 }

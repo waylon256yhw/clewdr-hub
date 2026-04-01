@@ -18,6 +18,7 @@ import {
   IconDashboard,
   IconServer,
   IconUsers,
+  IconKey,
   IconSettings,
   IconFileText,
   IconSun,
@@ -30,6 +31,7 @@ import Login from "./routes/Login";
 import Dashboard from "./routes/Dashboard";
 import Accounts from "./routes/Accounts";
 import Users from "./routes/Users";
+import Keys from "./routes/Keys";
 import Settings from "./routes/Settings";
 import Logs from "./routes/Logs";
 
@@ -37,6 +39,7 @@ const NAV_ITEMS = [
   { label: "总览", path: "/", icon: IconDashboard },
   { label: "账号池", path: "/accounts", icon: IconServer },
   { label: "用户管理", path: "/users", icon: IconUsers },
+  { label: "API 密钥", path: "/keys", icon: IconKey },
   { label: "设置", path: "/settings", icon: IconSettings },
   { label: "日志", path: "/logs", icon: IconFileText },
 ];
@@ -99,6 +102,7 @@ function AdminShell() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/accounts" element={<Accounts />} />
           <Route path="/users" element={<Users />} />
+          <Route path="/keys" element={<Keys />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/logs" element={<Logs />} />
           <Route path="*" element={<Navigate to="/" replace />} />

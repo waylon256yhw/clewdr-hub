@@ -21,6 +21,7 @@ pub struct AppState {
 #[derive(Clone)]
 pub struct AuthState {
     pub db: SqlitePool,
+    pub session_secret: [u8; 32],
 }
 
 impl FromRef<AppState> for Arc<ClaudeCodeProvider> {

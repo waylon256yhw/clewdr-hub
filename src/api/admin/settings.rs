@@ -15,6 +15,8 @@ pub struct UpdateSettingsRequest {
     pub settings: HashMap<String, String>,
 }
 
+const HIDDEN_KEYS: &[&str] = &["session_secret", "_proxy_migrated"];
+
 pub async fn get_all(
     State(db): State<SqlitePool>,
 ) -> Result<Json<HashMap<String, String>>, ClewdrError> {
@@ -22,7 +24,10 @@ pub async fn get_all(
         .fetch_all(&db)
         .await?;
 
-    let map: HashMap<String, String> = rows.into_iter().collect();
+    let map: HashMap<String, String> = rows
+        .into_iter()
+        .filter(|(k, _)| !HIDDEN_KEYS.contains(&k.as_str()))
+        .collect();
     Ok(Json(map))
 }
 
@@ -40,6 +45,9 @@ pub async fn update(
 
     let mut tx = db.begin().await?;
     for (key, value) in &req.settings {
+        if HIDDEN_KEYS.contains(&key.as_str()) {
+            continue;
+        }
         sqlx::query(
             "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, CURRENT_TIMESTAMP)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP"

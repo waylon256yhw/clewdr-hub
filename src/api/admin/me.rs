@@ -1,10 +1,11 @@
-use axum::{Extension, Json, extract::State};
+use axum::{Extension, Json, extract::State, response::IntoResponse};
 use serde::Deserialize;
-use sqlx::SqlitePool;
 
 use crate::db::models::AuthenticatedUser;
 use crate::db::hash_password_public;
 use crate::error::ClewdrError;
+use crate::session;
+use crate::state::AuthState;
 
 #[derive(Deserialize)]
 pub struct ChangePasswordRequest {
@@ -13,10 +14,10 @@ pub struct ChangePasswordRequest {
 }
 
 pub async fn change_password(
-    State(db): State<SqlitePool>,
+    State(auth): State<AuthState>,
     Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<ChangePasswordRequest>,
-) -> Result<Json<serde_json::Value>, ClewdrError> {
+) -> Result<impl IntoResponse, ClewdrError> {
     if req.new_password.trim().is_empty() {
         return Err(ClewdrError::BadRequest { msg: "new password cannot be empty" });
     }
@@ -25,14 +26,13 @@ pub async fn change_password(
         "SELECT password_hash FROM users WHERE id = ?1 AND role = 'admin'"
     )
     .bind(user.user_id)
-    .fetch_optional(&db)
+    .fetch_optional(&auth.db)
     .await?;
 
     let Some((current_hash,)) = row else {
         return Err(ClewdrError::NotFound { msg: "admin user not found" });
     };
 
-    // Verify current password
     let verify_result = {
         let hash = current_hash.clone();
         let pw = req.current_password.clone();
@@ -49,7 +49,6 @@ pub async fn change_password(
     };
     verify_result?;
 
-    // Hash new password
     let new_hash = {
         let pw = req.new_password.clone();
         let result: Result<String, ClewdrError> = tokio::task::spawn_blocking(move || hash_password_public(&pw))
@@ -60,18 +59,25 @@ pub async fn change_password(
         result?
     };
 
-    sqlx::query("UPDATE users SET password_hash = ?1, must_change_password = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-        .bind(&new_hash)
-        .bind(user.user_id)
-        .execute(&db)
-        .await?;
+    let new_version: (i32,) = sqlx::query_as(
+        "UPDATE users SET password_hash = ?1, must_change_password = 0, session_version = session_version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2 AND password_hash = ?3 RETURNING session_version"
+    )
+    .bind(&new_hash)
+    .bind(user.user_id)
+    .bind(&current_hash)
+    .fetch_one(&auth.db)
+    .await?;
 
-    // Revoke all web-session keys for this user (force re-login)
-    sqlx::query("DELETE FROM api_keys WHERE user_id = ?1 AND label = 'web-session' AND id != ?2")
-        .bind(user.user_id)
-        .bind(user.api_key_id)
-        .execute(&db)
-        .await?;
+    let cookie_value = session::create_session_cookie(
+        &auth.session_secret,
+        user.user_id,
+        new_version.0,
+        None,
+    );
+    let set_cookie = session::set_cookie_header(&cookie_value, 86400);
 
-    Ok(Json(serde_json::json!({ "message": "password updated" })))
+    Ok((
+        [(axum::http::header::SET_COOKIE, set_cookie)],
+        Json(serde_json::json!({ "message": "password updated" })),
+    ))
 }

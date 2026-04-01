@@ -14,6 +14,7 @@ pub mod error;
 pub mod middleware;
 pub mod providers;
 pub mod router;
+pub mod session;
 pub mod services;
 pub mod state;
 pub mod stealth;

@@ -46,7 +46,7 @@ pub struct AuthenticatedUser {
     pub user_id: i64,
     pub username: String,
     pub role: String,
-    pub api_key_id: i64,
+    pub api_key_id: Option<i64>,
     pub policy_id: i64,
     pub max_concurrent: i32,
     pub rpm_limit: i32,

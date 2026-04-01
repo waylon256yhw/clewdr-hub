@@ -15,9 +15,6 @@ import {
   logout as apiLogout,
   changePassword,
   getOverview,
-  getToken,
-  setToken,
-  clearToken,
   ApiError,
   type LoginResponse,
 } from "./api";
@@ -29,7 +26,6 @@ interface AuthUser {
 }
 
 interface AuthContextValue {
-  token: string | null;
   user: AuthUser | null;
   loading: boolean;
   mustChangePassword: boolean;
@@ -46,18 +42,13 @@ export function useAuth() {
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [token, setTokenState] = useState<string | null>(getToken);
   const [user, setUser] = useState<AuthUser | null>(null);
-  const [loading, setLoading] = useState(!!getToken());
+  const [loading, setLoading] = useState(true);
   const [mustChangePassword, setMustChangePassword] = useState(false);
   const queryClient = useQueryClient();
   const navigate = useNavigate();
 
   useEffect(() => {
-    if (!token) {
-      setLoading(false);
-      return;
-    }
     getOverview()
       .then((data) => {
         setUser({ user_id: 0, username: "admin", role: "admin" });
@@ -66,16 +57,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
       })
       .catch(() => {
-        clearToken();
-        setTokenState(null);
         setUser(null);
       })
       .finally(() => setLoading(false));
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     const handler = () => {
-      setTokenState(null);
       setUser(null);
       setMustChangePassword(false);
       queryClient.clear();
@@ -87,8 +75,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = useCallback(async (username: string, password: string) => {
     const res = await apiLogin({ username, password });
-    setToken(res.api_key);
-    setTokenState(res.api_key);
     setUser({ user_id: res.user_id, username: res.username, role: res.role });
     if (res.must_change_password) {
       setMustChangePassword(true);
@@ -98,8 +84,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const logout = useCallback(() => {
     apiLogout();
-    clearToken();
-    setTokenState(null);
     setUser(null);
     setMustChangePassword(false);
     queryClient.clear();
@@ -107,16 +91,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [queryClient, navigate]);
 
   return (
-    <AuthContext value={{ token, user, loading, mustChangePassword, login, logout }}>
+    <AuthContext value={{ user, loading, mustChangePassword, login, logout }}>
       {children}
     </AuthContext>
   );
 }
 
 export function RequireAuth({ children }: { children: ReactNode }) {
-  const { token, loading } = useAuth();
+  const { user, loading } = useAuth();
   if (loading) return null;
-  if (!token) return <Navigate to="/login" replace />;
+  if (!user) return <Navigate to="/login" replace />;
   return children;
 }
 

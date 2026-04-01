@@ -167,9 +167,10 @@ fn inject_metadata_user_id(
 
     // Deterministic user hex: HMAC-SHA256(billing_salt, api_key_id)
     let profile = stealth::global_profile().load();
+    let key_id = auth.api_key_id.unwrap_or(0);
     let user_hex = format!(
         "{:x}",
-        Sha256::digest(format!("{}{}", profile.billing_salt, auth.api_key_id))
+        Sha256::digest(format!("{}{}", profile.billing_salt, key_id))
     );
     let session_uuid = uuid::Uuid::new_v4();
     // account part left empty (like relay/中转 scenario)
@@ -272,7 +273,7 @@ where
                 cache_read_input_tokens: None,
             },
             user_id: auth_user.as_ref().map(|u| u.user_id),
-            api_key_id: auth_user.as_ref().map(|u| u.api_key_id),
+            api_key_id: auth_user.as_ref().and_then(|u| u.api_key_id),
             max_concurrent: auth_user.as_ref().map(|u| u.max_concurrent),
             rpm_limit: auth_user.as_ref().map(|u| u.rpm_limit),
             model_raw: body.model.clone(),

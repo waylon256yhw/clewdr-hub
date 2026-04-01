@@ -86,6 +86,7 @@ sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio
 argon2 = { version = "0.5.3", features = ["std"] }
 blake3 = "1.8.3"
 rand = { version = "0.10.0", features = ["std_rng"] }
+hmac = "0.12"
 
 [target.'cfg(windows)'.dependencies]
 enable-ansi-support = "0.3"

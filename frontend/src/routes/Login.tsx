@@ -15,13 +15,13 @@ import { useAuth } from "../auth";
 import { ApiError } from "../api";
 
 export default function Login() {
-  const { token, loading: authLoading, login } = useAuth();
+  const { user, loading: authLoading, login } = useAuth();
   const navigate = useNavigate();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
 
-  if (token && !authLoading) return <Navigate to="/" replace />;
+  if (user && !authLoading) return <Navigate to="/" replace />;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

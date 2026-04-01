@@ -6,10 +6,9 @@ use tracing::warn;
 use crate::db::api_key::parse_api_key;
 use crate::db::queries::authenticate_api_key;
 use crate::error::ClewdrError;
+use crate::session;
 use crate::state::AuthState;
 
-/// Extract the API key/token from request headers.
-/// Tries `x-api-key` first, falls back to `Authorization: Bearer`.
 fn extract_key_from_headers(parts: &Parts) -> Option<String> {
     if let Some(key) = parts.headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         return Some(key.to_string());
@@ -26,8 +25,6 @@ fn extract_key_from_headers(parts: &Parts) -> Option<String> {
     None
 }
 
-/// Middleware guard for `/v1/**` routes.
-/// Authenticates via DB-backed API keys (sk-prefixed).
 pub struct RequireFlexibleAuth;
 
 impl<S> FromRequestParts<S> for RequireFlexibleAuth
@@ -61,8 +58,6 @@ where
     }
 }
 
-/// Middleware guard for `/api/**` admin routes.
-/// Authenticates admin users via DB API keys.
 pub struct RequireAdminAuth;
 
 impl<S> FromRequestParts<S> for RequireAdminAuth
@@ -77,21 +72,64 @@ where
         state: &S,
     ) -> Result<Self, Self::Rejection> {
         let auth_state = AuthState::from_ref(state);
-        let key = extract_key_from_headers(parts).ok_or(ClewdrError::InvalidAuth)?;
 
-        if let Some((lookup, hash)) = parse_api_key(&key) {
-            match authenticate_api_key(&auth_state.db, &lookup, &hash).await {
-                Ok(Some(authed_user)) if authed_user.role == "admin" => {
-                    parts.extensions.insert(authed_user);
-                    return Ok(Self);
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!("DB error during admin API key auth: {e}");
-                }
-            }
+        let cookie_header = parts
+            .headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        let cookie_value = session::extract_session_cookie(cookie_header)
+            .ok_or(ClewdrError::InvalidAuth)?;
+
+        let claims = session::validate_session_cookie(&auth_state.session_secret, cookie_value)
+            .ok_or(ClewdrError::InvalidAuth)?;
+
+        let row: Option<(i64, String, String, i32, Option<String>, i64)> = sqlx::query_as(
+            "SELECT u.id, u.username, u.role, u.session_version, u.disabled_at, u.policy_id
+             FROM users u WHERE u.id = ?1",
+        )
+        .bind(claims.user_id)
+        .fetch_optional(&auth_state.db)
+        .await
+        .map_err(|e| {
+            warn!("DB error during cookie auth: {e}");
+            ClewdrError::InvalidAuth
+        })?;
+
+        let Some((user_id, username, role, session_version, disabled_at, policy_id)) = row else {
+            return Err(ClewdrError::InvalidAuth);
+        };
+
+        if disabled_at.is_some() || role != "admin" || session_version != claims.session_version {
+            return Err(ClewdrError::InvalidAuth);
         }
 
-        Err(ClewdrError::InvalidAuth)
+        let Some((max_concurrent, rpm_limit, weekly_budget_nanousd, monthly_budget_nanousd)) = sqlx::query_as::<_, (i32, i32, i64, i64)>(
+            "SELECT max_concurrent, rpm_limit, weekly_budget_nanousd, monthly_budget_nanousd FROM policies WHERE id = ?1",
+        )
+        .bind(policy_id)
+        .fetch_optional(&auth_state.db)
+        .await
+        .map_err(|e| {
+            warn!("DB error loading policy: {e}");
+            ClewdrError::InvalidAuth
+        })? else {
+            return Err(ClewdrError::InvalidAuth);
+        };
+
+        parts.extensions.insert(crate::db::models::AuthenticatedUser {
+            user_id,
+            username,
+            role,
+            api_key_id: None,
+            policy_id,
+            max_concurrent,
+            rpm_limit,
+            weekly_budget_nanousd,
+            monthly_budget_nanousd,
+        });
+
+        Ok(Self)
     }
 }
