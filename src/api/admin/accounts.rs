@@ -3,23 +3,76 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use super::common::{Paginated, PaginationParams};
+use crate::db::accounts::{load_all_accounts, AccountWithRuntime};
 use crate::error::ClewdrError;
 use crate::services::cookie_actor::CookieActorHandle;
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Serialize)]
+pub struct UsageWindowResponse {
+    pub has_reset: Option<bool>,
+    pub resets_at: Option<i64>,
+    pub utilization: Option<f64>,
+}
+
+#[derive(Serialize)]
+pub struct AccountRuntimeResponse {
+    pub resets_last_checked_at: Option<i64>,
+    pub session: Option<UsageWindowResponse>,
+    pub weekly: Option<UsageWindowResponse>,
+    pub weekly_sonnet: Option<UsageWindowResponse>,
+    pub weekly_opus: Option<UsageWindowResponse>,
+}
+
+#[derive(Serialize)]
 pub struct AccountResponse {
     pub id: i64,
     pub name: String,
     pub rr_order: i64,
-    pub max_slots: i64,
     pub status: String,
-    pub organization_uuid: Option<String>,
+    pub email: Option<String>,
+    pub account_type: Option<String>,
     pub invalid_reason: Option<String>,
-    pub last_refresh_at: Option<String>,
-    pub last_used_at: Option<String>,
-    pub last_error: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub runtime: Option<AccountRuntimeResponse>,
+}
+
+fn map_account(row: &AccountWithRuntime) -> AccountResponse {
+    let runtime = row.runtime.as_ref().map(|rt| AccountRuntimeResponse {
+        resets_last_checked_at: rt.resets_last_checked_at,
+        session: Some(UsageWindowResponse {
+            has_reset: rt.session_has_reset,
+            resets_at: rt.session_resets_at,
+            utilization: rt.session_utilization,
+        }),
+        weekly: Some(UsageWindowResponse {
+            has_reset: rt.weekly_has_reset,
+            resets_at: rt.weekly_resets_at,
+            utilization: rt.weekly_utilization,
+        }),
+        weekly_sonnet: Some(UsageWindowResponse {
+            has_reset: rt.weekly_sonnet_has_reset,
+            resets_at: rt.weekly_sonnet_resets_at,
+            utilization: rt.weekly_sonnet_utilization,
+        }),
+        weekly_opus: Some(UsageWindowResponse {
+            has_reset: rt.weekly_opus_has_reset,
+            resets_at: rt.weekly_opus_resets_at,
+            utilization: rt.weekly_opus_utilization,
+        }),
+    });
+    AccountResponse {
+        id: row.id,
+        name: row.name.clone(),
+        rr_order: row.rr_order,
+        status: row.status.clone(),
+        email: row.email.clone(),
+        account_type: row.account_type.clone(),
+        invalid_reason: row.invalid_reason.clone(),
+        created_at: None,
+        updated_at: None,
+        runtime,
+    }
 }
 
 #[derive(Deserialize)]
@@ -41,35 +94,21 @@ pub struct UpdateAccountRequest {
     pub organization_uuid: Option<String>,
 }
 
-const ACCOUNT_SELECT: &str = r#"
-    SELECT id, name, rr_order, max_slots, status,
-           organization_uuid, invalid_reason,
-           last_refresh_at, last_used_at, last_error,
-           created_at, updated_at
-    FROM accounts
-"#;
-
 pub async fn list(
     State(db): State<SqlitePool>,
-    Query(params): Query<PaginationParams>,
+    Query(_params): Query<PaginationParams>,
 ) -> Result<Json<Paginated<AccountResponse>>, ClewdrError> {
-    let (offset, limit) = params.resolve();
-
-    let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM accounts")
-        .fetch_one(&db).await?;
-
-    let query = format!("{ACCOUNT_SELECT} ORDER BY rr_order LIMIT ?1 OFFSET ?2");
-    let items: Vec<AccountResponse> = sqlx::query_as(&query)
-        .bind(limit).bind(offset).fetch_all(&db).await?;
-
-    Ok(Json(Paginated { items, total: total.0, offset, limit }))
+    let all = load_all_accounts(&db).await?;
+    let total = all.len() as i64;
+    let items: Vec<AccountResponse> = all.iter().map(map_account).collect();
+    Ok(Json(Paginated { items, total, offset: 0, limit: total }))
 }
 
 pub async fn create(
     State(db): State<SqlitePool>,
     State(actor): State<CookieActorHandle>,
     Json(req): Json<CreateAccountRequest>,
-) -> Result<(StatusCode, Json<AccountResponse>), ClewdrError> {
+) -> Result<(StatusCode, Json<serde_json::Value>), ClewdrError> {
     let max_slots = req.max_slots.unwrap_or(5);
     if max_slots <= 0 {
         return Err(ClewdrError::BadRequest { msg: "max_slots must be positive" });
@@ -105,14 +144,9 @@ pub async fn create(
     })?
     .last_insert_rowid();
 
-    // Trigger actor reload so the new account is immediately available
     let _ = actor.reload_from_db().await;
 
-    let query = format!("{ACCOUNT_SELECT} WHERE id = ?1");
-    let row: AccountResponse = sqlx::query_as(&query)
-        .bind(id).fetch_one(&db).await?;
-
-    Ok((StatusCode::CREATED, Json(row)))
+    Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
 }
 
 pub async fn update(
@@ -120,7 +154,7 @@ pub async fn update(
     State(actor): State<CookieActorHandle>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateAccountRequest>,
-) -> Result<Json<AccountResponse>, ClewdrError> {
+) -> Result<Json<serde_json::Value>, ClewdrError> {
     if let Some(slots) = req.max_slots {
         if slots <= 0 { return Err(ClewdrError::BadRequest { msg: "max_slots must be positive" }); }
     }
@@ -168,7 +202,6 @@ pub async fn update(
     }
     if let Some(ref status) = req.status {
         if status == "active" {
-            // Re-activate: clear invalid_reason and stale runtime state
             sqlx::query("UPDATE accounts SET status = 'active', invalid_reason = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?1")
                 .bind(id).execute(&mut *tx).await?;
             sqlx::query("DELETE FROM account_runtime_state WHERE account_id = ?1")
@@ -179,6 +212,10 @@ pub async fn update(
         }
     }
     if let Some(ref blob) = req.cookie_blob {
+        sqlx::query("UPDATE accounts SET email = NULL, account_type = NULL, organization_uuid = NULL, invalid_reason = NULL WHERE id = ?1")
+            .bind(id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM account_runtime_state WHERE account_id = ?1")
+            .bind(id).execute(&mut *tx).await?;
         sqlx::query("UPDATE accounts SET cookie_blob = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
             .bind(blob).bind(id).execute(&mut *tx).await?;
     }
@@ -189,14 +226,9 @@ pub async fn update(
 
     tx.commit().await?;
 
-    // Trigger actor reload
     let _ = actor.reload_from_db().await;
 
-    let query = format!("{ACCOUNT_SELECT} WHERE id = ?1");
-    let row: AccountResponse = sqlx::query_as(&query)
-        .bind(id).fetch_one(&db).await?;
-
-    Ok(Json(row))
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn remove(
@@ -211,7 +243,6 @@ pub async fn remove(
         return Err(ClewdrError::NotFound { msg: "account not found" });
     }
 
-    // Trigger actor reload
     let _ = actor.reload_from_db().await;
 
     Ok(StatusCode::NO_CONTENT)

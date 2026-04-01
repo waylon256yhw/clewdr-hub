@@ -10,9 +10,11 @@ use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 
 use crate::{
+    claude_code_state::probe::probe_cookie,
     config::{CookieStatus, Reason, UsageBreakdown, UselessCookie},
     db::accounts::{batch_upsert_runtime_states, load_all_accounts, set_account_disabled},
     error::ClewdrError,
+    stealth,
 };
 
 const INTERVAL: u64 = 300;
@@ -38,6 +40,7 @@ enum CookieActorMessage {
     Update1mSupport(CookieStatus, RpcReplyPort<Result<(), ClewdrError>>),
     ReloadFromDb,
     FlushDirty,
+    SetHandle(CookieActorHandle),
 }
 
 #[derive(Debug)]
@@ -48,6 +51,7 @@ struct CookieActorState {
     moka: Cache<u64, CookieStatus>,
     db: SqlitePool,
     dirty: HashSet<i64>,
+    handle: Option<CookieActorHandle>,
 }
 
 struct CookieActor;
@@ -107,11 +111,13 @@ impl CookieActor {
             has_reset: Option<bool>,
             resets_at: &mut Option<i64>,
             usage: &mut UsageBreakdown,
+            utilization: &mut Option<f64>,
             window_secs: i64,
             now: i64,
         ) -> bool {
             if has_reset == Some(true) && resets_at.map(|ts| now >= ts).unwrap_or(false) {
                 *usage = UsageBreakdown::default();
+                *utilization = Some(0.0);
                 *resets_at = Some(now + window_secs);
                 return true;
             }
@@ -126,6 +132,7 @@ impl CookieActor {
                 cookie.session_has_reset,
                 &mut cookie.session_resets_at,
                 &mut cookie.session_usage,
+                &mut cookie.session_utilization,
                 SESSION_WINDOW_SECS,
                 now,
             );
@@ -133,6 +140,7 @@ impl CookieActor {
                 cookie.weekly_has_reset,
                 &mut cookie.weekly_resets_at,
                 &mut cookie.weekly_usage,
+                &mut cookie.weekly_utilization,
                 WEEKLY_WINDOW_SECS,
                 now,
             );
@@ -140,6 +148,7 @@ impl CookieActor {
                 cookie.weekly_sonnet_has_reset,
                 &mut cookie.weekly_sonnet_resets_at,
                 &mut cookie.weekly_sonnet_usage,
+                &mut cookie.weekly_sonnet_utilization,
                 WEEKLY_WINDOW_SECS,
                 now,
             );
@@ -147,6 +156,7 @@ impl CookieActor {
                 cookie.weekly_opus_has_reset,
                 &mut cookie.weekly_opus_resets_at,
                 &mut cookie.weekly_opus_usage,
+                &mut cookie.weekly_opus_utilization,
                 WEEKLY_WINDOW_SECS,
                 now,
             );
@@ -262,10 +272,39 @@ impl CookieActor {
             warn!("Cookie already exists");
             return;
         }
+        let needs_probe = cookie.email.is_none() || cookie.account_type.is_none();
         let aid = cookie.account_id;
-        state.valid.push_back(cookie);
+        state.valid.push_back(cookie.clone());
         Self::mark_dirty(state, aid);
         Self::log(state);
+
+        if needs_probe {
+            Self::spawn_probe(state, &cookie);
+        }
+    }
+
+    fn spawn_probe(state: &CookieActorState, cookie: &CookieStatus) {
+        let Some(ref handle) = state.handle else {
+            return;
+        };
+        let Some(account_id) = cookie.account_id else {
+            return;
+        };
+        let handle = handle.clone();
+        let cookie = cookie.clone();
+        let db = state.db.clone();
+        let profile = stealth::global_profile().clone();
+        tokio::spawn(async move {
+            probe_cookie(account_id, cookie, handle, profile, db).await;
+        });
+    }
+
+    fn spawn_probes_for_unprobed(state: &CookieActorState) {
+        for cookie in &state.valid {
+            if cookie.email.is_none() || cookie.account_type.is_none() {
+                Self::spawn_probe(state, cookie);
+            }
+        }
     }
 
     fn report(state: &CookieActorState) -> CookieStatusInfo {
@@ -426,6 +465,8 @@ impl CookieActor {
                 }
             };
             cs.account_id = Some(row.id);
+            cs.email = row.email.clone();
+            cs.account_type = row.account_type.clone();
 
             // Merge: if memory has same account_id with same cookie, preserve runtime
             if let Some(mem) = mem_cookies.remove(&row.id) {
@@ -450,6 +491,17 @@ impl CookieActor {
                     cs.supports_claude_1m_sonnet = mem.supports_claude_1m_sonnet;
                     cs.supports_claude_1m_opus = mem.supports_claude_1m_opus;
                     cs.count_tokens_allowed = mem.count_tokens_allowed;
+                    cs.session_utilization = mem.session_utilization;
+                    cs.weekly_utilization = mem.weekly_utilization;
+                    cs.weekly_sonnet_utilization = mem.weekly_sonnet_utilization;
+                    cs.weekly_opus_utilization = mem.weekly_opus_utilization;
+                    // Prefer memory email/account_type if DB is null but memory has it
+                    if cs.email.is_none() {
+                        cs.email = mem.email;
+                    }
+                    if cs.account_type.is_none() {
+                        cs.account_type = mem.account_type;
+                    }
                 }
                 // Cookie changed = credential replacement → use fresh defaults from new()
             } else if let Some(ref runtime) = row.runtime {
@@ -479,6 +531,9 @@ impl CookieActor {
         state.moka.invalidate_all();
 
         Self::log(state);
+
+        // Spawn probes for unprobed cookies
+        Self::spawn_probes_for_unprobed(state);
     }
 }
 
@@ -504,6 +559,7 @@ impl Actor for CookieActor {
             moka,
             db,
             dirty: HashSet::new(),
+            handle: None,
         };
 
         // Load accounts from DB
@@ -552,6 +608,11 @@ impl Actor for CookieActor {
             CookieActorMessage::FlushDirty => {
                 Self::do_flush(state).await;
             }
+            CookieActorMessage::SetHandle(handle) => {
+                state.handle = Some(handle);
+                // Backfill probes missed during pre_start (handle was None then)
+                Self::spawn_probes_for_unprobed(state);
+            }
         }
         Ok(())
     }
@@ -589,10 +650,15 @@ impl Actor for CookieActor {
     }
 }
 
-/// Handle for interacting with the CookieActor
 #[derive(Clone)]
 pub struct CookieActorHandle {
     actor_ref: ActorRef<CookieActorMessage>,
+}
+
+impl std::fmt::Debug for CookieActorHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CookieActorHandle").finish()
+    }
 }
 
 impl CookieActorHandle {
@@ -602,6 +668,13 @@ impl CookieActorHandle {
         let handle = Self {
             actor_ref: actor_ref.clone(),
         };
+
+        // Send the handle to the actor so it can spawn probe tasks
+        let _ = ractor::cast!(
+            actor_ref,
+            CookieActorMessage::SetHandle(handle.clone())
+        );
+
         handle.spawn_timeout_checker().await;
         handle.spawn_flush_timer().await;
 

@@ -2,7 +2,6 @@ import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Title,
-  Table,
   Badge,
   Button,
   Group,
@@ -15,8 +14,10 @@ import {
   ActionIcon,
   Skeleton,
   Alert,
-  Tooltip,
-  ScrollArea,
+  Paper,
+  SimpleGrid,
+  Progress,
+  Divider,
 } from "@mantine/core";
 import { useForm } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
@@ -29,8 +30,127 @@ import {
   qk,
   ApiError,
   type Account,
+  type UsageWindow,
 } from "../api";
-import { formatDate, statusColor } from "../lib/format";
+import { statusColor } from "../lib/format";
+
+function accountTypeColor(t: string): string {
+  switch (t) {
+    case "max": return "violet";
+    case "enterprise": return "indigo";
+    case "pro": return "blue";
+    case "free": return "gray";
+    default: return "gray";
+  }
+}
+
+function utilizationColor(v: number): string {
+  if (v >= 80) return "red";
+  if (v >= 50) return "yellow";
+  return "teal";
+}
+
+function formatCountdown(epochSecs: number): string {
+  const diff = epochSecs - Date.now() / 1000;
+  if (diff <= 0) return "已到期";
+  const hours = Math.floor(diff / 3600);
+  if (hours >= 24) {
+    const days = Math.floor(hours / 24);
+    const rem = hours % 24;
+    return rem > 0 ? `${days}天${rem}小时后` : `${days}天后`;
+  }
+  const mins = Math.floor((diff % 3600) / 60);
+  return hours > 0 ? `${hours}小时${mins}分后` : `${mins}分钟后`;
+}
+
+function WindowRow({ label, window }: { label: string; window: UsageWindow | null | undefined }) {
+  if (!window || window.has_reset === null) {
+    return (
+      <Group justify="space-between" gap="xs">
+        <Text size="xs" fw={500} w={80}>{label}</Text>
+        <Badge size="xs" color="gray" variant="light">探测中</Badge>
+      </Group>
+    );
+  }
+  if (!window.has_reset) {
+    return (
+      <Group justify="space-between" gap="xs">
+        <Text size="xs" fw={500} w={80}>{label}</Text>
+        <Badge size="xs" color="gray" variant="light">无限制</Badge>
+      </Group>
+    );
+  }
+  const util = window.utilization ?? 0;
+  return (
+    <Stack gap={2}>
+      <Group justify="space-between" gap="xs">
+        <Text size="xs" fw={500}>{label}</Text>
+        <Group gap="xs">
+          <Text size="xs" c="dimmed">
+            {window.resets_at ? formatCountdown(window.resets_at) : "—"}
+          </Text>
+          <Text size="xs" fw={600} c={utilizationColor(util)}>
+            {util.toFixed(0)}%
+          </Text>
+        </Group>
+      </Group>
+      <Progress value={util} color={utilizationColor(util)} size="sm" radius="xl" />
+    </Stack>
+  );
+}
+
+function AccountCard({
+  account,
+  onEdit,
+  onDelete,
+}: {
+  account: Account;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  const rt = account.runtime;
+  return (
+    <Paper withBorder shadow="xs" radius="md" p="md">
+      <Group justify="space-between" mb="xs">
+        <Text fw={600}>{account.name}</Text>
+        <Group gap={4}>
+          <ActionIcon variant="subtle" size="sm" onClick={onEdit}>
+            <IconEdit size={14} />
+          </ActionIcon>
+          <ActionIcon variant="subtle" size="sm" color="red" onClick={onDelete}>
+            <IconTrash size={14} />
+          </ActionIcon>
+        </Group>
+      </Group>
+
+      <Group gap="xs" mb="xs">
+        <Badge color={statusColor(account.status)} variant="light" size="sm">{account.status}</Badge>
+        {account.account_type && (
+          <Badge color={accountTypeColor(account.account_type)} variant="light" size="sm">
+            {account.account_type}
+          </Badge>
+        )}
+      </Group>
+
+      {account.email && (
+        <Text size="xs" c="dimmed" mb="xs" lineClamp={1}>{account.email}</Text>
+      )}
+
+      {account.invalid_reason && (
+        <Text size="xs" c="red" mb="xs">{account.invalid_reason}</Text>
+      )}
+
+      <Divider my="xs" />
+
+      <Stack gap="xs">
+        <WindowRow label="5h 会话" window={rt?.session} />
+        <WindowRow label="7d 总量" window={rt?.weekly} />
+        <WindowRow label="7d Sonnet" window={rt?.weekly_sonnet} />
+        <WindowRow label="7d Opus" window={rt?.weekly_opus} />
+      </Stack>
+    </Paper>
+  );
+}
 
 interface FormValues {
   name: string;
@@ -55,13 +175,12 @@ function AccountFormModal({
     initialValues: {
       name: editing?.name ?? "",
       rr_order: editing?.rr_order ?? 0,
-      max_slots: editing?.max_slots ?? 5,
+      max_slots: 5,
       cookie_blob: "",
-      organization_uuid: editing?.organization_uuid ?? "",
+      organization_uuid: "",
     },
     validate: {
       name: (v) => (v.trim() ? null : "必填"),
-      max_slots: (v) => (v > 0 ? null : "必须大于 0"),
       cookie_blob: (v) => (!editing && !v.trim() ? "新账号必须提供 Cookie" : null),
     },
   });
@@ -72,10 +191,8 @@ function AccountFormModal({
         const body: Record<string, unknown> = {};
         if (values.name !== editing.name) body.name = values.name;
         if (values.rr_order !== editing.rr_order) body.rr_order = values.rr_order;
-        if (values.max_slots !== editing.max_slots) body.max_slots = values.max_slots;
         if (values.cookie_blob.trim()) body.cookie_blob = values.cookie_blob;
-        if (values.organization_uuid !== (editing.organization_uuid ?? ""))
-          body.organization_uuid = values.organization_uuid || null;
+        if (values.organization_uuid.trim()) body.organization_uuid = values.organization_uuid;
         return updateAccount(editing.id, body);
       }
       return createAccount({
@@ -102,7 +219,7 @@ function AccountFormModal({
         <Stack>
           <TextInput label="名称" required key={form.key("name")} {...form.getInputProps("name")} />
           {editing && <NumberInput label="轮询顺序" key={form.key("rr_order")} {...form.getInputProps("rr_order")} />}
-          <NumberInput label="最大并发" min={1} key={form.key("max_slots")} {...form.getInputProps("max_slots")} />
+          {!editing && <NumberInput label="最大并发" min={1} key={form.key("max_slots")} {...form.getInputProps("max_slots")} />}
           <Textarea
             label={editing ? "替换 Cookie（可选）" : "Cookie"}
             placeholder="粘贴 Cookie..."
@@ -169,6 +286,7 @@ export default function Accounts() {
   const { data, isLoading, error } = useQuery({
     queryKey: qk.accounts,
     queryFn: listAccounts,
+    refetchInterval: 30_000,
   });
   const [formOpened, setFormOpened] = useState(false);
   const [editing, setEditing] = useState<Account | null>(null);
@@ -206,53 +324,16 @@ export default function Accounts() {
       {accounts.length === 0 ? (
         <Text c="dimmed">暂无账号，点击上方按钮添加。</Text>
       ) : (
-        <ScrollArea>
-          <Table striped highlightOnHover verticalSpacing="sm">
-            <Table.Thead>
-              <Table.Tr>
-                <Table.Th>名称</Table.Th>
-                <Table.Th>状态</Table.Th>
-                <Table.Th>并发</Table.Th>
-                <Table.Th visibleFrom="md">组织 UUID</Table.Th>
-                <Table.Th>最后使用</Table.Th>
-                <Table.Th visibleFrom="md">最近错误</Table.Th>
-                <Table.Th w={100}>操作</Table.Th>
-              </Table.Tr>
-            </Table.Thead>
-            <Table.Tbody>
-              {accounts.map((a) => (
-                <Table.Tr key={a.id}>
-                  <Table.Td>{a.name}</Table.Td>
-                  <Table.Td>
-                    <Badge color={statusColor(a.status)} variant="light">{a.status}</Badge>
-                  </Table.Td>
-                  <Table.Td>{a.max_slots}</Table.Td>
-                  <Table.Td visibleFrom="md">
-                    <Text size="xs" lineClamp={1}>{a.organization_uuid ?? "—"}</Text>
-                  </Table.Td>
-                  <Table.Td>{formatDate(a.last_used_at)}</Table.Td>
-                  <Table.Td visibleFrom="md">
-                    <Tooltip label={a.last_error ?? ""} disabled={!a.last_error}>
-                      <Text size="xs" lineClamp={1} c={a.last_error ? "red" : "dimmed"}>
-                        {a.last_error ?? "—"}
-                      </Text>
-                    </Tooltip>
-                  </Table.Td>
-                  <Table.Td>
-                    <Group gap={4}>
-                      <ActionIcon variant="subtle" onClick={() => openEdit(a)}>
-                        <IconEdit size={16} />
-                      </ActionIcon>
-                      <ActionIcon variant="subtle" color="red" onClick={() => setDeleting(a)}>
-                        <IconTrash size={16} />
-                      </ActionIcon>
-                    </Group>
-                  </Table.Td>
-                </Table.Tr>
-              ))}
-            </Table.Tbody>
-          </Table>
-        </ScrollArea>
+        <SimpleGrid cols={{ base: 1, md: 2, xl: 3 }}>
+          {accounts.map((a) => (
+            <AccountCard
+              key={a.id}
+              account={a}
+              onEdit={() => openEdit(a)}
+              onDelete={() => setDeleting(a)}
+            />
+          ))}
+        </SimpleGrid>
       )}
 
       <AccountFormModal

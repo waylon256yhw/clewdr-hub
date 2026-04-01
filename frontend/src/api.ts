@@ -73,19 +73,31 @@ export interface OverviewResponse {
   must_change_password: boolean;
 }
 
+export interface UsageWindow {
+  has_reset: boolean | null;
+  resets_at: number | null;
+  utilization: number | null;
+}
+
+export interface AccountRuntime {
+  resets_last_checked_at: number | null;
+  session: UsageWindow | null;
+  weekly: UsageWindow | null;
+  weekly_sonnet: UsageWindow | null;
+  weekly_opus: UsageWindow | null;
+}
+
 export interface Account {
   id: number;
   name: string;
   rr_order: number;
-  max_slots: number;
   status: string;
-  organization_uuid: string | null;
+  email: string | null;
+  account_type: string | null;
   invalid_reason: string | null;
-  last_refresh_at: string | null;
-  last_used_at: string | null;
-  last_error: string | null;
-  created_at: string;
-  updated_at: string;
+  created_at: string | null;
+  updated_at: string | null;
+  runtime: AccountRuntime | null;
 }
 
 export interface UserRow {

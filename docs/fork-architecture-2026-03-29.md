@@ -1,7 +1,7 @@
 # ClewdR Fork 架构设计文档
 
 > 日期：2026-03-29（rev.3 同日更新，+请求伪装章节 +入站认证基础）
-> 更新：2026-04-01（rev.16，Phase 6.6 health + models 端点完成）
+> 更新：2026-04-01（rev.17，Phase 6.7 cookie telemetry probe + 用量展示）
 > 基于：[cc-proxy-research-2026-03-28.md](./cc-proxy-research-2026-03-28.md) 调研结论
 > 参与：Claude Code (Opus) + Codex 多轮协商
 
@@ -1263,3 +1263,52 @@ cost = input_tokens × input_price
     可通过 `ADMIN_PASSWORD` 环境变量覆盖
 11. **API key 存储**：明文 + blake3 hash 双存，便于 admin 面板复制；DB 泄露等同全部 key 泄露
 12. **Session secret**：32 字节随机，存 settings 表，启动时加载到内存；DB 删除后重建会使所有 session 失效
+
+---
+
+#### Phase 6.7: Cookie Telemetry Probe + 用量展示 ✅
+
+> 已完成：+3 新文件，9 文件修改
+
+Cookie 添加/启动时主动探测 Anthropic 端点，提取账户元数据和限额利用率，前端卡片化展示。
+
+**新建文件**：
+- `migrations/20260401000005_account_telemetry.sql` — accounts 表加 `email TEXT`, `account_type TEXT`
+- `migrations/20260401000006_utilization.sql` — account_runtime_state 表加 4 个 `*_utilization REAL`
+- `src/claude_code_state/probe.rs` — `probe_cookie()` 完整 probe 流程
+- `docs/probe_usage_res_sample.json` — Anthropic `/api/oauth/usage` 响应样例
+
+**核心改动**：
+
+1. **主动 Probe**：CookieActor 在 `accept()` 和 `do_reload()` 时对 `email.is_none()` 的 cookie spawn 后台 probe
+2. **Bootstrap 拆分**：`get_organization()` 拆为 `fetch_bootstrap_info() -> BootstrapInfo`（email/org_uuid/account_type/capabilities），避免请求路径和 probe 路径重复解析
+3. **Utilization 发现**：Anthropic `/api/oauth/usage` 返回 `utilization`（0-100 百分比），是上游权威数据，直接用于前端进度条
+4. **Stale-write 防护**：`update_account_metadata()` 用 cookie prefix 匹配防止过期 probe 覆盖已替换 cookie 的元数据
+5. **Actor handle 注入**：`SetHandle` 消息让 actor 能 spawn probe task，`SetHandle` 处理时补发启动时漏掉的 probe
+6. **前端卡片化**：Accounts 页从表格改为 `SimpleGrid` 卡片布局，每张卡片含 status/type badge、email、4 个 window 的 Progress bar + 倒计时
+
+**Probe 流程**：
+```
+cookie 入池 → spawn probe_cookie()
+  → fetch_bootstrap_info() → email/type/org_uuid → 写 accounts 表
+  → free? → invalidate
+  → exchange_code() + exchange_token() → OAuth token
+  → fetch_usage_metrics() → utilization% + resets_at → 写 CookieStatus
+  → return_cookie(None) → actor 更新内存 → flush DB
+```
+
+**Window 显示三态**：
+- `has_reset = null`（未探测）→ 灰色"探测中"
+- `has_reset = false`（无限制）→ "无限制"
+- `has_reset = true`（有限制）→ Progress bar（utilization%）+ 倒计时
+
+**设计决策**：
+
+| 决策 | 选择 | 理由 |
+|------|------|------|
+| Probe 触发 | actor reload + accept | 覆盖启动和新增两个入口 |
+| 并发控制 | 不加 semaphore | 3-10 cookie 规模无需 |
+| Utilization 来源 | 上游 API（非本地 counter） | 权威数据，覆盖直接使用 |
+| 本地 token counter | 保留但不用于进度条 | 作为辅助参考，未来可扩展 |
+| API response | `load_all_accounts()` 手动映射 | 脱离 `sqlx::query_as`，灵活嵌套 runtime |
+| 前端刷新 | 30s refetchInterval | 平衡实时性与请求频率 |

@@ -1,6 +1,7 @@
 mod chat;
 mod exchange;
 mod organization;
+pub mod probe;
 use std::sync::LazyLock;
 
 use http::{

@@ -11,6 +11,8 @@ pub struct AccountWithRuntime {
     pub status: String,
     pub cookie_blob: String,
     pub invalid_reason: Option<String>,
+    pub email: Option<String>,
+    pub account_type: Option<String>,
     pub runtime: Option<RuntimeStateRow>,
 }
 
@@ -29,6 +31,10 @@ pub struct RuntimeStateRow {
     pub weekly_has_reset: Option<bool>,
     pub weekly_sonnet_has_reset: Option<bool>,
     pub weekly_opus_has_reset: Option<bool>,
+    pub session_utilization: Option<f64>,
+    pub weekly_utilization: Option<f64>,
+    pub weekly_sonnet_utilization: Option<f64>,
+    pub weekly_opus_utilization: Option<f64>,
     pub buckets: [UsageBreakdown; 5],
 }
 
@@ -48,6 +54,10 @@ impl RuntimeStateRow {
             weekly_has_reset: self.weekly_has_reset,
             weekly_sonnet_has_reset: self.weekly_sonnet_has_reset,
             weekly_opus_has_reset: self.weekly_opus_has_reset,
+            session_utilization: self.session_utilization,
+            weekly_utilization: self.weekly_utilization,
+            weekly_sonnet_utilization: self.weekly_sonnet_utilization,
+            weekly_opus_utilization: self.weekly_opus_utilization,
             buckets: self.buckets.clone(),
         }
     }
@@ -77,12 +87,14 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
     let rows = sqlx::query(
         r#"SELECT
             a.id, a.name, a.rr_order, a.status, a.cookie_blob, a.invalid_reason,
+            a.email, a.account_type,
             rs.account_id AS rs_marker,
             rs.reset_time,
             rs.supports_claude_1m_sonnet, rs.supports_claude_1m_opus, rs.count_tokens_allowed,
             rs.session_resets_at, rs.weekly_resets_at, rs.weekly_sonnet_resets_at, rs.weekly_opus_resets_at,
             rs.resets_last_checked_at,
             rs.session_has_reset, rs.weekly_has_reset, rs.weekly_sonnet_has_reset, rs.weekly_opus_has_reset,
+            rs.session_utilization, rs.weekly_utilization, rs.weekly_sonnet_utilization, rs.weekly_opus_utilization,
             COALESCE(rs.session_total_input, 0) AS session_total_input,
             COALESCE(rs.session_total_output, 0) AS session_total_output,
             COALESCE(rs.session_sonnet_input, 0) AS session_sonnet_input,
@@ -137,6 +149,10 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
             weekly_has_reset: bool_from_int(row.get("weekly_has_reset")),
             weekly_sonnet_has_reset: bool_from_int(row.get("weekly_sonnet_has_reset")),
             weekly_opus_has_reset: bool_from_int(row.get("weekly_opus_has_reset")),
+            session_utilization: row.get("session_utilization"),
+            weekly_utilization: row.get("weekly_utilization"),
+            weekly_sonnet_utilization: row.get("weekly_sonnet_utilization"),
+            weekly_opus_utilization: row.get("weekly_opus_utilization"),
             buckets: [
                 make_bucket(row, "session"),
                 make_bucket(row, "weekly"),
@@ -153,6 +169,8 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
             status: row.get("status"),
             cookie_blob: row.get("cookie_blob"),
             invalid_reason: row.get("invalid_reason"),
+            email: row.get("email"),
+            account_type: row.get("account_type"),
             runtime,
         });
     }
@@ -185,6 +203,7 @@ pub async fn batch_upsert_runtime_states(
                 ws_total_input, ws_total_output, ws_sonnet_input, ws_sonnet_output, ws_opus_input, ws_opus_output,
                 wo_total_input, wo_total_output, wo_sonnet_input, wo_sonnet_output, wo_opus_input, wo_opus_output,
                 lifetime_total_input, lifetime_total_output, lifetime_sonnet_input, lifetime_sonnet_output, lifetime_opus_input, lifetime_opus_output,
+                session_utilization, weekly_utilization, weekly_sonnet_utilization, weekly_opus_utilization,
                 updated_at
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
@@ -193,6 +212,7 @@ pub async fn batch_upsert_runtime_states(
                 ?27, ?28, ?29, ?30, ?31, ?32,
                 ?33, ?34, ?35, ?36, ?37, ?38,
                 ?39, ?40, ?41, ?42, ?43, ?44,
+                ?45, ?46, ?47, ?48,
                 CURRENT_TIMESTAMP
             ) ON CONFLICT(account_id) DO UPDATE SET
                 reset_time = excluded.reset_time,
@@ -238,6 +258,10 @@ pub async fn batch_upsert_runtime_states(
                 lifetime_sonnet_output = excluded.lifetime_sonnet_output,
                 lifetime_opus_input = excluded.lifetime_opus_input,
                 lifetime_opus_output = excluded.lifetime_opus_output,
+                session_utilization = excluded.session_utilization,
+                weekly_utilization = excluded.weekly_utilization,
+                weekly_sonnet_utilization = excluded.weekly_sonnet_utilization,
+                weekly_opus_utilization = excluded.weekly_opus_utilization,
                 updated_at = CURRENT_TIMESTAMP"#,
         )
         .bind(account_id)
@@ -284,6 +308,10 @@ pub async fn batch_upsert_runtime_states(
         .bind(p.buckets[4].sonnet_output_tokens as i64)
         .bind(p.buckets[4].opus_input_tokens as i64)
         .bind(p.buckets[4].opus_output_tokens as i64)
+        .bind(p.session_utilization)
+        .bind(p.weekly_utilization)
+        .bind(p.weekly_sonnet_utilization)
+        .bind(p.weekly_opus_utilization)
         .execute(&mut *tx)
         .await?;
     }
@@ -302,6 +330,30 @@ pub async fn set_account_disabled(
     )
     .bind(reason)
     .bind(account_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Update account telemetry metadata (email, account_type, org_uuid).
+/// Only updates if the account's cookie_blob still matches the expected value,
+/// preventing stale probes from overwriting metadata after cookie replacement.
+pub async fn update_account_metadata(
+    pool: &SqlitePool,
+    account_id: i64,
+    email: &str,
+    account_type: &str,
+    org_uuid: &str,
+    expected_cookie_prefix: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE accounts SET email = ?1, account_type = ?2, organization_uuid = ?3, updated_at = CURRENT_TIMESTAMP WHERE id = ?4 AND cookie_blob LIKE ?5",
+    )
+    .bind(email)
+    .bind(account_type)
+    .bind(org_uuid)
+    .bind(account_id)
+    .bind(format!("{}%", expected_cookie_prefix))
     .execute(pool)
     .await?;
     Ok(())

@@ -10,8 +10,28 @@ use crate::{
     utils::print_out_json,
 };
 
+pub struct BootstrapInfo {
+    pub email: String,
+    pub org_uuid: String,
+    pub account_type: String,
+    pub capabilities: Vec<String>,
+}
+
+fn derive_account_type(capabilities: &[String]) -> String {
+    let has = |keyword: &str| capabilities.iter().any(|c| c.contains(keyword));
+    if has("max") {
+        "max".to_string()
+    } else if has("enterprise") {
+        "enterprise".to_string()
+    } else if has("pro") || has("raven") {
+        "pro".to_string()
+    } else {
+        "free".to_string()
+    }
+}
+
 impl ClaudeCodeState {
-    pub async fn get_organization(&self) -> Result<String, ClewdrError> {
+    pub async fn fetch_bootstrap_info(&self) -> Result<BootstrapInfo, ClewdrError> {
         let end_point = self
             .endpoint
             .join("api/bootstrap")
@@ -46,32 +66,39 @@ impl ClaudeCodeState {
             .ok_or(Reason::Null)?;
         let capabilities = boot_acc_info["capabilities"]
             .as_array()
-            .map(|a| a.iter().filter_map(|c| c.as_str()).collect::<Vec<_>>())
+            .map(|a| a.iter().filter_map(|c| c.as_str().map(String::from)).collect::<Vec<_>>())
             .unwrap_or_default();
-        if !capabilities.iter().any(|c| {
-            c.contains("pro")
-                || c.contains("enterprise")
-                || c.contains("raven")
-                || c.contains("max")
-        }) {
-            return Err(Reason::Free.into());
-        }
         let email = bootstrap["account"]["email_address"]
             .as_str()
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_string();
         let uuid = boot_acc_info["uuid"]
             .as_str()
             .ok_or(ClewdrError::UnexpectedNone {
                 msg: "Failed to get organization UUID",
             })?
             .to_string();
+        let account_type = derive_account_type(&capabilities);
 
+        Ok(BootstrapInfo {
+            email,
+            org_uuid: uuid,
+            account_type,
+            capabilities,
+        })
+    }
+
+    pub async fn get_organization(&self) -> Result<String, ClewdrError> {
+        let info = self.fetch_bootstrap_info().await?;
+        if info.account_type == "free" {
+            return Err(Reason::Free.into());
+        }
         println!(
             "[{}]\nemail: {}\ncapabilities: {}",
             self.cookie.as_ref().unwrap().cookie.ellipse().green(),
-            email.blue(),
-            capabilities.join(", ").blue()
+            info.email.blue(),
+            info.capabilities.join(", ").blue()
         );
-        Ok(uuid)
+        Ok(info.org_uuid)
     }
 }

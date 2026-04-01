@@ -129,6 +129,21 @@ pub struct CookieStatus {
     pub weekly_sonnet_has_reset: Option<bool>,
     #[serde(default)]
     pub weekly_opus_has_reset: Option<bool>,
+
+    // Account metadata from bootstrap probe
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub account_type: Option<String>,
+
+    #[serde(default)]
+    pub session_utilization: Option<f64>,
+    #[serde(default)]
+    pub weekly_utilization: Option<f64>,
+    #[serde(default)]
+    pub weekly_sonnet_utilization: Option<f64>,
+    #[serde(default)]
+    pub weekly_opus_utilization: Option<f64>,
 }
 
 impl PartialEq for CookieStatus {
@@ -191,6 +206,12 @@ impl CookieStatus {
             weekly_has_reset: None,
             weekly_sonnet_has_reset: None,
             weekly_opus_has_reset: None,
+            email: None,
+            account_type: None,
+            session_utilization: None,
+            weekly_utilization: None,
+            weekly_sonnet_utilization: None,
+            weekly_opus_utilization: None,
         })
     }
 
@@ -405,6 +426,10 @@ pub struct RuntimeStateParams {
     pub weekly_has_reset: Option<bool>,
     pub weekly_sonnet_has_reset: Option<bool>,
     pub weekly_opus_has_reset: Option<bool>,
+    pub session_utilization: Option<f64>,
+    pub weekly_utilization: Option<f64>,
+    pub weekly_sonnet_utilization: Option<f64>,
+    pub weekly_opus_utilization: Option<f64>,
     pub buckets: [UsageBreakdown; 5], // session, weekly, weekly_sonnet, weekly_opus, lifetime
 }
 
@@ -425,6 +450,10 @@ impl CookieStatus {
             weekly_has_reset: self.weekly_has_reset,
             weekly_sonnet_has_reset: self.weekly_sonnet_has_reset,
             weekly_opus_has_reset: self.weekly_opus_has_reset,
+            session_utilization: self.session_utilization,
+            weekly_utilization: self.weekly_utilization,
+            weekly_sonnet_utilization: self.weekly_sonnet_utilization,
+            weekly_opus_utilization: self.weekly_opus_utilization,
             buckets: [
                 self.session_usage.clone(),
                 self.weekly_usage.clone(),
@@ -450,6 +479,10 @@ impl CookieStatus {
         self.weekly_has_reset = p.weekly_has_reset;
         self.weekly_sonnet_has_reset = p.weekly_sonnet_has_reset;
         self.weekly_opus_has_reset = p.weekly_opus_has_reset;
+        self.session_utilization = p.session_utilization;
+        self.weekly_utilization = p.weekly_utilization;
+        self.weekly_sonnet_utilization = p.weekly_sonnet_utilization;
+        self.weekly_opus_utilization = p.weekly_opus_utilization;
         self.session_usage = p.buckets[0].clone();
         self.weekly_usage = p.buckets[1].clone();
         self.weekly_sonnet_usage = p.buckets[2].clone();

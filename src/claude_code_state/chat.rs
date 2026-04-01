@@ -802,21 +802,30 @@ impl ClaudeCodeState {
             *cookie = updated;
         }
 
-        let parse_reset = |obj_key: &str| -> Option<i64> {
-            usage
-                .get(obj_key)
+        let parse_window = |obj_key: &str| -> (Option<i64>, Option<f64>) {
+            let obj = usage.get(obj_key);
+            let resets_at = obj
                 .and_then(|o| o.get("resets_at"))
                 .and_then(|v| v.as_str())
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.timestamp())
+                .map(|dt| dt.timestamp());
+            let utilization = obj
+                .and_then(|o| o.get("utilization"))
+                .and_then(|v| v.as_f64());
+            (resets_at, utilization)
         };
 
-        Some((
-            parse_reset("five_hour"),
-            parse_reset("seven_day"),
-            parse_reset("seven_day_opus"),
-            parse_reset("seven_day_sonnet"),
-        ))
+        let (sess_ts, sess_util) = parse_window("five_hour");
+        let (week_ts, week_util) = parse_window("seven_day");
+        let (opus_ts, opus_util) = parse_window("seven_day_opus");
+        let (sonnet_ts, sonnet_util) = parse_window("seven_day_sonnet");
+
+        cookie.session_utilization = sess_util;
+        cookie.weekly_utilization = week_util;
+        cookie.weekly_opus_utilization = opus_util;
+        cookie.weekly_sonnet_utilization = sonnet_util;
+
+        Some((sess_ts, week_ts, opus_ts, sonnet_ts))
     }
 
     fn local_count_tokens_response(body: &CreateMessageParams) -> axum::response::Response {
