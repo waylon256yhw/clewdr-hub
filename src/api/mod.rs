@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod auth;
 mod claude_code;
 mod error;
 mod misc;

@@ -60,9 +60,16 @@ pub async fn change_password(
         result?
     };
 
-    sqlx::query("UPDATE users SET password_hash = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
+    sqlx::query("UPDATE users SET password_hash = ?1, must_change_password = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
         .bind(&new_hash)
         .bind(user.user_id)
+        .execute(&db)
+        .await?;
+
+    // Revoke all web-session keys for this user (force re-login)
+    sqlx::query("DELETE FROM api_keys WHERE user_id = ?1 AND label = 'web-session' AND id != ?2")
+        .bind(user.user_id)
+        .bind(user.api_key_id)
         .execute(&db)
         .await?;
 

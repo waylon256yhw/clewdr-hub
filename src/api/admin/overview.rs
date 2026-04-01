@@ -1,7 +1,8 @@
-use axum::{Json, extract::State};
+use axum::{Extension, Json, extract::State};
 use serde::Serialize;
 use sqlx::SqlitePool;
 
+use crate::db::models::AuthenticatedUser;
 use crate::error::ClewdrError;
 use crate::services::cookie_actor::CookieActorHandle;
 use crate::stealth;
@@ -18,6 +19,7 @@ pub struct OverviewResponse {
     pub requests_1h: i64,
     pub requests_24h: i64,
     pub stealth: StealthOverview,
+    pub must_change_password: bool,
 }
 
 #[derive(Serialize)]
@@ -58,6 +60,7 @@ pub struct StealthOverview {
 pub async fn overview(
     State(db): State<SqlitePool>,
     State(cookie_handle): State<CookieActorHandle>,
+    Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<Json<OverviewResponse>, ClewdrError> {
     let cookie_status = cookie_handle.get_status().await.ok();
 
@@ -103,6 +106,13 @@ pub async fn overview(
 
     let profile = stealth::global_profile().load();
 
+    let (must_change,): (i32,) = sqlx::query_as(
+        "SELECT must_change_password FROM users WHERE id = ?1"
+    )
+    .bind(user.user_id)
+    .fetch_one(&db)
+    .await?;
+
     Ok(Json(OverviewResponse {
         version: crate::VERSION_INFO.clone(),
         server_time: now.to_rfc3339(),
@@ -130,5 +140,6 @@ pub async fn overview(
             cli_version: profile.cli_version.clone(),
             sdk_version: profile.sdk_version.clone(),
         },
+        must_change_password: must_change != 0,
     }))
 }

@@ -1,10 +1,128 @@
-import { Title, Text } from "@mantine/core";
+import { useQuery } from "@tanstack/react-query";
+import {
+  SimpleGrid,
+  Paper,
+  Text,
+  Group,
+  Title,
+  ActionIcon,
+  Badge,
+  Skeleton,
+  Alert,
+} from "@mantine/core";
+import { IconRefresh } from "@tabler/icons-react";
+import { getOverview, qk } from "../api";
 
 export default function Dashboard() {
+  const { data, isLoading, error, refetch } = useQuery({
+    queryKey: qk.overview,
+    queryFn: getOverview,
+    refetchInterval: 30_000,
+  });
+
+  if (isLoading) {
+    return (
+      <>
+        <Title order={3} mb="md">总览</Title>
+        <SimpleGrid cols={{ base: 1, xs: 2, md: 3 }} spacing="md">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <Skeleton key={i} height={100} radius="md" />
+          ))}
+        </SimpleGrid>
+      </>
+    );
+  }
+
+  if (error || !data) {
+    return (
+      <Alert color="red" title="加载失败">
+        {String(error ?? "未知错误")}
+        <br />
+        <ActionIcon variant="light" mt="xs" onClick={() => refetch()}>
+          <IconRefresh size={16} />
+        </ActionIcon>
+      </Alert>
+    );
+  }
+
+  const cards: { label: string; value: React.ReactNode }[] = [
+    {
+      label: "Cookie 状态",
+      value: (
+        <Group gap="xs">
+          <Badge color="green" variant="light">{data.cookies.valid} 可用</Badge>
+          <Badge color="yellow" variant="light">{data.cookies.exhausted} 耗尽</Badge>
+          <Badge color="red" variant="light">{data.cookies.invalid} 失效</Badge>
+        </Group>
+      ),
+    },
+    {
+      label: "用户",
+      value: (
+        <Group gap="xs">
+          <Text fw={600} size="xl">{data.users.total}</Text>
+          <Text size="sm" c="dimmed">({data.users.admins} 管理员, {data.users.members} 成员)</Text>
+        </Group>
+      ),
+    },
+    {
+      label: "API Key",
+      value: (
+        <Group gap="xs">
+          <Badge color="green" variant="light">{data.api_keys.active} 活跃</Badge>
+          <Badge color="gray" variant="light">{data.api_keys.disabled} 禁用</Badge>
+        </Group>
+      ),
+    },
+    {
+      label: "账号池",
+      value: (
+        <Group gap="xs">
+          <Badge color="green" variant="light">{data.accounts.active} 活跃</Badge>
+          <Badge color="gray" variant="light">{data.accounts.disabled} 禁用</Badge>
+        </Group>
+      ),
+    },
+    {
+      label: "请求量",
+      value: (
+        <Group gap="xs">
+          <Text fw={600} size="xl">{data.requests_1h}</Text>
+          <Text size="sm" c="dimmed">/ 1小时</Text>
+          <Text fw={600} size="xl">{data.requests_24h}</Text>
+          <Text size="sm" c="dimmed">/ 24小时</Text>
+        </Group>
+      ),
+    },
+    {
+      label: "伪装版本",
+      value: (
+        <Text size="sm">
+          CLI {data.stealth.cli_version} / SDK {data.stealth.sdk_version}
+        </Text>
+      ),
+    },
+  ];
+
   return (
     <>
-      <Title order={2}>Overview</Title>
-      <Text c="dimmed" mt="sm">Dashboard coming in Phase 6.</Text>
+      <Group justify="space-between" mb="md">
+        <Title order={3}>总览</Title>
+        <Group gap="xs">
+          <Text size="xs" c="dimmed">{data.version}</Text>
+          <ActionIcon variant="default" onClick={() => refetch()}>
+            <IconRefresh size={16} />
+          </ActionIcon>
+        </Group>
+      </Group>
+      <SimpleGrid cols={{ base: 1, xs: 2, md: 3 }} spacing="md">
+        {cards.map((card) => (
+          <Paper key={card.label} shadow="xs" p="md" radius="md" withBorder>
+            <Text size="sm" c="dimmed" mb="xs">{card.label}</Text>
+            {card.value}
+          </Paper>
+        ))}
+      </SimpleGrid>
     </>
   );
 }

@@ -71,28 +71,97 @@ impl RouterBuilder {
         let router = Router::new()
             .nest("/api/admin", admin_router)
             .route("/api/version", get(api_version))
+            .route("/auth/login", post(crate::api::auth::login))
+            .route(
+                "/auth/logout",
+                post(crate::api::auth::logout)
+                    .route_layer(from_extractor_with_state::<RequireAdminAuth, _>(self.state.clone())),
+            )
             .with_state(self.state.clone());
         self.inner = self.inner.merge(router);
         self
     }
 
     fn setup_static_serving(mut self) -> Self {
+        use axum::http::{StatusCode, Uri, header};
+        use axum::response::{IntoResponse, Response};
+
+        // SPA fallback: serve index.html for client-side routes, 404 for API paths
         #[cfg(feature = "embed-resource")]
         {
             use include_dir::{Dir, include_dir};
             const INCLUDE_STATIC: Dir = include_dir!("$CARGO_MANIFEST_DIR/static");
-            self.inner = self
-                .inner
-                .fallback_service(tower_serve_static::ServeDir::new(&INCLUDE_STATIC));
+
+            async fn embed_handler(uri: Uri) -> Response {
+                let path = uri.path().trim_start_matches('/');
+                // Serve static file if it exists
+                if let Some(file) = INCLUDE_STATIC.get_file(path) {
+                    let ct = if path.ends_with(".js") { "application/javascript" }
+                        else if path.ends_with(".css") { "text/css" }
+                        else if path.ends_with(".html") { "text/html; charset=utf-8" }
+                        else if path.ends_with(".svg") { "image/svg+xml" }
+                        else if path.ends_with(".json") { "application/json" }
+                        else { "application/octet-stream" };
+                    return Response::builder()
+                        .header(header::CONTENT_TYPE, ct)
+                        .body(axum::body::Body::from(file.contents()))
+                        .unwrap();
+                }
+                // API paths → 404
+                if path.starts_with("api/") || path.starts_with("auth/") || path.starts_with("v1/") {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                // SPA fallback
+                match INCLUDE_STATIC.get_file("index.html") {
+                    Some(file) => Response::builder()
+                        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                        .body(axum::body::Body::from(file.contents()))
+                        .unwrap(),
+                    None => StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+
+            self.inner = self.inner.fallback(embed_handler);
         }
         #[cfg(feature = "external-resource")]
         {
             use const_format::formatc;
-            use tower_http::services::ServeDir;
-            self.inner = self.inner.fallback_service(ServeDir::new(formatc!(
-                "{}/static",
-                env!("CARGO_MANIFEST_DIR")
-            )));
+            const STATIC_DIR: &str = formatc!("{}/static", env!("CARGO_MANIFEST_DIR"));
+            const INDEX_HTML: &str = formatc!("{}/static/index.html", env!("CARGO_MANIFEST_DIR"));
+
+            async fn external_handler(uri: Uri) -> Response {
+                let path = uri.path().trim_start_matches('/');
+                // Try serving static file
+                let file_path = std::path::Path::new(STATIC_DIR).join(path);
+                if file_path.is_file() {
+                    if let Ok(bytes) = tokio::fs::read(&file_path).await {
+                        let ct = if path.ends_with(".js") { "application/javascript" }
+                            else if path.ends_with(".css") { "text/css" }
+                            else if path.ends_with(".html") { "text/html; charset=utf-8" }
+                            else if path.ends_with(".svg") { "image/svg+xml" }
+                            else if path.ends_with(".json") { "application/json" }
+                            else { "application/octet-stream" };
+                        return Response::builder()
+                            .header(header::CONTENT_TYPE, ct)
+                            .body(axum::body::Body::from(bytes))
+                            .unwrap();
+                    }
+                }
+                // API paths → 404
+                if path.starts_with("api/") || path.starts_with("auth/") || path.starts_with("v1/") {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                // SPA fallback
+                match tokio::fs::read(INDEX_HTML).await {
+                    Ok(bytes) => Response::builder()
+                        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                        .body(axum::body::Body::from(bytes))
+                        .unwrap(),
+                    Err(_) => StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+
+            self.inner = self.inner.fallback(external_handler);
         }
         self
     }

@@ -7,4 +7,10 @@ export default defineConfig({
     outDir: '../static',
     emptyOutDir: true,
   },
+  server: {
+    proxy: {
+      '/api': 'http://localhost:3000',
+      '/auth': 'http://localhost:3000',
+    },
+  },
 })

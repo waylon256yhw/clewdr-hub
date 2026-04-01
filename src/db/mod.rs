@@ -11,7 +11,6 @@ use argon2::{
     password_hash::{PasswordHasher, SaltString, rand_core::OsRng},
 };
 use colored::Colorize;
-use rand::RngExt;
 use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -45,40 +44,46 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, ClewdrError> {
     Ok(pool)
 }
 
+const DEFAULT_PASSWORD_HASH: &str =
+    "$argon2id$v=19$m=65536,t=3,p=1$Li5+S+9BeUmy3TFviGbZ9Q$tI+ZLpzW3LhrR5OA8izKSR+mw4APjT6m4rQTicuXNsE";
+
 pub async fn seed_admin(pool: &SqlitePool) -> Result<(), ClewdrError> {
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE role = 'admin'")
         .fetch_one(pool)
         .await?;
 
     if count.0 == 0 {
-        let password = match std::env::var(ADMIN_PASSWORD_ENV) {
+        let (password_hash, must_change) = match std::env::var(ADMIN_PASSWORD_ENV) {
             Ok(p) if !p.trim().is_empty() => {
                 info!("Using admin password from {ADMIN_PASSWORD_ENV} environment variable");
-                p
+                let pw = p;
+                let hash = tokio::task::spawn_blocking(move || hash_password(&pw))
+                    .await
+                    .map_err(|e| ClewdrError::UnexpectedNone {
+                        msg: Box::leak(format!("argon2 task panicked: {e}").into_boxed_str()),
+                    })??;
+                (hash, 0i32)
             }
             _ => {
-                let generated = generate_password(16);
                 println!(
-                    "{} {}",
-                    "Generated admin password:".green().bold(),
-                    generated.yellow().bold()
+                    "{}\n  {} {}\n  {} {}",
+                    "Default admin credentials:".green().bold(),
+                    "Username:".bold(),
+                    "admin".yellow().bold(),
+                    "Password:".bold(),
+                    "password".yellow().bold(),
                 );
-                generated
+                (DEFAULT_PASSWORD_HASH.to_string(), 1i32)
             }
         };
 
-        let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
-            .await
-            .map_err(|e| ClewdrError::UnexpectedNone {
-                msg: Box::leak(format!("argon2 task panicked: {e}").into_boxed_str()),
-            })??;
-
         sqlx::query(
-            "INSERT OR IGNORE INTO users (username, display_name, password_hash, role, policy_id) VALUES (?1, ?2, ?3, 'admin', 1)",
+            "INSERT OR IGNORE INTO users (username, display_name, password_hash, role, policy_id, must_change_password) VALUES (?1, ?2, ?3, 'admin', 1, ?4)",
         )
         .bind("admin")
         .bind("Administrator")
         .bind(&password_hash)
+        .bind(must_change)
         .execute(pool)
         .await?;
 
@@ -161,15 +166,4 @@ fn hash_password(password: &str) -> Result<String, ClewdrError> {
 /// Public wrapper for admin API user creation/update.
 pub fn hash_password_public(password: &str) -> Result<String, ClewdrError> {
     hash_password(password)
-}
-
-fn generate_password(len: usize) -> String {
-    const CHARSET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let mut rng = rand::rng();
-    (0..len)
-        .map(|_| {
-            let idx = rng.random_range(0..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect()
 }
