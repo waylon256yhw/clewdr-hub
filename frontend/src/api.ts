@@ -197,7 +197,7 @@ export const listAccounts = () =>
   apiFetch<Paginated<Account>>("/api/admin/accounts", { params: { limit: 100 } });
 export const createAccount = (data: {
   name: string;
-  rr_order: number;
+  rr_order?: number;
   max_slots?: number;
   cookie_blob: string;
   organization_uuid?: string;
@@ -263,6 +263,28 @@ export const listRequests = (filters: RequestFilters) =>
 export const changePassword = (data: { current_password: string; new_password: string }) =>
   apiFetch<{ message: string }>("/api/admin/me/password", { method: "PUT", body: data });
 
+// Models
+export interface ModelRow {
+  model_id: string;
+  display_name: string;
+  enabled: number;
+  source: string;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export const listModelsAdmin = () =>
+  apiFetch<Paginated<ModelRow>>("/api/admin/models", { params: { limit: 100 } });
+export const createModel = (data: { model_id: string; display_name: string; sort_order?: number }) =>
+  apiFetch<ModelRow>("/api/admin/models", { method: "POST", body: data });
+export const updateModel = (modelId: string, data: { display_name?: string; enabled?: boolean; sort_order?: number }) =>
+  apiFetch<ModelRow>(`/api/admin/models/${encodeURIComponent(modelId)}`, { method: "PUT", body: data });
+export const deleteModel = (modelId: string) =>
+  apiFetch<void>(`/api/admin/models/${encodeURIComponent(modelId)}`, { method: "DELETE" });
+export const resetDefaultModels = () =>
+  apiFetch<Paginated<ModelRow>>("/api/admin/models/reset-defaults", { method: "POST" });
+
 // --- Query Keys ---
 
 export const qk = {
@@ -272,5 +294,6 @@ export const qk = {
   policies: ["policies"] as const,
   keys: (userId?: number) => ["keys", userId] as const,
   settings: ["settings"] as const,
+  models: ["models"] as const,
   requests: (filters: RequestFilters) => ["requests", filters] as const,
 };

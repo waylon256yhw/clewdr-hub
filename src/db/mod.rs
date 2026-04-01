@@ -138,6 +138,51 @@ pub async fn seed_admin(pool: &SqlitePool) -> Result<(), ClewdrError> {
         .await?;
     }
 
+    seed_models(pool).await?;
+
+    Ok(())
+}
+
+const DEFAULT_MODELS: &[(&str, &str, i32)] = &[
+    ("claude-opus-4-6",   "Claude Opus 4.6",   10),
+    ("claude-opus-4-5",   "Claude Opus 4.5",   20),
+    ("claude-opus-4-1",   "Claude Opus 4.1",   30),
+    ("claude-opus-4-0",   "Claude Opus 4.0",   40),
+    ("claude-sonnet-4-6", "Claude Sonnet 4.6",  50),
+    ("claude-sonnet-4-5", "Claude Sonnet 4.5",  60),
+    ("claude-sonnet-4-0", "Claude Sonnet 4.0",  70),
+    ("claude-haiku-4-5",  "Claude Haiku 4.5",   80),
+    ("claude-haiku-3-5",  "Claude Haiku 3.5",   90),
+];
+
+pub async fn seed_models(pool: &SqlitePool) -> Result<(), ClewdrError> {
+    for &(model_id, display_name, sort_order) in DEFAULT_MODELS {
+        sqlx::query(
+            "INSERT OR IGNORE INTO models (model_id, display_name, source, sort_order) VALUES (?1, ?2, 'builtin', ?3)"
+        )
+        .bind(model_id)
+        .bind(display_name)
+        .bind(sort_order)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+pub async fn reset_default_models(pool: &SqlitePool) -> Result<(), ClewdrError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM models").execute(&mut *tx).await?;
+    for &(model_id, display_name, sort_order) in DEFAULT_MODELS {
+        sqlx::query(
+            "INSERT OR IGNORE INTO models (model_id, display_name, source, sort_order) VALUES (?1, ?2, 'builtin', ?3)"
+        )
+        .bind(model_id)
+        .bind(display_name)
+        .bind(sort_order)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 

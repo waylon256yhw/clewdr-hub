@@ -80,7 +80,6 @@ function AccountFormModal({
       }
       return createAccount({
         name: values.name,
-        rr_order: values.rr_order,
         max_slots: values.max_slots,
         cookie_blob: values.cookie_blob,
         organization_uuid: values.organization_uuid || undefined,
@@ -90,6 +89,7 @@ function AccountFormModal({
       queryClient.invalidateQueries({ queryKey: qk.accounts });
       queryClient.invalidateQueries({ queryKey: qk.overview });
       notifications.show({ message: editing ? "账号已更新" : "账号已创建", color: "green" });
+      form.reset();
       onClose();
     },
     onError: (e) =>
@@ -101,7 +101,7 @@ function AccountFormModal({
       <form onSubmit={form.onSubmit((v) => mutation.mutate(v))}>
         <Stack>
           <TextInput label="名称" required key={form.key("name")} {...form.getInputProps("name")} />
-          <NumberInput label="轮询顺序" key={form.key("rr_order")} {...form.getInputProps("rr_order")} />
+          {editing && <NumberInput label="轮询顺序" key={form.key("rr_order")} {...form.getInputProps("rr_order")} />}
           <NumberInput label="最大并发" min={1} key={form.key("max_slots")} {...form.getInputProps("max_slots")} />
           <Textarea
             label={editing ? "替换 Cookie（可选）" : "Cookie"}

@@ -50,11 +50,22 @@ impl RouterBuilder {
     }
 
     pub fn with_default_setup(self) -> Self {
-        self.route_claude_code_endpoints()
+        self.route_public_endpoints()
+            .route_claude_code_endpoints()
             .route_admin_endpoints()
             .setup_static_serving()
             .with_tower_trace()
             .with_cors()
+    }
+
+    fn route_public_endpoints(mut self) -> Self {
+        let router = Router::new()
+            .route("/health", get(crate::api::health::health))
+            .route("/v1/models", get(crate::api::models::list))
+            .route("/v1/models/{model_id}", get(crate::api::models::get))
+            .with_state(self.state.clone());
+        self.inner = self.inner.merge(router);
+        self
     }
 
     fn route_claude_code_endpoints(mut self) -> Self {

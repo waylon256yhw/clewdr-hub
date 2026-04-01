@@ -2,6 +2,7 @@ pub mod accounts;
 pub mod common;
 pub mod keys;
 mod me;
+pub mod models;
 pub mod overview;
 pub mod policies;
 pub mod requests;
@@ -10,7 +11,7 @@ pub mod users;
 
 use axum::{
     Router,
-    routing::{delete, get, put},
+    routing::{delete, get, post, put},
 };
 
 use crate::state::AppState;
@@ -35,6 +36,10 @@ pub fn admin_router() -> Router<AppState> {
             "/accounts/{id}",
             put(accounts::update).delete(accounts::remove),
         )
+        // Models
+        .route("/models", get(models::list).post(models::create))
+        .route("/models/reset-defaults", post(models::reset_defaults))
+        .route("/models/{model_id}", put(models::update).delete(models::remove))
         // Settings
         .route("/settings", get(settings::get_all).post(settings::update))
         // CLI versions (npm)

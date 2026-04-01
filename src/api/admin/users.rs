@@ -50,12 +50,12 @@ fn current_week_start() -> String {
     let now = Utc::now();
     let weekday = now.weekday().num_days_from_monday();
     let monday = now.date_naive() - chrono::Duration::days(weekday as i64);
-    monday.format("%Y-%m-%d").to_string()
+    monday.format("%Y-%m-%dT00:00:00Z").to_string()
 }
 
 fn current_month_start() -> String {
     use chrono::Utc;
-    Utc::now().format("%Y-%m-01").to_string()
+    Utc::now().format("%Y-%m-01T00:00:00Z").to_string()
 }
 
 fn user_list_query(week_start: &str, month_start: &str) -> String {

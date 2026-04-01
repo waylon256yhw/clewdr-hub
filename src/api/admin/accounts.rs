@@ -25,7 +25,7 @@ pub struct AccountResponse {
 #[derive(Deserialize)]
 pub struct CreateAccountRequest {
     pub name: String,
-    pub rr_order: i64,
+    pub rr_order: Option<i64>,
     pub max_slots: Option<i64>,
     pub cookie_blob: String,
     pub organization_uuid: Option<String>,
@@ -75,11 +75,21 @@ pub async fn create(
         return Err(ClewdrError::BadRequest { msg: "max_slots must be positive" });
     }
 
+    let rr_order = match req.rr_order {
+        Some(v) => v,
+        None => {
+            let (max_rr,): (Option<i64>,) = sqlx::query_as("SELECT MAX(rr_order) FROM accounts")
+                .fetch_one(&db)
+                .await?;
+            max_rr.unwrap_or(-1) + 1
+        }
+    };
+
     let id = sqlx::query(
         "INSERT INTO accounts (name, rr_order, max_slots, cookie_blob, organization_uuid) VALUES (?1, ?2, ?3, ?4, ?5)",
     )
     .bind(&req.name)
-    .bind(req.rr_order)
+    .bind(rr_order)
     .bind(max_slots)
     .bind(&req.cookie_blob)
     .bind(&req.organization_uuid)
