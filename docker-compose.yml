@@ -1,0 +1,16 @@
+services:
+  clewdr-hub:
+    image: ghcr.io/waylon256yhw/clewdr-hub:latest
+    container_name: clewdr-hub
+    restart: unless-stopped
+    ports:
+      - "8484:8484"
+    volumes:
+      - clewdr-data:/etc/clewdr
+    environment:
+      - CLEWDR_IP=0.0.0.0
+      - CLEWDR_PORT=8484
+      # - ADMIN_PASSWORD=changeme
+
+volumes:
+  clewdr-data:
