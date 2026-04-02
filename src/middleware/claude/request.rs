@@ -184,6 +184,29 @@ fn inject_metadata_user_id(
     metadata.fields.insert("user_id".to_string(), user_id);
 }
 
+/// Normalize sampling parameters to comply with Claude API constraints.
+///
+/// When thinking is active (enabled or adaptive):
+///   - `temperature` must be 1 or unset
+///   - `top_p` must be >= 0.95 or unset
+///   - `top_k` must be unset
+fn normalize_sampling_params(body: &mut CreateMessageParams) {
+    let thinking_active = matches!(
+        body.thinking,
+        Some(Thinking::Adaptive) | Some(Thinking::Enabled { .. })
+    );
+
+    if thinking_active {
+        if body.temperature != Some(1.0) {
+            body.temperature = None;
+        }
+        if !matches!(body.top_p, Some(p) if (0.95..=1.0).contains(&p)) {
+            body.top_p = None;
+        }
+        body.top_k = None;
+    }
+}
+
 /// Predefined test message for connection testing
 static TEST_MESSAGE_CLAUDE: LazyLock<Message> =
     LazyLock::new(|| Message::new_blocks(Role::User, vec![ContentBlock::text("Hi")]));
@@ -211,15 +234,8 @@ where
         let session_id = client_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let Json(mut body) = Json::<CreateMessageParams>::from_request(req, &()).await?;
 
-        if body.model.ends_with("-thinking") {
-            body.model = body.model.trim_end_matches("-thinking").to_string();
-            body.thinking.get_or_insert(Thinking::new(4096));
-        }
         drop_empty_system(&mut body);
-
-        if body.temperature.is_some() {
-            body.top_p = None;
-        }
+        normalize_sampling_params(&mut body);
 
         // Check for test messages
         if !body.stream.unwrap_or_default()
@@ -361,5 +377,80 @@ mod tests {
             .map(|value| value["text"].as_str().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(texts, vec!["billing", "original system"]);
+    }
+
+    fn make_body(
+        thinking: Option<Thinking>,
+        temp: Option<f32>,
+        top_p: Option<f32>,
+        top_k: Option<u32>,
+    ) -> CreateMessageParams {
+        CreateMessageParams {
+            model: "claude-sonnet-4-6".to_string(),
+            messages: vec![Message::new_text(Role::User, "hi")],
+            thinking,
+            temperature: temp,
+            top_p,
+            top_k,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn normalize_thinking_adaptive_strips_invalid_params() {
+        let mut body = make_body(Some(Thinking::Adaptive), Some(0.7), Some(0.9), Some(40));
+        normalize_sampling_params(&mut body);
+        assert_eq!(body.temperature, None);
+        assert_eq!(body.top_p, None);
+        assert_eq!(body.top_k, None);
+    }
+
+    #[test]
+    fn normalize_thinking_adaptive_keeps_valid_params() {
+        let mut body = make_body(Some(Thinking::Adaptive), Some(1.0), Some(0.95), None);
+        normalize_sampling_params(&mut body);
+        assert_eq!(body.temperature, Some(1.0));
+        assert_eq!(body.top_p, Some(0.95));
+    }
+
+    #[test]
+    fn normalize_thinking_enabled_strips_invalid_params() {
+        let mut body = make_body(Some(Thinking::new(4096)), Some(0.5), Some(0.8), Some(10));
+        normalize_sampling_params(&mut body);
+        assert_eq!(body.temperature, None);
+        assert_eq!(body.top_p, None);
+        assert_eq!(body.top_k, None);
+    }
+
+    #[test]
+    fn normalize_thinking_strips_top_p_above_one() {
+        let mut body = make_body(Some(Thinking::Adaptive), None, Some(1.5), None);
+        normalize_sampling_params(&mut body);
+        assert_eq!(body.top_p, None);
+    }
+
+    #[test]
+    fn normalize_thinking_keeps_top_p_one() {
+        let mut body = make_body(Some(Thinking::Adaptive), None, Some(1.0), None);
+        normalize_sampling_params(&mut body);
+        assert_eq!(body.top_p, Some(1.0));
+    }
+
+    #[test]
+    fn normalize_no_thinking_passes_all_through() {
+        let mut body = make_body(None, Some(0.7), Some(0.9), Some(40));
+        normalize_sampling_params(&mut body);
+        assert_eq!(body.temperature, Some(0.7));
+        assert_eq!(body.top_p, Some(0.9));
+        assert_eq!(body.top_k, Some(40));
+    }
+
+    #[test]
+    fn normalize_thinking_disabled_passes_all_through() {
+        let mut body = make_body(Some(Thinking::Disabled), Some(0.7), Some(0.9), Some(40));
+        normalize_sampling_params(&mut body);
+        assert_eq!(body.temperature, Some(0.7));
+        assert_eq!(body.top_p, Some(0.9));
+        assert_eq!(body.top_k, Some(40));
     }
 }

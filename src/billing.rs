@@ -77,7 +77,6 @@ static KNOWN_ALIASES: &[(&str, &str)] = &[
 /// Returns None if the model cannot be matched (caller should use fallback pricing).
 pub fn normalize_model(raw: &str) -> Option<String> {
     let m = raw.to_ascii_lowercase();
-    let m = m.strip_suffix("-thinking").unwrap_or(&m);
 
     // Exact alias match
     for &(alias, key) in KNOWN_ALIASES {
