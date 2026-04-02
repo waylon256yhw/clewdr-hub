@@ -1,4 +1,7 @@
-use axum::{Json, extract::{Query, State}};
+use axum::{
+    Json,
+    extract::{Query, State},
+};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
@@ -107,22 +110,47 @@ pub async fn list(
 
     // Build and execute count query
     let mut count_query = sqlx::query_as::<_, (i64,)>(&count_sql);
-    if let Some(uid) = params.user_id { count_query = count_query.bind(uid); }
-    if let Some(ref s) = params.status { count_query = count_query.bind(s); }
-    if let Some(ref m) = params.model { count_query = count_query.bind(format!("%{m}%")); }
-    if let Some(ref f) = params.started_from { count_query = count_query.bind(f); }
-    if let Some(ref t) = params.started_to { count_query = count_query.bind(t); }
+    if let Some(uid) = params.user_id {
+        count_query = count_query.bind(uid);
+    }
+    if let Some(ref s) = params.status {
+        count_query = count_query.bind(s);
+    }
+    if let Some(ref m) = params.model {
+        count_query = count_query.bind(format!("%{m}%"));
+    }
+    if let Some(ref f) = params.started_from {
+        count_query = count_query.bind(f);
+    }
+    if let Some(ref t) = params.started_to {
+        count_query = count_query.bind(t);
+    }
     let (total,) = count_query.fetch_one(&db).await?;
 
     // Build and execute list query
     let mut list_query = sqlx::query_as::<_, RequestLogResponse>(&list_sql);
-    if let Some(uid) = params.user_id { list_query = list_query.bind(uid); }
-    if let Some(ref s) = params.status { list_query = list_query.bind(s); }
-    if let Some(ref m) = params.model { list_query = list_query.bind(format!("%{m}%")); }
-    if let Some(ref f) = params.started_from { list_query = list_query.bind(f); }
-    if let Some(ref t) = params.started_to { list_query = list_query.bind(t); }
+    if let Some(uid) = params.user_id {
+        list_query = list_query.bind(uid);
+    }
+    if let Some(ref s) = params.status {
+        list_query = list_query.bind(s);
+    }
+    if let Some(ref m) = params.model {
+        list_query = list_query.bind(format!("%{m}%"));
+    }
+    if let Some(ref f) = params.started_from {
+        list_query = list_query.bind(f);
+    }
+    if let Some(ref t) = params.started_to {
+        list_query = list_query.bind(t);
+    }
     list_query = list_query.bind(limit).bind(offset);
     let items = list_query.fetch_all(&db).await?;
 
-    Ok(Json(Paginated { items, total, offset, limit }))
+    Ok(Json(Paginated {
+        items,
+        total,
+        offset,
+        limit,
+    }))
 }

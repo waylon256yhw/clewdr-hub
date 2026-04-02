@@ -1,7 +1,7 @@
 use serde::de;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use serde_with::{serde_as, DefaultOnError};
+use serde_with::{DefaultOnError, serde_as};
 use tiktoken_rs::o200k_base;
 
 #[derive(Debug)]

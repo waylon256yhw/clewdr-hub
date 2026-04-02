@@ -42,7 +42,10 @@ pub fn admin_router() -> Router<AppState> {
         // Models
         .route("/models", get(models::list).post(models::create))
         .route("/models/reset-defaults", post(models::reset_defaults))
-        .route("/models/{model_id}", put(models::update).delete(models::remove))
+        .route(
+            "/models/{model_id}",
+            put(models::update).delete(models::remove),
+        )
         // Settings
         .route("/settings", get(settings::get_all).post(settings::update))
         // CLI versions (npm)

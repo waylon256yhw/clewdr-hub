@@ -34,7 +34,11 @@ enum CookieActorMessage {
     Return(CookieStatus, Option<Reason>),
     Submit(CookieStatus),
     CheckReset,
-    Request(Option<u64>, Vec<i64>, RpcReplyPort<Result<CookieStatus, ClewdrError>>),
+    Request(
+        Option<u64>,
+        Vec<i64>,
+        RpcReplyPort<Result<CookieStatus, ClewdrError>>,
+    ),
     GetStatus(RpcReplyPort<CookieStatusInfo>),
     Delete(CookieStatus, RpcReplyPort<Result<(), ClewdrError>>),
     Update1mSupport(CookieStatus, RpcReplyPort<Result<(), ClewdrError>>),
@@ -42,6 +46,7 @@ enum CookieActorMessage {
     ProbeAll,
     FlushDirty,
     SetHandle(CookieActorHandle),
+    ReleaseSlot(i64),
 }
 
 #[derive(Debug)]
@@ -53,6 +58,8 @@ struct CookieActorState {
     db: SqlitePool,
     dirty: HashSet<i64>,
     handle: Option<CookieActorHandle>,
+    /// Per-account inflight tracking: account_id → (current_inflight, max_slots)
+    inflight: HashMap<i64, (u32, u32)>,
 }
 
 struct CookieActor;
@@ -218,22 +225,35 @@ impl CookieActor {
             }
         });
 
-        let is_allowed = |c: &CookieStatus| -> bool {
-            bound.is_empty() || c.account_id.is_some_and(|id| bound.contains(&id))
+        let is_allowed = |c: &CookieStatus, inflight: &HashMap<i64, (u32, u32)>| -> bool {
+            let bound_ok = bound.is_empty() || c.account_id.is_some_and(|id| bound.contains(&id));
+            let slot_ok = c.account_id.map_or(true, |id| {
+                inflight.get(&id).map_or(true, |(cur, max)| cur < max)
+            });
+            bound_ok && slot_ok
         };
 
         if let Some(key) = cache_key
             && let Some(cached) = state.moka.get(&key)
-            && let Some(cookie) = state.valid.iter().find(|c| *c == &cached && is_allowed(c))
+            && let Some(cookie) = state
+                .valid
+                .iter()
+                .find(|c| *c == &cached && is_allowed(c, &state.inflight))
         {
+            let cookie = cookie.clone();
+            if let Some(aid) = cookie.account_id {
+                if let Some((cur, _)) = state.inflight.get_mut(&aid) {
+                    *cur += 1;
+                }
+            }
             state.moka.insert(key, cookie.clone());
-            return Ok(cookie.clone());
+            return Ok(cookie);
         }
 
         let idx = state
             .valid
             .iter()
-            .position(|c| is_allowed(c))
+            .position(|c| is_allowed(c, &state.inflight))
             .ok_or(if bound.is_empty() {
                 ClewdrError::NoCookieAvailable
             } else {
@@ -241,6 +261,11 @@ impl CookieActor {
             })?;
 
         let cookie = state.valid.remove(idx).unwrap();
+        if let Some(aid) = cookie.account_id {
+            if let Some((cur, _)) = state.inflight.get_mut(&aid) {
+                *cur += 1;
+            }
+        }
         state.valid.push_back(cookie.clone());
         if let Some(key) = cache_key {
             state.moka.insert(key, cookie.clone());
@@ -566,6 +591,14 @@ impl CookieActor {
         // Clear moka cache since cookie set changed
         state.moka.invalidate_all();
 
+        // Rebuild inflight map: preserve current counts, update max_slots from DB
+        let mut new_inflight = HashMap::new();
+        for row in &accounts {
+            let current = state.inflight.get(&row.id).map_or(0, |(cur, _)| *cur);
+            new_inflight.insert(row.id, (current, row.max_slots as u32));
+        }
+        state.inflight = new_inflight;
+
         Self::log(state);
 
         // Spawn probes for unprobed cookies
@@ -596,6 +629,7 @@ impl Actor for CookieActor {
             db,
             dirty: HashSet::new(),
             handle: None,
+            inflight: HashMap::new(),
         };
 
         // Load accounts from DB
@@ -659,6 +693,11 @@ impl Actor for CookieActor {
                 // Backfill probes missed during pre_start (handle was None then)
                 Self::spawn_probes_for_unprobed(state);
             }
+            CookieActorMessage::ReleaseSlot(account_id) => {
+                if let Some((cur, _)) = state.inflight.get_mut(&account_id) {
+                    *cur = cur.saturating_sub(1);
+                }
+            }
         }
         Ok(())
     }
@@ -686,7 +725,9 @@ impl Actor for CookieActor {
         for uc in &state.invalid {
             if let Some(id) = uc.account_id {
                 if dirty_ids.contains(&id) {
-                    if let Err(e) = set_account_disabled(&state.db, id, &uc.reason.to_db_string()).await {
+                    if let Err(e) =
+                        set_account_disabled(&state.db, id, &uc.reason.to_db_string()).await
+                    {
                         error!("Failed to set account {id} disabled on shutdown: {e}");
                     }
                 }
@@ -716,10 +757,7 @@ impl CookieActorHandle {
         };
 
         // Send the handle to the actor so it can spawn probe tasks
-        let _ = ractor::cast!(
-            actor_ref,
-            CookieActorMessage::SetHandle(handle.clone())
-        );
+        let _ = ractor::cast!(actor_ref, CookieActorMessage::SetHandle(handle.clone()));
 
         handle.spawn_timeout_checker().await;
         handle.spawn_flush_timer().await;
@@ -754,12 +792,20 @@ impl CookieActorHandle {
         });
     }
 
-    pub async fn request(&self, cache_hash: Option<u64>, bound_account_ids: &[i64]) -> Result<CookieStatus, ClewdrError> {
-        ractor::call!(self.actor_ref, CookieActorMessage::Request, cache_hash, bound_account_ids.to_vec()).map_err(|e| {
-            ClewdrError::RactorError {
-                loc: Location::generate(),
-                msg: format!("Failed to communicate with CookieActor for request operation: {e}"),
-            }
+    pub async fn request(
+        &self,
+        cache_hash: Option<u64>,
+        bound_account_ids: &[i64],
+    ) -> Result<CookieStatus, ClewdrError> {
+        ractor::call!(
+            self.actor_ref,
+            CookieActorMessage::Request,
+            cache_hash,
+            bound_account_ids.to_vec()
+        )
+        .map_err(|e| ClewdrError::RactorError {
+            loc: Location::generate(),
+            msg: format!("Failed to communicate with CookieActor for request operation: {e}"),
         })?
     }
 
@@ -830,5 +876,9 @@ impl CookieActorHandle {
                 msg: format!("Failed to communicate with CookieActor for probe operation: {e}"),
             }
         })
+    }
+
+    pub async fn release_slot(&self, account_id: i64) {
+        let _ = ractor::cast!(self.actor_ref, CookieActorMessage::ReleaseSlot(account_id));
     }
 }

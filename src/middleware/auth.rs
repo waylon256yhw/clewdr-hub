@@ -25,6 +25,18 @@ fn extract_key_from_headers(parts: &Parts) -> Option<String> {
     None
 }
 
+fn extract_client_ip(parts: &Parts) -> Option<String> {
+    for header in &["x-forwarded-for", "x-real-ip"] {
+        if let Some(val) = parts.headers.get(*header).and_then(|v| v.to_str().ok()) {
+            let ip = val.split(',').next().unwrap_or(val).trim();
+            if !ip.is_empty() {
+                return Some(ip.to_string());
+            }
+        }
+    }
+    None
+}
+
 pub struct RequireFlexibleAuth;
 
 impl<S> FromRequestParts<S> for RequireFlexibleAuth
@@ -34,16 +46,24 @@ where
 {
     type Rejection = ClewdrError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let auth_state = AuthState::from_ref(state);
         let key = extract_key_from_headers(parts).ok_or(ClewdrError::InvalidAuth)?;
 
         if let Some((lookup, hash)) = parse_api_key(&key) {
             match authenticate_api_key(&auth_state.db, &lookup, &hash).await {
                 Ok(Some(authed_user)) => {
+                    let ip = extract_client_ip(parts);
+                    let db = auth_state.db.clone();
+                    let ak_id = authed_user.api_key_id;
+                    let uid = authed_user.user_id;
+                    tokio::spawn(async move {
+                        if let Some(ak_id) = ak_id {
+                            let _ =
+                                crate::db::queries::touch_api_key(&db, ak_id, ip.as_deref()).await;
+                        }
+                        let _ = crate::db::queries::touch_user(&db, uid).await;
+                    });
                     parts.extensions.insert(authed_user);
                     return Ok(Self);
                 }
@@ -67,10 +87,7 @@ where
 {
     type Rejection = ClewdrError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let auth_state = AuthState::from_ref(state);
 
         let cookie_header = parts
@@ -79,8 +96,8 @@ where
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
-        let cookie_value = session::extract_session_cookie(cookie_header)
-            .ok_or(ClewdrError::InvalidAuth)?;
+        let cookie_value =
+            session::extract_session_cookie(cookie_header).ok_or(ClewdrError::InvalidAuth)?;
 
         let claims = session::validate_session_cookie(&auth_state.session_secret, cookie_value)
             .ok_or(ClewdrError::InvalidAuth)?;
@@ -118,18 +135,20 @@ where
             return Err(ClewdrError::InvalidAuth);
         };
 
-        parts.extensions.insert(crate::db::models::AuthenticatedUser {
-            user_id,
-            username,
-            role,
-            api_key_id: None,
-            policy_id,
-            max_concurrent,
-            rpm_limit,
-            weekly_budget_nanousd,
-            monthly_budget_nanousd,
-            bound_account_ids: Vec::new(),
-        });
+        parts
+            .extensions
+            .insert(crate::db::models::AuthenticatedUser {
+                user_id,
+                username,
+                role,
+                api_key_id: None,
+                policy_id,
+                max_concurrent,
+                rpm_limit,
+                weekly_budget_nanousd,
+                monthly_budget_nanousd,
+                bound_account_ids: Vec::new(),
+            });
 
         Ok(Self)
     }

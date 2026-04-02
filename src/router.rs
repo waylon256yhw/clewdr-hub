@@ -28,7 +28,12 @@ impl RouterBuilder {
             .expect("Failed to start CookieActor");
         let stealth_profile = stealth::init_stealth_profile(&db_pool).await;
         let (event_tx, _) = tokio::sync::broadcast::channel(64);
-        let claude_providers = crate::providers::claude::build_providers(cookie_handle.clone(), db_pool.clone(), stealth_profile.clone(), event_tx.clone());
+        let claude_providers = crate::providers::claude::build_providers(
+            cookie_handle.clone(),
+            db_pool.clone(),
+            stealth_profile.clone(),
+            event_tx.clone(),
+        );
         let session_secret = crate::db::load_session_secret(&db_pool)
             .await
             .expect("Failed to load session secret");
@@ -73,17 +78,25 @@ impl RouterBuilder {
     fn route_claude_code_endpoints(mut self) -> Self {
         let router = Router::new()
             .route("/v1/messages", post(api_claude_code))
-            .route("/v1/messages/count_tokens", post(api_claude_code_count_tokens))
+            .route(
+                "/v1/messages/count_tokens",
+                post(api_claude_code_count_tokens),
+            )
             .layer(CompressionLayer::new())
-            .route_layer(from_extractor_with_state::<RequireFlexibleAuth, _>(self.state.clone()))
+            .route_layer(from_extractor_with_state::<RequireFlexibleAuth, _>(
+                self.state.clone(),
+            ))
             .with_state(self.state.clone());
         self.inner = self.inner.merge(router);
         self
     }
 
     fn route_admin_endpoints(mut self) -> Self {
-        let admin_router = crate::api::admin::admin_router()
-            .route_layer(from_extractor_with_state::<RequireAdminAuth, _>(self.state.clone()));
+        let admin_router =
+            crate::api::admin::admin_router()
+                .route_layer(from_extractor_with_state::<RequireAdminAuth, _>(
+                    self.state.clone(),
+                ));
 
         let router = Router::new()
             .nest("/api/admin", admin_router)
@@ -92,7 +105,9 @@ impl RouterBuilder {
             .route(
                 "/auth/logout",
                 post(crate::api::auth::logout)
-                    .route_layer(from_extractor_with_state::<RequireAdminAuth, _>(self.state.clone())),
+                    .route_layer(from_extractor_with_state::<RequireAdminAuth, _>(
+                        self.state.clone(),
+                    )),
             )
             .with_state(self.state.clone());
         self.inner = self.inner.merge(router);
@@ -113,19 +128,27 @@ impl RouterBuilder {
                 let path = uri.path().trim_start_matches('/');
                 // Serve static file if it exists
                 if let Some(file) = INCLUDE_STATIC.get_file(path) {
-                    let ct = if path.ends_with(".js") { "application/javascript" }
-                        else if path.ends_with(".css") { "text/css" }
-                        else if path.ends_with(".html") { "text/html; charset=utf-8" }
-                        else if path.ends_with(".svg") { "image/svg+xml" }
-                        else if path.ends_with(".json") { "application/json" }
-                        else { "application/octet-stream" };
+                    let ct = if path.ends_with(".js") {
+                        "application/javascript"
+                    } else if path.ends_with(".css") {
+                        "text/css"
+                    } else if path.ends_with(".html") {
+                        "text/html; charset=utf-8"
+                    } else if path.ends_with(".svg") {
+                        "image/svg+xml"
+                    } else if path.ends_with(".json") {
+                        "application/json"
+                    } else {
+                        "application/octet-stream"
+                    };
                     return Response::builder()
                         .header(header::CONTENT_TYPE, ct)
                         .body(axum::body::Body::from(file.contents()))
                         .unwrap();
                 }
                 // API paths → 404
-                if path.starts_with("api/") || path.starts_with("auth/") || path.starts_with("v1/") {
+                if path.starts_with("api/") || path.starts_with("auth/") || path.starts_with("v1/")
+                {
                     return StatusCode::NOT_FOUND.into_response();
                 }
                 // SPA fallback
@@ -152,12 +175,19 @@ impl RouterBuilder {
                 let file_path = std::path::Path::new(STATIC_DIR).join(path);
                 if file_path.is_file() {
                     if let Ok(bytes) = tokio::fs::read(&file_path).await {
-                        let ct = if path.ends_with(".js") { "application/javascript" }
-                            else if path.ends_with(".css") { "text/css" }
-                            else if path.ends_with(".html") { "text/html; charset=utf-8" }
-                            else if path.ends_with(".svg") { "image/svg+xml" }
-                            else if path.ends_with(".json") { "application/json" }
-                            else { "application/octet-stream" };
+                        let ct = if path.ends_with(".js") {
+                            "application/javascript"
+                        } else if path.ends_with(".css") {
+                            "text/css"
+                        } else if path.ends_with(".html") {
+                            "text/html; charset=utf-8"
+                        } else if path.ends_with(".svg") {
+                            "image/svg+xml"
+                        } else if path.ends_with(".json") {
+                            "application/json"
+                        } else {
+                            "application/octet-stream"
+                        };
                         return Response::builder()
                             .header(header::CONTENT_TYPE, ct)
                             .body(axum::body::Body::from(bytes))
@@ -165,7 +195,8 @@ impl RouterBuilder {
                     }
                 }
                 // API paths → 404
-                if path.starts_with("api/") || path.starts_with("auth/") || path.starts_with("v1/") {
+                if path.starts_with("api/") || path.starts_with("auth/") || path.starts_with("v1/")
+                {
                     return StatusCode::NOT_FOUND.into_response();
                 }
                 // SPA fallback

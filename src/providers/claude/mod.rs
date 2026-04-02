@@ -62,7 +62,12 @@ struct ClaudeSharedState {
 }
 
 impl ClaudeSharedState {
-    fn new(cookie_actor_handle: CookieActorHandle, db: SqlitePool, stealth_profile: SharedStealthProfile, event_tx: broadcast::Sender<()>) -> Self {
+    fn new(
+        cookie_actor_handle: CookieActorHandle,
+        db: SqlitePool,
+        stealth_profile: SharedStealthProfile,
+        event_tx: broadcast::Sender<()>,
+    ) -> Self {
         Self {
             cookie_actor_handle,
             db,
@@ -78,8 +83,18 @@ pub struct ClaudeProviders {
 }
 
 impl ClaudeProviders {
-    pub fn new(cookie_actor_handle: CookieActorHandle, db: SqlitePool, stealth_profile: SharedStealthProfile, event_tx: broadcast::Sender<()>) -> Self {
-        let shared = Arc::new(ClaudeSharedState::new(cookie_actor_handle, db, stealth_profile, event_tx));
+    pub fn new(
+        cookie_actor_handle: CookieActorHandle,
+        db: SqlitePool,
+        stealth_profile: SharedStealthProfile,
+        event_tx: broadcast::Sender<()>,
+    ) -> Self {
+        let shared = Arc::new(ClaudeSharedState::new(
+            cookie_actor_handle,
+            db,
+            stealth_profile,
+            event_tx,
+        ));
         let code = Arc::new(ClaudeCodeProvider::new(shared));
         Self { code }
     }
@@ -170,6 +185,11 @@ impl LLMProvider for ClaudeCodeProvider {
     }
 }
 
-pub fn build_providers(cookie_actor_handle: CookieActorHandle, db: SqlitePool, stealth_profile: SharedStealthProfile, event_tx: broadcast::Sender<()>) -> ClaudeProviders {
+pub fn build_providers(
+    cookie_actor_handle: CookieActorHandle,
+    db: SqlitePool,
+    stealth_profile: SharedStealthProfile,
+    event_tx: broadcast::Sender<()>,
+) -> ClaudeProviders {
     ClaudeProviders::new(cookie_actor_handle, db, stealth_profile, event_tx)
 }

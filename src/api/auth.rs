@@ -59,6 +59,11 @@ pub async fn login(
         session::create_session_cookie(&auth.session_secret, user_id, session_version, None);
     let set_cookie = session::set_cookie_header(&cookie_value, 86400);
 
+    let db = auth.db.clone();
+    tokio::spawn(async move {
+        let _ = crate::db::queries::touch_user(&db, user_id).await;
+    });
+
     let body = LoginResponse {
         user_id,
         username,
@@ -73,9 +78,7 @@ pub async fn login(
     ))
 }
 
-pub async fn logout(
-    Extension(_user): Extension<AuthenticatedUser>,
-) -> impl IntoResponse {
+pub async fn logout(Extension(_user): Extension<AuthenticatedUser>) -> impl IntoResponse {
     let clear = session::clear_cookie_header();
     (
         StatusCode::NO_CONTENT,

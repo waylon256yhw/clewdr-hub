@@ -1,4 +1,8 @@
-use axum::{Json, extract::{Path, Query, State}, http::StatusCode};
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::StatusCode,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
@@ -94,7 +98,12 @@ pub async fn list(
         .fetch_all(&db)
         .await?;
 
-    Ok(Json(Paginated { items, total: total.0, offset, limit }))
+    Ok(Json(Paginated {
+        items,
+        total: total.0,
+        offset,
+        limit,
+    }))
 }
 
 pub async fn create(
@@ -103,12 +112,22 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<UserResponse>), ClewdrError> {
     let role = req.role.as_deref().unwrap_or("member");
     if role != "admin" && role != "member" {
-        return Err(ClewdrError::BadRequest { msg: "role must be 'admin' or 'member'" });
+        return Err(ClewdrError::BadRequest {
+            msg: "role must be 'admin' or 'member'",
+        });
     }
     if role == "admin" {
         match &req.password {
-            None => return Err(ClewdrError::BadRequest { msg: "password is required for admin users" }),
-            Some(pw) if pw.trim().is_empty() => return Err(ClewdrError::BadRequest { msg: "password cannot be empty" }),
+            None => {
+                return Err(ClewdrError::BadRequest {
+                    msg: "password is required for admin users",
+                });
+            }
+            Some(pw) if pw.trim().is_empty() => {
+                return Err(ClewdrError::BadRequest {
+                    msg: "password cannot be empty",
+                });
+            }
             _ => {}
         }
     }
@@ -119,17 +138,24 @@ pub async fn create(
         .fetch_optional(&db)
         .await?;
     if policy_exists.is_none() {
-        return Err(ClewdrError::BadRequest { msg: "policy_id does not exist" });
+        return Err(ClewdrError::BadRequest {
+            msg: "policy_id does not exist",
+        });
     }
 
     let password_hash = if let Some(ref pw) = req.password {
         if pw.trim().is_empty() {
-            return Err(ClewdrError::BadRequest { msg: "password cannot be empty" });
+            return Err(ClewdrError::BadRequest {
+                msg: "password cannot be empty",
+            });
         }
         let pw = pw.clone();
-        let hash: String = tokio::task::spawn_blocking(move || crate::db::hash_password_public(&pw))
-            .await
-            .map_err(|_| ClewdrError::UnexpectedNone { msg: "password hash task panicked" })??;
+        let hash: String =
+            tokio::task::spawn_blocking(move || crate::db::hash_password_public(&pw))
+                .await
+                .map_err(|_| ClewdrError::UnexpectedNone {
+                    msg: "password hash task panicked",
+                })??;
         Some(hash)
     } else {
         None
@@ -158,10 +184,7 @@ pub async fn create(
 
     let base = user_list_query(&current_week_start(), &current_month_start());
     let query = format!("{base} WHERE u.id = ?1");
-    let row: UserResponse = sqlx::query_as(&query)
-        .bind(id)
-        .fetch_one(&db)
-        .await?;
+    let row: UserResponse = sqlx::query_as(&query).bind(id).fetch_one(&db).await?;
 
     Ok((StatusCode::CREATED, Json(row)))
 }
@@ -175,71 +198,112 @@ pub async fn update(
     // Use a transaction for atomicity (prevents TOCTOU on admin checks + partial writes)
     let mut tx = db.begin().await?;
 
-    let existing: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT role, password_hash FROM users WHERE id = ?1"
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let existing: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT role, password_hash FROM users WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
     let Some((current_role, current_pw_hash)) = existing else {
-        return Err(ClewdrError::NotFound { msg: "user not found" });
+        return Err(ClewdrError::NotFound {
+            msg: "user not found",
+        });
     };
 
     if let Some(ref username) = req.username {
         sqlx::query("UPDATE users SET username = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(username).bind(id).execute(&mut *tx).await
+            .bind(username)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
             .map_err(|e| {
                 if let sqlx::Error::Database(ref de) = e {
                     if de.message().contains("UNIQUE") {
-                        return ClewdrError::Conflict { msg: "username already exists" };
+                        return ClewdrError::Conflict {
+                            msg: "username already exists",
+                        };
                     }
                 }
                 ClewdrError::from(e)
             })?;
     }
     if let Some(ref display_name) = req.display_name {
-        sqlx::query("UPDATE users SET display_name = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(display_name).bind(id).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE users SET display_name = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        )
+        .bind(display_name)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     }
     if let Some(ref pw) = req.password {
         if pw.trim().is_empty() {
-            return Err(ClewdrError::BadRequest { msg: "password cannot be empty" });
+            return Err(ClewdrError::BadRequest {
+                msg: "password cannot be empty",
+            });
         }
         let pw = pw.clone();
-        let hash: String = tokio::task::spawn_blocking(move || crate::db::hash_password_public(&pw))
-            .await
-            .map_err(|_| ClewdrError::UnexpectedNone { msg: "password hash task panicked" })??;
-        sqlx::query("UPDATE users SET password_hash = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(&hash).bind(id).execute(&mut *tx).await?;
+        let hash: String =
+            tokio::task::spawn_blocking(move || crate::db::hash_password_public(&pw))
+                .await
+                .map_err(|_| ClewdrError::UnexpectedNone {
+                    msg: "password hash task panicked",
+                })??;
+        sqlx::query(
+            "UPDATE users SET password_hash = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        )
+        .bind(&hash)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("UPDATE users SET session_version = session_version + 1 WHERE id = ?1")
-            .bind(id).execute(&mut *tx).await?;
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
     }
     if let Some(ref role) = req.role {
         if role != "admin" && role != "member" {
-            return Err(ClewdrError::BadRequest { msg: "role must be 'admin' or 'member'" });
+            return Err(ClewdrError::BadRequest {
+                msg: "role must be 'admin' or 'member'",
+            });
         }
         if role == "admin" && current_pw_hash.is_none() && req.password.is_none() {
-            return Err(ClewdrError::BadRequest { msg: "cannot promote to admin without a password" });
+            return Err(ClewdrError::BadRequest {
+                msg: "cannot promote to admin without a password",
+            });
         }
         if current_role == "admin" && role == "member" {
             let admin_count: (i64,) = sqlx::query_as(
                 "SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled_at IS NULL AND id != ?1"
             ).bind(id).fetch_one(&mut *tx).await?;
             if admin_count.0 == 0 {
-                return Err(ClewdrError::Conflict { msg: "cannot demote the last active admin" });
+                return Err(ClewdrError::Conflict {
+                    msg: "cannot demote the last active admin",
+                });
             }
         }
         sqlx::query("UPDATE users SET role = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(role).bind(id).execute(&mut *tx).await?;
+            .bind(role)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
     }
     if let Some(policy_id) = req.policy_id {
         let policy_exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM policies WHERE id = ?1")
-            .bind(policy_id).fetch_optional(&mut *tx).await?;
+            .bind(policy_id)
+            .fetch_optional(&mut *tx)
+            .await?;
         if policy_exists.is_none() {
-            return Err(ClewdrError::BadRequest { msg: "policy_id does not exist" });
+            return Err(ClewdrError::BadRequest {
+                msg: "policy_id does not exist",
+            });
         }
-        sqlx::query("UPDATE users SET policy_id = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(policy_id).bind(id).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE users SET policy_id = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        )
+        .bind(policy_id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     }
     if let Some(disabled) = req.disabled {
         if disabled {
@@ -248,18 +312,27 @@ pub async fn update(
                 "SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled_at IS NULL AND id != ?1"
             ).bind(id).fetch_one(&mut *tx).await?;
             if current_role == "admin" && admin_count.0 == 0 {
-                return Err(ClewdrError::Conflict { msg: "cannot disable the last active admin" });
+                return Err(ClewdrError::Conflict {
+                    msg: "cannot disable the last active admin",
+                });
             }
             sqlx::query("UPDATE users SET disabled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?1")
                 .bind(id).execute(&mut *tx).await?;
         } else {
-            sqlx::query("UPDATE users SET disabled_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?1")
-                .bind(id).execute(&mut *tx).await?;
+            sqlx::query(
+                "UPDATE users SET disabled_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         }
     }
     if let Some(ref notes) = req.notes {
         sqlx::query("UPDATE users SET notes = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(notes).bind(id).execute(&mut *tx).await?;
+            .bind(notes)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
     }
 
     tx.commit().await?;
@@ -271,10 +344,7 @@ pub async fn update(
 
     let base = user_list_query(&current_week_start(), &current_month_start());
     let query = format!("{base} WHERE u.id = ?1");
-    let row: UserResponse = sqlx::query_as(&query)
-        .bind(id)
-        .fetch_one(&db)
-        .await?;
+    let row: UserResponse = sqlx::query_as(&query).bind(id).fetch_one(&db).await?;
 
     Ok(Json(row))
 }
@@ -287,23 +357,29 @@ pub async fn remove(
     // Transaction for atomic last-admin check + delete
     let mut tx = db.begin().await?;
 
-    let role: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT role, disabled_at FROM users WHERE id = ?1"
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let role: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT role, disabled_at FROM users WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
 
     let Some((role, disabled_at)) = role else {
-        return Err(ClewdrError::NotFound { msg: "user not found" });
+        return Err(ClewdrError::NotFound {
+            msg: "user not found",
+        });
     };
 
     if role == "admin" && disabled_at.is_none() {
         let admin_count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled_at IS NULL AND id != ?1"
-        ).bind(id).fetch_one(&mut *tx).await?;
+            "SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled_at IS NULL AND id != ?1",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
         if admin_count.0 == 0 {
-            return Err(ClewdrError::Conflict { msg: "cannot delete the last active admin" });
+            return Err(ClewdrError::Conflict {
+                msg: "cannot delete the last active admin",
+            });
         }
     }
 

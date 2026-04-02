@@ -66,7 +66,11 @@ impl ClaudeCodeState {
             .ok_or(Reason::Null)?;
         let capabilities = boot_acc_info["capabilities"]
             .as_array()
-            .map(|a| a.iter().filter_map(|c| c.as_str().map(String::from)).collect::<Vec<_>>())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| c.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         let email = bootstrap["account"]["email_address"]
             .as_str()

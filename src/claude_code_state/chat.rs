@@ -4,7 +4,7 @@ use axum::{
 };
 use colored::Colorize;
 use eventsource_stream::Eventsource;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use http::header::ACCEPT;
 use snafu::{GenerateImplicitData, ResultExt};
 use tracing::{Instrument, error, info, warn};
@@ -53,6 +53,7 @@ impl ClaudeCodeState {
             let p = p.to_owned();
 
             let cookie = state.request_cookie().await?;
+            let account_id = cookie.account_id;
             // Propagate account_id to billing context
             if let Some(ref mut ctx) = state.billing_ctx {
                 ctx.account_id = cookie.account_id;
@@ -91,9 +92,18 @@ impl ClaudeCodeState {
             ));
             match retry.await {
                 Ok(res) => {
+                    // For streaming, the slot is released in MessageStop handler
+                    if !self.stream {
+                        if let Some(aid) = account_id {
+                            state.cookie_actor_handle.release_slot(aid).await;
+                        }
+                    }
                     return Ok(res);
                 }
                 Err(e) => {
+                    if let Some(aid) = account_id {
+                        state.cookie_actor_handle.release_slot(aid).await;
+                    }
                     error!(
                         "[{}] {}",
                         state.cookie.as_ref().unwrap().cookie.ellipse().green(),
@@ -181,7 +191,10 @@ impl ClaudeCodeState {
         let profile = self.stealth_profile.load();
         let headers = stealth::build_stealth_headers(
             &profile,
-            EndpointKind::DirectApi { use_context_1m, session_id: self.session_id.clone() },
+            EndpointKind::DirectApi {
+                use_context_1m,
+                session_id: self.session_id.clone(),
+            },
         );
         let mut url = self.endpoint.join("v1/messages").expect("Url parse error");
         url.set_query(Some("beta=true"));
@@ -282,8 +295,12 @@ impl ClaudeCodeState {
             let p = p.to_owned();
 
             let cookie = state.request_cookie().await?;
+            let account_id = cookie.account_id;
             let cookie_disallows = matches!(cookie.count_tokens_allowed, Some(false));
             if cookie_disallows {
+                if let Some(aid) = account_id {
+                    state.cookie_actor_handle.release_slot(aid).await;
+                }
                 state.persist_count_tokens_allowed(false).await;
                 return Ok(Self::local_count_tokens_response(&p));
             }
@@ -321,9 +338,15 @@ impl ClaudeCodeState {
             ));
             match retry.await {
                 Ok(res) => {
+                    if let Some(aid) = account_id {
+                        state.cookie_actor_handle.release_slot(aid).await;
+                    }
                     return Ok(res);
                 }
                 Err(e) => {
+                    if let Some(aid) = account_id {
+                        state.cookie_actor_handle.release_slot(aid).await;
+                    }
                     error!(
                         "[{}][TOKENS] {}",
                         state.cookie.as_ref().unwrap().cookie.ellipse().green(),
@@ -458,7 +481,7 @@ impl ClaudeCodeState {
     ) -> Result<axum::response::Response, ClewdrError> {
         use std::sync::{
             Arc,
-            atomic::{AtomicI64, AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         };
 
         let input_tokens = self.usage.input_tokens as u64;
@@ -471,6 +494,9 @@ impl ClaudeCodeState {
         let handle = self.cookie_actor_handle.clone();
         let cookie = self.cookie.clone();
         let billing_ctx = self.billing_ctx.clone();
+        let stream_account_id = cookie.as_ref().and_then(|c| c.account_id);
+        let slot_released = Arc::new(AtomicBool::new(false));
+        let slot_released_inner = slot_released.clone();
 
         let osum = output_sum.clone();
         let isum = input_sum.clone();
@@ -495,7 +521,12 @@ impl ClaudeCodeState {
                         }
                     }
                     crate::types::claude::StreamEvent::ContentBlockDelta { .. } => {
-                        let _ = ttft.compare_exchange(-1, stream_start.elapsed().as_millis() as i64, Ordering::Relaxed, Ordering::Relaxed);
+                        let _ = ttft.compare_exchange(
+                            -1,
+                            stream_start.elapsed().as_millis() as i64,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
                     }
                     crate::types::claude::StreamEvent::MessageDelta { usage: Some(u), .. } => {
                         // usage fields in message_delta are cumulative, use store not add
@@ -517,14 +548,21 @@ impl ClaudeCodeState {
                         let total_cc = ccsum.load(Ordering::Relaxed);
                         let total_cr = crsum.load(Ordering::Relaxed);
 
-                        // Cookie persistence (existing, unchanged)
+                        // Cookie persistence + slot release
                         if let (Some(cookie), handle) = (cookie.clone(), handle.clone()) {
                             let mut c = cookie.clone();
+                            let aid = stream_account_id;
+                            let released = slot_released_inner.clone();
                             tokio::spawn(async move {
                                 ClaudeCodeState::update_cookie_boundaries_if_due(&mut c, &handle)
                                     .await;
                                 c.add_and_bucket_usage(total_input, total_out, family);
                                 let _ = handle.return_cookie(c, None).await;
+                                if let Some(aid) = aid {
+                                    if !released.swap(true, Ordering::Relaxed) {
+                                        handle.release_slot(aid).await;
+                                    }
+                                }
                             });
                         }
 
@@ -556,6 +594,34 @@ impl ClaudeCodeState {
             e.data(event.data)
         });
 
+        // Drop guard: release slot when stream ends abnormally (client disconnect, upstream error)
+        struct SlotDropGuard {
+            released: Arc<AtomicBool>,
+            account_id: Option<i64>,
+            handle: CookieActorHandle,
+        }
+        impl Drop for SlotDropGuard {
+            fn drop(&mut self) {
+                if let Some(aid) = self.account_id {
+                    if !self.released.swap(true, Ordering::Relaxed) {
+                        let h = self.handle.clone();
+                        tokio::spawn(async move {
+                            h.release_slot(aid).await;
+                        });
+                    }
+                }
+            }
+        }
+        let guard = SlotDropGuard {
+            released: slot_released,
+            account_id: stream_account_id,
+            handle: self.cookie_actor_handle.clone(),
+        };
+        let stream = stream.map(move |item| {
+            let _ = &guard;
+            item
+        });
+
         Ok(Sse::new(stream)
             .keep_alive(Default::default())
             .into_response())
@@ -563,7 +629,13 @@ impl ClaudeCodeState {
 
     async fn materialize_non_stream_response(
         response: wreq::Response,
-    ) -> Result<(axum::response::Response, Option<crate::billing::BillingUsage>), ClewdrError> {
+    ) -> Result<
+        (
+            axum::response::Response,
+            Option<crate::billing::BillingUsage>,
+        ),
+        ClewdrError,
+    > {
         let status = response.status();
         let headers = response.headers().clone();
         let bytes = response.bytes().await.context(WreqSnafu {
@@ -631,9 +703,15 @@ impl ClaudeCodeState {
         let profile = self.stealth_profile.load();
         let headers = stealth::build_stealth_headers(
             &profile,
-            EndpointKind::DirectApi { use_context_1m, session_id: self.session_id.clone() },
+            EndpointKind::DirectApi {
+                use_context_1m,
+                session_id: self.session_id.clone(),
+            },
         );
-        let mut url = self.endpoint.join("v1/messages/count_tokens").expect("Url parse error");
+        let mut url = self
+            .endpoint
+            .join("v1/messages/count_tokens")
+            .expect("Url parse error");
         url.set_query(Some("beta=true"));
         self.client
             .post(url.to_string())
@@ -806,7 +884,8 @@ impl ClaudeCodeState {
         handle: &CookieActorHandle,
     ) -> Option<(Option<i64>, Option<i64>, Option<i64>, Option<i64>)> {
         let profile = crate::stealth::global_profile().clone();
-        let mut state = ClaudeCodeState::from_cookie(handle.clone(), cookie.clone(), profile).ok()?;
+        let mut state =
+            ClaudeCodeState::from_cookie(handle.clone(), cookie.clone(), profile).ok()?;
         let usage = state.fetch_usage_metrics().await.ok()?;
         state.return_cookie(None).await;
         if let Some(updated) = state.cookie.clone() {

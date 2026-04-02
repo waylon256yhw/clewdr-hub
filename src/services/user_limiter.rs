@@ -63,7 +63,10 @@ impl UserLimiterMap {
         {
             let mut rpm = limiter.rpm.lock().unwrap();
             let now = Instant::now();
-            while rpm.front().is_some_and(|t| now.duration_since(*t).as_secs() >= 60) {
+            while rpm
+                .front()
+                .is_some_and(|t| now.duration_since(*t).as_secs() >= 60)
+            {
                 rpm.pop_front();
             }
             if rpm.len() >= rpm_limit as usize {
@@ -72,7 +75,9 @@ impl UserLimiterMap {
             rpm.push_back(now);
         }
 
-        Ok(UserPermit { _permit: Arc::new(permit) })
+        Ok(UserPermit {
+            _permit: Arc::new(permit),
+        })
     }
 
     async fn get_or_create(

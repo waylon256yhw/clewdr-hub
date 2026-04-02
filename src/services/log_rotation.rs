@@ -28,7 +28,9 @@ async fn run_rotation(db: &SqlitePool) {
     match delete_old_request_logs(db, retention_days).await {
         Ok(count) => {
             if count > 0 {
-                info!("Log rotation: deleted {count} request logs older than {retention_days} days");
+                info!(
+                    "Log rotation: deleted {count} request logs older than {retention_days} days"
+                );
             }
         }
         Err(e) => warn!("Log rotation failed: {e}"),

@@ -1,8 +1,8 @@
 use axum::{Extension, Json, extract::State, response::IntoResponse};
 use serde::Deserialize;
 
-use crate::db::models::AuthenticatedUser;
 use crate::db::hash_password_public;
+use crate::db::models::AuthenticatedUser;
 use crate::error::ClewdrError;
 use crate::session;
 use crate::state::AuthState;
@@ -19,18 +19,21 @@ pub async fn change_password(
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<impl IntoResponse, ClewdrError> {
     if req.new_password.trim().is_empty() {
-        return Err(ClewdrError::BadRequest { msg: "new password cannot be empty" });
+        return Err(ClewdrError::BadRequest {
+            msg: "new password cannot be empty",
+        });
     }
 
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT password_hash FROM users WHERE id = ?1 AND role = 'admin'"
-    )
-    .bind(user.user_id)
-    .fetch_optional(&auth.db)
-    .await?;
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT password_hash FROM users WHERE id = ?1 AND role = 'admin'")
+            .bind(user.user_id)
+            .fetch_optional(&auth.db)
+            .await?;
 
     let Some((current_hash,)) = row else {
-        return Err(ClewdrError::NotFound { msg: "admin user not found" });
+        return Err(ClewdrError::NotFound {
+            msg: "admin user not found",
+        });
     };
 
     let verify_result = {
@@ -51,11 +54,12 @@ pub async fn change_password(
 
     let new_hash = {
         let pw = req.new_password.clone();
-        let result: Result<String, ClewdrError> = tokio::task::spawn_blocking(move || hash_password_public(&pw))
-            .await
-            .map_err(|e| ClewdrError::UnexpectedNone {
-                msg: Box::leak(format!("argon2 task panicked: {e}").into_boxed_str()),
-            })?;
+        let result: Result<String, ClewdrError> =
+            tokio::task::spawn_blocking(move || hash_password_public(&pw))
+                .await
+                .map_err(|e| ClewdrError::UnexpectedNone {
+                    msg: Box::leak(format!("argon2 task panicked: {e}").into_boxed_str()),
+                })?;
         result?
     };
 
@@ -68,12 +72,8 @@ pub async fn change_password(
     .fetch_one(&auth.db)
     .await?;
 
-    let cookie_value = session::create_session_cookie(
-        &auth.session_secret,
-        user.user_id,
-        new_version.0,
-        None,
-    );
+    let cookie_value =
+        session::create_session_cookie(&auth.session_secret, user.user_id, new_version.0, None);
     let set_cookie = session::set_cookie_header(&cookie_value, 86400);
 
     Ok((

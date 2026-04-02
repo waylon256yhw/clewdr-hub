@@ -27,8 +27,18 @@ pub async fn authenticate_api_key(
     .fetch_optional(pool)
     .await?;
 
-    let Some((ak_id, user_id, username, role, stored_hash, policy_id, max_concurrent, rpm_limit, weekly_budget_nanousd, monthly_budget_nanousd)) =
-        row
+    let Some((
+        ak_id,
+        user_id,
+        username,
+        role,
+        stored_hash,
+        policy_id,
+        max_concurrent,
+        rpm_limit,
+        weekly_budget_nanousd,
+        monthly_budget_nanousd,
+    )) = row
     else {
         return Ok(None);
     };
@@ -65,7 +75,6 @@ pub async fn authenticate_api_key(
 }
 
 /// Update last_used_at and last_used_ip for an API key (fire-and-forget).
-#[allow(dead_code)]
 pub async fn touch_api_key(
     pool: &SqlitePool,
     api_key_id: i64,
@@ -78,6 +87,15 @@ pub async fn touch_api_key(
     .bind(api_key_id)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Update last_seen_at for a user (fire-and-forget).
+pub async fn touch_user(pool: &SqlitePool, user_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE users SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?1")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

@@ -8,6 +8,7 @@
 
 set -e
 cd "$(dirname "$0")"
+git config core.hooksPath .githooks 2>/dev/null || true
 
 DB_FILE="clewdr.db"
 BIND_IP="${CLEWDR_IP:-0.0.0.0}"

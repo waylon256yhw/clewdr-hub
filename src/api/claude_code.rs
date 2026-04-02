@@ -6,7 +6,7 @@ use tracing::warn;
 
 use crate::{
     billing::check_quota,
-    db::billing::{insert_request_log, RequestLogRow},
+    db::billing::{RequestLogRow, insert_request_log},
     error::ClewdrError,
     middleware::claude::{ClaudeCodePreprocess, ClaudeContext},
     providers::{

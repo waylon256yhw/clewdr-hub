@@ -20,9 +20,10 @@ const HIDDEN_KEYS: &[&str] = &["session_secret", "_proxy_migrated"];
 pub async fn get_all(
     State(db): State<SqlitePool>,
 ) -> Result<Json<HashMap<String, String>>, ClewdrError> {
-    let rows: Vec<(String, String)> = sqlx::query_as("SELECT key, value FROM settings ORDER BY key")
-        .fetch_all(&db)
-        .await?;
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT key, value FROM settings ORDER BY key")
+            .fetch_all(&db)
+            .await?;
 
     let map: HashMap<String, String> = rows
         .into_iter()
@@ -32,8 +33,13 @@ pub async fn get_all(
 }
 
 const STEALTH_KEYS: &[&str] = &[
-    "cc_cli_version", "cc_sdk_version", "cc_node_version",
-    "cc_stainless_os", "cc_stainless_arch", "cc_beta_flags", "cc_billing_salt",
+    "cc_cli_version",
+    "cc_sdk_version",
+    "cc_node_version",
+    "cc_stainless_os",
+    "cc_stainless_arch",
+    "cc_beta_flags",
+    "cc_billing_salt",
     "proxy",
 ];
 
@@ -50,7 +56,7 @@ pub async fn update(
         }
         sqlx::query(
             "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, CURRENT_TIMESTAMP)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP"
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
         )
         .bind(key)
         .bind(value)
@@ -117,7 +123,11 @@ pub async fn cli_versions(
                 fetched_at: std::time::Instant::now(),
                 fetched_at_utc: now,
             });
-            Ok(Json(CliVersionsResponse { versions, cached: false, fetched_at: Some(now.to_rfc3339()) }))
+            Ok(Json(CliVersionsResponse {
+                versions,
+                cached: false,
+                fetched_at: Some(now.to_rfc3339()),
+            }))
         }
         _ => {
             // Fetch failed — return stale cache if available
@@ -129,7 +139,11 @@ pub async fn cli_versions(
                     fetched_at: Some(c.fetched_at_utc.to_rfc3339()),
                 }))
             } else {
-                Ok(Json(CliVersionsResponse { versions: vec![], cached: false, fetched_at: None }))
+                Ok(Json(CliVersionsResponse {
+                    versions: vec![],
+                    cached: false,
+                    fetched_at: None,
+                }))
             }
         }
     }
@@ -154,18 +168,14 @@ async fn fetch_npm_versions() -> Result<Vec<String>, Box<dyn std::error::Error +
         .unwrap_or_default();
 
     // Sort by semver descending, take latest 10
-    versions.sort_by(|a, b| {
-        version_tuple(b).cmp(&version_tuple(a))
-    });
+    versions.sort_by(|a, b| version_tuple(b).cmp(&version_tuple(a)));
     versions.truncate(5);
 
     Ok(versions)
 }
 
 fn version_tuple(v: &str) -> (u32, u32, u32) {
-    let parts: Vec<u32> = v.split('.')
-        .filter_map(|s| s.parse().ok())
-        .collect();
+    let parts: Vec<u32> = v.split('.').filter_map(|s| s.parse().ok()).collect();
     (
         parts.first().copied().unwrap_or(0),
         parts.get(1).copied().unwrap_or(0),

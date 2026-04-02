@@ -22,7 +22,10 @@ const CONTEXT_1M_TOKEN: &str = "context-1m-2025-08-07";
 /// Endpoint type determines which headers to send.
 pub enum EndpointKind {
     /// /v1/messages, /v1/messages/count_tokens — full CLI fingerprint
-    DirectApi { use_context_1m: bool, session_id: String },
+    DirectApi {
+        use_context_1m: bool,
+        session_id: String,
+    },
     /// /api/oauth/usage — similar to DirectApi but GET
     UsageApi,
     /// /api/bootstrap — browser-like, needs Origin/Referer/Cookie
@@ -116,7 +119,10 @@ pub fn build_stealth_headers(profile: &StealthProfile, kind: EndpointKind) -> He
     let mut headers = HeaderMap::new();
 
     match kind {
-        EndpointKind::DirectApi { use_context_1m, session_id } => {
+        EndpointKind::DirectApi {
+            use_context_1m,
+            session_id,
+        } => {
             insert_cli_headers(&mut headers, profile, &session_id);
             let beta = profile.beta_flags_for(use_context_1m);
             headers.insert(
@@ -208,7 +214,9 @@ static GLOBAL_PROFILE: std::sync::OnceLock<SharedStealthProfile> = std::sync::On
 
 /// Get the global stealth profile. Panics if not initialized.
 pub fn global_profile() -> &'static SharedStealthProfile {
-    GLOBAL_PROFILE.get().expect("stealth profile not initialized")
+    GLOBAL_PROFILE
+        .get()
+        .expect("stealth profile not initialized")
 }
 
 /// Create and register the global shared profile from DB.

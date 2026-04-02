@@ -1,4 +1,8 @@
-use axum::{Json, extract::{Path, Query, State}, http::StatusCode};
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::StatusCode,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
@@ -61,7 +65,12 @@ pub async fn list(
         .fetch_all(&db)
         .await?;
 
-    Ok(Json(Paginated { items, total: total.0, offset, limit }))
+    Ok(Json(Paginated {
+        items,
+        total: total.0,
+        offset,
+        limit,
+    }))
 }
 
 pub async fn create(
@@ -69,7 +78,9 @@ pub async fn create(
     Json(req): Json<CreatePolicyRequest>,
 ) -> Result<(StatusCode, Json<PolicyResponse>), ClewdrError> {
     if req.max_concurrent <= 0 || req.rpm_limit <= 0 {
-        return Err(ClewdrError::BadRequest { msg: "max_concurrent and rpm_limit must be positive" });
+        return Err(ClewdrError::BadRequest {
+            msg: "max_concurrent and rpm_limit must be positive",
+        });
     }
 
     let id = sqlx::query(
@@ -93,10 +104,7 @@ pub async fn create(
     .last_insert_rowid();
 
     let query = format!("{POLICY_SELECT} WHERE p.id = ?1");
-    let row: PolicyResponse = sqlx::query_as(&query)
-        .bind(id)
-        .fetch_one(&db)
-        .await?;
+    let row: PolicyResponse = sqlx::query_as(&query).bind(id).fetch_one(&db).await?;
 
     Ok((StatusCode::CREATED, Json(row)))
 }
@@ -108,10 +116,18 @@ pub async fn update(
 ) -> Result<Json<PolicyResponse>, ClewdrError> {
     // Validate all fields first before any writes
     if let Some(v) = req.max_concurrent {
-        if v <= 0 { return Err(ClewdrError::BadRequest { msg: "max_concurrent must be positive" }); }
+        if v <= 0 {
+            return Err(ClewdrError::BadRequest {
+                msg: "max_concurrent must be positive",
+            });
+        }
     }
     if let Some(v) = req.rpm_limit {
-        if v <= 0 { return Err(ClewdrError::BadRequest { msg: "rpm_limit must be positive" }); }
+        if v <= 0 {
+            return Err(ClewdrError::BadRequest {
+                msg: "rpm_limit must be positive",
+            });
+        }
     }
 
     let mut tx = db.begin().await?;
@@ -121,28 +137,45 @@ pub async fn update(
         .fetch_optional(&mut *tx)
         .await?;
     if existing.is_none() {
-        return Err(ClewdrError::NotFound { msg: "policy not found" });
+        return Err(ClewdrError::NotFound {
+            msg: "policy not found",
+        });
     }
 
     if let Some(ref name) = req.name {
         sqlx::query("UPDATE policies SET name = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(name).bind(id).execute(&mut *tx).await
+            .bind(name)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
             .map_err(|e| {
                 if let sqlx::Error::Database(ref de) = e {
                     if de.message().contains("UNIQUE") {
-                        return ClewdrError::Conflict { msg: "policy name already exists" };
+                        return ClewdrError::Conflict {
+                            msg: "policy name already exists",
+                        };
                     }
                 }
                 ClewdrError::from(e)
             })?;
     }
     if let Some(v) = req.max_concurrent {
-        sqlx::query("UPDATE policies SET max_concurrent = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(v).bind(id).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE policies SET max_concurrent = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        )
+        .bind(v)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     }
     if let Some(v) = req.rpm_limit {
-        sqlx::query("UPDATE policies SET rpm_limit = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(v).bind(id).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE policies SET rpm_limit = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        )
+        .bind(v)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     }
     if let Some(v) = req.weekly_budget_nanousd {
         sqlx::query("UPDATE policies SET weekly_budget_nanousd = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
@@ -156,10 +189,7 @@ pub async fn update(
     tx.commit().await?;
 
     let query = format!("{POLICY_SELECT} WHERE p.id = ?1");
-    let row: PolicyResponse = sqlx::query_as(&query)
-        .bind(id)
-        .fetch_one(&db)
-        .await?;
+    let row: PolicyResponse = sqlx::query_as(&query).bind(id).fetch_one(&db).await?;
 
     Ok(Json(row))
 }
@@ -169,7 +199,9 @@ pub async fn remove(
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ClewdrError> {
     if id == 1 {
-        return Err(ClewdrError::Conflict { msg: "cannot delete the default policy" });
+        return Err(ClewdrError::Conflict {
+            msg: "cannot delete the default policy",
+        });
     }
 
     let mut tx = db.begin().await?;
@@ -179,7 +211,9 @@ pub async fn remove(
         .fetch_one(&mut *tx)
         .await?;
     if count.0 > 0 {
-        return Err(ClewdrError::Conflict { msg: "policy is still assigned to users" });
+        return Err(ClewdrError::Conflict {
+            msg: "policy is still assigned to users",
+        });
     }
 
     let result = sqlx::query("DELETE FROM policies WHERE id = ?1")
@@ -187,7 +221,9 @@ pub async fn remove(
         .execute(&mut *tx)
         .await?;
     if result.rows_affected() == 0 {
-        return Err(ClewdrError::NotFound { msg: "policy not found" });
+        return Err(ClewdrError::NotFound {
+            msg: "policy not found",
+        });
     }
 
     tx.commit().await?;

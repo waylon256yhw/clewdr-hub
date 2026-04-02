@@ -4,7 +4,7 @@ use tokio::sync::broadcast;
 use tracing::warn;
 
 use crate::db::billing::{
-    insert_request_log, lookup_model_pricing, upsert_usage_rollup, RequestLogRow,
+    RequestLogRow, insert_request_log, lookup_model_pricing, upsert_usage_rollup,
 };
 
 /// Cache write multiplier (5-min ephemeral cache, 1.25x base input price).
@@ -33,8 +33,8 @@ impl BillingUsage {
     /// Compute cost in nanousd using pure integer arithmetic.
     pub fn cost_nanousd(&self, input_price: i64, output_price: i64) -> i64 {
         let base_input = self.input_tokens as i64 * input_price;
-        let cache_create =
-            self.cache_creation_tokens as i64 * input_price * CACHE_CREATION_NUM / CACHE_CREATION_DEN;
+        let cache_create = self.cache_creation_tokens as i64 * input_price * CACHE_CREATION_NUM
+            / CACHE_CREATION_DEN;
         let cache_read =
             self.cache_read_tokens as i64 * input_price * CACHE_READ_NUM / CACHE_READ_DEN;
         let output = self.output_tokens as i64 * output_price;
@@ -191,9 +191,16 @@ pub async fn persist_billing_to_db(ctx: &BillingContext, usage: BillingUsage, st
         let (week_start, week_end) = current_week_bounds(now);
         let (month_start, month_end) = current_month_bounds(now);
 
-        if let Err(e) =
-            upsert_usage_rollup(&ctx.db, user_id, "week", &week_start, &week_end, &usage, cost)
-                .await
+        if let Err(e) = upsert_usage_rollup(
+            &ctx.db,
+            user_id,
+            "week",
+            &week_start,
+            &week_end,
+            &usage,
+            cost,
+        )
+        .await
         {
             warn!("Failed to upsert weekly rollup: {e}");
         }
@@ -224,13 +231,16 @@ pub async fn check_quota(
 
     if let Some(budget) = weekly_budget.filter(|&b| b > 0) {
         let (week_start, _) = current_week_bounds(now);
-        let current = match crate::db::billing::get_current_period_cost(db, user_id, "week", &week_start).await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("Quota check DB error (weekly), failing open: {e}");
-                0
-            }
-        };
+        let current =
+            match crate::db::billing::get_current_period_cost(db, user_id, "week", &week_start)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Quota check DB error (weekly), failing open: {e}");
+                    0
+                }
+            };
         if current >= budget {
             return Err(crate::error::ClewdrError::QuotaExceeded);
         }
@@ -238,13 +248,16 @@ pub async fn check_quota(
 
     if let Some(budget) = monthly_budget.filter(|&b| b > 0) {
         let (month_start, _) = current_month_bounds(now);
-        let current = match crate::db::billing::get_current_period_cost(db, user_id, "month", &month_start).await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("Quota check DB error (monthly), failing open: {e}");
-                0
-            }
-        };
+        let current =
+            match crate::db::billing::get_current_period_cost(db, user_id, "month", &month_start)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Quota check DB error (monthly), failing open: {e}");
+                    0
+                }
+            };
         if current >= budget {
             return Err(crate::error::ClewdrError::QuotaExceeded);
         }

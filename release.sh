@@ -7,6 +7,8 @@ if [ -z "$VERSION" ]; then
 fi
 cargo update
 cargo set-version $VERSION
+cargo test
+(cd frontend && npm ci && npm run build)
 cargo check
 git add RELEASE_NOTES.md Cargo.toml Cargo.lock
 git commit -m "Update to v$VERSION"

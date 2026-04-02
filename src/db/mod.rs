@@ -44,8 +44,7 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, ClewdrError> {
     Ok(pool)
 }
 
-const DEFAULT_PASSWORD_HASH: &str =
-    "$argon2id$v=19$m=65536,t=3,p=1$Li5+S+9BeUmy3TFviGbZ9Q$tI+ZLpzW3LhrR5OA8izKSR+mw4APjT6m4rQTicuXNsE";
+const DEFAULT_PASSWORD_HASH: &str = "$argon2id$v=19$m=65536,t=3,p=1$Li5+S+9BeUmy3TFviGbZ9Q$tI+ZLpzW3LhrR5OA8izKSR+mw4APjT6m4rQTicuXNsE";
 
 pub async fn seed_admin(pool: &SqlitePool) -> Result<(), ClewdrError> {
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE role = 'admin'")
@@ -113,11 +112,10 @@ pub async fn seed_admin(pool: &SqlitePool) -> Result<(), ClewdrError> {
     }
 
     // Migrate proxy from TOML config to DB settings (one-time, guarded by flag)
-    let migrated: Option<(String,)> = sqlx::query_as(
-        "SELECT value FROM settings WHERE key = '_proxy_migrated'"
-    )
-    .fetch_optional(pool)
-    .await?;
+    let migrated: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM settings WHERE key = '_proxy_migrated'")
+            .fetch_optional(pool)
+            .await?;
     if migrated.is_none() {
         if let Some(ref proxy) = crate::config::CLEWDR_CONFIG.load().proxy {
             if !proxy.is_empty() {
@@ -144,15 +142,15 @@ pub async fn seed_admin(pool: &SqlitePool) -> Result<(), ClewdrError> {
 }
 
 const DEFAULT_MODELS: &[(&str, &str, i32)] = &[
-    ("claude-opus-4-6",   "Claude Opus 4.6",   10),
-    ("claude-opus-4-5",   "Claude Opus 4.5",   20),
-    ("claude-opus-4-1",   "Claude Opus 4.1",   30),
-    ("claude-opus-4-0",   "Claude Opus 4.0",   40),
-    ("claude-sonnet-4-6", "Claude Sonnet 4.6",  50),
-    ("claude-sonnet-4-5", "Claude Sonnet 4.5",  60),
-    ("claude-sonnet-4-0", "Claude Sonnet 4.0",  70),
-    ("claude-haiku-4-5",  "Claude Haiku 4.5",   80),
-    ("claude-haiku-3-5",  "Claude Haiku 3.5",   90),
+    ("claude-opus-4-6", "Claude Opus 4.6", 10),
+    ("claude-opus-4-5", "Claude Opus 4.5", 20),
+    ("claude-opus-4-1", "Claude Opus 4.1", 30),
+    ("claude-opus-4-0", "Claude Opus 4.0", 40),
+    ("claude-sonnet-4-6", "Claude Sonnet 4.6", 50),
+    ("claude-sonnet-4-5", "Claude Sonnet 4.5", 60),
+    ("claude-sonnet-4-0", "Claude Sonnet 4.0", 70),
+    ("claude-haiku-4-5", "Claude Haiku 4.5", 80),
+    ("claude-haiku-3-5", "Claude Haiku 3.5", 90),
 ];
 
 pub async fn seed_models(pool: &SqlitePool) -> Result<(), ClewdrError> {
@@ -188,18 +186,19 @@ pub async fn reset_default_models(pool: &SqlitePool) -> Result<(), ClewdrError> 
 
 pub async fn load_session_secret(pool: &SqlitePool) -> Result<[u8; 32], ClewdrError> {
     use base64::Engine;
-    let row: (String,) =
-        sqlx::query_as("SELECT value FROM settings WHERE key = 'session_secret'")
-            .fetch_one(pool)
-            .await?;
+    let row: (String,) = sqlx::query_as("SELECT value FROM settings WHERE key = 'session_secret'")
+        .fetch_one(pool)
+        .await?;
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(&row.0)
         .map_err(|e| ClewdrError::UnexpectedNone {
             msg: Box::leak(format!("invalid session_secret base64: {e}").into_boxed_str()),
         })?;
-    let secret: [u8; 32] = decoded.try_into().map_err(|_| ClewdrError::UnexpectedNone {
-        msg: "session_secret must be 32 bytes",
-    })?;
+    let secret: [u8; 32] = decoded
+        .try_into()
+        .map_err(|_| ClewdrError::UnexpectedNone {
+            msg: "session_secret must be 32 bytes",
+        })?;
     Ok(secret)
 }
 

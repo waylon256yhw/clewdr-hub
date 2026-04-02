@@ -16,9 +16,7 @@ pub struct AccountCounts {
     pub exhausted: usize,
 }
 
-pub async fn health(
-    State(cookie_handle): State<CookieActorHandle>,
-) -> Json<HealthResponse> {
+pub async fn health(State(cookie_handle): State<CookieActorHandle>) -> Json<HealthResponse> {
     let (valid, exhausted) = match cookie_handle.get_status().await {
         Ok(s) => (s.valid.len(), s.exhausted.len()),
         Err(_) => (0, 0),

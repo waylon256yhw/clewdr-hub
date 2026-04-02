@@ -1,8 +1,7 @@
 FROM node:lts-slim AS frontend-builder
 WORKDIR /build/frontend
-RUN npm install -g pnpm
 COPY frontend/ .
-RUN pnpm install && pnpm run build
+RUN npm ci && npm run build
 
 FROM docker.io/lukemathwalker/cargo-chef:latest-rust-trixie AS chef
 WORKDIR /build

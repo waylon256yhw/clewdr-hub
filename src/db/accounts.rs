@@ -8,6 +8,7 @@ pub struct AccountWithRuntime {
     pub id: i64,
     pub name: String,
     pub rr_order: i64,
+    pub max_slots: i64,
     pub status: String,
     pub cookie_blob: String,
     pub invalid_reason: Option<String>,
@@ -86,7 +87,7 @@ fn make_bucket(row: &sqlx::sqlite::SqliteRow, prefix: &str) -> UsageBreakdown {
 pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRuntime>, sqlx::Error> {
     let rows = sqlx::query(
         r#"SELECT
-            a.id, a.name, a.rr_order, a.status, a.cookie_blob, a.invalid_reason,
+            a.id, a.name, a.rr_order, a.max_slots, a.status, a.cookie_blob, a.invalid_reason,
             a.email, a.account_type,
             rs.account_id AS rs_marker,
             rs.reset_time,
@@ -166,6 +167,7 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
             id: row.get("id"),
             name: row.get("name"),
             rr_order: row.get("rr_order"),
+            max_slots: row.get("max_slots"),
             status: row.get("status"),
             cookie_blob: row.get("cookie_blob"),
             invalid_reason: row.get("invalid_reason"),

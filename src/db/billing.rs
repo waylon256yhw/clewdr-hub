@@ -164,20 +164,16 @@ pub async fn delete_old_request_logs(
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days)).to_rfc3339();
     let result = sqlx::query("DELETE FROM request_logs WHERE started_at < ?1")
         .bind(cutoff)
-    .execute(pool)
-    .await?;
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected())
 }
 
 /// Read a setting value from the settings KV table.
-pub async fn get_setting(
-    pool: &SqlitePool,
-    key: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT value FROM settings WHERE key = ?1")
-            .bind(key)
-            .fetch_optional(pool)
-            .await?;
+pub async fn get_setting(pool: &SqlitePool, key: &str) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT value FROM settings WHERE key = ?1")
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(|(v,)| v))
 }

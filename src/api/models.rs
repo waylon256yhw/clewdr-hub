@@ -1,4 +1,7 @@
-use axum::{Json, extract::{Path, State}};
+use axum::{
+    Json,
+    extract::{Path, State},
+};
 use serde::Serialize;
 use sqlx::SqlitePool;
 
@@ -40,9 +43,7 @@ pub struct ModelsListResponse {
     last_id: Option<String>,
 }
 
-pub async fn list(
-    State(db): State<SqlitePool>,
-) -> Result<Json<ModelsListResponse>, ClewdrError> {
+pub async fn list(State(db): State<SqlitePool>) -> Result<Json<ModelsListResponse>, ClewdrError> {
     let rows: Vec<ModelEntry> = sqlx::query_as(
         "SELECT model_id, display_name, created_at FROM models WHERE enabled = 1 ORDER BY sort_order, model_id"
     )
@@ -66,7 +67,7 @@ pub async fn get(
     Path(model_id): Path<String>,
 ) -> Result<Json<ModelResponse>, ClewdrError> {
     let entry: Option<ModelEntry> = sqlx::query_as(
-        "SELECT model_id, display_name, created_at FROM models WHERE model_id = ?1 AND enabled = 1"
+        "SELECT model_id, display_name, created_at FROM models WHERE model_id = ?1 AND enabled = 1",
     )
     .bind(&model_id)
     .fetch_optional(&db)
@@ -74,6 +75,8 @@ pub async fn get(
 
     match entry {
         Some(e) => Ok(Json(e.into())),
-        None => Err(ClewdrError::NotFound { msg: "model not found" }),
+        None => Err(ClewdrError::NotFound {
+            msg: "model not found",
+        }),
     }
 }

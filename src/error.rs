@@ -243,7 +243,10 @@ impl IntoResponse for ClewdrError {
                     r#type: "rate_limit_error".to_string(),
                     code: Some(429),
                 };
-                return (StatusCode::TOO_MANY_REQUESTS, Json(ClaudeError { error: inner }))
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(ClaudeError { error: inner }),
+                )
                     .into_response();
             }
             ClewdrError::NotFound { .. } => (StatusCode::NOT_FOUND, json!(self.to_string())),

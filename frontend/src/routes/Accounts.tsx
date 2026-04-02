@@ -74,14 +74,7 @@ function WindowRow({ label, window }: { label: string; window: UsageWindow | nul
       </Group>
     );
   }
-  if (!window.has_reset) {
-    return (
-      <Group justify="space-between" gap="xs">
-        <Text size="xs" fw={500} w={80}>{label}</Text>
-        <Badge size="xs" color="gray" variant="light">无限制</Badge>
-      </Group>
-    );
-  }
+  if (!window.has_reset) return null;
   const util = window.utilization ?? 0;
   return (
     <Stack gap={2}>
@@ -148,6 +141,7 @@ function AccountCard({
         <WindowRow label="5h 会话" window={rt?.session} />
         <WindowRow label="7d 总量" window={rt?.weekly} />
         <WindowRow label="7d Sonnet" window={rt?.weekly_sonnet} />
+        <WindowRow label="7d Opus" window={rt?.weekly_opus} />
       </Stack>
     </Paper>
   );

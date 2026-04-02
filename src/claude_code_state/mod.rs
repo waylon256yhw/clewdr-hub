@@ -55,7 +55,10 @@ pub struct ClaudeCodeState {
 
 impl ClaudeCodeState {
     /// Create a new ClaudeCodeState instance
-    pub fn new(cookie_actor_handle: CookieActorHandle, stealth_profile: SharedStealthProfile) -> Self {
+    pub fn new(
+        cookie_actor_handle: CookieActorHandle,
+        stealth_profile: SharedStealthProfile,
+    ) -> Self {
         let proxy = proxy_from_profile(&stealth_profile);
         ClaudeCodeState {
             cookie_actor_handle,
@@ -92,8 +95,7 @@ impl ClaudeCodeState {
             .to_string();
         let header_value = HeaderValue::from_str(cookie_value.as_str())?;
         state.cookie_header_value = header_value.clone();
-        let mut client = wreq::Client::builder()
-            .cookie_store(true);
+        let mut client = wreq::Client::builder().cookie_store(true);
         if let Some(ref proxy) = state.proxy {
             client = client.proxy(proxy.to_owned());
         }
@@ -150,8 +152,7 @@ impl ClaudeCodeState {
         // Always pull latest proxy from stealth profile
         self.proxy = proxy_from_profile(&self.stealth_profile);
         self.endpoint = crate::config::ENDPOINT_URL.to_owned();
-        let mut client = wreq::Client::builder()
-            .cookie_store(true);
+        let mut client = wreq::Client::builder().cookie_store(true);
         if let Some(ref proxy) = self.proxy {
             client = client.proxy(proxy.to_owned());
         }

@@ -55,7 +55,9 @@ pub fn validate_session_cookie(secret: &[u8; 32], value: &str) -> Option<Session
 }
 
 pub fn set_cookie_header(cookie_value: &str, max_age: u64) -> String {
-    format!("{COOKIE_NAME}={cookie_value}; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age={max_age}")
+    format!(
+        "{COOKIE_NAME}={cookie_value}; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age={max_age}"
+    )
 }
 
 pub fn clear_cookie_header() -> String {
@@ -74,8 +76,7 @@ pub fn extract_session_cookie(cookie_header: &str) -> Option<&str> {
 }
 
 fn sign(secret: &[u8; 32], payload: &str) -> String {
-    let mut mac =
-        HmacSha256::new_from_slice(secret).expect("HMAC can take key of any size");
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC can take key of any size");
     mac.update(payload.as_bytes());
     let result = mac.finalize().into_bytes();
     result.iter().fold(String::with_capacity(64), |mut s, b| {
@@ -89,7 +90,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 fn now_unix() -> u64 {

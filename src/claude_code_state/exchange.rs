@@ -20,10 +20,7 @@ use url::Url;
 
 use crate::{
     claude_code_state::ClaudeCodeState,
-    config::{
-        CC_REDIRECT_URI, CC_TOKEN_URL, CLEWDR_CONFIG, CookieStatus,
-        TokenInfo,
-    },
+    config::{CC_REDIRECT_URI, CC_TOKEN_URL, CLEWDR_CONFIG, CookieStatus, TokenInfo},
     error::{CheckClaudeErr, ClewdrError, UnexpectedNoneSnafu, UrlSnafu, WreqSnafu},
 };
 

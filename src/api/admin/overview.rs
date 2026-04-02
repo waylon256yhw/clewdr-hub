@@ -64,11 +64,17 @@ pub async fn overview(
 ) -> Result<Json<OverviewResponse>, ClewdrError> {
     let cookie_status = cookie_handle.get_status().await.ok();
 
-    let cookies = cookie_status.map(|s| CookieOverview {
-        valid: s.valid.len(),
-        exhausted: s.exhausted.len(),
-        invalid: s.invalid.len(),
-    }).unwrap_or(CookieOverview { valid: 0, exhausted: 0, invalid: 0 });
+    let cookies = cookie_status
+        .map(|s| CookieOverview {
+            valid: s.valid.len(),
+            exhausted: s.exhausted.len(),
+            invalid: s.invalid.len(),
+        })
+        .unwrap_or(CookieOverview {
+            valid: 0,
+            exhausted: 0,
+            invalid: 0,
+        });
 
     let user_stats: (i64, i64, i64, i64) = sqlx::query_as(
         r#"SELECT COUNT(*),
@@ -76,7 +82,9 @@ pub async fn overview(
                   COALESCE(SUM(CASE WHEN role = 'member' THEN 1 ELSE 0 END), 0),
                   COALESCE(SUM(CASE WHEN disabled_at IS NOT NULL THEN 1 ELSE 0 END), 0)
            FROM users"#,
-    ).fetch_one(&db).await?;
+    )
+    .fetch_one(&db)
+    .await?;
 
     let key_stats: (i64, i64, i64) = sqlx::query_as(
         r#"SELECT COUNT(*),
@@ -90,28 +98,36 @@ pub async fn overview(
                   COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0),
                   COALESCE(SUM(CASE WHEN status = 'disabled' THEN 1 ELSE 0 END), 0)
            FROM accounts"#,
-    ).fetch_one(&db).await?;
+    )
+    .fetch_one(&db)
+    .await?;
 
     let (policy_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM policies")
-        .fetch_one(&db).await?;
+        .fetch_one(&db)
+        .await?;
 
     let now = chrono::Utc::now();
     let one_hour_ago = (now - chrono::Duration::hours(1)).to_rfc3339();
     let one_day_ago = (now - chrono::Duration::hours(24)).to_rfc3339();
 
-    let (requests_1h,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM request_logs WHERE started_at >= ?1")
-        .bind(&one_hour_ago).fetch_one(&db).await?;
-    let (requests_24h,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM request_logs WHERE started_at >= ?1")
-        .bind(&one_day_ago).fetch_one(&db).await?;
+    let (requests_1h,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM request_logs WHERE started_at >= ?1")
+            .bind(&one_hour_ago)
+            .fetch_one(&db)
+            .await?;
+    let (requests_24h,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM request_logs WHERE started_at >= ?1")
+            .bind(&one_day_ago)
+            .fetch_one(&db)
+            .await?;
 
     let profile = stealth::global_profile().load();
 
-    let (must_change,): (i32,) = sqlx::query_as(
-        "SELECT must_change_password FROM users WHERE id = ?1"
-    )
-    .bind(user.user_id)
-    .fetch_one(&db)
-    .await?;
+    let (must_change,): (i32,) =
+        sqlx::query_as("SELECT must_change_password FROM users WHERE id = ?1")
+            .bind(user.user_id)
+            .fetch_one(&db)
+            .await?;
 
     Ok(Json(OverviewResponse {
         version: crate::VERSION_INFO.clone(),

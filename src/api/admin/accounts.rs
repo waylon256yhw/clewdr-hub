@@ -1,9 +1,13 @@
-use axum::{Json, extract::{Path, Query, State}, http::StatusCode};
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::StatusCode,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use super::common::{Paginated, PaginationParams};
-use crate::db::accounts::{load_all_accounts, AccountWithRuntime};
+use crate::db::accounts::{AccountWithRuntime, load_all_accounts};
 use crate::error::ClewdrError;
 use crate::services::cookie_actor::CookieActorHandle;
 
@@ -101,7 +105,12 @@ pub async fn list(
     let all = load_all_accounts(&db).await?;
     let total = all.len() as i64;
     let items: Vec<AccountResponse> = all.iter().map(map_account).collect();
-    Ok(Json(Paginated { items, total, offset: 0, limit: total }))
+    Ok(Json(Paginated {
+        items,
+        total,
+        offset: 0,
+        limit: total,
+    }))
 }
 
 pub async fn create(
@@ -111,7 +120,9 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<serde_json::Value>), ClewdrError> {
     let max_slots = req.max_slots.unwrap_or(5);
     if max_slots <= 0 {
-        return Err(ClewdrError::BadRequest { msg: "max_slots must be positive" });
+        return Err(ClewdrError::BadRequest {
+            msg: "max_slots must be positive",
+        });
     }
 
     let rr_order = match req.rr_order {
@@ -156,68 +167,109 @@ pub async fn update(
     Json(req): Json<UpdateAccountRequest>,
 ) -> Result<Json<serde_json::Value>, ClewdrError> {
     if let Some(slots) = req.max_slots {
-        if slots <= 0 { return Err(ClewdrError::BadRequest { msg: "max_slots must be positive" }); }
+        if slots <= 0 {
+            return Err(ClewdrError::BadRequest {
+                msg: "max_slots must be positive",
+            });
+        }
     }
     if let Some(ref status) = req.status {
         if !["active", "disabled"].contains(&status.as_str()) {
-            return Err(ClewdrError::BadRequest { msg: "invalid status value" });
+            return Err(ClewdrError::BadRequest {
+                msg: "invalid status value",
+            });
         }
     }
 
     let mut tx = db.begin().await?;
 
     let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM accounts WHERE id = ?1")
-        .bind(id).fetch_optional(&mut *tx).await?;
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
     if exists.is_none() {
-        return Err(ClewdrError::NotFound { msg: "account not found" });
+        return Err(ClewdrError::NotFound {
+            msg: "account not found",
+        });
     }
 
     if let Some(ref name) = req.name {
         sqlx::query("UPDATE accounts SET name = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(name).bind(id).execute(&mut *tx).await
+            .bind(name)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
             .map_err(|e| {
                 if let sqlx::Error::Database(ref de) = e {
                     if de.message().contains("UNIQUE") {
-                        return ClewdrError::Conflict { msg: "account name already exists" };
+                        return ClewdrError::Conflict {
+                            msg: "account name already exists",
+                        };
                     }
                 }
                 ClewdrError::from(e)
             })?;
     }
     if let Some(rr) = req.rr_order {
-        sqlx::query("UPDATE accounts SET rr_order = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(rr).bind(id).execute(&mut *tx).await
-            .map_err(|e| {
-                if let sqlx::Error::Database(ref de) = e {
-                    if de.message().contains("UNIQUE") {
-                        return ClewdrError::Conflict { msg: "rr_order already exists" };
-                    }
+        sqlx::query(
+            "UPDATE accounts SET rr_order = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        )
+        .bind(rr)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(ref de) = e {
+                if de.message().contains("UNIQUE") {
+                    return ClewdrError::Conflict {
+                        msg: "rr_order already exists",
+                    };
                 }
-                ClewdrError::from(e)
-            })?;
+            }
+            ClewdrError::from(e)
+        })?;
     }
     if let Some(slots) = req.max_slots {
-        sqlx::query("UPDATE accounts SET max_slots = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(slots).bind(id).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE accounts SET max_slots = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        )
+        .bind(slots)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     }
     if let Some(ref status) = req.status {
         if status == "active" {
             sqlx::query("UPDATE accounts SET status = 'active', invalid_reason = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?1")
                 .bind(id).execute(&mut *tx).await?;
             sqlx::query("DELETE FROM account_runtime_state WHERE account_id = ?1")
-                .bind(id).execute(&mut *tx).await?;
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
         } else {
-            sqlx::query("UPDATE accounts SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-                .bind(status).bind(id).execute(&mut *tx).await?;
+            sqlx::query(
+                "UPDATE accounts SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            )
+            .bind(status)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         }
     }
     if let Some(ref blob) = req.cookie_blob {
         sqlx::query("UPDATE accounts SET email = NULL, account_type = NULL, organization_uuid = NULL, invalid_reason = NULL WHERE id = ?1")
             .bind(id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM account_runtime_state WHERE account_id = ?1")
-            .bind(id).execute(&mut *tx).await?;
-        sqlx::query("UPDATE accounts SET cookie_blob = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(blob).bind(id).execute(&mut *tx).await?;
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE accounts SET cookie_blob = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        )
+        .bind(blob)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     }
     if let Some(ref org) = req.organization_uuid {
         sqlx::query("UPDATE accounts SET organization_uuid = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
@@ -237,10 +289,14 @@ pub async fn remove(
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ClewdrError> {
     let result = sqlx::query("DELETE FROM accounts WHERE id = ?1")
-        .bind(id).execute(&db).await?;
+        .bind(id)
+        .execute(&db)
+        .await?;
 
     if result.rows_affected() == 0 {
-        return Err(ClewdrError::NotFound { msg: "account not found" });
+        return Err(ClewdrError::NotFound {
+            msg: "account not found",
+        });
     }
 
     let _ = actor.reload_from_db().await;
@@ -248,9 +304,7 @@ pub async fn remove(
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub async fn probe_all(
-    State(actor): State<CookieActorHandle>,
-) -> Result<StatusCode, ClewdrError> {
+pub async fn probe_all(State(actor): State<CookieActorHandle>) -> Result<StatusCode, ClewdrError> {
     actor.probe_all().await?;
     Ok(StatusCode::NO_CONTENT)
 }

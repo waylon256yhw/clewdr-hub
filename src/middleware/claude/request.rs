@@ -156,7 +156,11 @@ fn inject_metadata_user_id(
 ) {
     // Check if metadata.user_id already exists
     if let Some(ref metadata) = body.metadata {
-        if metadata.fields.get("user_id").is_some_and(|v| !v.is_empty()) {
+        if metadata
+            .fields
+            .get("user_id")
+            .is_some_and(|v| !v.is_empty())
+        {
             return;
         }
     }
@@ -184,8 +188,7 @@ fn inject_metadata_user_id(
 static TEST_MESSAGE_CLAUDE: LazyLock<Message> =
     LazyLock::new(|| Message::new_blocks(Role::User, vec![ContentBlock::text("Hi")]));
 
-static TEST_MESSAGE_TEXT: LazyLock<Message> =
-    LazyLock::new(|| Message::new_text(Role::User, "Hi"));
+static TEST_MESSAGE_TEXT: LazyLock<Message> = LazyLock::new(|| Message::new_text(Role::User, "Hi"));
 
 pub struct ClaudeCodePreprocess(pub CreateMessageParams, pub ClaudeContext);
 
@@ -282,7 +285,10 @@ where
             weekly_budget_nanousd: auth_user.as_ref().map(|u| u.weekly_budget_nanousd),
             monthly_budget_nanousd: auth_user.as_ref().map(|u| u.monthly_budget_nanousd),
             session_id,
-            bound_account_ids: auth_user.as_ref().map(|u| u.bound_account_ids.clone()).unwrap_or_default(),
+            bound_account_ids: auth_user
+                .as_ref()
+                .map(|u| u.bound_account_ids.clone())
+                .unwrap_or_default(),
         };
 
         Ok(Self(body, context))
@@ -347,10 +353,7 @@ mod tests {
             ..Default::default()
         };
 
-        prepend_system_blocks(
-            &mut body,
-            vec![ContentBlock::text("billing")],
-        );
+        prepend_system_blocks(&mut body, vec![ContentBlock::text("billing")]);
 
         let systems = body.system.unwrap().as_array().cloned().unwrap();
         let texts = systems

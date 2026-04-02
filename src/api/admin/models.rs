@@ -1,4 +1,8 @@
-use axum::{Json, extract::{Path, State}, http::StatusCode};
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::StatusCode,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
@@ -47,7 +51,12 @@ pub async fn list(
     .bind(offset)
     .fetch_all(&db)
     .await?;
-    Ok(Json(Paginated { items, total: total.0, offset, limit }))
+    Ok(Json(Paginated {
+        items,
+        total: total.0,
+        offset,
+        limit,
+    }))
 }
 
 pub async fn create(
@@ -56,11 +65,15 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<ModelRow>), ClewdrError> {
     let model_id = req.model_id.trim().to_string();
     if model_id.is_empty() {
-        return Err(ClewdrError::BadRequest { msg: "model_id is required" });
+        return Err(ClewdrError::BadRequest {
+            msg: "model_id is required",
+        });
     }
     let display_name = req.display_name.trim().to_string();
     if display_name.is_empty() {
-        return Err(ClewdrError::BadRequest { msg: "display_name is required" });
+        return Err(ClewdrError::BadRequest {
+            msg: "display_name is required",
+        });
     }
 
     let sort_order = req.sort_order.unwrap_or(0);
@@ -75,7 +88,9 @@ pub async fn create(
 
     match result {
         Err(sqlx::Error::Database(e)) if e.message().contains("UNIQUE") => {
-            return Err(ClewdrError::Conflict { msg: "model_id already exists" });
+            return Err(ClewdrError::Conflict {
+                msg: "model_id already exists",
+            });
         }
         Err(e) => return Err(e.into()),
         Ok(_) => {}
@@ -95,18 +110,23 @@ pub async fn update(
 ) -> Result<Json<ModelRow>, ClewdrError> {
     let mut tx = db.begin().await?;
 
-    let existing: Option<(String,)> = sqlx::query_as("SELECT model_id FROM models WHERE model_id = ?1")
-        .bind(&model_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let existing: Option<(String,)> =
+        sqlx::query_as("SELECT model_id FROM models WHERE model_id = ?1")
+            .bind(&model_id)
+            .fetch_optional(&mut *tx)
+            .await?;
     if existing.is_none() {
-        return Err(ClewdrError::NotFound { msg: "model not found" });
+        return Err(ClewdrError::NotFound {
+            msg: "model not found",
+        });
     }
 
     if let Some(ref name) = req.display_name {
         let trimmed = name.trim();
         if trimmed.is_empty() {
-            return Err(ClewdrError::BadRequest { msg: "display_name cannot be empty" });
+            return Err(ClewdrError::BadRequest {
+                msg: "display_name cannot be empty",
+            });
         }
         sqlx::query("UPDATE models SET display_name = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE model_id = ?2")
             .bind(trimmed)
@@ -147,7 +167,9 @@ pub async fn remove(
         .execute(&db)
         .await?;
     if result.rows_affected() == 0 {
-        return Err(ClewdrError::NotFound { msg: "model not found" });
+        return Err(ClewdrError::NotFound {
+            msg: "model not found",
+        });
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -156,9 +178,15 @@ pub async fn reset_defaults(
     State(db): State<SqlitePool>,
 ) -> Result<Json<Paginated<ModelRow>>, ClewdrError> {
     crate::db::reset_default_models(&db).await?;
-    let items: Vec<ModelRow> = sqlx::query_as(&format!("{MODEL_SELECT} ORDER BY sort_order, model_id"))
-        .fetch_all(&db)
-        .await?;
+    let items: Vec<ModelRow> =
+        sqlx::query_as(&format!("{MODEL_SELECT} ORDER BY sort_order, model_id"))
+            .fetch_all(&db)
+            .await?;
     let total = items.len() as i64;
-    Ok(Json(Paginated { items, total, offset: 0, limit: 100 }))
+    Ok(Json(Paginated {
+        items,
+        total,
+        offset: 0,
+        limit: 100,
+    }))
 }
