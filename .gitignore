@@ -17,3 +17,6 @@ static/
 test
 scripts
 AGENTS.md
+docs/
+.serena/
+clewdr-bin
