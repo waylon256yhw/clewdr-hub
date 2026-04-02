@@ -1,5 +1,5 @@
 # Use the pre-built image
-FROM ghcr.io/waylon256yhw/clewdr:latest
+FROM ghcr.io/waylon256yhw/clewdr-hub:latest
 
 # Set environment variables for Hugging Face deployment
 # Use PORT env var from Hugging Face or default to 7860

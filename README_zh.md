@@ -1,106 +1,116 @@
-# ClewdR
+# clewdr-hub
 
-<p align="center">
-  <img src="./assets/clewdr-logo.svg" alt="ClewdR" height="60">
-</p>
+基于 [clewdr](https://github.com/Xerxes-2/clewdr) 的多用户 Claude 共享网关。
 
-ClewdR 是面向 Claude（Claude.ai、Claude Code）的 Rust 代理。  
-它提供低资源占用的多端点转发，并附带一个 React 管理界面用于管理 Cookie 和配置。
+```
+单二进制 / SQLite / 无额外提示词 / 原生 Anthropic Messages API
+```
+
+把 Claude Pro/Max 订阅变成团队 API：账号池轮询、并发槽隔离、per-user 限额、费用追踪，开箱即用。
 
 ---
 
-## 核心特点
+## 特性
 
-- 对接 Claude Web、Claude Code。
-- 单个静态二进制可运行在 Linux、macOS、Windows、Android，另有 Docker 镜像。
-- 网页控制台可查看状态、编辑 Cookie，并支持热加载配置。
-- 同时支持 OpenAI 兼容接口和原生 Claude 协议，流式响应可用。
-- 典型占用：`<10 MB` 内存、`<1 秒` 启动、`~15 MB` 二进制。
+- **零依赖部署**：单个静态链接二进制，前端编译嵌入，SQLite WAL 自动建库
+- **透明代理**：直接转发 `/v1/messages`，不注入系统提示词、不改写请求体
+- **轻量伪装**：可配置 CLI/SDK 版本号和请求头，过上游客户端检测
+- **多账号调度**：cookie 池 + round-robin + 亲和性缓存 + per-account 并发槽（`max_slots`）
+- **团队隔离**：用户 → 策略 → API Key，并发/RPM/周预算/月预算多重限额
+- **Per-Key 绑定**：把特定 key 锁定到指定账号，隔离资源
+- **管理后台**：总览 / 账号池 / 用户 / Key / 日志 / 设置，SSE 实时推送
+- **自适应探测**：自动识别 Pro/Max 账号类型，按实际用量窗口显示
 
-## 支持的端点
+## 部署
 
-| 服务 | 地址 |
+### Docker
+
+```bash
+docker run -d --name clewdr-hub \
+  -p 8484:8484 -v clewdr-data:/etc/clewdr \
+  ghcr.io/waylon256yhw/clewdr-hub:latest
+```
+
+### 二进制
+
+[Releases](https://github.com/waylon256yhw/clewdr-hub/releases) 下载，解压运行：
+
+```bash
+./clewdr                          # DB 在同目录 clewdr.db
+./clewdr --db /data/clewdr.db     # 指定 DB 路径
+```
+
+| 环境变量 | 默认 | 说明 |
+|----------|------|------|
+| `CLEWDR_IP` | `0.0.0.0` | 监听地址 |
+| `CLEWDR_PORT` | `8484` | 监听端口 |
+| `ADMIN_PASSWORD` | `password` | 初始管理员密码（首次登录强制修改） |
+
+## 使用
+
+```bash
+export ANTHROPIC_BASE_URL=http://your-ip:8484
+export ANTHROPIC_API_KEY=sk-...    # 从后台创建
+```
+
+流程：**后台登录 → 账号池添加 Cookie → 创建 API Key → 客户端配置上面两行**。单人到这里就够了。
+
+### 团队扩展
+
+在上面基础上：
+
+1. **策略**（用户页 → 策略标签）：定义并发/RPM/周月预算模板
+2. **用户**：为成员创建账号，分配策略
+3. **分发 Key**：每人一个 key，可选绑定到特定账号
+4. 超限请求直接拒绝，不消耗账号资源
+
+## 后台功能
+
+地址即服务根路径，管理员登录后可见：
+
+| 页面 | 用途 |
 |------|------|
-| Claude 原生 | `http://127.0.0.1:8484/v1/messages` |
-| Claude OpenAI 兼容 | `http://127.0.0.1:8484/v1/chat/completions` |
-| Claude Code | `http://127.0.0.1:8484/code/v1/messages` |
+| **总览** | 账号/用户/Key 数量，请求量，当前伪装版本 |
+| **账号池** | 添加/管理 Cookie，查看用量窗口和重置倒计时 |
+| **用户** | 用户 CRUD + 策略管理（并发/RPM/预算） |
+| **API Keys** | 创建/绑定/管理 Key |
+| **日志** | 请求明细，按用户/状态/模型/时间筛选，点击展开详情 |
+| **设置** | CLI 版本伪装、模型列表管理、出站代理、改密 |
 
-所有端点均支持流式返回。
+### 设置项说明
 
-## 快速开始
+- **CLI 版本伪装**：从 npm 拉取最新版本号，切换后立即生效。上游更新检测策略时用。
+- **模型列表**：控制 `/v1/models` 返回内容，可添加自定义模型 ID。禁用 ≠ 不可调用，只是不列出。
+- **出站代理**：`socks5://` 或 `http://` 格式，服务器不能直连时用。
 
-1. 从 GitHub Releases 下载对应平台的最新版。  
-   Linux/macOS 示例：
-   ```bash
-   curl -L -o clewdr.tar.gz https://github.com/Xerxes-2/clewdr/releases/latest/download/clewdr-linux-x64.tar.gz
-   tar -xzf clewdr.tar.gz && cd clewdr-linux-x64
-   chmod +x clewdr
-   ```
-2. 运行二进制：
-   ```bash
-   ./clewdr
-   ```
-3. 打开 `http://127.0.0.1:8484`，使用控制台（或 Docker 容器日志）显示的管理员密码登录。
+## 与同类项目对比
 
-## Web 管理界面
+|  | **clewdr-hub** | **Sub2API** | **CLIProxyAPI** | **clewdr** (原版) |
+|--|---------------|-------------|-----------------|------------------|
+| 定位 | 小团队自用网关 | 商业级中转/拼车平台 | 多 provider 代理 | 个人轻代理 |
+| 部署 | Rust 单二进制 + SQLite | Go + PostgreSQL + Redis | Go 单二进制 | Rust 单二进制 |
+| 支持 provider | Claude 专精 | Claude / OpenAI / Gemini / Antigravity | Gemini / OpenAI / Claude / Codex / Qwen | Claude |
+| 代理方式 | cookie → 原生 Messages API | OAuth + cookie | OAuth 包装 CLI | cookie |
+| 提示词注入 | **无**，透明转发 | 有平台层注入 | 有 | 无 |
+| 用户端 UA 校验 | **不做**，自由接入 | 有 | 有 | 无 |
+| 伪装 | 可配版本号 + 请求头 | 内置 | 内置 | 可配版本号 |
+| 多用户 | 用户/策略/Key/RBAC | 用户/Key/计费/支付 | 管理 API | 单 admin |
+| 管理后台 | 内嵌 6 页 React | Vue 全功能后台 | 社区 Dashboard | 配置页 |
+| 适合规模 | 3–10 人 | 10–1000+ 人 / 商用 | 个人–中小团队 | 个人 |
+| 资源占用 | ~20MB RAM | PG + Redis + Go | ~50MB RAM | ~15MB RAM |
 
-- `Dashboard`：查看健康状态、限流命中、连接数。
-- `Claude`：粘贴浏览器导出的 Cookie，ClewdR 自动检测有效性。
-- `Settings`：修改管理员密码、上游代理、指纹配置，支持热重载。
+**如果你是 3–10 人团队共享 Claude 订阅，要轻、要透明、不想运维数据库——这个项目就是为你写的。**
 
-如忘记密码，删除 `clewdr.toml` 再启动即可。Docker 建议挂载该文件所在目录以持久化。
+fork 自 [clewdr](https://github.com/Xerxes-2/clewdr)，保留其核心代理能力（轻量伪装、cookie 认证、无提示词注入），重构为多用户网关：
 
-## 配置上游
+**新增**：用户/策略/RBAC、API Key 认证（blake3）、账号池并发槽调度、请求日志与费用追踪、管理后台（6 页）、SSE 实时事件、审计字段
 
-### Claude
-
-1. 在浏览器开发者工具导出 Claude.ai Cookie。  
-2. 粘贴至 Claude 页签并保存，ClewdR 会实时标记状态。  
-3. 如需自定义网络出口，可设置上游代理或指纹选项。
-
-## 客户端示例
-
-SillyTavern：
-
-```json
-{
-  "api_url": "http://127.0.0.1:8484/v1/chat/completions",
-  "api_key": "控制台显示的密码",
-  "model": "claude-3-sonnet-20240229"
-}
-```
-
-Continue（VS Code）：
-
-```json
-{
-  "models": [
-    {
-      "title": "Claude via ClewdR",
-      "provider": "openai",
-      "model": "claude-3-sonnet-20240229",
-      "apiBase": "http://127.0.0.1:8484/v1/",
-      "apiKey": "控制台显示的密码"
-    }
-  ]
-}
-```
-
-Cursor：
-
-```json
-{
-  "openaiApiBase": "http://127.0.0.1:8484/v1/",
-  "openaiApiKey": "控制台显示的密码"
-}
-```
-
-## 资源
-
-- Wiki：<https://github.com/Xerxes-2/clewdr/wiki>  
+**移除**：OpenAI 兼容端点（`/v1/chat/completions`）、`/code/v1/*` 路由。需要 OpenAI 格式请用原版。
 
 ## 致谢
 
-- [wreq](https://github.com/0x676e67/wreq) 提供指纹识别能力。  
-- [Clewd](https://github.com/teralomaniac/clewd) 提供参考实现。  
-- [Clove](https://github.com/mirrorange/clove) 提供 Claude Code 相关逻辑。
+[clewdr](https://github.com/Xerxes-2/clewdr) by [Xerxes-2](https://github.com/Xerxes-2)
+
+## License
+
+AGPL-3.0
