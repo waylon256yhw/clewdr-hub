@@ -38,13 +38,31 @@ docker compose up -d
 ### 二进制
 
 ```bash
-# Linux x86_64 示例，其他架构见 Releases 页面
+# 下载（Linux x86_64 示例，其他架构见 Releases）
 curl -fL https://github.com/waylon256yhw/clewdr-hub/releases/latest/download/clewdr-linux-x86_64.zip -o clewdr.zip
 unzip clewdr.zip && chmod +x clewdr
 ./clewdr
 ```
 
 DB 自动创建在同目录（`clewdr.db`），可用 `--db /path/to/db` 指定。
+
+#### systemd 持久化（推荐）
+
+```bash
+# 安装二进制
+sudo mkdir -p /opt/clewdr
+sudo cp clewdr /opt/clewdr/
+sudo useradd -r -s /sbin/nologin clewdr 2>/dev/null || true
+sudo chown -R clewdr:clewdr /opt/clewdr
+
+# 安装 service
+sudo curl -fL https://raw.githubusercontent.com/waylon256yhw/clewdr-hub/master/deploy/clewdr.service \
+  -o /etc/systemd/system/clewdr.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now clewdr
+```
+
+查看状态：`systemctl status clewdr`，日志：`journalctl -u clewdr -f`。
 
 ### 环境变量
 

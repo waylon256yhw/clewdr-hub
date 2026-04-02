@@ -1,0 +1,18 @@
+[Unit]
+Description=clewdr-hub - Claude shared gateway
+After=network.target
+
+[Service]
+Type=simple
+User=clewdr
+Group=clewdr
+WorkingDirectory=/opt/clewdr
+ExecStart=/opt/clewdr/clewdr
+Restart=on-failure
+RestartSec=5
+
+Environment=CLEWDR_IP=0.0.0.0
+Environment=CLEWDR_PORT=8484
+
+[Install]
+WantedBy=multi-user.target
