@@ -23,25 +23,33 @@
 
 ## 部署
 
-### Docker
+### Docker Compose（推荐）
 
 ```bash
-docker run -d --name clewdr-hub \
-  -p 8484:8484 -v clewdr-data:/etc/clewdr \
-  ghcr.io/waylon256yhw/clewdr-hub:latest
+mkdir clewdr-hub && cd clewdr-hub
+curl -O https://raw.githubusercontent.com/waylon256yhw/clewdr-hub/master/docker-compose.yml
+docker compose up -d
 ```
+
+管理后台：`http://your-ip:8484`，默认账号 `admin` / `password`（首次登录强制改密）。
+
+数据持久化在 Docker volume `clewdr-data` 中，`docker compose down` 不会丢数据。
 
 ### 二进制
 
-[Releases](https://github.com/waylon256yhw/clewdr-hub/releases) 下载，解压运行：
-
 ```bash
-./clewdr                          # DB 在同目录 clewdr.db
-./clewdr --db /data/clewdr.db     # 指定 DB 路径
+# Linux x86_64 示例，其他架构见 Releases 页面
+curl -fL https://github.com/waylon256yhw/clewdr-hub/releases/latest/download/clewdr-linux-x86_64.zip -o clewdr.zip
+unzip clewdr.zip && chmod +x clewdr
+./clewdr
 ```
 
-| 环境变量 | 默认 | 说明 |
-|----------|------|------|
+DB 自动创建在同目录（`clewdr.db`），可用 `--db /path/to/db` 指定。
+
+### 环境变量
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
 | `CLEWDR_IP` | `0.0.0.0` | 监听地址 |
 | `CLEWDR_PORT` | `8484` | 监听端口 |
 | `ADMIN_PASSWORD` | `password` | 初始管理员密码（首次登录强制修改） |
