@@ -74,7 +74,7 @@ function WindowRow({ label, window }: { label: string; window: UsageWindow | nul
       </Group>
     );
   }
-  if (!window.has_reset) return null;
+  if (!window.has_reset && window.utilization === null) return null;
   const util = window.utilization ?? 0;
   return (
     <Stack gap={2}>
