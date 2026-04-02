@@ -3,9 +3,11 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Title,
   Table,
+  Badge,
   Button,
   Group,
   Modal,
+  MultiSelect,
   Select,
   TextInput,
   Stack,
@@ -24,12 +26,15 @@ import {
   IconTrash,
   IconCopy,
   IconCheck,
+  IconLink,
 } from "@tabler/icons-react";
 import {
   listKeys,
   listUsers,
+  listAccounts,
   createKey,
   deleteKey,
+  updateKeyBindings,
   qk,
   ApiError,
   type KeyRow,
@@ -45,12 +50,18 @@ function CreateKeyModal({
 }) {
   const queryClient = useQueryClient();
   const { data: usersData } = useQuery({ queryKey: qk.users, queryFn: listUsers });
+  const { data: accountsData } = useQuery({ queryKey: qk.accounts, queryFn: listAccounts });
   const [userId, setUserId] = useState<string | null>(null);
   const [label, setLabel] = useState("");
+  const [boundIds, setBoundIds] = useState<string[]>([]);
   const [newKey, setNewKey] = useState<string | null>(null);
 
   const mutation = useMutation({
-    mutationFn: () => createKey({ user_id: Number(userId), label: label || undefined }),
+    mutationFn: () => createKey({
+      user_id: Number(userId),
+      label: label || undefined,
+      bound_account_ids: boundIds.length > 0 ? boundIds.map(Number) : undefined,
+    }),
     onSuccess: (res) => {
       setNewKey(res.plaintext_key);
       queryClient.invalidateQueries({ queryKey: ["keys"] });
@@ -64,11 +75,14 @@ function CreateKeyModal({
     setNewKey(null);
     setUserId(null);
     setLabel("");
+    setBoundIds([]);
     onClose();
   };
 
   const users = usersData?.items ?? [];
+  const accounts = accountsData?.items ?? [];
   const userOptions = users.map((u) => ({ value: String(u.id), label: `${u.username}${u.display_name ? ` (${u.display_name})` : ""}` }));
+  const accountOptions = accounts.map((a) => ({ value: String(a.id), label: a.name }));
 
   return (
     <Modal opened={opened} onClose={handleClose} title="创建 API Key">
@@ -108,6 +122,15 @@ function CreateKeyModal({
               value={label}
               onChange={(e) => setLabel(e.currentTarget.value)}
             />
+            <MultiSelect
+              label="绑定账号（可选）"
+              placeholder="留空 = 使用全部账号"
+              data={accountOptions}
+              value={boundIds}
+              onChange={setBoundIds}
+              searchable
+              clearable
+            />
             <Group justify="flex-end">
               <Button variant="default" onClick={handleClose}>取消</Button>
               <Button
@@ -125,10 +148,60 @@ function CreateKeyModal({
   );
 }
 
+function BindingsModal({
+  keyItem,
+  onClose,
+}: {
+  keyItem: KeyRow | null;
+  onClose: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const { data: accountsData } = useQuery({ queryKey: qk.accounts, queryFn: listAccounts });
+  const [selected, setSelected] = useState<string[]>(
+    keyItem?.bound_account_ids.map(String) ?? [],
+  );
+
+  const mutation = useMutation({
+    mutationFn: () => updateKeyBindings(keyItem!.id, selected.map(Number)),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["keys"] });
+      notifications.show({ message: "绑定已更新", color: "green" });
+      onClose();
+    },
+    onError: (e) =>
+      notifications.show({ message: e instanceof ApiError ? e.message : "更新失败", color: "red" }),
+  });
+
+  const accounts = accountsData?.items ?? [];
+  const accountOptions = accounts.map((a) => ({ value: String(a.id), label: a.name }));
+
+  return (
+    <Modal opened={!!keyItem} onClose={onClose} title={`绑定账号 — ${keyItem?.label || `sk-${keyItem?.lookup_key}...`}`}>
+      <Stack>
+        <Text size="sm" c="dimmed">选择此 Key 可使用的上游账号。留空表示不限制。</Text>
+        <MultiSelect
+          label="绑定账号"
+          placeholder="全部可用"
+          data={accountOptions}
+          value={selected}
+          onChange={setSelected}
+          searchable
+          clearable
+        />
+        <Group justify="flex-end">
+          <Button variant="default" onClick={onClose}>取消</Button>
+          <Button onClick={() => mutation.mutate()} loading={mutation.isPending}>保存</Button>
+        </Group>
+      </Stack>
+    </Modal>
+  );
+}
+
 export default function Keys() {
   const queryClient = useQueryClient();
   const [createOpened, setCreateOpened] = useState(false);
   const [deleting, setDeleting] = useState<KeyRow | null>(null);
+  const [binding, setBinding] = useState<KeyRow | null>(null);
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["keys"],
@@ -168,33 +241,55 @@ export default function Keys() {
         </Alert>
       ) : (
         <ScrollArea>
-          <Table striped highlightOnHover verticalSpacing="sm">
+          <Table striped highlightOnHover verticalSpacing="xs">
             <Table.Thead>
               <Table.Tr>
                 <Table.Th>Key</Table.Th>
                 <Table.Th>用户</Table.Th>
-                <Table.Th>标签</Table.Th>
+                <Table.Th visibleFrom="sm">绑定</Table.Th>
                 <Table.Th visibleFrom="md">最后使用</Table.Th>
+                <Table.Th style={{ width: 80 }}>操作</Table.Th>
               </Table.Tr>
             </Table.Thead>
             <Table.Tbody>
               {keys.map((k) => (
                 <Table.Tr key={k.id}>
                   <Table.Td>
+                    {k.plaintext_key ? (
+                      <CopyButton value={k.plaintext_key}>
+                        {({ copied, copy }) => (
+                          <Tooltip label={copied ? "已复制" : "点击复制完整 Key"}>
+                            <Code style={{ cursor: "pointer" }} onClick={copy}>
+                              {copied ? "已复制!" : `sk-${k.lookup_key}...`}
+                            </Code>
+                          </Tooltip>
+                        )}
+                      </CopyButton>
+                    ) : (
+                      <Code>sk-{k.lookup_key}...</Code>
+                    )}
+                    {k.label && <Text size="xs" c="dimmed">{k.label}</Text>}
+                  </Table.Td>
+                  <Table.Td><Text size="sm">{k.username}</Text></Table.Td>
+                  <Table.Td visibleFrom="sm">
+                    {k.bound_account_ids.length === 0 ? (
+                      <Text size="xs" c="dimmed">全部</Text>
+                    ) : (
+                      <Group gap={4}>
+                        {k.bound_account_ids.map((id) => (
+                          <Badge key={id} size="xs" variant="light">#{id}</Badge>
+                        ))}
+                      </Group>
+                    )}
+                  </Table.Td>
+                  <Table.Td visibleFrom="md"><Text size="xs">{formatDate(k.last_used_at)}</Text></Table.Td>
+                  <Table.Td>
                     <Group gap={4} wrap="nowrap">
-                      {k.plaintext_key ? (
-                        <CopyButton value={k.plaintext_key}>
-                          {({ copied, copy }) => (
-                            <Tooltip label={copied ? "已复制" : "点击复制完整 Key"}>
-                              <Code style={{ cursor: "pointer" }} onClick={copy}>
-                                {copied ? "已复制!" : `sk-${k.lookup_key}...`}
-                              </Code>
-                            </Tooltip>
-                          )}
-                        </CopyButton>
-                      ) : (
-                        <Code>sk-{k.lookup_key}...</Code>
-                      )}
+                      <Tooltip label="绑定账号">
+                        <ActionIcon variant="subtle" size="sm" onClick={() => setBinding(k)}>
+                          <IconLink size={14} />
+                        </ActionIcon>
+                      </Tooltip>
                       <Tooltip label="删除">
                         <ActionIcon variant="subtle" color="red" size="sm" onClick={() => setDeleting(k)}>
                           <IconTrash size={14} />
@@ -202,9 +297,6 @@ export default function Keys() {
                       </Tooltip>
                     </Group>
                   </Table.Td>
-                  <Table.Td>{k.username}</Table.Td>
-                  <Table.Td>{k.label ?? "—"}</Table.Td>
-                  <Table.Td visibleFrom="md">{formatDate(k.last_used_at)}</Table.Td>
                 </Table.Tr>
               ))}
             </Table.Tbody>
@@ -213,6 +305,7 @@ export default function Keys() {
       )}
 
       <CreateKeyModal opened={createOpened} onClose={() => setCreateOpened(false)} />
+      <BindingsModal key={binding?.id ?? "none"} keyItem={binding} onClose={() => setBinding(null)} />
 
       <Modal opened={!!deleting} onClose={() => setDeleting(null)} title="删除密钥">
         <Stack>

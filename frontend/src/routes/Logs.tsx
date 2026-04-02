@@ -1,12 +1,11 @@
-import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useRef, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Title,
   Table,
   Badge,
   Button,
   Group,
-  TextInput,
   Select,
   Text,
   Skeleton,
@@ -15,8 +14,8 @@ import {
   Drawer,
   Code,
 } from "@mantine/core";
-import { IconChevronLeft, IconChevronRight, IconFilter } from "@tabler/icons-react";
-import { listRequests, listUsers, qk, type RequestLog, type RequestFilters } from "../api";
+import { IconChevronLeft, IconChevronRight } from "@tabler/icons-react";
+import { listModelsAdmin, listRequests, listUsers, qk, type RequestLog, type RequestFilters } from "../api";
 import { formatCost, formatDate, statusColor } from "../lib/format";
 
 const PAGE_SIZE = 50;
@@ -33,13 +32,16 @@ function LogDetail({ log, onClose }: { log: RequestLog | null; onClose: () => vo
     ["模型", log.model_raw],
     ["模型 (标准化)", log.model_normalized ?? "—"],
     ["流式", log.stream ? "是" : "否"],
-    ["开始时间", log.started_at],
-    ["完成时间", log.completed_at ?? "—"],
-    ["耗时", log.duration_ms != null ? `${log.duration_ms}ms` : "—"],
+    ["开始时间", formatDate(log.started_at)],
+    ["完成时间", formatDate(log.completed_at)],
+    ["首字耗时", log.ttft_ms != null ? `${log.ttft_ms}ms` : "—"],
+    ["总耗时", log.duration_ms != null ? `${log.duration_ms}ms` : "—"],
     ["状态", <Badge key="st" color={statusColor(log.status)} variant="light">{log.status}</Badge>],
     ["HTTP 状态", log.http_status != null ? String(log.http_status) : "—"],
     ["输入 Token", log.input_tokens?.toLocaleString() ?? "—"],
     ["输出 Token", log.output_tokens?.toLocaleString() ?? "—"],
+    ["缓存创建", log.cache_creation_tokens?.toLocaleString() ?? "—"],
+    ["缓存读取", log.cache_read_tokens?.toLocaleString() ?? "—"],
     ["费用", formatCost(log.cost_nanousd)],
     ["错误码", log.error_code ?? "—"],
     ["错误信息", log.error_message ?? "—"],
@@ -64,23 +66,74 @@ function LogDetail({ log, onClose }: { log: RequestLog | null; onClose: () => vo
 export default function Logs() {
   const [filters, setFilters] = useState<RequestFilters>({ offset: 0, limit: PAGE_SIZE });
   const [detail, setDetail] = useState<RequestLog | null>(null);
+  const queryClient = useQueryClient();
 
   const { data: usersData } = useQuery({ queryKey: qk.users, queryFn: listUsers });
   const userData = usersData?.items?.map((u) => ({ value: String(u.id), label: u.username })) ?? [];
 
+  const { data: modelsData } = useQuery({ queryKey: qk.models, queryFn: listModelsAdmin });
+  const modelData = modelsData?.items?.map((m) => ({ value: m.model_id, label: m.display_name })) ?? [];
+
   const { data, isLoading, error } = useQuery({
     queryKey: qk.requests(filters),
     queryFn: () => listRequests(filters),
+    refetchInterval: 60_000,
   });
+
+  const offset = filters.offset ?? 0;
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(null);
+  useEffect(() => {
+    if (offset > 0) return;
+    let disposed = false;
+    let es: EventSource | null = null;
+
+    function connect() {
+      if (disposed) return;
+      es = new EventSource("/api/admin/events");
+      es.onmessage = () => queryClient.invalidateQueries({ queryKey: ["requests"] });
+      es.onerror = () => {
+        es?.close();
+        es = null;
+        if (!disposed) reconnectTimer.current = setTimeout(connect, 5000);
+      };
+    }
+    connect();
+
+    return () => {
+      disposed = true;
+      es?.close();
+      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+    };
+  }, [offset, queryClient]);
 
   const logs = data?.items ?? [];
   const total = data?.total ?? 0;
-  const offset = filters.offset ?? 0;
   const hasNext = offset + PAGE_SIZE < total;
   const hasPrev = offset > 0;
 
   const updateFilter = (key: string, value: string | number | undefined) => {
     setFilters((f) => ({ ...f, [key]: value || undefined, offset: 0 }));
+  };
+
+  const setTimeRange = (range: string | null) => {
+    if (!range) {
+      setFilters((f) => ({ ...f, started_from: undefined, started_to: undefined, offset: 0 }));
+      return;
+    }
+    const now = new Date();
+    const shanghaiNow = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Shanghai" }));
+    const from = new Date(shanghaiNow);
+    if (range === "today") from.setHours(0, 0, 0, 0);
+    else if (range === "7d") from.setDate(from.getDate() - 7);
+    else if (range === "30d") from.setDate(from.getDate() - 30);
+    const offset = shanghaiNow.getTime() - now.getTime();
+    const utcFrom = new Date(from.getTime() - offset);
+    setFilters((f) => ({
+      ...f,
+      started_from: utcFrom.toISOString(),
+      started_to: undefined,
+      offset: 0,
+    }));
   };
 
   return (
@@ -117,14 +170,36 @@ export default function Logs() {
           size="sm"
           w={130}
         />
-        <TextInput
+        <Select
           label="模型"
-          placeholder="筛选..."
-          value={filters.model ?? ""}
-          onChange={(e) => updateFilter("model", e.currentTarget.value)}
+          placeholder="全部"
+          data={modelData}
+          value={filters.model ?? null}
+          onChange={(v) => updateFilter("model", v ?? undefined)}
+          clearable
+          searchable
           size="sm"
-          w={150}
-          leftSection={<IconFilter size={14} />}
+          w={200}
+        />
+        <Select
+          label="时间"
+          placeholder="全部"
+          data={[
+            { value: "today", label: "今天" },
+            { value: "7d", label: "近 7 天" },
+            { value: "30d", label: "近 30 天" },
+          ]}
+          value={
+            filters.started_from
+              ? (new Date().getTime() - new Date(filters.started_from).getTime() < 86400_000 ? "today"
+                : new Date().getTime() - new Date(filters.started_from).getTime() < 7 * 86400_000 + 60_000 ? "7d"
+                : "30d")
+              : null
+          }
+          onChange={setTimeRange}
+          clearable
+          size="sm"
+          w={120}
         />
       </Group>
 
@@ -144,9 +219,9 @@ export default function Logs() {
                   <Table.Th>用户</Table.Th>
                   <Table.Th>模型</Table.Th>
                   <Table.Th>状态</Table.Th>
-                  <Table.Th visibleFrom="md">耗时</Table.Th>
-                  <Table.Th visibleFrom="md">输入</Table.Th>
-                  <Table.Th visibleFrom="md">输出</Table.Th>
+                  <Table.Th visibleFrom="md">首字</Table.Th>
+                  <Table.Th visibleFrom="md">总耗时</Table.Th>
+                  <Table.Th visibleFrom="md">Token</Table.Th>
                   <Table.Th>费用</Table.Th>
                 </Table.Tr>
               </Table.Thead>
@@ -168,10 +243,19 @@ export default function Logs() {
                       </Badge>
                     </Table.Td>
                     <Table.Td visibleFrom="md">
-                      {log.duration_ms != null ? `${log.duration_ms}ms` : "—"}
+                      {log.ttft_ms != null ? `${(log.ttft_ms / 1000).toFixed(1)}s` : "—"}
                     </Table.Td>
-                    <Table.Td visibleFrom="md">{log.input_tokens?.toLocaleString() ?? "—"}</Table.Td>
-                    <Table.Td visibleFrom="md">{log.output_tokens?.toLocaleString() ?? "—"}</Table.Td>
+                    <Table.Td visibleFrom="md">
+                      {log.duration_ms != null ? `${(log.duration_ms / 1000).toFixed(1)}s` : "—"}
+                    </Table.Td>
+                    <Table.Td visibleFrom="md">
+                      <Text size="xs">
+                        {log.input_tokens != null ? `${log.input_tokens.toLocaleString()}→${(log.output_tokens ?? 0).toLocaleString()}` : "—"}
+                        {(log.cache_creation_tokens || log.cache_read_tokens)
+                          ? ` (w${(log.cache_creation_tokens ?? 0).toLocaleString()}/r${(log.cache_read_tokens ?? 0).toLocaleString()})`
+                          : ""}
+                      </Text>
+                    </Table.Td>
                     <Table.Td>{formatCost(log.cost_nanousd)}</Table.Td>
                   </Table.Tr>
                 ))}

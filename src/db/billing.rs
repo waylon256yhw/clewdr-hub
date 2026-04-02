@@ -15,6 +15,7 @@ pub struct RequestLogRow<'a> {
     pub started_at: &'a str,
     pub completed_at: Option<&'a str>,
     pub duration_ms: Option<i64>,
+    pub ttft_ms: Option<i64>,
     pub status: &'a str,
     pub http_status: Option<u16>,
     pub input_tokens: Option<i64>,
@@ -51,7 +52,7 @@ pub async fn insert_request_log(
         r#"INSERT INTO request_logs (
             request_id, request_type, user_id, api_key_id, account_id,
             model_raw, model_normalized, stream,
-            started_at, completed_at, duration_ms,
+            started_at, completed_at, duration_ms, ttft_ms,
             status, http_status,
             input_tokens, output_tokens,
             cache_creation_tokens, cache_read_tokens,
@@ -60,12 +61,12 @@ pub async fn insert_request_log(
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
             ?6, ?7, ?8,
-            ?9, ?10, ?11,
-            ?12, ?13,
-            ?14, ?15,
-            ?16, ?17,
-            ?18, ?19,
-            ?20, ?21, ?22
+            ?9, ?10, ?11, ?12,
+            ?13, ?14,
+            ?15, ?16,
+            ?17, ?18,
+            ?19, ?20,
+            ?21, ?22, ?23
         )"#,
     )
     .bind(r.request_id)
@@ -79,6 +80,7 @@ pub async fn insert_request_log(
     .bind(r.started_at)
     .bind(r.completed_at)
     .bind(r.duration_ms)
+    .bind(r.ttft_ms)
     .bind(r.status)
     .bind(r.http_status.map(|v| v as i32))
     .bind(r.input_tokens)

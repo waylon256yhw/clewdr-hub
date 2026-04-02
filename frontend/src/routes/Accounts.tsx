@@ -18,15 +18,17 @@ import {
   SimpleGrid,
   Progress,
   Divider,
+  Tooltip,
 } from "@mantine/core";
 import { useForm } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
-import { IconPlus, IconEdit, IconTrash } from "@tabler/icons-react";
+import { IconPlus, IconEdit, IconTrash, IconRefresh } from "@tabler/icons-react";
 import {
   listAccounts,
   createAccount,
   updateAccount,
   deleteAccount,
+  probeAllAccounts,
   qk,
   ApiError,
   type Account,
@@ -146,7 +148,6 @@ function AccountCard({
         <WindowRow label="5h 会话" window={rt?.session} />
         <WindowRow label="7d 总量" window={rt?.weekly} />
         <WindowRow label="7d Sonnet" window={rt?.weekly_sonnet} />
-        <WindowRow label="7d Opus" window={rt?.weekly_opus} />
       </Stack>
     </Paper>
   );
@@ -283,6 +284,7 @@ function DeleteModal({
 }
 
 export default function Accounts() {
+  const queryClient = useQueryClient();
   const { data, isLoading, error } = useQuery({
     queryKey: qk.accounts,
     queryFn: listAccounts,
@@ -291,6 +293,16 @@ export default function Accounts() {
   const [formOpened, setFormOpened] = useState(false);
   const [editing, setEditing] = useState<Account | null>(null);
   const [deleting, setDeleting] = useState<Account | null>(null);
+
+  const probeMut = useMutation({
+    mutationFn: probeAllAccounts,
+    onSuccess: () => {
+      notifications.show({ message: "已触发全量探测", color: "green" });
+      setTimeout(() => queryClient.invalidateQueries({ queryKey: qk.accounts }), 3000);
+    },
+    onError: (e) =>
+      notifications.show({ message: e instanceof ApiError ? e.message : "探测失败", color: "red" }),
+  });
 
   if (isLoading) return <Skeleton height={300} radius="md" />;
   if (error) {
@@ -316,9 +328,16 @@ export default function Accounts() {
     <>
       <Group justify="space-between" mb="md">
         <Title order={3}>账号池</Title>
-        <Button leftSection={<IconPlus size={16} />} onClick={openCreate}>
-          添加账号
-        </Button>
+        <Group gap="xs">
+          <Tooltip label="探测所有账号用量">
+            <ActionIcon variant="default" loading={probeMut.isPending} onClick={() => probeMut.mutate()}>
+              <IconRefresh size={16} />
+            </ActionIcon>
+          </Tooltip>
+          <Button leftSection={<IconPlus size={16} />} onClick={openCreate}>
+            添加账号
+          </Button>
+        </Group>
       </Group>
 
       {accounts.length === 0 ? (

@@ -11,9 +11,11 @@ import {
   Alert,
 } from "@mantine/core";
 import { IconRefresh } from "@tabler/icons-react";
+import { useNavigate } from "react-router";
 import { getOverview, qk } from "../api";
 
 export default function Dashboard() {
+  const navigate = useNavigate();
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: qk.overview,
     queryFn: getOverview,
@@ -45,9 +47,10 @@ export default function Dashboard() {
     );
   }
 
-  const cards: { label: string; value: React.ReactNode }[] = [
+  const cards: { label: string; value: React.ReactNode; link?: string }[] = [
     {
       label: "Cookie 状态",
+      link: "/accounts",
       value: (
         <Group gap="xs">
           <Badge color="green" variant="light">{data.cookies.valid} 可用</Badge>
@@ -58,6 +61,7 @@ export default function Dashboard() {
     },
     {
       label: "用户",
+      link: "/users",
       value: (
         <Group gap="xs">
           <Text fw={600} size="xl">{data.users.total}</Text>
@@ -67,19 +71,11 @@ export default function Dashboard() {
     },
     {
       label: "API Key",
+      link: "/keys",
       value: (
         <Group gap="xs">
           <Badge color="green" variant="light">{data.api_keys.active} 活跃</Badge>
           <Badge color="gray" variant="light">{data.api_keys.disabled} 禁用</Badge>
-        </Group>
-      ),
-    },
-    {
-      label: "账号池",
-      value: (
-        <Group gap="xs">
-          <Badge color="green" variant="light">{data.accounts.active} 活跃</Badge>
-          <Badge color="gray" variant="light">{data.accounts.disabled} 禁用</Badge>
         </Group>
       ),
     },
@@ -117,7 +113,15 @@ export default function Dashboard() {
       </Group>
       <SimpleGrid cols={{ base: 1, xs: 2, md: 3 }} spacing="md">
         {cards.map((card) => (
-          <Paper key={card.label} shadow="xs" p="md" radius="md" withBorder>
+          <Paper
+            key={card.label}
+            shadow="xs"
+            p="md"
+            radius="md"
+            withBorder
+            style={card.link ? { cursor: "pointer" } : undefined}
+            onClick={card.link ? () => navigate(card.link!) : undefined}
+          >
             <Text size="sm" c="dimmed" mb="xs">{card.label}</Text>
             {card.value}
           </Paper>

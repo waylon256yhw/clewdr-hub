@@ -77,6 +77,8 @@ function UserFormModal({
       },
     },
   });
+  const [watchedRole, setWatchedRole] = useState(editing?.role ?? "member");
+  form.watch("role", ({ value }) => setWatchedRole(value));
 
   const mutation = useMutation({
     mutationFn: async (values: typeof form.values) => {
@@ -117,11 +119,6 @@ function UserFormModal({
         <Stack>
           <TextInput label="用户名" required key={form.key("username")} {...form.getInputProps("username")} />
           <TextInput label="显示名称" key={form.key("display_name")} {...form.getInputProps("display_name")} />
-          <PasswordInput
-            label={editing ? "新密码（留空不修改）" : "密码"}
-            key={form.key("password")}
-            {...form.getInputProps("password")}
-          />
           <Select
             label="角色"
             data={[
@@ -131,6 +128,13 @@ function UserFormModal({
             key={form.key("role")}
             {...form.getInputProps("role")}
           />
+          {(!editing && watchedRole === "admin") || (editing && watchedRole === "admin" && editing.role !== "admin") ? (
+            <PasswordInput
+              label={editing ? "设置密码（提升为管理员）" : "密码"}
+              key={form.key("password")}
+              {...form.getInputProps("password")}
+            />
+          ) : null}
           <Select label="策略" data={policyData} key={form.key("policy_id")} {...form.getInputProps("policy_id")} />
           <TextInput label="备注" key={form.key("notes")} {...form.getInputProps("notes")} />
           <Group justify="flex-end">
@@ -289,53 +293,51 @@ function UsersTab({ policies }: { policies: Policy[] }) {
         <Text c="dimmed">暂无用户。</Text>
       ) : (
         <ScrollArea>
-          <Table striped highlightOnHover verticalSpacing="sm">
+          <Table striped highlightOnHover verticalSpacing="xs" style={{ tableLayout: "auto" }}>
             <Table.Thead>
               <Table.Tr>
-                <Table.Th>用户名</Table.Th>
-                <Table.Th>角色</Table.Th>
-                <Table.Th>策略</Table.Th>
-                <Table.Th visibleFrom="md">Key</Table.Th>
-                <Table.Th>本周</Table.Th>
-                <Table.Th>本月</Table.Th>
+                <Table.Th>用户</Table.Th>
+                <Table.Th>用量</Table.Th>
                 <Table.Th visibleFrom="md">最后活跃</Table.Th>
-                <Table.Th w={140}>操作</Table.Th>
+                <Table.Th style={{ width: 100 }}>操作</Table.Th>
               </Table.Tr>
             </Table.Thead>
             <Table.Tbody>
               {users.map((u) => (
                 <Table.Tr key={u.id}>
                   <Table.Td>
-                    <Group gap="xs">
-                      <Text size="sm">{u.username}</Text>
-                      {u.disabled_at && <Badge color="gray" size="xs">已禁用</Badge>}
+                    <Group gap={4} wrap="nowrap">
+                      <Text size="sm" fw={500}>{u.username}</Text>
+                      <Badge color={u.role === "admin" ? "blue" : "gray"} variant="light" size="xs">{u.role === "admin" ? "管理" : "成员"}</Badge>
+                      {u.disabled_at && <Badge color="red" size="xs">禁用</Badge>}
                     </Group>
+                    <Text size="xs" c="dimmed">{u.policy_name}{u.key_count > 0 ? ` · ${u.key_count} key` : ""}</Text>
                   </Table.Td>
-                  <Table.Td><Badge color={u.role === "admin" ? "blue" : "gray"} variant="light">{u.role === "admin" ? "管理员" : "成员"}</Badge></Table.Td>
-                  <Table.Td>{u.policy_name}</Table.Td>
-                  <Table.Td visibleFrom="md">{u.key_count}</Table.Td>
-                  <Table.Td>{formatCost(u.current_week_cost_nanousd)}</Table.Td>
-                  <Table.Td>{formatCost(u.current_month_cost_nanousd)}</Table.Td>
-                  <Table.Td visibleFrom="md">{formatDate(u.last_seen_at)}</Table.Td>
                   <Table.Td>
-                    <Group gap={4}>
+                    <Text size="xs">周 {formatCost(u.current_week_cost_nanousd)}</Text>
+                    <Text size="xs" c="dimmed">月 {formatCost(u.current_month_cost_nanousd)}</Text>
+                  </Table.Td>
+                  <Table.Td visibleFrom="md"><Text size="xs">{formatDate(u.last_seen_at)}</Text></Table.Td>
+                  <Table.Td>
+                    <Group gap={4} wrap="nowrap">
                       <Tooltip label="编辑">
-                        <ActionIcon variant="subtle" onClick={() => { setEditing(u); setFormOpened(true); }}>
-                          <IconEdit size={16} />
+                        <ActionIcon variant="subtle" size="sm" onClick={() => { setEditing(u); setFormOpened(true); }}>
+                          <IconEdit size={14} />
                         </ActionIcon>
                       </Tooltip>
                       <Tooltip label={u.disabled_at ? "启用" : "禁用"}>
                         <ActionIcon
                           variant="subtle"
+                          size="sm"
                           color={u.disabled_at ? "green" : "yellow"}
                           onClick={() => toggleMut.mutate({ id: u.id, disabled: !u.disabled_at })}
                         >
-                          {u.disabled_at ? <IconPlayerPlay size={16} /> : <IconPlayerPause size={16} />}
+                          {u.disabled_at ? <IconPlayerPlay size={14} /> : <IconPlayerPause size={14} />}
                         </ActionIcon>
                       </Tooltip>
                       <Tooltip label="删除">
-                        <ActionIcon variant="subtle" color="red" onClick={() => setDeleting(u)}>
-                          <IconTrash size={16} />
+                        <ActionIcon variant="subtle" size="sm" color="red" onClick={() => setDeleting(u)}>
+                          <IconTrash size={14} />
                         </ActionIcon>
                       </Tooltip>
                     </Group>
@@ -402,40 +404,41 @@ function PoliciesTab() {
         <Text c="dimmed">暂无策略。</Text>
       ) : (
         <ScrollArea>
-          <Table striped highlightOnHover verticalSpacing="sm">
+          <Table striped highlightOnHover verticalSpacing="xs" style={{ tableLayout: "auto" }}>
             <Table.Thead>
               <Table.Tr>
-                <Table.Th>名称</Table.Th>
-                <Table.Th>并发</Table.Th>
-                <Table.Th>RPM</Table.Th>
-                <Table.Th>周预算</Table.Th>
-                <Table.Th>月预算</Table.Th>
-                <Table.Th>用户数</Table.Th>
-                <Table.Th w={80}>操作</Table.Th>
+                <Table.Th>策略</Table.Th>
+                <Table.Th>预算</Table.Th>
+                <Table.Th visibleFrom="md">用户数</Table.Th>
+                <Table.Th style={{ width: 80 }}>操作</Table.Th>
               </Table.Tr>
             </Table.Thead>
             <Table.Tbody>
               {policies.map((p) => (
                 <Table.Tr key={p.id}>
-                  <Table.Td>{p.name}</Table.Td>
-                  <Table.Td>{p.max_concurrent}</Table.Td>
-                  <Table.Td>{p.rpm_limit}</Table.Td>
-                  <Table.Td>{formatCost(p.weekly_budget_nanousd)}</Table.Td>
-                  <Table.Td>{formatCost(p.monthly_budget_nanousd)}</Table.Td>
-                  <Table.Td>{p.assigned_user_count}</Table.Td>
                   <Table.Td>
-                    <Group gap={4}>
-                      <ActionIcon variant="subtle" onClick={() => { setEditing(p); setFormOpened(true); }}>
-                        <IconEdit size={16} />
+                    <Text size="sm" fw={500}>{p.name}</Text>
+                    <Text size="xs" c="dimmed">并发 {p.max_concurrent} · RPM {p.rpm_limit}</Text>
+                  </Table.Td>
+                  <Table.Td>
+                    <Text size="xs">周 {formatCost(p.weekly_budget_nanousd)}</Text>
+                    <Text size="xs" c="dimmed">月 {formatCost(p.monthly_budget_nanousd)}</Text>
+                  </Table.Td>
+                  <Table.Td visibleFrom="md">{p.assigned_user_count}</Table.Td>
+                  <Table.Td>
+                    <Group gap={4} wrap="nowrap">
+                      <ActionIcon variant="subtle" size="sm" onClick={() => { setEditing(p); setFormOpened(true); }}>
+                        <IconEdit size={14} />
                       </ActionIcon>
                       <Tooltip label={p.assigned_user_count > 0 ? "有关联用户" : "删除"}>
                         <ActionIcon
                           variant="subtle"
+                          size="sm"
                           color="red"
                           disabled={p.assigned_user_count > 0}
                           onClick={() => setDeleting(p)}
                         >
-                          <IconTrash size={16} />
+                          <IconTrash size={14} />
                         </ActionIcon>
                       </Tooltip>
                     </Group>

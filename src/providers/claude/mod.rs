@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Instant};
 use axum::response::Response;
 use colored::Colorize;
 use sqlx::SqlitePool;
+use tokio::sync::broadcast;
 use tracing::info;
 
 use super::LLMProvider;
@@ -57,14 +58,16 @@ struct ClaudeSharedState {
     cookie_actor_handle: CookieActorHandle,
     db: SqlitePool,
     stealth_profile: SharedStealthProfile,
+    event_tx: broadcast::Sender<()>,
 }
 
 impl ClaudeSharedState {
-    fn new(cookie_actor_handle: CookieActorHandle, db: SqlitePool, stealth_profile: SharedStealthProfile) -> Self {
+    fn new(cookie_actor_handle: CookieActorHandle, db: SqlitePool, stealth_profile: SharedStealthProfile, event_tx: broadcast::Sender<()>) -> Self {
         Self {
             cookie_actor_handle,
             db,
             stealth_profile,
+            event_tx,
         }
     }
 }
@@ -75,8 +78,8 @@ pub struct ClaudeProviders {
 }
 
 impl ClaudeProviders {
-    pub fn new(cookie_actor_handle: CookieActorHandle, db: SqlitePool, stealth_profile: SharedStealthProfile) -> Self {
-        let shared = Arc::new(ClaudeSharedState::new(cookie_actor_handle, db, stealth_profile));
+    pub fn new(cookie_actor_handle: CookieActorHandle, db: SqlitePool, stealth_profile: SharedStealthProfile, event_tx: broadcast::Sender<()>) -> Self {
+        let shared = Arc::new(ClaudeSharedState::new(cookie_actor_handle, db, stealth_profile, event_tx));
         let code = Arc::new(ClaudeCodeProvider::new(shared));
         Self { code }
     }
@@ -111,6 +114,7 @@ impl LLMProvider for ClaudeCodeProvider {
         state.system_prompt_hash = request.context.system_prompt_hash;
         state.usage = request.context.usage.to_owned();
         state.session_id = request.context.session_id.clone();
+        state.bound_account_ids = request.context.bound_account_ids.clone();
 
         // Set billing context for cost tracking
         state.billing_ctx = Some(BillingContext {
@@ -121,6 +125,7 @@ impl LLMProvider for ClaudeCodeProvider {
             model_raw: request.context.model_raw.clone(),
             request_id: request.context.request_id.clone(),
             started_at: request.context.started_at,
+            event_tx: self.shared.event_tx.clone(),
         });
 
         let ClaudeInvocation {
@@ -165,6 +170,6 @@ impl LLMProvider for ClaudeCodeProvider {
     }
 }
 
-pub fn build_providers(cookie_actor_handle: CookieActorHandle, db: SqlitePool, stealth_profile: SharedStealthProfile) -> ClaudeProviders {
-    ClaudeProviders::new(cookie_actor_handle, db, stealth_profile)
+pub fn build_providers(cookie_actor_handle: CookieActorHandle, db: SqlitePool, stealth_profile: SharedStealthProfile, event_tx: broadcast::Sender<()>) -> ClaudeProviders {
+    ClaudeProviders::new(cookie_actor_handle, db, stealth_profile, event_tx)
 }

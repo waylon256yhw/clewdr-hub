@@ -164,6 +164,8 @@ pub enum ClewdrError {
     RpmExceeded,
     #[snafu(display("Usage quota exceeded"))]
     QuotaExceeded,
+    #[snafu(display("All bound accounts are unavailable"))]
+    BoundAccountsUnavailable,
     #[snafu(display("Not found: {}", msg))]
     NotFound { msg: &'static str },
     #[snafu(display("Conflict: {}", msg))]
@@ -234,7 +236,8 @@ impl IntoResponse for ClewdrError {
             ClewdrError::InvalidAuth => (StatusCode::UNAUTHORIZED, json!(self.to_string())),
             ClewdrError::UserConcurrencyExceeded
             | ClewdrError::RpmExceeded
-            | ClewdrError::QuotaExceeded => {
+            | ClewdrError::QuotaExceeded
+            | ClewdrError::BoundAccountsUnavailable => {
                 let inner = ClaudeErrorBody {
                     message: json!(self.to_string()),
                     r#type: "rate_limit_error".to_string(),

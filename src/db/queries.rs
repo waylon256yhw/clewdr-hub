@@ -52,6 +52,15 @@ pub async fn authenticate_api_key(
         rpm_limit,
         weekly_budget_nanousd,
         monthly_budget_nanousd,
+        bound_account_ids: {
+            let rows: Vec<(i64,)> = sqlx::query_as(
+                "SELECT account_id FROM api_key_account_bindings WHERE api_key_id = ?1",
+            )
+            .bind(ak_id)
+            .fetch_all(pool)
+            .await?;
+            rows.into_iter().map(|(id,)| id).collect()
+        },
     }))
 }
 

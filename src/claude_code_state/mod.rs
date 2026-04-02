@@ -50,6 +50,7 @@ pub struct ClaudeCodeState {
     pub billing_ctx: Option<BillingContext>,
     pub stealth_profile: SharedStealthProfile,
     pub session_id: String,
+    pub bound_account_ids: Vec<i64>,
 }
 
 impl ClaudeCodeState {
@@ -69,6 +70,7 @@ impl ClaudeCodeState {
             billing_ctx: None,
             stealth_profile,
             session_id: String::new(),
+            bound_account_ids: Vec::new(),
         }
     }
 
@@ -141,7 +143,7 @@ impl ClaudeCodeState {
     pub async fn request_cookie(&mut self) -> Result<CookieStatus, ClewdrError> {
         let res = self
             .cookie_actor_handle
-            .request(self.system_prompt_hash)
+            .request(self.system_prompt_hash, &self.bound_account_ids)
             .await?;
         self.cookie = Some(res.to_owned());
         self.cookie_header_value = HeaderValue::from_str(res.cookie.to_string().as_str())?;

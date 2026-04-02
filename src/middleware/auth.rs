@@ -128,6 +128,7 @@ where
             rpm_limit,
             weekly_budget_nanousd,
             monthly_budget_nanousd,
+            bound_account_ids: Vec::new(),
         });
 
         Ok(Self)

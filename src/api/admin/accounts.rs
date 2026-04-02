@@ -247,3 +247,10 @@ pub async fn remove(
 
     Ok(StatusCode::NO_CONTENT)
 }
+
+pub async fn probe_all(
+    State(actor): State<CookieActorHandle>,
+) -> Result<StatusCode, ClewdrError> {
+    actor.probe_all().await?;
+    Ok(StatusCode::NO_CONTENT)
+}

@@ -34,11 +34,12 @@ enum CookieActorMessage {
     Return(CookieStatus, Option<Reason>),
     Submit(CookieStatus),
     CheckReset,
-    Request(Option<u64>, RpcReplyPort<Result<CookieStatus, ClewdrError>>),
+    Request(Option<u64>, Vec<i64>, RpcReplyPort<Result<CookieStatus, ClewdrError>>),
     GetStatus(RpcReplyPort<CookieStatusInfo>),
     Delete(CookieStatus, RpcReplyPort<Result<(), ClewdrError>>),
     Update1mSupport(CookieStatus, RpcReplyPort<Result<(), ClewdrError>>),
     ReloadFromDb,
+    ProbeAll,
     FlushDirty,
     SetHandle(CookieActorHandle),
 }
@@ -201,22 +202,48 @@ impl CookieActor {
         &self,
         state: &mut CookieActorState,
         hash: Option<u64>,
+        bound: &[i64],
     ) -> Result<CookieStatus, ClewdrError> {
+        use std::hash::{DefaultHasher, Hash, Hasher};
         Self::reset(state);
-        if let Some(hash) = hash
-            && let Some(cookie) = state.moka.get(&hash)
-            && let Some(cookie) = state.valid.iter().find(|&c| c == &cookie)
+
+        let cache_key = hash.map(|h| {
+            if bound.is_empty() {
+                h
+            } else {
+                let mut hasher = DefaultHasher::new();
+                h.hash(&mut hasher);
+                bound.hash(&mut hasher);
+                hasher.finish()
+            }
+        });
+
+        let is_allowed = |c: &CookieStatus| -> bool {
+            bound.is_empty() || c.account_id.is_some_and(|id| bound.contains(&id))
+        };
+
+        if let Some(key) = cache_key
+            && let Some(cached) = state.moka.get(&key)
+            && let Some(cookie) = state.valid.iter().find(|c| *c == &cached && is_allowed(c))
         {
-            state.moka.insert(hash, cookie.clone());
+            state.moka.insert(key, cookie.clone());
             return Ok(cookie.clone());
         }
-        let cookie = state
+
+        let idx = state
             .valid
-            .pop_front()
-            .ok_or(ClewdrError::NoCookieAvailable)?;
+            .iter()
+            .position(|c| is_allowed(c))
+            .ok_or(if bound.is_empty() {
+                ClewdrError::NoCookieAvailable
+            } else {
+                ClewdrError::BoundAccountsUnavailable
+            })?;
+
+        let cookie = state.valid.remove(idx).unwrap();
         state.valid.push_back(cookie.clone());
-        if let Some(hash) = hash {
-            state.moka.insert(hash, cookie.clone());
+        if let Some(key) = cache_key {
+            state.moka.insert(key, cookie.clone());
         }
         Ok(cookie)
     }
@@ -304,6 +331,15 @@ impl CookieActor {
             if cookie.email.is_none() || cookie.account_type.is_none() {
                 Self::spawn_probe(state, cookie);
             }
+        }
+    }
+
+    fn spawn_probe_all(state: &CookieActorState) {
+        for cookie in &state.valid {
+            Self::spawn_probe(state, cookie);
+        }
+        for cookie in &state.exhausted {
+            Self::spawn_probe(state, cookie);
         }
     }
 
@@ -585,8 +621,8 @@ impl Actor for CookieActor {
                 Self::refresh_usage_windows(state);
                 Self::reset(state);
             }
-            CookieActorMessage::Request(cache_hash, reply_port) => {
-                let result = self.dispatch(state, cache_hash);
+            CookieActorMessage::Request(cache_hash, bound, reply_port) => {
+                let result = self.dispatch(state, cache_hash, &bound);
                 reply_port.send(result)?;
             }
             CookieActorMessage::GetStatus(reply_port) => {
@@ -604,6 +640,16 @@ impl Actor for CookieActor {
             }
             CookieActorMessage::ReloadFromDb => {
                 Self::do_reload(state).await;
+            }
+            CookieActorMessage::ProbeAll => {
+                // Reactivate all disabled accounts so reload picks them up
+                if let Err(e) = sqlx::query(
+                    "UPDATE accounts SET status = 'active', invalid_reason = NULL WHERE status = 'disabled'"
+                ).execute(&state.db).await {
+                    warn!("Failed to reactivate disabled accounts: {e}");
+                }
+                Self::do_reload(state).await;
+                Self::spawn_probe_all(state);
             }
             CookieActorMessage::FlushDirty => {
                 Self::do_flush(state).await;
@@ -708,8 +754,8 @@ impl CookieActorHandle {
         });
     }
 
-    pub async fn request(&self, cache_hash: Option<u64>) -> Result<CookieStatus, ClewdrError> {
-        ractor::call!(self.actor_ref, CookieActorMessage::Request, cache_hash).map_err(|e| {
+    pub async fn request(&self, cache_hash: Option<u64>, bound_account_ids: &[i64]) -> Result<CookieStatus, ClewdrError> {
+        ractor::call!(self.actor_ref, CookieActorMessage::Request, cache_hash, bound_account_ids.to_vec()).map_err(|e| {
             ClewdrError::RactorError {
                 loc: Location::generate(),
                 msg: format!("Failed to communicate with CookieActor for request operation: {e}"),
@@ -773,6 +819,15 @@ impl CookieActorHandle {
             ClewdrError::RactorError {
                 loc: Location::generate(),
                 msg: format!("Failed to communicate with CookieActor for reload operation: {e}"),
+            }
+        })
+    }
+
+    pub async fn probe_all(&self) -> Result<(), ClewdrError> {
+        ractor::cast!(self.actor_ref, CookieActorMessage::ProbeAll).map_err(|e| {
+            ClewdrError::RactorError {
+                loc: Location::generate(),
+                msg: format!("Failed to communicate with CookieActor for probe operation: {e}"),
             }
         })
     }

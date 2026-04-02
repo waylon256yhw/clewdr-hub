@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use axum::extract::FromRef;
 use sqlx::SqlitePool;
+use tokio::sync::broadcast;
 
 use crate::providers::claude::ClaudeCodeProvider;
 use crate::services::cookie_actor::CookieActorHandle;
@@ -16,6 +17,7 @@ pub struct AppState {
     pub auth: AuthState,
     pub user_limiter: UserLimiterMap,
     pub stealth_profile: SharedStealthProfile,
+    pub event_tx: broadcast::Sender<()>,
 }
 
 #[derive(Clone)]
@@ -57,5 +59,11 @@ impl FromRef<AppState> for UserLimiterMap {
 impl FromRef<AppState> for SharedStealthProfile {
     fn from_ref(state: &AppState) -> Self {
         state.stealth_profile.clone()
+    }
+}
+
+impl FromRef<AppState> for broadcast::Sender<()> {
+    fn from_ref(state: &AppState) -> Self {
+        state.event_tx.clone()
     }
 }

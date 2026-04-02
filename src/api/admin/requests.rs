@@ -22,10 +22,13 @@ pub struct RequestLogResponse {
     pub started_at: String,
     pub completed_at: Option<String>,
     pub duration_ms: Option<i64>,
+    pub ttft_ms: Option<i64>,
     pub status: String,
     pub http_status: Option<i32>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    pub cache_creation_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
     pub cost_nanousd: i64,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
@@ -86,9 +89,11 @@ pub async fn list(
                   r.api_key_id, ak.label as key_label,
                   r.account_id, acc.name as account_name,
                   r.model_raw, r.model_normalized, r.stream,
-                  r.started_at, r.completed_at, r.duration_ms,
+                  r.started_at, r.completed_at, r.duration_ms, r.ttft_ms,
                   r.status, r.http_status,
-                  r.input_tokens, r.output_tokens, r.cost_nanousd,
+                  r.input_tokens, r.output_tokens,
+                  r.cache_creation_tokens, r.cache_read_tokens,
+                  r.cost_nanousd,
                   r.error_code, r.error_message
            FROM request_logs r
            LEFT JOIN users u ON r.user_id = u.id

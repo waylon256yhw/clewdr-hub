@@ -16,7 +16,6 @@ import {
   Tooltip,
   Table,
   Switch,
-  Badge,
   Modal,
   NumberInput,
   Popover,
@@ -265,11 +264,6 @@ function ModelsSection() {
 
   const models: ModelRow[] = data?.items ?? [];
 
-  const sourceBadge = (source: string) => {
-    const color = source === "builtin" ? "blue" : source === "admin" ? "green" : "orange";
-    return <Badge size="xs" variant="light" color={color}>{source}</Badge>;
-  };
-
   return (
     <Paper shadow="xs" p="md" radius="md" withBorder>
       <Stack>
@@ -305,9 +299,7 @@ function ModelsSection() {
             <Table.Thead>
               <Table.Tr>
                 <Table.Th>模型 ID</Table.Th>
-                <Table.Th>显示名</Table.Th>
-                <Table.Th>来源</Table.Th>
-                <Table.Th>排序</Table.Th>
+                <Table.Th visibleFrom="sm">显示名</Table.Th>
                 <Table.Th>启用</Table.Th>
                 <Table.Th />
               </Table.Tr>
@@ -315,10 +307,12 @@ function ModelsSection() {
             <Table.Tbody>
               {models.map((m) => (
                 <Table.Tr key={m.model_id}>
-                  <Table.Td><Text size="sm" ff="monospace">{m.model_id}</Text></Table.Td>
-                  <Table.Td><Text size="sm">{m.display_name}</Text></Table.Td>
-                  <Table.Td>{sourceBadge(m.source)}</Table.Td>
-                  <Table.Td><Text size="sm">{m.sort_order}</Text></Table.Td>
+                  <Table.Td>
+                    <Text size="sm" ff="monospace" c={m.source === "builtin" ? undefined : "teal"}>
+                      {m.model_id}
+                    </Text>
+                  </Table.Td>
+                  <Table.Td visibleFrom="sm"><Text size="sm">{m.display_name}</Text></Table.Td>
                   <Table.Td>
                     <Switch
                       checked={m.enabled === 1}
@@ -336,7 +330,7 @@ function ModelsSection() {
               ))}
               {models.length === 0 && (
                 <Table.Tr>
-                  <Table.Td colSpan={6}><Text size="sm" c="dimmed" ta="center">暂无模型</Text></Table.Td>
+                  <Table.Td colSpan={4}><Text size="sm" c="dimmed" ta="center">暂无模型</Text></Table.Td>
                 </Table.Tr>
               )}
             </Table.Tbody>

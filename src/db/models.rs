@@ -52,4 +52,5 @@ pub struct AuthenticatedUser {
     pub rpm_limit: i32,
     pub weekly_budget_nanousd: i64,
     pub monthly_budget_nanousd: i64,
+    pub bound_account_ids: Vec<i64>,
 }

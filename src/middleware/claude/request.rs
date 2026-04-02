@@ -282,6 +282,7 @@ where
             weekly_budget_nanousd: auth_user.as_ref().map(|u| u.weekly_budget_nanousd),
             monthly_budget_nanousd: auth_user.as_ref().map(|u| u.monthly_budget_nanousd),
             session_id,
+            bound_account_ids: auth_user.as_ref().map(|u| u.bound_account_ids.clone()).unwrap_or_default(),
         };
 
         Ok(Self(body, context))

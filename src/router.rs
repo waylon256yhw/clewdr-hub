@@ -27,7 +27,8 @@ impl RouterBuilder {
             .await
             .expect("Failed to start CookieActor");
         let stealth_profile = stealth::init_stealth_profile(&db_pool).await;
-        let claude_providers = crate::providers::claude::build_providers(cookie_handle.clone(), db_pool.clone(), stealth_profile.clone());
+        let (event_tx, _) = tokio::sync::broadcast::channel(64);
+        let claude_providers = crate::providers::claude::build_providers(cookie_handle.clone(), db_pool.clone(), stealth_profile.clone(), event_tx.clone());
         let session_secret = crate::db::load_session_secret(&db_pool)
             .await
             .expect("Failed to load session secret");
@@ -42,6 +43,7 @@ impl RouterBuilder {
             auth,
             user_limiter: UserLimiterMap::new(),
             stealth_profile,
+            event_tx,
         };
         RouterBuilder {
             state,

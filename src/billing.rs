@@ -1,5 +1,6 @@
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use sqlx::SqlitePool;
+use tokio::sync::broadcast;
 use tracing::warn;
 
 use crate::db::billing::{
@@ -25,6 +26,7 @@ pub struct BillingUsage {
     pub output_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
+    pub ttft_ms: Option<i64>,
 }
 
 impl BillingUsage {
@@ -50,6 +52,7 @@ pub struct BillingContext {
     pub model_raw: String,
     pub request_id: String,
     pub started_at: DateTime<Utc>,
+    pub event_tx: broadcast::Sender<()>,
 }
 
 /// Canonical alias table for model normalization.
@@ -164,6 +167,7 @@ pub async fn persist_billing_to_db(ctx: &BillingContext, usage: BillingUsage, st
         started_at: &ctx.started_at.to_rfc3339(),
         completed_at: Some(&completed_at),
         duration_ms: Some(duration_ms),
+        ttft_ms: usage.ttft_ms,
         status: "ok",
         http_status: Some(200),
         input_tokens: Some(usage.input_tokens as i64),
@@ -179,6 +183,8 @@ pub async fn persist_billing_to_db(ctx: &BillingContext, usage: BillingUsage, st
 
     if let Err(e) = insert_request_log(&ctx.db, &log).await {
         warn!("Failed to insert request log: {e}");
+    } else {
+        let _ = ctx.event_tx.send(());
     }
 
     if let Some(user_id) = ctx.user_id {

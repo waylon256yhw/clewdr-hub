@@ -422,6 +422,7 @@ impl ClaudeCodeState {
                 output_tokens: 0,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
+                ttft_ms: None,
             });
             self.persist_usage_totals(bu.input_tokens, bu.output_tokens, model_family)
                 .await;
@@ -457,7 +458,7 @@ impl ClaudeCodeState {
     ) -> Result<axum::response::Response, ClewdrError> {
         use std::sync::{
             Arc,
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicI64, AtomicU64, Ordering},
         };
 
         let input_tokens = self.usage.input_tokens as u64;
@@ -465,6 +466,8 @@ impl ClaudeCodeState {
         let input_sum = Arc::new(AtomicU64::new(input_tokens));
         let cache_create_sum = Arc::new(AtomicU64::new(0));
         let cache_read_sum = Arc::new(AtomicU64::new(0));
+        let ttft_ms = Arc::new(AtomicI64::new(-1));
+        let stream_start = std::time::Instant::now();
         let handle = self.cookie_actor_handle.clone();
         let cookie = self.cookie.clone();
         let billing_ctx = self.billing_ctx.clone();
@@ -473,6 +476,7 @@ impl ClaudeCodeState {
         let isum = input_sum.clone();
         let ccsum = cache_create_sum.clone();
         let crsum = cache_read_sum.clone();
+        let ttft = ttft_ms.clone();
         let stream = response.bytes_stream().eventsource().map_ok(move |event| {
             if let Ok(parsed) =
                 serde_json::from_str::<crate::types::claude::StreamEvent>(&event.data)
@@ -489,6 +493,9 @@ impl ClaudeCodeState {
                                 crsum.store(cr as u64, Ordering::Relaxed);
                             }
                         }
+                    }
+                    crate::types::claude::StreamEvent::ContentBlockDelta { .. } => {
+                        let _ = ttft.compare_exchange(-1, stream_start.elapsed().as_millis() as i64, Ordering::Relaxed, Ordering::Relaxed);
                     }
                     crate::types::claude::StreamEvent::MessageDelta { usage: Some(u), .. } => {
                         // usage fields in message_delta are cumulative, use store not add
@@ -523,11 +530,13 @@ impl ClaudeCodeState {
 
                         // Billing persistence
                         if let Some(ctx) = billing_ctx.clone() {
+                            let ttft_val = ttft.load(Ordering::Relaxed);
                             let usage = crate::billing::BillingUsage {
                                 input_tokens: total_input,
                                 output_tokens: total_out,
                                 cache_creation_tokens: total_cc,
                                 cache_read_tokens: total_cr,
+                                ttft_ms: if ttft_val >= 0 { Some(ttft_val) } else { None },
                             };
                             tokio::spawn(async move {
                                 crate::billing::persist_billing_to_db(&ctx, usage, true).await;
@@ -592,6 +601,7 @@ impl ClaudeCodeState {
                     output_tokens: output,
                     cache_creation_tokens: get_u64("cache_creation_input_tokens").unwrap_or(0),
                     cache_read_tokens: get_u64("cache_read_input_tokens").unwrap_or(0),
+                    ttft_ms: None,
                 });
             }
         }
@@ -606,6 +616,7 @@ impl ClaudeCodeState {
                 output_tokens,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
+                ttft_ms: None,
             });
         }
         None

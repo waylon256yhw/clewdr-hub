@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod common;
+pub mod events;
 pub mod keys;
 mod me;
 pub mod models;
@@ -30,8 +31,10 @@ pub fn admin_router() -> Router<AppState> {
         // Keys
         .route("/keys", get(keys::list).post(keys::create))
         .route("/keys/{id}", delete(keys::remove))
+        .route("/keys/{id}/bindings", put(keys::update_bindings))
         // Accounts
         .route("/accounts", get(accounts::list).post(accounts::create))
+        .route("/accounts/probe", post(accounts::probe_all))
         .route(
             "/accounts/{id}",
             put(accounts::update).delete(accounts::remove),
@@ -46,6 +49,8 @@ pub fn admin_router() -> Router<AppState> {
         .route("/cli-versions", get(settings::cli_versions))
         // Request logs
         .route("/requests", get(requests::list))
+        // SSE events
+        .route("/events", get(events::events))
         // Overview
         .route("/overview", get(overview::overview))
         // Change own password

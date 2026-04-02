@@ -141,6 +141,7 @@ export interface KeyRow {
   last_used_at: string | null;
   last_used_ip: string | null;
   created_at: string;
+  bound_account_ids: number[];
 }
 
 export interface KeyCreated {
@@ -150,6 +151,7 @@ export interface KeyCreated {
   lookup_key: string;
   plaintext_key: string;
   created_at: string;
+  bound_account_ids: number[];
 }
 
 export interface RequestLog {
@@ -168,10 +170,13 @@ export interface RequestLog {
   started_at: string;
   completed_at: string | null;
   duration_ms: number | null;
+  ttft_ms: number | null;
   status: string;
   http_status: number | null;
   input_tokens: number | null;
   output_tokens: number | null;
+  cache_creation_tokens: number | null;
+  cache_read_tokens: number | null;
   cost_nanousd: number;
   error_code: string | null;
   error_message: string | null;
@@ -218,6 +223,8 @@ export const updateAccount = (id: number, data: Record<string, unknown>) =>
   apiFetch<Account>(`/api/admin/accounts/${id}`, { method: "PUT", body: data });
 export const deleteAccount = (id: number) =>
   apiFetch<void>(`/api/admin/accounts/${id}`, { method: "DELETE" });
+export const probeAllAccounts = () =>
+  apiFetch<void>("/api/admin/accounts/probe", { method: "POST" });
 
 // Users
 export const listUsers = () =>
@@ -244,10 +251,12 @@ export const listKeys = (userId?: number) =>
   apiFetch<Paginated<KeyRow>>("/api/admin/keys", {
     params: { limit: 100, ...(userId !== undefined ? { user_id: userId } : {}) },
   });
-export const createKey = (data: { user_id: number; label?: string }) =>
+export const createKey = (data: { user_id: number; label?: string; bound_account_ids?: number[] }) =>
   apiFetch<KeyCreated>("/api/admin/keys", { method: "POST", body: data });
 export const deleteKey = (id: number) =>
   apiFetch<void>(`/api/admin/keys/${id}`, { method: "DELETE" });
+export const updateKeyBindings = (id: number, accountIds: number[]) =>
+  apiFetch<void>(`/api/admin/keys/${id}/bindings`, { method: "PUT", body: { account_ids: accountIds } });
 
 // Settings
 export const getSettings = () => apiFetch<Record<string, string>>("/api/admin/settings");
