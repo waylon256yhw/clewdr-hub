@@ -44,7 +44,7 @@ export default function Login() {
         <form onSubmit={handleSubmit}>
           <Stack>
             <Title order={3} ta="center">
-              ClewdR 管理面板
+              clewdr-hub 管理面板
             </Title>
             <TextInput
               label="用户名"
