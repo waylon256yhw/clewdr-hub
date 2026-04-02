@@ -11,6 +11,11 @@ services:
       - CLEWDR_IP=0.0.0.0
       - CLEWDR_PORT=8484
       # - ADMIN_PASSWORD=changeme
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   clewdr-data:

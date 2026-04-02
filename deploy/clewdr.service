@@ -7,12 +7,16 @@ Type=simple
 User=clewdr
 Group=clewdr
 WorkingDirectory=/opt/clewdr
-ExecStart=/opt/clewdr/clewdr
+ExecStart=/opt/clewdr/clewdr --log-dir /opt/clewdr/log
 Restart=on-failure
 RestartSec=5
 
 Environment=CLEWDR_IP=0.0.0.0
 Environment=CLEWDR_PORT=8484
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clewdr
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+/opt/clewdr/log/*.log {
+    daily
+    rotate 7
+    maxsize 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
