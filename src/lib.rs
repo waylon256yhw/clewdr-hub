@@ -26,9 +26,8 @@ pub static IS_DEV: LazyLock<bool> = LazyLock::new(|| std::env::var("CARGO_MANIFE
 
 pub static VERSION_INFO: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "v{} by {}\n| profile: {}\n| mode: {}\n| no_fs: {}",
+        "v{}\n| profile: {}\n| mode: {}\n| no_fs: {}",
         env!("CARGO_PKG_VERSION"),
-        env!("CARGO_PKG_AUTHORS"),
         if IS_DEBUG { "debug" } else { "release" },
         if *IS_DEV { "dev" } else { "prod" },
         if CLEWDR_CONFIG.load().no_fs {
@@ -42,9 +41,8 @@ pub static VERSION_INFO: LazyLock<String> = LazyLock::new(|| {
 /// Returns version info with colors for terminal output
 pub fn version_info_colored() -> String {
     format!(
-        "v{} by {}\n| profile: {}\n| mode: {}\n| no_fs: {}",
+        "v{}\n| profile: {}\n| mode: {}\n| no_fs: {}",
         env!("CARGO_PKG_VERSION"),
-        env!("CARGO_PKG_AUTHORS"),
         if IS_DEBUG {
             "debug".yellow()
         } else {
