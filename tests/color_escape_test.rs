@@ -13,7 +13,7 @@
 
 #[cfg(test)]
 mod tests {
-    use clewdr::config::Reason;
+    use clewdr_hub::config::Reason;
 
     /// ANSI escape sequence pattern
     const ANSI_ESCAPE_PATTERN: &str = "\x1b[";

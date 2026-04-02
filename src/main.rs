@@ -1,5 +1,5 @@
-use clewdr::{
-    self, FIG, IS_DEBUG,
+use clewdr_hub::{
+    FIG, IS_DEBUG,
     config::{CLEWDR_CONFIG, CONFIG_PATH, DB_PATH, LOG_DIR},
     error::ClewdrError,
     version_info_colored,
@@ -116,7 +116,7 @@ async fn main() -> Result<(), ClewdrError> {
     #[cfg(feature = "portable")]
     {
         use tracing::warn;
-        let updater = clewdr::services::update::ClewdrUpdater::new()?;
+        let updater = clewdr_hub::services::update::ClewdrUpdater::new()?;
         if let Err(e) = updater.check_for_updates().await {
             warn!("Update check failed: {}", e);
         }
@@ -134,18 +134,18 @@ async fn main() -> Result<(), ClewdrError> {
         DB_PATH.to_owned()
     };
     println!("Database: {}", db_path.display().to_string().blue());
-    let db_pool = clewdr::db::init_pool(&db_path).await?;
-    clewdr::db::seed_admin(&db_pool).await?;
+    let db_pool = clewdr_hub::db::init_pool(&db_path).await?;
+    clewdr_hub::db::seed_admin(&db_pool).await?;
 
     // Start log rotation background task
-    tokio::spawn(clewdr::services::log_rotation::start_log_rotation(
+    tokio::spawn(clewdr_hub::services::log_rotation::start_log_rotation(
         db_pool.clone(),
     ));
 
     // build axum router
     let addr = CLEWDR_CONFIG.load().address();
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    let router = clewdr::router::RouterBuilder::new(db_pool)
+    let router = clewdr_hub::router::RouterBuilder::new(db_pool)
         .await
         .with_default_setup()
         .build();
