@@ -37,6 +37,7 @@ pub async fn probe_cookie(
         Ok(s) => s,
         Err(e) => {
             warn!("[probe] failed to init state for account {account_id}: {e}");
+            let _ = handle.clear_probing(account_id).await;
             return;
         }
     };
@@ -50,6 +51,7 @@ pub async fn probe_cookie(
                 state.return_cookie(Some(reason)).await;
             } else {
                 warn!("[probe] bootstrap failed for account {account_id} (transient): {e}");
+                let _ = handle.clear_probing(account_id).await;
             }
             return;
         }

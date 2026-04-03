@@ -6,10 +6,19 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
-use super::common::{Paginated, PaginationParams};
+use super::common::PaginationParams;
 use crate::db::accounts::{AccountWithRuntime, load_all_accounts};
 use crate::error::ClewdrError;
 use crate::services::cookie_actor::CookieActorHandle;
+
+#[derive(Serialize)]
+pub struct AccountsListResponse {
+    pub items: Vec<AccountResponse>,
+    pub total: i64,
+    pub offset: i64,
+    pub limit: i64,
+    pub probing_ids: Vec<i64>,
+}
 
 #[derive(Serialize)]
 pub struct UsageWindowResponse {
@@ -100,16 +109,19 @@ pub struct UpdateAccountRequest {
 
 pub async fn list(
     State(db): State<SqlitePool>,
+    State(actor): State<CookieActorHandle>,
     Query(_params): Query<PaginationParams>,
-) -> Result<Json<Paginated<AccountResponse>>, ClewdrError> {
+) -> Result<Json<AccountsListResponse>, ClewdrError> {
     let all = load_all_accounts(&db).await?;
+    let probing_ids = actor.get_probing_ids().await.unwrap_or_default();
     let total = all.len() as i64;
     let items: Vec<AccountResponse> = all.iter().map(map_account).collect();
-    Ok(Json(Paginated {
+    Ok(Json(AccountsListResponse {
         items,
         total,
         offset: 0,
         limit: total,
+        probing_ids,
     }))
 }
 
@@ -122,6 +134,16 @@ pub async fn create(
     if max_slots <= 0 {
         return Err(ClewdrError::BadRequest {
             msg: "max_slots must be positive",
+        });
+    }
+
+    let dup: Option<(String,)> = sqlx::query_as("SELECT name FROM accounts WHERE cookie_blob = ?1")
+        .bind(&req.cookie_blob)
+        .fetch_optional(&db)
+        .await?;
+    if dup.is_some() {
+        return Err(ClewdrError::Conflict {
+            msg: "该 Cookie 已被其他账号使用",
         });
     }
 
@@ -257,6 +279,17 @@ pub async fn update(
         }
     }
     if let Some(ref blob) = req.cookie_blob {
+        let dup: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM accounts WHERE cookie_blob = ?1 AND id != ?2")
+                .bind(blob)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if dup.is_some() {
+            return Err(ClewdrError::Conflict {
+                msg: "该 Cookie 已被其他账号使用",
+            });
+        }
         sqlx::query("UPDATE accounts SET email = NULL, account_type = NULL, organization_uuid = NULL, invalid_reason = NULL WHERE id = ?1")
             .bind(id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM account_runtime_state WHERE account_id = ?1")

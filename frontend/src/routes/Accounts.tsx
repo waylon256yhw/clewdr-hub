@@ -96,10 +96,12 @@ function WindowRow({ label, window }: { label: string; window: UsageWindow | nul
 
 function AccountCard({
   account,
+  probing,
   onEdit,
   onDelete,
 }: {
   account: Account;
+  probing: boolean;
   onEdit: () => void;
   onDelete: () => void;
 }) {
@@ -120,6 +122,7 @@ function AccountCard({
 
       <Group gap="xs" mb="xs">
         <Badge color={statusColor(account.status)} variant="light" size="sm">{account.status}</Badge>
+        {probing && <Badge color="blue" variant="light" size="sm">探测中</Badge>}
         {account.account_type && (
           <Badge color={accountTypeColor(account.account_type)} variant="light" size="sm">
             {account.account_type}
@@ -282,7 +285,10 @@ export default function Accounts() {
   const { data, isLoading, error } = useQuery({
     queryKey: qk.accounts,
     queryFn: listAccounts,
-    refetchInterval: 30_000,
+    refetchInterval: (query) => {
+      const ids = query.state.data?.probing_ids ?? [];
+      return ids.length > 0 ? 3000 : 30_000;
+    },
   });
   const [formOpened, setFormOpened] = useState(false);
   const [editing, setEditing] = useState<Account | null>(null);
@@ -292,7 +298,7 @@ export default function Accounts() {
     mutationFn: probeAllAccounts,
     onSuccess: () => {
       notifications.show({ message: "已触发全量探测", color: "green" });
-      setTimeout(() => queryClient.invalidateQueries({ queryKey: qk.accounts }), 3000);
+      setTimeout(() => queryClient.invalidateQueries({ queryKey: qk.accounts }), 500);
     },
     onError: (e) =>
       notifications.show({ message: e instanceof ApiError ? e.message : "探测失败", color: "red" }),
@@ -308,6 +314,7 @@ export default function Accounts() {
   }
 
   const accounts = data?.items ?? [];
+  const probingIds = new Set(data?.probing_ids ?? []);
 
   const openCreate = () => {
     setEditing(null);
@@ -334,6 +341,12 @@ export default function Accounts() {
         </Group>
       </Group>
 
+      {probingIds.size > 0 && (
+        <Alert color="blue" mb="md">
+          正在探测 {probingIds.size}/{accounts.length} 个账号...
+        </Alert>
+      )}
+
       {accounts.length === 0 ? (
         <Text c="dimmed">暂无账号，点击上方按钮添加。</Text>
       ) : (
@@ -342,6 +355,7 @@ export default function Accounts() {
             <AccountCard
               key={a.id}
               account={a}
+              probing={probingIds.has(a.id)}
               onEdit={() => openEdit(a)}
               onDelete={() => setDeleting(a)}
             />

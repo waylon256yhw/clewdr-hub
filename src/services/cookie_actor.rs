@@ -11,8 +11,10 @@ use tracing::{error, info, warn};
 
 use crate::{
     claude_code_state::probe::probe_cookie,
-    config::{CookieStatus, Reason, UsageBreakdown, UselessCookie},
-    db::accounts::{batch_upsert_runtime_states, load_all_accounts, set_account_disabled},
+    config::{ClewdrCookie, CookieStatus, Reason, UsageBreakdown, UselessCookie},
+    db::accounts::{
+        batch_upsert_runtime_states, load_all_accounts, set_account_disabled, set_accounts_active,
+    },
     error::ClewdrError,
     stealth,
 };
@@ -47,6 +49,8 @@ enum CookieActorMessage {
     FlushDirty,
     SetHandle(CookieActorHandle),
     ReleaseSlot(i64),
+    GetProbingIds(RpcReplyPort<Vec<i64>>),
+    ClearProbing(i64),
 }
 
 #[derive(Debug)]
@@ -60,6 +64,8 @@ struct CookieActorState {
     handle: Option<CookieActorHandle>,
     /// Per-account inflight tracking: account_id → (current_inflight, max_slots)
     inflight: HashMap<i64, (u32, u32)>,
+    probing: HashSet<i64>,
+    reactivated: HashSet<i64>,
 }
 
 struct CookieActor;
@@ -274,46 +280,75 @@ impl CookieActor {
     }
 
     fn collect(state: &mut CookieActorState, cookie: CookieStatus, reason: Option<Reason>) {
-        let Some(reason) = reason else {
-            if let Some(existing) = state.valid.iter_mut().find(|c| **c == cookie) {
-                let aid = existing.account_id;
-                *existing = cookie;
-                existing.account_id = aid;
-                Self::mark_dirty(state, aid);
-            }
+        let aid = cookie.account_id;
+
+        if let Some(id) = aid {
+            state.probing.remove(&id);
+        }
+
+        // Remove from whichever set the cookie currently lives in
+        let was_valid = state
+            .valid
+            .iter()
+            .position(|c| *c == cookie)
+            .map(|i| state.valid.remove(i).unwrap());
+        let was_exhausted = state.exhausted.take(&cookie);
+        let tmp = UselessCookie::new(cookie.cookie.clone(), Reason::Null);
+        let was_invalid = state.invalid.take(&tmp);
+
+        if was_valid.is_none() && was_exhausted.is_none() && was_invalid.is_none() {
             return;
-        };
-        let mut find_remove = |cookie: &CookieStatus| {
-            state.valid.retain(|c| c != cookie);
-        };
-        match reason {
-            Reason::TooManyRequest(i) | Reason::Restricted(i) => {
-                find_remove(&cookie);
-                let mut cookie = cookie;
-                cookie.reset_time = Some(i);
-                cookie.reset_window_usage();
-                let aid = cookie.account_id;
-                if !state.exhausted.insert(cookie) {
-                    return;
+        }
+
+        let changed_set = match &reason {
+            None => {
+                if cookie.reset_time.is_some() {
+                    let was_ex = was_exhausted.is_some();
+                    state.exhausted.insert(cookie);
+                    !was_ex
+                } else {
+                    let was_val = was_valid.is_some();
+                    state.valid.push_back(cookie);
+                    !was_val
                 }
-                Self::mark_dirty(state, aid);
             }
-            reason => {
-                find_remove(&cookie);
-                let aid = cookie.account_id;
+            Some(Reason::TooManyRequest(i) | Reason::Restricted(i)) => {
+                let mut cookie = cookie;
+                cookie.reset_time = Some(*i);
+                cookie.reset_window_usage();
+                let was_ex = was_exhausted.is_some();
+                state.exhausted.insert(cookie);
+                !was_ex
+            }
+            Some(reason) => {
                 let mut cookie = cookie;
                 cookie.reset_window_usage();
-                if !state.invalid.insert(UselessCookie::with_account_id(
+                let was_inv = was_invalid.is_some();
+                state.invalid.insert(UselessCookie::with_account_id(
                     cookie.cookie.clone(),
-                    reason,
+                    reason.clone(),
                     aid,
-                )) {
-                    return;
-                }
-                Self::mark_dirty(state, aid);
+                ));
+                !was_inv
+            }
+        };
+
+        // Track invalid → valid/exhausted for DB status reactivation
+        let moved_out_of_invalid = was_invalid.is_some()
+            && matches!(
+                &reason,
+                None | Some(Reason::TooManyRequest(_) | Reason::Restricted(_))
+            );
+        if moved_out_of_invalid {
+            if let Some(id) = aid {
+                state.reactivated.insert(id);
             }
         }
-        Self::log(state);
+
+        Self::mark_dirty(state, aid);
+        if changed_set {
+            Self::log(state);
+        }
     }
 
     fn accept(state: &mut CookieActorState, cookie: CookieStatus) {
@@ -331,17 +366,21 @@ impl CookieActor {
         Self::log(state);
 
         if needs_probe {
-            Self::spawn_probe(state, &cookie);
+            Self::spawn_probe_guarded(state, &cookie);
         }
     }
 
-    fn spawn_probe(state: &CookieActorState, cookie: &CookieStatus) {
-        let Some(ref handle) = state.handle else {
-            return;
-        };
+    fn spawn_probe_guarded(state: &mut CookieActorState, cookie: &CookieStatus) {
         let Some(account_id) = cookie.account_id else {
             return;
         };
+        if state.probing.contains(&account_id) {
+            return;
+        }
+        let Some(ref handle) = state.handle else {
+            return;
+        };
+        state.probing.insert(account_id);
         let handle = handle.clone();
         let cookie = cookie.clone();
         let db = state.db.clone();
@@ -351,20 +390,39 @@ impl CookieActor {
         });
     }
 
-    fn spawn_probes_for_unprobed(state: &CookieActorState) {
-        for cookie in &state.valid {
-            if cookie.email.is_none() || cookie.account_type.is_none() {
-                Self::spawn_probe(state, cookie);
-            }
+    fn spawn_probes_for_unprobed(state: &mut CookieActorState) {
+        let unprobed: Vec<CookieStatus> = state
+            .valid
+            .iter()
+            .filter(|c| c.email.is_none() || c.account_type.is_none())
+            .cloned()
+            .collect();
+        for cookie in &unprobed {
+            Self::spawn_probe_guarded(state, cookie);
         }
     }
 
-    fn spawn_probe_all(state: &CookieActorState) {
-        for cookie in &state.valid {
-            Self::spawn_probe(state, cookie);
+    fn spawn_probe_all(state: &mut CookieActorState) {
+        let cookies: Vec<CookieStatus> = state
+            .valid
+            .iter()
+            .cloned()
+            .chain(state.exhausted.iter().cloned())
+            .collect();
+        for cookie in &cookies {
+            Self::spawn_probe_guarded(state, cookie);
         }
-        for cookie in &state.exhausted {
-            Self::spawn_probe(state, cookie);
+
+        let invalid_cookies: Vec<(ClewdrCookie, Option<i64>)> = state
+            .invalid
+            .iter()
+            .map(|uc| (uc.cookie.clone(), uc.account_id))
+            .collect();
+        for (cookie_blob, account_id) in invalid_cookies {
+            if let Ok(mut cs) = CookieStatus::new(&cookie_blob.to_string(), None) {
+                cs.account_id = account_id;
+                Self::spawn_probe_guarded(state, &cs);
+            }
         }
     }
 
@@ -463,6 +521,13 @@ impl CookieActor {
                 state.dirty.insert(*id);
             }
         }
+
+        if !state.reactivated.is_empty() {
+            let ids: Vec<i64> = state.reactivated.drain().collect();
+            if let Err(e) = set_accounts_active(&state.db, &ids).await {
+                warn!("Failed to reactivate accounts: {e}");
+            }
+        }
         for (id, reason) in &disabled {
             if let Err(e) = set_account_disabled(&state.db, *id, reason).await {
                 warn!("Failed to set account {id} disabled: {e}");
@@ -497,6 +562,8 @@ impl CookieActor {
         }
         // Drain invalid set — will be rebuilt from DB
         state.invalid.clear();
+
+        let mut replaced_ids = Vec::new();
 
         // Rebuild from DB
         for row in &accounts {
@@ -565,6 +632,9 @@ impl CookieActor {
                     }
                 }
                 // Cookie changed = credential replacement → use fresh defaults from new()
+                else {
+                    replaced_ids.push(row.id);
+                }
             } else if let Some(ref runtime) = row.runtime {
                 let params = runtime.to_params();
                 cs.apply_runtime_state(&params);
@@ -599,6 +669,13 @@ impl CookieActor {
         }
         state.inflight = new_inflight;
 
+        // Clean stale probing IDs (deleted accounts + cookie-replaced accounts)
+        let current_ids: HashSet<i64> = accounts.iter().map(|r| r.id).collect();
+        state.probing.retain(|id| current_ids.contains(id));
+        for id in &replaced_ids {
+            state.probing.remove(id);
+        }
+
         Self::log(state);
 
         // Spawn probes for unprobed cookies
@@ -630,6 +707,8 @@ impl Actor for CookieActor {
             dirty: HashSet::new(),
             handle: None,
             inflight: HashMap::new(),
+            probing: HashSet::new(),
+            reactivated: HashSet::new(),
         };
 
         // Load accounts from DB
@@ -676,13 +755,6 @@ impl Actor for CookieActor {
                 Self::do_reload(state).await;
             }
             CookieActorMessage::ProbeAll => {
-                // Reactivate all disabled accounts so reload picks them up
-                if let Err(e) = sqlx::query(
-                    "UPDATE accounts SET status = 'active', invalid_reason = NULL WHERE status = 'disabled'"
-                ).execute(&state.db).await {
-                    warn!("Failed to reactivate disabled accounts: {e}");
-                }
-                Self::do_reload(state).await;
                 Self::spawn_probe_all(state);
             }
             CookieActorMessage::FlushDirty => {
@@ -697,6 +769,12 @@ impl Actor for CookieActor {
                 if let Some((cur, _)) = state.inflight.get_mut(&account_id) {
                     *cur = cur.saturating_sub(1);
                 }
+            }
+            CookieActorMessage::GetProbingIds(reply_port) => {
+                reply_port.send(state.probing.iter().copied().collect())?;
+            }
+            CookieActorMessage::ClearProbing(account_id) => {
+                state.probing.remove(&account_id);
             }
         }
         Ok(())
@@ -880,5 +958,23 @@ impl CookieActorHandle {
 
     pub async fn release_slot(&self, account_id: i64) {
         let _ = ractor::cast!(self.actor_ref, CookieActorMessage::ReleaseSlot(account_id));
+    }
+
+    pub async fn get_probing_ids(&self) -> Result<Vec<i64>, ClewdrError> {
+        ractor::call!(self.actor_ref, CookieActorMessage::GetProbingIds).map_err(|e| {
+            ClewdrError::RactorError {
+                loc: Location::generate(),
+                msg: format!("Failed to communicate with CookieActor for get probing ids: {e}"),
+            }
+        })
+    }
+
+    pub async fn clear_probing(&self, account_id: i64) -> Result<(), ClewdrError> {
+        ractor::cast!(self.actor_ref, CookieActorMessage::ClearProbing(account_id)).map_err(|e| {
+            ClewdrError::RactorError {
+                loc: Location::generate(),
+                msg: format!("Failed to communicate with CookieActor for clear probing: {e}"),
+            }
+        })
     }
 }

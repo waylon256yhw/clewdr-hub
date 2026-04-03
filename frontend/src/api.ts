@@ -209,9 +209,17 @@ export const getOverview = () => apiFetch<OverviewResponse>("/api/admin/overview
 // Version (no auth)
 export const getVersion = () => fetch("/api/version").then((r) => r.text());
 
+export interface AccountsListResponse {
+  items: Account[];
+  total: number;
+  offset: number;
+  limit: number;
+  probing_ids: number[];
+}
+
 // Accounts
 export const listAccounts = () =>
-  apiFetch<Paginated<Account>>("/api/admin/accounts", { params: { limit: 100 } });
+  apiFetch<AccountsListResponse>("/api/admin/accounts", { params: { limit: 100 } });
 export const createAccount = (data: {
   name: string;
   rr_order?: number;

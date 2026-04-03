@@ -337,6 +337,23 @@ pub async fn set_account_disabled(
     Ok(())
 }
 
+pub async fn set_accounts_active(pool: &SqlitePool, ids: &[i64]) -> Result<(), sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "UPDATE accounts SET status = 'active', invalid_reason = NULL, updated_at = CURRENT_TIMESTAMP \
+         WHERE id IN ({placeholders}) AND status = 'disabled'"
+    );
+    let mut q = sqlx::query(&sql);
+    for id in ids {
+        q = q.bind(id);
+    }
+    q.execute(pool).await?;
+    Ok(())
+}
+
 /// Update account telemetry metadata (email, account_type, org_uuid).
 /// Only updates if the account's cookie_blob still matches the expected value,
 /// preventing stale probes from overwriting metadata after cookie replacement.
