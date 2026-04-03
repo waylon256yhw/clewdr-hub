@@ -646,7 +646,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clewdr-hub"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "arc-swap",
  "argon2",
@@ -665,7 +665,7 @@ dependencies = [
  "const_format",
  "dhat",
  "enable-ansi-support",
- "etcetera 0.11.0",
+ "etcetera",
  "eventsource-stream",
  "figment",
  "futures",
@@ -1156,16 +1156,6 @@ dependencies = [
  "cfg-if",
  "home",
  "windows-sys 0.48.0",
-]
-
-[[package]]
-name = "etcetera"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de48cc4d1c1d97a20fd819def54b890cadde72ed3ad0c614822a0a433361be96"
-dependencies = [
- "cfg-if",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3350,7 +3340,7 @@ dependencies = [
  "byteorder",
  "crc",
  "dotenvy",
- "etcetera 0.8.0",
+ "etcetera",
  "futures-channel",
  "futures-core",
  "futures-util",

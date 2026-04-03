@@ -29,6 +29,7 @@ interface AuthContextValue {
   user: AuthUser | null;
   loading: boolean;
   mustChangePassword: boolean;
+  setMustChangePassword: (v: boolean) => void;
   login: (username: string, password: string) => Promise<LoginResponse>;
   logout: () => void;
 }
@@ -91,7 +92,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [queryClient, navigate]);
 
   return (
-    <AuthContext value={{ user, loading, mustChangePassword, login, logout }}>
+    <AuthContext value={{ user, loading, mustChangePassword, setMustChangePassword, login, logout }}>
       {children}
     </AuthContext>
   );
@@ -105,7 +106,7 @@ export function RequireAuth({ children }: { children: ReactNode }) {
 }
 
 export function ForceChangePasswordModal() {
-  const { mustChangePassword } = useAuth();
+  const { mustChangePassword, setMustChangePassword } = useAuth();
   const [open, setOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
@@ -126,6 +127,7 @@ export function ForceChangePasswordModal() {
     setSubmitting(true);
     try {
       await changePassword({ current_password, new_password });
+      setMustChangePassword(false);
       notifications.show({ message: "密码已修改，请牢记新密码", color: "green" });
       setOpen(false);
     } catch (err) {

@@ -33,7 +33,6 @@ pub struct CreateUserRequest {
     pub username: String,
     pub display_name: Option<String>,
     pub password: Option<String>,
-    pub role: Option<String>,
     pub policy_id: Option<i64>,
     pub notes: Option<String>,
 }
@@ -110,27 +109,7 @@ pub async fn create(
     State(db): State<SqlitePool>,
     Json(req): Json<CreateUserRequest>,
 ) -> Result<(StatusCode, Json<UserResponse>), ClewdrError> {
-    let role = req.role.as_deref().unwrap_or("member");
-    if role != "admin" && role != "member" {
-        return Err(ClewdrError::BadRequest {
-            msg: "role must be 'admin' or 'member'",
-        });
-    }
-    if role == "admin" {
-        match &req.password {
-            None => {
-                return Err(ClewdrError::BadRequest {
-                    msg: "password is required for admin users",
-                });
-            }
-            Some(pw) if pw.trim().is_empty() => {
-                return Err(ClewdrError::BadRequest {
-                    msg: "password cannot be empty",
-                });
-            }
-            _ => {}
-        }
-    }
+    let role = "member";
 
     let policy_id = req.policy_id.unwrap_or(1);
     let policy_exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM policies WHERE id = ?1")
@@ -198,16 +177,29 @@ pub async fn update(
     // Use a transaction for atomicity (prevents TOCTOU on admin checks + partial writes)
     let mut tx = db.begin().await?;
 
-    let existing: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT role, password_hash FROM users WHERE id = ?1")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    let Some((current_role, current_pw_hash)) = existing else {
+    let existing: Option<(String,)> = sqlx::query_as("SELECT role FROM users WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some((current_role,)) = existing else {
         return Err(ClewdrError::NotFound {
             msg: "user not found",
         });
     };
+
+    // Prevent renaming the admin account
+    if current_role == "admin" && req.username.is_some() {
+        return Err(ClewdrError::BadRequest {
+            msg: "admin username cannot be changed",
+        });
+    }
+
+    // Prevent role changes
+    if req.role.is_some() {
+        return Err(ClewdrError::BadRequest {
+            msg: "role changes are not supported",
+        });
+    }
 
     if let Some(ref username) = req.username {
         sqlx::query("UPDATE users SET username = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
@@ -256,33 +248,6 @@ pub async fn update(
         .execute(&mut *tx)
         .await?;
         sqlx::query("UPDATE users SET session_version = session_version + 1 WHERE id = ?1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-    }
-    if let Some(ref role) = req.role {
-        if role != "admin" && role != "member" {
-            return Err(ClewdrError::BadRequest {
-                msg: "role must be 'admin' or 'member'",
-            });
-        }
-        if role == "admin" && current_pw_hash.is_none() && req.password.is_none() {
-            return Err(ClewdrError::BadRequest {
-                msg: "cannot promote to admin without a password",
-            });
-        }
-        if current_role == "admin" && role == "member" {
-            let admin_count: (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled_at IS NULL AND id != ?1"
-            ).bind(id).fetch_one(&mut *tx).await?;
-            if admin_count.0 == 0 {
-                return Err(ClewdrError::Conflict {
-                    msg: "cannot demote the last active admin",
-                });
-            }
-        }
-        sqlx::query("UPDATE users SET role = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(role)
             .bind(id)
             .execute(&mut *tx)
             .await?;

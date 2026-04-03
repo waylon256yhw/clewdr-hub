@@ -9,7 +9,6 @@ import {
   Group,
   Modal,
   TextInput,
-  PasswordInput,
   NumberInput,
   Select,
   Stack,
@@ -59,26 +58,20 @@ function UserFormModal({
   policies: Policy[];
 }) {
   const queryClient = useQueryClient();
+  const isAdmin = editing?.role === "admin";
   const form = useForm({
     mode: "uncontrolled",
     initialValues: {
       username: editing?.username ?? "",
       display_name: editing?.display_name ?? "",
       password: "",
-      role: editing?.role ?? "member",
       policy_id: String(editing?.policy_id ?? policies[0]?.id ?? 1),
       notes: editing?.notes ?? "",
     },
     validate: {
       username: (v) => (v.trim() ? null : "必填"),
-      password: (v, values) => {
-        if (!editing && values.role === "admin" && !v) return "管理员必须设置密码";
-        return null;
-      },
     },
   });
-  const [watchedRole, setWatchedRole] = useState(editing?.role ?? "member");
-  form.watch("role", ({ value }) => setWatchedRole(value));
 
   const mutation = useMutation({
     mutationFn: async (values: typeof form.values) => {
@@ -88,7 +81,6 @@ function UserFormModal({
         if (values.display_name !== (editing.display_name ?? ""))
           body.display_name = values.display_name || null;
         if (values.password) body.password = values.password;
-        if (values.role !== editing.role) body.role = values.role;
         if (Number(values.policy_id) !== editing.policy_id) body.policy_id = Number(values.policy_id);
         if (values.notes !== (editing.notes ?? "")) body.notes = values.notes || null;
         return updateUser(editing.id, body);
@@ -96,7 +88,6 @@ function UserFormModal({
       body.username = values.username;
       if (values.display_name) body.display_name = values.display_name;
       if (values.password) body.password = values.password;
-      body.role = values.role;
       body.policy_id = Number(values.policy_id);
       if (values.notes) body.notes = values.notes;
       return createUser(body);
@@ -117,24 +108,8 @@ function UserFormModal({
     <Modal opened={opened} onClose={onClose} title={editing ? "编辑用户" : "新建用户"}>
       <form onSubmit={form.onSubmit((v) => mutation.mutate(v))}>
         <Stack>
-          <TextInput label="用户名" required key={form.key("username")} {...form.getInputProps("username")} />
+          <TextInput label="用户名" required disabled={isAdmin} key={form.key("username")} {...form.getInputProps("username")} />
           <TextInput label="显示名称" key={form.key("display_name")} {...form.getInputProps("display_name")} />
-          <Select
-            label="角色"
-            data={[
-              { value: "admin", label: "管理员" },
-              { value: "member", label: "成员" },
-            ]}
-            key={form.key("role")}
-            {...form.getInputProps("role")}
-          />
-          {(!editing && watchedRole === "admin") || (editing && watchedRole === "admin" && editing.role !== "admin") ? (
-            <PasswordInput
-              label={editing ? "设置密码（提升为管理员）" : "密码"}
-              key={form.key("password")}
-              {...form.getInputProps("password")}
-            />
-          ) : null}
           <Select label="策略" data={policyData} key={form.key("policy_id")} {...form.getInputProps("policy_id")} />
           <TextInput label="备注" key={form.key("notes")} {...form.getInputProps("notes")} />
           <Group justify="flex-end">
@@ -308,7 +283,7 @@ function UsersTab({ policies }: { policies: Policy[] }) {
                   <Table.Td>
                     <Group gap={4} wrap="nowrap">
                       <Text size="sm" fw={500}>{u.username}</Text>
-                      <Badge color={u.role === "admin" ? "blue" : "gray"} variant="light" size="xs">{u.role === "admin" ? "管理" : "成员"}</Badge>
+                      {u.role === "admin" && <Badge color="blue" variant="light" size="xs">管理</Badge>}
                       {u.disabled_at && <Badge color="red" size="xs">禁用</Badge>}
                     </Group>
                     <Text size="xs" c="dimmed">{u.policy_name}{u.key_count > 0 ? ` · ${u.key_count} key` : ""}</Text>
@@ -320,26 +295,32 @@ function UsersTab({ policies }: { policies: Policy[] }) {
                   <Table.Td visibleFrom="md"><Text size="xs">{formatDate(u.last_seen_at)}</Text></Table.Td>
                   <Table.Td>
                     <Group gap={4} wrap="nowrap">
-                      <Tooltip label="编辑">
-                        <ActionIcon variant="subtle" size="sm" onClick={() => { setEditing(u); setFormOpened(true); }}>
-                          <IconEdit size={14} />
-                        </ActionIcon>
-                      </Tooltip>
-                      <Tooltip label={u.disabled_at ? "启用" : "禁用"}>
-                        <ActionIcon
-                          variant="subtle"
-                          size="sm"
-                          color={u.disabled_at ? "green" : "yellow"}
-                          onClick={() => toggleMut.mutate({ id: u.id, disabled: !u.disabled_at })}
-                        >
-                          {u.disabled_at ? <IconPlayerPlay size={14} /> : <IconPlayerPause size={14} />}
-                        </ActionIcon>
-                      </Tooltip>
-                      <Tooltip label="删除">
-                        <ActionIcon variant="subtle" size="sm" color="red" onClick={() => setDeleting(u)}>
-                          <IconTrash size={14} />
-                        </ActionIcon>
-                      </Tooltip>
+                      {u.role !== "admin" && (
+                        <Tooltip label="编辑">
+                          <ActionIcon variant="subtle" size="sm" onClick={() => { setEditing(u); setFormOpened(true); }}>
+                            <IconEdit size={14} />
+                          </ActionIcon>
+                        </Tooltip>
+                      )}
+                      {u.role !== "admin" && (
+                        <Tooltip label={u.disabled_at ? "启用" : "禁用"}>
+                          <ActionIcon
+                            variant="subtle"
+                            size="sm"
+                            color={u.disabled_at ? "green" : "yellow"}
+                            onClick={() => toggleMut.mutate({ id: u.id, disabled: !u.disabled_at })}
+                          >
+                            {u.disabled_at ? <IconPlayerPlay size={14} /> : <IconPlayerPause size={14} />}
+                          </ActionIcon>
+                        </Tooltip>
+                      )}
+                      {u.role !== "admin" && (
+                        <Tooltip label="删除">
+                          <ActionIcon variant="subtle" size="sm" color="red" onClick={() => setDeleting(u)}>
+                            <IconTrash size={14} />
+                          </ActionIcon>
+                        </Tooltip>
+                      )}
                     </Group>
                   </Table.Td>
                 </Table.Tr>

@@ -18,9 +18,17 @@ pub async fn change_password(
     Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<impl IntoResponse, ClewdrError> {
-    if req.new_password.trim().is_empty() {
+    let new_password = req.new_password.trim();
+
+    if new_password.len() < 6 {
         return Err(ClewdrError::BadRequest {
-            msg: "new password cannot be empty",
+            msg: "new password must be at least 6 characters",
+        });
+    }
+
+    if new_password == req.current_password.trim() {
+        return Err(ClewdrError::BadRequest {
+            msg: "new password must differ from current password",
         });
     }
 
@@ -53,7 +61,7 @@ pub async fn change_password(
     verify_result?;
 
     let new_hash = {
-        let pw = req.new_password.clone();
+        let pw = new_password.to_owned();
         let result: Result<String, ClewdrError> =
             tokio::task::spawn_blocking(move || hash_password_public(&pw))
                 .await

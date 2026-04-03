@@ -55,13 +55,11 @@ pub fn validate_session_cookie(secret: &[u8; 32], value: &str) -> Option<Session
 }
 
 pub fn set_cookie_header(cookie_value: &str, max_age: u64) -> String {
-    format!(
-        "{COOKIE_NAME}={cookie_value}; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age={max_age}"
-    )
+    format!("{COOKIE_NAME}={cookie_value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}")
 }
 
 pub fn clear_cookie_header() -> String {
-    format!("{COOKIE_NAME}=; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=0")
+    format!("{COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
 }
 
 pub fn extract_session_cookie(cookie_header: &str) -> Option<&str> {
