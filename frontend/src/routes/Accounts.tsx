@@ -32,6 +32,7 @@ import {
   qk,
   ApiError,
   type Account,
+  type AccountsListResponse,
   type UsageWindow,
 } from "../api";
 import { statusColor } from "../lib/format";
@@ -97,11 +98,13 @@ function WindowRow({ label, window }: { label: string; window: UsageWindow | nul
 function AccountCard({
   account,
   probing,
+  probeError,
   onEdit,
   onDelete,
 }: {
   account: Account;
   probing: boolean;
+  probeError?: string;
   onEdit: () => void;
   onDelete: () => void;
 }) {
@@ -136,6 +139,10 @@ function AccountCard({
 
       {account.invalid_reason && (
         <Text size="xs" c="red" mb="xs">{account.invalid_reason}</Text>
+      )}
+
+      {probeError && (
+        <Text size="xs" c="orange" mb="xs">探测错误: {probeError}</Text>
       )}
 
       <Divider my="xs" />
@@ -296,9 +303,11 @@ export default function Accounts() {
 
   const probeMut = useMutation({
     mutationFn: probeAllAccounts,
-    onSuccess: () => {
+    onSuccess: (resp) => {
       notifications.show({ message: "已触发全量探测", color: "green" });
-      setTimeout(() => queryClient.invalidateQueries({ queryKey: qk.accounts }), 500);
+      queryClient.setQueryData(qk.accounts, (old: AccountsListResponse | undefined) =>
+        old ? { ...old, probing_ids: resp.probing_ids } : old,
+      );
     },
     onError: (e) =>
       notifications.show({ message: e instanceof ApiError ? e.message : "探测失败", color: "red" }),
@@ -315,6 +324,7 @@ export default function Accounts() {
 
   const accounts = data?.items ?? [];
   const probingIds = new Set(data?.probing_ids ?? []);
+  const probeErrors = data?.probe_errors ?? {};
 
   const openCreate = () => {
     setEditing(null);
@@ -356,6 +366,7 @@ export default function Accounts() {
               key={a.id}
               account={a}
               probing={probingIds.has(a.id)}
+              probeError={probeErrors[a.id]}
               onEdit={() => openEdit(a)}
               onDelete={() => setDeleting(a)}
             />

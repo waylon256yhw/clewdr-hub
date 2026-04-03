@@ -215,6 +215,7 @@ export interface AccountsListResponse {
   offset: number;
   limit: number;
   probing_ids: number[];
+  probe_errors: Record<string, string>;
 }
 
 // Accounts
@@ -232,7 +233,7 @@ export const updateAccount = (id: number, data: Record<string, unknown>) =>
 export const deleteAccount = (id: number) =>
   apiFetch<void>(`/api/admin/accounts/${id}`, { method: "DELETE" });
 export const probeAllAccounts = () =>
-  apiFetch<void>("/api/admin/accounts/probe", { method: "POST" });
+  apiFetch<{ probing_ids: number[] }>("/api/admin/accounts/probe", { method: "POST" });
 
 // Users
 export const listUsers = () =>

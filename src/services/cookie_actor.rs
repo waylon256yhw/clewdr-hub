@@ -45,12 +45,15 @@ enum CookieActorMessage {
     Delete(CookieStatus, RpcReplyPort<Result<(), ClewdrError>>),
     Update1mSupport(CookieStatus, RpcReplyPort<Result<(), ClewdrError>>),
     ReloadFromDb,
-    ProbeAll,
+    ProbeAll(RpcReplyPort<Vec<i64>>),
     FlushDirty,
     SetHandle(CookieActorHandle),
     ReleaseSlot(i64),
     GetProbingIds(RpcReplyPort<Vec<i64>>),
     ClearProbing(i64),
+    SetProbeError(i64, String),
+    ClearProbeError(i64),
+    GetProbeErrors(RpcReplyPort<HashMap<i64, String>>),
 }
 
 #[derive(Debug)]
@@ -66,6 +69,8 @@ struct CookieActorState {
     inflight: HashMap<i64, (u32, u32)>,
     probing: HashSet<i64>,
     reactivated: HashSet<i64>,
+    /// Last probe error per account (transient errors only, cleared on success)
+    probe_errors: HashMap<i64, String>,
 }
 
 struct CookieActor;
@@ -709,6 +714,7 @@ impl Actor for CookieActor {
             inflight: HashMap::new(),
             probing: HashSet::new(),
             reactivated: HashSet::new(),
+            probe_errors: HashMap::new(),
         };
 
         // Load accounts from DB
@@ -754,8 +760,9 @@ impl Actor for CookieActor {
             CookieActorMessage::ReloadFromDb => {
                 Self::do_reload(state).await;
             }
-            CookieActorMessage::ProbeAll => {
+            CookieActorMessage::ProbeAll(reply_port) => {
                 Self::spawn_probe_all(state);
+                reply_port.send(state.probing.iter().copied().collect())?;
             }
             CookieActorMessage::FlushDirty => {
                 Self::do_flush(state).await;
@@ -775,6 +782,15 @@ impl Actor for CookieActor {
             }
             CookieActorMessage::ClearProbing(account_id) => {
                 state.probing.remove(&account_id);
+            }
+            CookieActorMessage::SetProbeError(account_id, msg) => {
+                state.probe_errors.insert(account_id, msg);
+            }
+            CookieActorMessage::ClearProbeError(account_id) => {
+                state.probe_errors.remove(&account_id);
+            }
+            CookieActorMessage::GetProbeErrors(reply_port) => {
+                reply_port.send(state.probe_errors.clone())?;
             }
         }
         Ok(())
@@ -947,8 +963,8 @@ impl CookieActorHandle {
         })
     }
 
-    pub async fn probe_all(&self) -> Result<(), ClewdrError> {
-        ractor::cast!(self.actor_ref, CookieActorMessage::ProbeAll).map_err(|e| {
+    pub async fn probe_all(&self) -> Result<Vec<i64>, ClewdrError> {
+        ractor::call!(self.actor_ref, CookieActorMessage::ProbeAll).map_err(|e| {
             ClewdrError::RactorError {
                 loc: Location::generate(),
                 msg: format!("Failed to communicate with CookieActor for probe operation: {e}"),
@@ -974,6 +990,29 @@ impl CookieActorHandle {
             ClewdrError::RactorError {
                 loc: Location::generate(),
                 msg: format!("Failed to communicate with CookieActor for clear probing: {e}"),
+            }
+        })
+    }
+
+    pub async fn set_probe_error(&self, account_id: i64, msg: String) {
+        let _ = ractor::cast!(
+            self.actor_ref,
+            CookieActorMessage::SetProbeError(account_id, msg)
+        );
+    }
+
+    pub async fn clear_probe_error(&self, account_id: i64) {
+        let _ = ractor::cast!(
+            self.actor_ref,
+            CookieActorMessage::ClearProbeError(account_id)
+        );
+    }
+
+    pub async fn get_probe_errors(&self) -> Result<HashMap<i64, String>, ClewdrError> {
+        ractor::call!(self.actor_ref, CookieActorMessage::GetProbeErrors).map_err(|e| {
+            ClewdrError::RactorError {
+                loc: Location::generate(),
+                msg: format!("Failed to communicate with CookieActor for get probe errors: {e}"),
             }
         })
     }

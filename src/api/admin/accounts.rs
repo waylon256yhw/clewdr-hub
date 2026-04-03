@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -18,6 +20,7 @@ pub struct AccountsListResponse {
     pub offset: i64,
     pub limit: i64,
     pub probing_ids: Vec<i64>,
+    pub probe_errors: HashMap<i64, String>,
 }
 
 #[derive(Serialize)]
@@ -114,6 +117,7 @@ pub async fn list(
 ) -> Result<Json<AccountsListResponse>, ClewdrError> {
     let all = load_all_accounts(&db).await?;
     let probing_ids = actor.get_probing_ids().await.unwrap_or_default();
+    let probe_errors = actor.get_probe_errors().await.unwrap_or_default();
     let total = all.len() as i64;
     let items: Vec<AccountResponse> = all.iter().map(map_account).collect();
     Ok(Json(AccountsListResponse {
@@ -122,6 +126,7 @@ pub async fn list(
         offset: 0,
         limit: total,
         probing_ids,
+        probe_errors,
     }))
 }
 
@@ -337,7 +342,9 @@ pub async fn remove(
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub async fn probe_all(State(actor): State<CookieActorHandle>) -> Result<StatusCode, ClewdrError> {
-    actor.probe_all().await?;
-    Ok(StatusCode::NO_CONTENT)
+pub async fn probe_all(
+    State(actor): State<CookieActorHandle>,
+) -> Result<Json<serde_json::Value>, ClewdrError> {
+    let ids = actor.probe_all().await?;
+    Ok(Json(serde_json::json!({ "probing_ids": ids })))
 }

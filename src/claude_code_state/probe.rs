@@ -36,7 +36,9 @@ pub async fn probe_cookie(
     let mut state = match ClaudeCodeState::from_cookie(handle.clone(), cookie, profile) {
         Ok(s) => s,
         Err(e) => {
-            warn!("[probe] failed to init state for account {account_id}: {e}");
+            let msg = format!("init failed: {e}");
+            warn!("[probe] account {account_id}: {msg}");
+            handle.set_probe_error(account_id, msg).await;
             let _ = handle.clear_probing(account_id).await;
             return;
         }
@@ -50,7 +52,9 @@ pub async fn probe_cookie(
                 warn!("[probe] account {account_id} invalid: {reason}");
                 state.return_cookie(Some(reason)).await;
             } else {
-                warn!("[probe] bootstrap failed for account {account_id} (transient): {e}");
+                let msg = format!("bootstrap failed: {e}");
+                warn!("[probe] account {account_id} (transient): {msg}");
+                handle.set_probe_error(account_id, msg).await;
                 let _ = handle.clear_probing(account_id).await;
             }
             return;
@@ -95,7 +99,9 @@ pub async fn probe_cookie(
             if let Some(reason) = extract_cookie_reason(&e) {
                 state.return_cookie(Some(reason)).await;
             } else {
-                warn!("[probe] OAuth code exchange failed for account {account_id}: {e}");
+                let msg = format!("OAuth code exchange failed: {e}");
+                warn!("[probe] account {account_id}: {msg}");
+                handle.set_probe_error(account_id, msg).await;
                 state.return_cookie(None).await;
             }
             return;
@@ -105,7 +111,9 @@ pub async fn probe_cookie(
         if let Some(reason) = extract_cookie_reason(&e) {
             state.return_cookie(Some(reason)).await;
         } else {
-            warn!("[probe] OAuth token exchange failed for account {account_id}: {e}");
+            let msg = format!("OAuth token exchange failed: {e}");
+            warn!("[probe] account {account_id}: {msg}");
+            handle.set_probe_error(account_id, msg).await;
             state.return_cookie(None).await;
         }
         return;
@@ -154,14 +162,33 @@ pub async fn probe_cookie(
                     "[probe] account {account_id} usage: session={:?}% weekly={:?}% opus={:?}% sonnet={:?}%",
                     session_util, weekly_util, opus_util, sonnet_util
                 );
+
+                // If session or weekly total hits 100%, set reset_time for cooldown
+                // (model-specific windows like opus/sonnet are NOT checked here
+                //  to avoid blocking the entire account when only one model is exhausted)
+                let cooldown_until = [(session_util, session_ts), (weekly_util, weekly_ts)]
+                    .into_iter()
+                    .filter(|(util, ts)| util >= &Some(100.0) && ts.is_some())
+                    .map(|(_, ts)| ts.unwrap())
+                    .max();
+
+                if let Some(ts) = cooldown_until {
+                    cs.reset_time = Some(ts);
+                    info!("[probe] account {account_id} exhausted, cooldown until {ts}");
+                } else {
+                    cs.reset_time = None;
+                }
             }
+            handle.clear_probe_error(account_id).await;
         }
         Err(e) => {
             if let Some(reason) = extract_cookie_reason(&e) {
                 state.return_cookie(Some(reason)).await;
                 return;
             }
-            warn!("[probe] usage fetch failed for account {account_id}: {e}");
+            let msg = format!("usage fetch failed: {e}");
+            warn!("[probe] account {account_id}: {msg}");
+            handle.set_probe_error(account_id, msg).await;
         }
     }
 
