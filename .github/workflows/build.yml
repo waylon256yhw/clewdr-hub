@@ -40,10 +40,10 @@ jobs:
     name: Build Frontend
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "lts/*"
           check-latest: true
@@ -57,7 +57,7 @@ jobs:
           npm run build
 
       - name: Upload static directory
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: static-files
           path: static/
@@ -105,7 +105,7 @@ jobs:
 
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Add Rust target
         shell: bash
@@ -154,7 +154,7 @@ jobs:
           echo "FEATURE_ARGS=--no-default-features --features embed-resource,portable" >> $GITHUB_ENV
 
       - name: Download static files
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: static-files
           path: static
@@ -205,7 +205,7 @@ jobs:
           fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.BIN_NAME }}-${{ matrix.os }}-${{matrix.target_arch}}
           path: ${{ env.BIN_NAME }}-${{ matrix.os }}-${{matrix.target_arch}}.zip
@@ -217,13 +217,13 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: master # Ensure we get the latest master with RELEASE_NOTES.md
           fetch-depth: 0 # Full history for consistency
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
