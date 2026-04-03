@@ -31,7 +31,7 @@ curl -O https://raw.githubusercontent.com/waylon256yhw/clewdr-hub/master/docker-
 docker compose up -d
 ```
 
-管理后台：`http://your-ip:8484`，默认账号 `admin` / `password`（首次登录强制改密）。
+管理后台：`http://your-ip:8484`，默认密码 `password`（首次登录强制改密）。
 
 数据持久化在 Docker volume `clewdr-data` 中，`docker compose down` 不会丢数据。
 
@@ -72,7 +72,7 @@ sudo systemctl enable --now clewdr
 |------|------|------|
 | `CLEWDR_IP` | `0.0.0.0` | 监听地址 |
 | `CLEWDR_PORT` | `8484` | 监听端口 |
-| `ADMIN_PASSWORD` | `password` | 初始管理员密码（首次登录强制修改） |
+| `ADMIN_PASSWORD` | `password` | 管理员密码（首次登录强制修改） |
 
 ## 使用
 
@@ -88,7 +88,7 @@ export ANTHROPIC_API_KEY=sk-...    # 从后台创建
 在上面基础上：
 
 1. **策略**（用户页 → 策略标签）：定义并发/RPM/周月预算模板
-2. **用户**：为成员创建账号，分配策略
+2. **用户**：为成员创建账号，分配策略（管理员账号内置，不可新建）
 3. **分发 Key**：每人一个 key，可选绑定到特定账号
 4. 超限请求直接拒绝，不消耗账号资源
 
@@ -100,7 +100,7 @@ export ANTHROPIC_API_KEY=sk-...    # 从后台创建
 |------|------|
 | **总览** | 账号/用户/Key 数量，请求量，当前伪装版本 |
 | **账号池** | 添加/管理 Cookie，查看用量窗口和重置倒计时 |
-| **用户** | 用户 CRUD + 策略管理（并发/RPM/预算） |
+| **用户** | 成员 CRUD + 策略管理（并发/RPM/预算） |
 | **API Keys** | 创建/绑定/管理 Key |
 | **日志** | 请求明细，按用户/状态/模型/时间筛选，点击展开详情 |
 | **设置** | CLI 版本伪装、模型列表管理、出站代理、改密 |
