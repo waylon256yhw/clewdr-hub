@@ -14,6 +14,7 @@ use crate::{
     config::{ClewdrCookie, CookieStatus, Reason, UsageBreakdown, UselessCookie},
     db::accounts::{
         batch_upsert_runtime_states, load_all_accounts, set_account_disabled, set_accounts_active,
+        upsert_account_oauth,
     },
     error::ClewdrError,
     stealth,
@@ -502,10 +503,12 @@ impl CookieActor {
         let dirty_ids: HashSet<i64> = std::mem::take(&mut state.dirty);
 
         let mut params = Vec::new();
+        let mut oauth_updates = Vec::new();
         for cs in state.valid.iter().chain(state.exhausted.iter()) {
             if let Some(id) = cs.account_id {
                 if dirty_ids.contains(&id) {
                     params.push((id, cs.to_runtime_params()));
+                    oauth_updates.push((id, cs.token.clone()));
                 }
             }
         }
@@ -523,6 +526,12 @@ impl CookieActor {
         if let Err(e) = batch_upsert_runtime_states(&state.db, &params).await {
             warn!("Failed to flush runtime states: {e}");
             for (id, _) in &params {
+                state.dirty.insert(*id);
+            }
+        }
+        for (id, token) in &oauth_updates {
+            if let Err(e) = upsert_account_oauth(&state.db, *id, token.as_ref(), None).await {
+                warn!("Failed to flush OAuth token for account {id}: {e}");
                 state.dirty.insert(*id);
             }
         }
@@ -573,23 +582,26 @@ impl CookieActor {
         // Rebuild from DB
         for row in &accounts {
             if row.status == "disabled" {
-                let reason = row
-                    .invalid_reason
-                    .as_deref()
-                    .map(Reason::from_db_string)
-                    .unwrap_or(Reason::Null);
-                let cookie_str = &row.cookie_blob;
-                if let Ok(cs) = CookieStatus::new(cookie_str, None) {
-                    state.invalid.insert(UselessCookie::with_account_id(
-                        cs.cookie,
-                        reason,
-                        Some(row.id),
-                    ));
+                if let Some(cookie_str) = row.cookie_blob.as_deref() {
+                    let reason = row
+                        .invalid_reason
+                        .as_deref()
+                        .map(Reason::from_db_string)
+                        .unwrap_or(Reason::Null);
+                    if let Ok(cs) = CookieStatus::new(cookie_str, None) {
+                        state.invalid.insert(UselessCookie::with_account_id(
+                            cs.cookie,
+                            reason,
+                            Some(row.id),
+                        ));
+                    }
                 }
                 continue;
             }
 
-            let cookie_str = &row.cookie_blob;
+            let Some(cookie_str) = row.cookie_blob.as_deref() else {
+                continue;
+            };
             let mut cs = match CookieStatus::new(cookie_str, None) {
                 Ok(cs) => cs,
                 Err(e) => {
@@ -600,6 +612,9 @@ impl CookieActor {
             cs.account_id = Some(row.id);
             cs.email = row.email.clone();
             cs.account_type = row.account_type.clone();
+            if let Some(token) = row.oauth_token.clone() {
+                cs.token = Some(token);
+            }
 
             // Merge: if memory has same account_id with same cookie, preserve runtime
             if let Some(mem) = mem_cookies.remove(&row.id) {
@@ -669,6 +684,9 @@ impl CookieActor {
         // Rebuild inflight map: preserve current counts, update max_slots from DB
         let mut new_inflight = HashMap::new();
         for row in &accounts {
+            if row.cookie_blob.is_none() {
+                continue;
+            }
             let current = state.inflight.get(&row.id).map_or(0, |(cur, _)| *cur);
             new_inflight.insert(row.id, (current, row.max_slots as u32));
         }

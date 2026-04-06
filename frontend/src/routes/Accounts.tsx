@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Title,
@@ -19,16 +19,18 @@ import {
   Progress,
   Divider,
   Tooltip,
+  Tabs,
 } from "@mantine/core";
 import { useForm } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
-import { IconPlus, IconEdit, IconTrash, IconRefresh } from "@tabler/icons-react";
+import { IconPlus, IconEdit, IconTrash, IconRefresh, IconLink } from "@tabler/icons-react";
 import {
   listAccounts,
   createAccount,
   updateAccount,
   deleteAccount,
   probeAllAccounts,
+  startAccountOAuth,
   qk,
   ApiError,
   type Account,
@@ -126,6 +128,7 @@ function AccountCard({
       <Group gap="xs" mb="xs">
         <Badge color={statusColor(account.status)} variant="light" size="sm">{account.status}</Badge>
         {probing && <Badge color="blue" variant="light" size="sm">探测中</Badge>}
+        <Badge color="dark" variant="outline" size="sm">{account.auth_source}</Badge>
         {account.account_type && (
           <Badge color={accountTypeColor(account.account_type)} variant="light" size="sm">
             {account.account_type}
@@ -145,6 +148,10 @@ function AccountCard({
         <Text size="xs" c="orange" mb="xs">探测错误: {probeError}</Text>
       )}
 
+      {account.last_error && (
+        <Text size="xs" c="orange" mb="xs">OAuth: {account.last_error}</Text>
+      )}
+
       <Divider my="xs" />
 
       <Stack gap="xs">
@@ -162,7 +169,7 @@ interface FormValues {
   rr_order: number;
   max_slots: number;
   cookie_blob: string;
-  organization_uuid: string;
+  oauth_callback_input: string;
 }
 
 function AccountFormModal({
@@ -175,6 +182,9 @@ function AccountFormModal({
   editing: Account | null;
 }) {
   const queryClient = useQueryClient();
+  const [tab, setTab] = useState<"oauth" | "cookie">(editing?.auth_source === "cookie" ? "cookie" : "oauth");
+  const [authUrl, setAuthUrl] = useState("");
+  const [oauthState, setOauthState] = useState("");
   const form = useForm<FormValues>({
     mode: "uncontrolled",
     initialValues: {
@@ -182,29 +192,64 @@ function AccountFormModal({
       rr_order: editing?.rr_order ?? 0,
       max_slots: 5,
       cookie_blob: "",
-      organization_uuid: "",
+      oauth_callback_input: "",
     },
-    validate: {
-      name: (v) => (v.trim() ? null : "必填"),
-      cookie_blob: (v) => (!editing && !v.trim() ? "新账号必须提供 Cookie" : null),
+  });
+
+  useEffect(() => {
+    setTab(editing?.auth_source === "cookie" ? "cookie" : "oauth");
+    setAuthUrl("");
+    setOauthState("");
+    form.setValues({
+      name: editing?.name ?? "",
+      rr_order: editing?.rr_order ?? 0,
+      max_slots: 5,
+      cookie_blob: "",
+      oauth_callback_input: "",
+    });
+  }, [editing]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const oauthStartMutation = useMutation({
+    mutationFn: () => startAccountOAuth(),
+    onSuccess: async (resp) => {
+      setAuthUrl(resp.auth_url);
+      setOauthState(resp.state);
+      try {
+        await navigator.clipboard.writeText(resp.auth_url);
+        notifications.show({ message: "鉴权 URL 已复制", color: "green" });
+      } catch {
+        notifications.show({ message: "鉴权 URL 已生成", color: "green" });
+      }
     },
+    onError: (e) =>
+      notifications.show({ message: e instanceof ApiError ? e.message : "生成鉴权 URL 失败", color: "red" }),
   });
 
   const mutation = useMutation({
     mutationFn: async (values: FormValues) => {
+      const name = values.name.trim();
+      const cookieBlob = values.cookie_blob.trim();
+      const oauthInput = values.oauth_callback_input.trim();
+      if (!name) throw new ApiError(400, "名称必填");
+      if (!editing && tab === "cookie" && !cookieBlob) throw new ApiError(400, "新账号必须提供 Cookie");
+      if (!editing && tab === "oauth" && !oauthInput) throw new ApiError(400, "请粘贴 Callback URL 或 Code");
+
       if (editing) {
         const body: Record<string, unknown> = {};
-        if (values.name !== editing.name) body.name = values.name;
+        if (name !== editing.name) body.name = name;
         if (values.rr_order !== editing.rr_order) body.rr_order = values.rr_order;
-        if (values.cookie_blob.trim()) body.cookie_blob = values.cookie_blob;
-        if (values.organization_uuid.trim()) body.organization_uuid = values.organization_uuid;
+        if (cookieBlob) body.cookie_blob = cookieBlob;
+        if (oauthInput) body.oauth_callback_input = oauthInput;
+        if (oauthState) body.oauth_state = oauthState;
         return updateAccount(editing.id, body);
       }
       return createAccount({
-        name: values.name,
+        name,
         max_slots: values.max_slots,
-        cookie_blob: values.cookie_blob,
-        organization_uuid: values.organization_uuid || undefined,
+        auth_source: tab,
+        cookie_blob: cookieBlob || undefined,
+        oauth_callback_input: oauthInput || undefined,
+        oauth_state: oauthState || undefined,
       });
     },
     onSuccess: () => {
@@ -212,6 +257,8 @@ function AccountFormModal({
       queryClient.invalidateQueries({ queryKey: qk.overview });
       notifications.show({ message: editing ? "账号已更新" : "账号已创建", color: "green" });
       form.reset();
+      setAuthUrl("");
+      setOauthState("");
       onClose();
     },
     onError: (e) =>
@@ -225,19 +272,63 @@ function AccountFormModal({
           <TextInput label="名称" required key={form.key("name")} {...form.getInputProps("name")} />
           {editing && <NumberInput label="轮询顺序" key={form.key("rr_order")} {...form.getInputProps("rr_order")} />}
           {!editing && <NumberInput label="最大并发" min={1} key={form.key("max_slots")} {...form.getInputProps("max_slots")} />}
-          <Textarea
-            label={editing ? "替换 Cookie（可选）" : "Cookie"}
-            placeholder="粘贴 Cookie..."
-            autosize
-            minRows={3}
-            key={form.key("cookie_blob")}
-            {...form.getInputProps("cookie_blob")}
-          />
-          <TextInput
-            label="组织 UUID（可选）"
-            key={form.key("organization_uuid")}
-            {...form.getInputProps("organization_uuid")}
-          />
+          <Tabs value={tab} onChange={(value) => setTab((value as "oauth" | "cookie") ?? "oauth")}>
+            <Tabs.List>
+              <Tabs.Tab value="oauth">OAuth Token</Tabs.Tab>
+              <Tabs.Tab value="cookie">Cookie</Tabs.Tab>
+            </Tabs.List>
+            <Tabs.Panel value="oauth" pt="md">
+              <Stack>
+                <Group justify="space-between" align="flex-start">
+                  <Text size="sm" c="dimmed" maw={420}>
+                    先生成鉴权 URL 并在浏览器完成授权，再把完整 callback URL 或单独 code 粘贴回来。
+                  </Text>
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="light"
+                    leftSection={<IconLink size={14} />}
+                    loading={oauthStartMutation.isPending}
+                    onClick={() => oauthStartMutation.mutate()}
+                  >
+                    生成并复制 URL
+                  </Button>
+                </Group>
+                {authUrl && (
+                  <TextInput
+                    label="鉴权 URL"
+                    value={authUrl}
+                    readOnly
+                    styles={{
+                      input: {
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      },
+                    }}
+                  />
+                )}
+                <Textarea
+                  label={editing ? "Callback URL / Code（可选）" : "Callback URL / Code"}
+                  placeholder="粘贴完整 callback URL 或单独 code"
+                  autosize
+                  minRows={3}
+                  key={form.key("oauth_callback_input")}
+                  {...form.getInputProps("oauth_callback_input")}
+                />
+              </Stack>
+            </Tabs.Panel>
+            <Tabs.Panel value="cookie" pt="md">
+              <Textarea
+                label={editing ? "替换 Cookie（可选）" : "Cookie"}
+                placeholder="粘贴 Cookie..."
+                autosize
+                minRows={3}
+                key={form.key("cookie_blob")}
+                {...form.getInputProps("cookie_blob")}
+              />
+            </Tabs.Panel>
+          </Tabs>
           <Group justify="flex-end">
             <Button variant="default" onClick={onClose}>取消</Button>
             <Button type="submit" loading={mutation.isPending}>

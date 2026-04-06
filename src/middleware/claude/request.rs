@@ -9,6 +9,7 @@ use axum::{
     Json,
     extract::{FromRequest, Request},
 };
+use http::HeaderMap;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -148,6 +149,26 @@ fn strip_ephemeral_scope_from_system(system: &mut Value) {
     }
 }
 
+fn extract_anthropic_beta_header(headers: &HeaderMap) -> Option<String> {
+    let mut parts = Vec::new();
+    for value in headers.get_all("anthropic-beta") {
+        if let Ok(raw) = value.to_str() {
+            for token in raw.split(',') {
+                let token = token.trim();
+                if !token.is_empty() {
+                    parts.push(token.to_string());
+                }
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(","))
+    }
+}
+
 /// Inject `metadata.user_id` if missing (for non-CLI clients).
 /// Format: `user_{64hex}_account_{org_uuid}_session_{random_uuid}`
 fn inject_metadata_user_id(
@@ -226,12 +247,7 @@ where
             .extensions()
             .get::<crate::db::models::AuthenticatedUser>()
             .cloned();
-        let client_session_id = req
-            .headers()
-            .get("x-claude-code-session-id")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let session_id = client_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let anthropic_beta = extract_anthropic_beta_header(req.headers());
         let Json(mut body) = Json::<CreateMessageParams>::from_request(req, &()).await?;
 
         drop_empty_system(&mut body);
@@ -285,6 +301,7 @@ where
         let context = ClaudeContext {
             stream,
             system_prompt_hash,
+            anthropic_beta,
             usage: Usage {
                 input_tokens,
                 output_tokens: 0,
@@ -300,7 +317,6 @@ where
             started_at: chrono::Utc::now(),
             weekly_budget_nanousd: auth_user.as_ref().map(|u| u.weekly_budget_nanousd),
             monthly_budget_nanousd: auth_user.as_ref().map(|u| u.monthly_budget_nanousd),
-            session_id,
             bound_account_ids: auth_user
                 .as_ref()
                 .map(|u| u.bound_account_ids.clone())

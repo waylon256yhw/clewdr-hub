@@ -69,7 +69,7 @@ export interface OverviewResponse {
   policies: number;
   requests_1h: number;
   requests_24h: number;
-  stealth: { cli_version: string; sdk_version: string };
+  stealth: { cli_version: string };
   must_change_password: boolean;
 }
 
@@ -92,6 +92,12 @@ export interface Account {
   name: string;
   rr_order: number;
   status: string;
+  auth_source: "cookie" | "oauth" | "hybrid";
+  has_cookie: boolean;
+  has_oauth: boolean;
+  oauth_expires_at: string | null;
+  last_refresh_at: string | null;
+  last_error: string | null;
   email: string | null;
   account_type: string | null;
   invalid_reason: string | null;
@@ -225,8 +231,10 @@ export const createAccount = (data: {
   name: string;
   rr_order?: number;
   max_slots?: number;
-  cookie_blob: string;
-  organization_uuid?: string;
+  auth_source?: "cookie" | "oauth" | "hybrid";
+  cookie_blob?: string;
+  oauth_callback_input?: string;
+  oauth_state?: string;
 }) => apiFetch<Account>("/api/admin/accounts", { method: "POST", body: data });
 export const updateAccount = (id: number, data: Record<string, unknown>) =>
   apiFetch<Account>(`/api/admin/accounts/${id}`, { method: "PUT", body: data });
@@ -234,6 +242,11 @@ export const deleteAccount = (id: number) =>
   apiFetch<void>(`/api/admin/accounts/${id}`, { method: "DELETE" });
 export const probeAllAccounts = () =>
   apiFetch<{ probing_ids: number[] }>("/api/admin/accounts/probe", { method: "POST" });
+export const startAccountOAuth = (data?: { redirect_uri?: string }) =>
+  apiFetch<{ auth_url: string; state: string; redirect_uri: string }>(
+    "/api/admin/accounts/oauth/start",
+    { method: "POST", body: data ?? {} },
+  );
 
 // Users
 export const listUsers = () =>

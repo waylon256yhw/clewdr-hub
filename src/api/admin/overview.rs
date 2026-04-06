@@ -54,7 +54,6 @@ pub struct AccountOverview {
 #[derive(Serialize)]
 pub struct StealthOverview {
     pub cli_version: String,
-    pub sdk_version: String,
 }
 
 pub async fn overview(
@@ -154,7 +153,6 @@ pub async fn overview(
         requests_24h,
         stealth: StealthOverview {
             cli_version: profile.cli_version.clone(),
-            sdk_version: profile.sdk_version.clone(),
         },
         must_change_password: must_change != 0,
     }))

@@ -9,6 +9,7 @@ use crate::types::claude::Usage;
 pub struct ClaudeContext {
     pub stream: bool,
     pub system_prompt_hash: Option<u64>,
+    pub anthropic_beta: Option<String>,
     pub usage: Usage,
     pub user_id: Option<i64>,
     pub api_key_id: Option<i64>,
@@ -24,7 +25,5 @@ pub struct ClaudeContext {
     pub weekly_budget_nanousd: Option<i64>,
     /// Monthly budget from policy (nanousd)
     pub monthly_budget_nanousd: Option<i64>,
-    /// Session ID for upstream (passthrough from client, or generated fallback)
-    pub session_id: String,
     pub bound_account_ids: Vec<i64>,
 }

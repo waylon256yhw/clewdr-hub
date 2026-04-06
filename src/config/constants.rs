@@ -17,7 +17,7 @@ pub const CLAUDE_CONSOLE_ENDPOINT: &str = "https://console.anthropic.com/";
 pub const GEMINI_ENDPOINT: &str = "https://generativelanguage.googleapis.com/";
 pub const CC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const CC_TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
-pub const CC_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
+pub const CC_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 
 pub static ENDPOINT_URL: LazyLock<Url> = LazyLock::new(|| {
     Url::parse(CLAUDE_ENDPOINT).unwrap_or_else(|_| {

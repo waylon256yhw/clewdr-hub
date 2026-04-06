@@ -94,7 +94,7 @@ export default function Dashboard() {
       label: "伪装版本",
       value: (
         <Text size="sm">
-          CLI {data.stealth.cli_version} / SDK {data.stealth.sdk_version}
+          CLI {data.stealth.cli_version}
         </Text>
       ),
     },

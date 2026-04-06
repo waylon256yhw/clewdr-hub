@@ -5,7 +5,7 @@ use axum::{
 use colored::Colorize;
 use eventsource_stream::Eventsource;
 use futures::{StreamExt, TryStreamExt};
-use http::header::ACCEPT;
+use http::header::{ACCEPT, USER_AGENT};
 use snafu::{GenerateImplicitData, ResultExt};
 use tracing::{Instrument, error, info, warn};
 use wreq::Method;
@@ -13,16 +13,100 @@ use wreq::Method;
 use crate::{
     claude_code_state::{ClaudeCodeState, TokenStatus},
     config::{Claude1mChannel, ModelFamily},
+    db::accounts::{
+        batch_upsert_runtime_states, set_account_auth_error, update_account_metadata_unchecked,
+        upsert_account_oauth,
+    },
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
+    oauth::refresh_oauth_token,
     services::cookie_actor::CookieActorHandle,
-    stealth::{self, EndpointKind},
     types::claude::{CountMessageTokensResponse, CreateMessageParams},
 };
 
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MAX_RETRIES: usize = 5;
+const CLAUDE_BETA_BASE: &str = "oauth-2025-04-20";
+const CLAUDE_BETA_CONTEXT_1M_TOKEN: &str = "context-1m-2025-08-07";
+const CLAUDE_API_VERSION: &str = "2023-06-01";
 
 impl ClaudeCodeState {
+    fn is_oauth_auth_failure(err: &ClewdrError) -> bool {
+        match err {
+            ClewdrError::ClaudeHttpError { code, .. } => {
+                matches!(code.as_u16(), 401 | 403)
+            }
+            ClewdrError::Whatever { message, .. } => {
+                let msg = message.to_ascii_lowercase();
+                msg.contains("invalid_grant")
+                    || msg.contains("refresh token not found")
+                    || msg.contains("refresh token")
+                        && (msg.contains("invalid") || msg.contains("expired"))
+                    || msg.contains("status 401")
+                    || msg.contains("status 403")
+                    || msg.contains("access token")
+                        && (msg.contains("expired") || msg.contains("invalid"))
+            }
+            _ => false,
+        }
+    }
+
+    async fn mark_oauth_account_auth_error(
+        &mut self,
+        account_id: i64,
+        message: String,
+    ) {
+        let Some(db) = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()) else {
+            return;
+        };
+        if let Err(db_err) = upsert_account_oauth(&db, account_id, None, Some(&message)).await {
+            warn!("Failed to clear OAuth token for account {account_id}: {db_err}");
+            return;
+        }
+        if let Err(db_err) = set_account_auth_error(&db, account_id, &message).await {
+            warn!("Failed to set OAuth auth_error for account {account_id}: {db_err}");
+            return;
+        }
+        self.oauth_token = None;
+    }
+
+    async fn release_selected_slot(&self, account_id: Option<i64>) {
+        if let Some(aid) = account_id {
+            if self.oauth_token.is_some() && self.cookie.is_none() {
+                if let Some(pool) = &self.oauth_pool {
+                    pool.release(aid).await;
+                }
+            } else {
+                self.cookie_actor_handle.release_slot(aid).await;
+            }
+        }
+    }
+
+    async fn persist_oauth_refresh(&mut self, account_id: i64) -> Result<(), ClewdrError> {
+        let Some(token) = self.oauth_token.as_ref() else {
+            return Ok(());
+        };
+        let refreshed = refresh_oauth_token(token).await?;
+        let db = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()).ok_or(
+            ClewdrError::UnexpectedNone {
+                msg: "Missing billing context database",
+            },
+        )?;
+        upsert_account_oauth(&db, account_id, Some(&refreshed.token), None).await?;
+        update_account_metadata_unchecked(
+            &db,
+            account_id,
+            refreshed.snapshot.email.as_deref(),
+            refreshed.snapshot.account_type.as_deref(),
+            Some(refreshed.snapshot.organization_uuid.as_str()),
+        )
+        .await?;
+        batch_upsert_runtime_states(&db, &[(account_id, refreshed.snapshot.runtime.clone())])
+            .await?;
+        self.oauth_token = Some(refreshed.token);
+        self.organization_uuid = Some(refreshed.snapshot.organization_uuid);
+        Ok(())
+    }
+
     /// Attempts to send a chat message to Claude API with retry mechanism
     ///
     /// This method handles the complete chat flow including:
@@ -45,6 +129,51 @@ impl ClaudeCodeState {
         &mut self,
         p: CreateMessageParams,
     ) -> Result<axum::response::Response, ClewdrError> {
+        if self.oauth_token.is_some() && self.cookie.is_none() && self.account_id.is_some() {
+            let account_id = self.account_id;
+            let access_token = match self.check_token() {
+                TokenStatus::Valid => self.oauth_token.as_ref().map(|t| t.access_token.clone()),
+                TokenStatus::Expired => {
+                    if let Err(err) = self.persist_oauth_refresh(account_id.expect("checked above")).await {
+                        if Self::is_oauth_auth_failure(&err) {
+                            self.mark_oauth_account_auth_error(
+                                account_id.expect("checked above"),
+                                err.to_string(),
+                            )
+                                .await;
+                        }
+                        self.release_selected_slot(account_id).await;
+                        return Err(err);
+                    }
+                    self.oauth_token.as_ref().map(|t| t.access_token.clone())
+                }
+                TokenStatus::None => None,
+            }
+            .ok_or(ClewdrError::UnexpectedNone {
+                msg: "No OAuth access token available",
+            })?;
+
+            match self.send_chat(access_token, p).await {
+                Ok(response) => {
+                    if !self.stream {
+                        self.release_selected_slot(account_id).await;
+                    }
+                    return Ok(response);
+                }
+                Err(err) => {
+                    if Self::is_oauth_auth_failure(&err) {
+                        self.mark_oauth_account_auth_error(
+                            account_id.expect("checked above"),
+                            err.to_string(),
+                        )
+                            .await;
+                    }
+                    self.release_selected_slot(account_id).await;
+                    return Err(err);
+                }
+            }
+        }
+
         for i in 0..MAX_RETRIES + 1 {
             if i > 0 {
                 info!("[RETRY] attempt: {}", i.to_string().green());
@@ -94,16 +223,12 @@ impl ClaudeCodeState {
                 Ok(res) => {
                     // For streaming, the slot is released in MessageStop handler
                     if !self.stream {
-                        if let Some(aid) = account_id {
-                            state.cookie_actor_handle.release_slot(aid).await;
-                        }
+                        state.release_selected_slot(account_id).await;
                     }
                     return Ok(res);
                 }
                 Err(e) => {
-                    if let Some(aid) = account_id {
-                        state.cookie_actor_handle.release_slot(aid).await;
-                    }
+                    state.release_selected_slot(account_id).await;
                     error!(
                         "[{}] {}",
                         state.cookie.as_ref().unwrap().cookie.ellipse().green(),
@@ -189,19 +314,18 @@ impl ClaudeCodeState {
         use_context_1m: bool,
     ) -> Result<wreq::Response, ClewdrError> {
         let profile = self.stealth_profile.load();
-        let headers = stealth::build_stealth_headers(
-            &profile,
-            EndpointKind::DirectApi {
-                use_context_1m,
-                session_id: self.session_id.clone(),
-            },
+        let beta_header = Self::merge_anthropic_beta_header(
+            self.anthropic_beta_header.as_deref(),
+            use_context_1m,
         );
         let mut url = self.endpoint.join("v1/messages").expect("Url parse error");
         url.set_query(Some("beta=true"));
         self.client
             .post(url.to_string())
             .bearer_auth(access_token)
-            .headers(headers)
+            .header(USER_AGENT, profile.user_agent())
+            .header("anthropic-beta", beta_header)
+            .header("anthropic-version", CLAUDE_API_VERSION)
             .json(body)
             .send()
             .await
@@ -262,13 +386,14 @@ impl ClaudeCodeState {
             .to_owned();
 
         let profile = self.stealth_profile.load();
-        let headers = stealth::build_stealth_headers(&profile, EndpointKind::UsageApi);
 
         self.client
             .request(Method::GET, CLAUDE_USAGE_URL)
             .bearer_auth(access_token)
             .header(ACCEPT, "application/json, text/plain, */*")
-            .headers(headers)
+            .header(USER_AGENT, profile.user_agent())
+            .header("anthropic-beta", CLAUDE_BETA_BASE)
+            .header("anthropic-version", CLAUDE_API_VERSION)
             .send()
             .await
             .context(WreqSnafu {
@@ -287,6 +412,49 @@ impl ClaudeCodeState {
         &mut self,
         p: CreateMessageParams,
     ) -> Result<axum::response::Response, ClewdrError> {
+        if self.oauth_token.is_some() && self.cookie.is_none() && self.account_id.is_some() {
+            let account_id = self.account_id;
+            let access_token = match self.check_token() {
+                TokenStatus::Valid => self.oauth_token.as_ref().map(|t| t.access_token.clone()),
+                TokenStatus::Expired => {
+                    if let Err(err) = self.persist_oauth_refresh(account_id.expect("checked above")).await {
+                        if Self::is_oauth_auth_failure(&err) {
+                            self.mark_oauth_account_auth_error(
+                                account_id.expect("checked above"),
+                                err.to_string(),
+                            )
+                                .await;
+                        }
+                        self.release_selected_slot(account_id).await;
+                        return Err(err);
+                    }
+                    self.oauth_token.as_ref().map(|t| t.access_token.clone())
+                }
+                TokenStatus::None => None,
+            }
+            .ok_or(ClewdrError::UnexpectedNone {
+                msg: "No OAuth access token available",
+            })?;
+
+            match self.perform_count_tokens(access_token, p).await {
+                Ok(response) => {
+                    self.release_selected_slot(account_id).await;
+                    return Ok(response);
+                }
+                Err(err) => {
+                    if Self::is_oauth_auth_failure(&err) {
+                        self.mark_oauth_account_auth_error(
+                            account_id.expect("checked above"),
+                            err.to_string(),
+                        )
+                            .await;
+                    }
+                    self.release_selected_slot(account_id).await;
+                    return Err(err);
+                }
+            }
+        }
+
         for i in 0..MAX_RETRIES + 1 {
             if i > 0 {
                 info!("[TOKENS][RETRY] attempt: {}", i.to_string().green());
@@ -298,9 +466,7 @@ impl ClaudeCodeState {
             let account_id = cookie.account_id;
             let cookie_disallows = matches!(cookie.count_tokens_allowed, Some(false));
             if cookie_disallows {
-                if let Some(aid) = account_id {
-                    state.cookie_actor_handle.release_slot(aid).await;
-                }
+                state.release_selected_slot(account_id).await;
                 state.persist_count_tokens_allowed(false).await;
                 return Ok(Self::local_count_tokens_response(&p));
             }
@@ -338,15 +504,11 @@ impl ClaudeCodeState {
             ));
             match retry.await {
                 Ok(res) => {
-                    if let Some(aid) = account_id {
-                        state.cookie_actor_handle.release_slot(aid).await;
-                    }
+                    state.release_selected_slot(account_id).await;
                     return Ok(res);
                 }
                 Err(e) => {
-                    if let Some(aid) = account_id {
-                        state.cookie_actor_handle.release_slot(aid).await;
-                    }
+                    state.release_selected_slot(account_id).await;
                     error!(
                         "[{}][TOKENS] {}",
                         state.cookie.as_ref().unwrap().cookie.ellipse().green(),
@@ -492,9 +654,12 @@ impl ClaudeCodeState {
         let ttft_ms = Arc::new(AtomicI64::new(-1));
         let stream_start = std::time::Instant::now();
         let handle = self.cookie_actor_handle.clone();
+        let oauth_pool = self.oauth_pool.clone();
         let cookie = self.cookie.clone();
         let billing_ctx = self.billing_ctx.clone();
-        let stream_account_id = cookie.as_ref().and_then(|c| c.account_id);
+        let stream_account_id = self
+            .account_id
+            .or(cookie.as_ref().and_then(|c| c.account_id));
         let slot_released = Arc::new(AtomicBool::new(false));
         let slot_released_inner = slot_released.clone();
 
@@ -564,6 +729,16 @@ impl ClaudeCodeState {
                                     }
                                 }
                             });
+                        } else if let Some(aid) = stream_account_id {
+                            let released = slot_released_inner.clone();
+                            let oauth_pool = oauth_pool.clone();
+                            tokio::spawn(async move {
+                                if !released.swap(true, Ordering::Relaxed)
+                                    && let Some(pool) = oauth_pool
+                                {
+                                    pool.release(aid).await;
+                                }
+                            });
                         }
 
                         // Billing persistence
@@ -599,14 +774,24 @@ impl ClaudeCodeState {
             released: Arc<AtomicBool>,
             account_id: Option<i64>,
             handle: CookieActorHandle,
+            oauth_pool: Option<std::sync::Arc<crate::providers::claude::OAuthAccountPool>>,
+            oauth_only: bool,
         }
         impl Drop for SlotDropGuard {
             fn drop(&mut self) {
                 if let Some(aid) = self.account_id {
                     if !self.released.swap(true, Ordering::Relaxed) {
                         let h = self.handle.clone();
+                        let oauth_pool = self.oauth_pool.clone();
+                        let oauth_only = self.oauth_only;
                         tokio::spawn(async move {
-                            h.release_slot(aid).await;
+                            if oauth_only {
+                                if let Some(pool) = oauth_pool {
+                                    pool.release(aid).await;
+                                }
+                            } else {
+                                h.release_slot(aid).await;
+                            }
                         });
                     }
                 }
@@ -616,6 +801,8 @@ impl ClaudeCodeState {
             released: slot_released,
             account_id: stream_account_id,
             handle: self.cookie_actor_handle.clone(),
+            oauth_pool: self.oauth_pool.clone(),
+            oauth_only: self.oauth_token.is_some() && self.cookie.is_none(),
         };
         let stream = stream.map(move |item| {
             let _ = &guard;
@@ -701,12 +888,9 @@ impl ClaudeCodeState {
         use_context_1m: bool,
     ) -> Result<wreq::Response, ClewdrError> {
         let profile = self.stealth_profile.load();
-        let headers = stealth::build_stealth_headers(
-            &profile,
-            EndpointKind::DirectApi {
-                use_context_1m,
-                session_id: self.session_id.clone(),
-            },
+        let beta_header = Self::merge_anthropic_beta_header(
+            self.anthropic_beta_header.as_deref(),
+            use_context_1m,
         );
         let mut url = self
             .endpoint
@@ -716,7 +900,9 @@ impl ClaudeCodeState {
         self.client
             .post(url.to_string())
             .bearer_auth(access_token)
-            .headers(headers)
+            .header(USER_AGENT, profile.user_agent())
+            .header("anthropic-beta", beta_header)
+            .header("anthropic-version", CLAUDE_API_VERSION)
             .json(body)
             .send()
             .await
@@ -725,6 +911,36 @@ impl ClaudeCodeState {
             })?
             .check_claude()
             .await
+    }
+
+    fn merge_anthropic_beta_header(extra: Option<&str>, use_context_1m: bool) -> String {
+        let mut seen = std::collections::HashSet::new();
+        let mut merged = Vec::new();
+        let mut push = |token: &str| {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            let key = trimmed.to_ascii_lowercase();
+            if !use_context_1m && key == CLAUDE_BETA_CONTEXT_1M_TOKEN {
+                return;
+            }
+            if seen.insert(key) {
+                merged.push(trimmed.to_string());
+            }
+        };
+
+        push(CLAUDE_BETA_BASE);
+        if use_context_1m {
+            push(CLAUDE_BETA_CONTEXT_1M_TOKEN);
+        }
+        if let Some(extra) = extra {
+            for token in extra.split(',') {
+                push(token);
+            }
+        }
+
+        merged.join(",")
     }
 
     fn auto_1m_probe_channel(model: &str) -> Option<Claude1mChannel> {

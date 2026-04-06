@@ -16,6 +16,13 @@ pub struct UpdateSettingsRequest {
 }
 
 const HIDDEN_KEYS: &[&str] = &["session_secret", "_proxy_migrated"];
+const DEPRECATED_KEYS: &[&str] = &[
+    "cc_sdk_version",
+    "cc_node_version",
+    "cc_stainless_os",
+    "cc_stainless_arch",
+    "cc_beta_flags",
+];
 
 pub async fn get_all(
     State(db): State<SqlitePool>,
@@ -27,21 +34,14 @@ pub async fn get_all(
 
     let map: HashMap<String, String> = rows
         .into_iter()
-        .filter(|(k, _)| !HIDDEN_KEYS.contains(&k.as_str()))
+        .filter(|(k, _)| {
+            !HIDDEN_KEYS.contains(&k.as_str()) && !DEPRECATED_KEYS.contains(&k.as_str())
+        })
         .collect();
     Ok(Json(map))
 }
 
-const STEALTH_KEYS: &[&str] = &[
-    "cc_cli_version",
-    "cc_sdk_version",
-    "cc_node_version",
-    "cc_stainless_os",
-    "cc_stainless_arch",
-    "cc_beta_flags",
-    "cc_billing_salt",
-    "proxy",
-];
+const STEALTH_KEYS: &[&str] = &["cc_cli_version", "cc_billing_salt", "proxy"];
 
 pub async fn update(
     State(db): State<SqlitePool>,
@@ -51,7 +51,7 @@ pub async fn update(
 
     let mut tx = db.begin().await?;
     for (key, value) in &req.settings {
-        if HIDDEN_KEYS.contains(&key.as_str()) {
+        if HIDDEN_KEYS.contains(&key.as_str()) || DEPRECATED_KEYS.contains(&key.as_str()) {
             continue;
         }
         sqlx::query(

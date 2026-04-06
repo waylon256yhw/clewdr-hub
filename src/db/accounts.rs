@@ -1,23 +1,31 @@
 use sqlx::{Row, SqlitePool};
 
-use crate::config::{RuntimeStateParams, UsageBreakdown};
+use crate::config::{RuntimeStateParams, TokenInfo, UsageBreakdown};
 
 /// Joined result of accounts + account_runtime_state.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AccountWithRuntime {
     pub id: i64,
     pub name: String,
     pub rr_order: i64,
     pub max_slots: i64,
     pub status: String,
-    pub cookie_blob: String,
+    pub auth_source: String,
+    pub cookie_blob: Option<String>,
+    pub oauth_token: Option<TokenInfo>,
+    pub oauth_expires_at: Option<String>,
+    pub last_refresh_at: Option<String>,
+    pub last_error: Option<String>,
+    pub organization_uuid: Option<String>,
     pub invalid_reason: Option<String>,
     pub email: Option<String>,
     pub account_type: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
     pub runtime: Option<RuntimeStateRow>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RuntimeStateRow {
     pub reset_time: Option<i64>,
     pub supports_claude_1m_sonnet: Option<bool>,
@@ -87,8 +95,10 @@ fn make_bucket(row: &sqlx::sqlite::SqliteRow, prefix: &str) -> UsageBreakdown {
 pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRuntime>, sqlx::Error> {
     let rows = sqlx::query(
         r#"SELECT
-            a.id, a.name, a.rr_order, a.max_slots, a.status, a.cookie_blob, a.invalid_reason,
-            a.email, a.account_type,
+            a.id, a.name, a.rr_order, a.max_slots, a.status, a.auth_source, a.cookie_blob,
+            a.oauth_access_token, a.oauth_refresh_token, a.oauth_expires_at,
+            a.organization_uuid, a.last_refresh_at, a.last_error, a.invalid_reason,
+            a.email, a.account_type, a.created_at, a.updated_at,
             rs.account_id AS rs_marker,
             rs.reset_time,
             rs.supports_claude_1m_sonnet, rs.supports_claude_1m_opus, rs.count_tokens_allowed,
@@ -163,16 +173,51 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
             ],
         });
 
+        let oauth_access_token: Option<String> = row.get("oauth_access_token");
+        let oauth_refresh_token: Option<String> = row.get("oauth_refresh_token");
+        let oauth_expires_at: Option<String> = row.get("oauth_expires_at");
+        let organization_uuid: Option<String> = row.get("organization_uuid");
+        let oauth_token = match (
+            oauth_access_token,
+            oauth_refresh_token,
+            oauth_expires_at.clone(),
+            organization_uuid.clone(),
+        ) {
+            (Some(access_token), Some(refresh_token), Some(expires_at), Some(org_uuid)) => {
+                let expires_at = chrono::DateTime::parse_from_rfc3339(&expires_at)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc));
+                expires_at.map(|expires_at| TokenInfo {
+                    access_token,
+                    refresh_token,
+                    expires_in: (expires_at - chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or_default(),
+                    expires_at,
+                    organization: crate::config::Organization { uuid: org_uuid },
+                })
+            }
+            _ => None,
+        };
+
         result.push(AccountWithRuntime {
             id: row.get("id"),
             name: row.get("name"),
             rr_order: row.get("rr_order"),
             max_slots: row.get("max_slots"),
             status: row.get("status"),
+            auth_source: row.get("auth_source"),
             cookie_blob: row.get("cookie_blob"),
+            oauth_token,
+            oauth_expires_at,
+            last_refresh_at: row.get("last_refresh_at"),
+            last_error: row.get("last_error"),
+            organization_uuid,
             invalid_reason: row.get("invalid_reason"),
             email: row.get("email"),
             account_type: row.get("account_type"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
             runtime,
         });
     }
@@ -376,4 +421,112 @@ pub async fn update_account_metadata(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub async fn update_account_metadata_unchecked(
+    pool: &SqlitePool,
+    account_id: i64,
+    email: Option<&str>,
+    account_type: Option<&str>,
+    org_uuid: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE accounts
+         SET email = COALESCE(?1, email),
+             account_type = COALESCE(?2, account_type),
+             organization_uuid = COALESCE(?3, organization_uuid),
+             invalid_reason = NULL,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?4",
+    )
+    .bind(email)
+    .bind(account_type)
+    .bind(org_uuid)
+    .bind(account_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn upsert_account_oauth(
+    pool: &SqlitePool,
+    account_id: i64,
+    token: Option<&TokenInfo>,
+    last_error: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let (access_token, refresh_token, expires_at, last_refresh_at) = match token {
+        Some(token) => (
+            Some(token.access_token.as_str()),
+            Some(token.refresh_token.as_str()),
+            Some(token.expires_at.to_rfc3339()),
+            Some(chrono::Utc::now().to_rfc3339()),
+        ),
+        None => (None, None, None, None),
+    };
+
+    sqlx::query(
+        "UPDATE accounts
+         SET oauth_access_token = ?1,
+             oauth_refresh_token = ?2,
+             oauth_expires_at = ?3,
+             last_refresh_at = COALESCE(?4, last_refresh_at),
+             last_error = ?5,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?6",
+    )
+    .bind(access_token)
+    .bind(refresh_token)
+    .bind(expires_at)
+    .bind(last_refresh_at)
+    .bind(last_error)
+    .bind(account_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn set_account_auth_error(
+    pool: &SqlitePool,
+    account_id: i64,
+    last_error: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE accounts
+         SET status = 'auth_error',
+             invalid_reason = NULL,
+             last_error = ?1,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?2",
+    )
+    .bind(last_error)
+    .bind(account_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_account_by_id(
+    pool: &SqlitePool,
+    account_id: i64,
+) -> Result<Option<AccountWithRuntime>, sqlx::Error> {
+    Ok(load_all_accounts(pool)
+        .await?
+        .into_iter()
+        .find(|account| account.id == account_id))
+}
+
+pub async fn load_pure_oauth_accounts(
+    pool: &SqlitePool,
+    bound_ids: &[i64],
+) -> Result<Vec<AccountWithRuntime>, sqlx::Error> {
+    let all = load_all_accounts(pool).await?;
+    Ok(all
+        .into_iter()
+        .filter(|account| {
+            account.status == "active"
+                && account.auth_source == "oauth"
+                && account.oauth_token.is_some()
+                && (bound_ids.is_empty() || bound_ids.contains(&account.id))
+        })
+        .collect())
 }

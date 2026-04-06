@@ -11,11 +11,13 @@ use http::{
 use snafu::ResultExt;
 use tracing::error;
 use wreq::RequestBuilder;
+use wreq_util::Emulation;
 
 use crate::{
     billing::BillingContext,
-    config::{CLAUDE_ENDPOINT, CookieStatus, Reason},
+    config::{CLAUDE_ENDPOINT, CookieStatus, Reason, TokenInfo},
     error::{ClewdrError, WreqSnafu},
+    providers::claude::OAuthAccountPool,
     services::cookie_actor::CookieActorHandle,
     stealth::SharedStealthProfile,
     types::claude::Usage,
@@ -36,6 +38,17 @@ fn proxy_from_profile(profile: &SharedStealthProfile) -> Option<wreq::Proxy> {
         })
 }
 
+fn build_api_client(proxy: Option<&wreq::Proxy>) -> wreq::Client {
+    let mut builder = wreq::Client::builder();
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy.to_owned());
+    }
+    builder.build().unwrap_or_else(|e| {
+        error!("Failed to build API client: {e}");
+        SUPER_CLIENT.to_owned()
+    })
+}
+
 #[derive(Clone)]
 pub struct ClaudeCodeState {
     pub cookie_actor_handle: CookieActorHandle,
@@ -46,10 +59,14 @@ pub struct ClaudeCodeState {
     pub client: wreq::Client,
     pub stream: bool,
     pub system_prompt_hash: Option<u64>,
+    pub anthropic_beta_header: Option<String>,
+    pub oauth_token: Option<TokenInfo>,
+    pub account_id: Option<i64>,
+    pub organization_uuid: Option<String>,
+    pub(crate) oauth_pool: Option<std::sync::Arc<OAuthAccountPool>>,
     pub usage: Usage,
     pub billing_ctx: Option<BillingContext>,
     pub stealth_profile: SharedStealthProfile,
-    pub session_id: String,
     pub bound_account_ids: Vec<i64>,
 }
 
@@ -64,15 +81,19 @@ impl ClaudeCodeState {
             cookie_actor_handle,
             cookie: None,
             cookie_header_value: HeaderValue::from_static(""),
+            client: build_api_client(proxy.as_ref()),
             proxy,
             endpoint: crate::config::ENDPOINT_URL.to_owned(),
-            client: SUPER_CLIENT.to_owned(),
             stream: false,
             system_prompt_hash: None,
+            anthropic_beta_header: None,
+            oauth_token: None,
+            account_id: None,
+            organization_uuid: None,
+            oauth_pool: None,
             usage: Usage::default(),
             billing_ctx: None,
             stealth_profile,
-            session_id: String::new(),
             bound_account_ids: Vec::new(),
         }
     }
@@ -95,7 +116,9 @@ impl ClaudeCodeState {
             .to_string();
         let header_value = HeaderValue::from_str(cookie_value.as_str())?;
         state.cookie_header_value = header_value.clone();
-        let mut client = wreq::Client::builder().cookie_store(true);
+        let mut client = wreq::Client::builder()
+            .cookie_store(true)
+            .emulation(Emulation::Chrome136);
         if let Some(ref proxy) = state.proxy {
             client = client.proxy(proxy.to_owned());
         }
@@ -152,7 +175,9 @@ impl ClaudeCodeState {
         // Always pull latest proxy from stealth profile
         self.proxy = proxy_from_profile(&self.stealth_profile);
         self.endpoint = crate::config::ENDPOINT_URL.to_owned();
-        let mut client = wreq::Client::builder().cookie_store(true);
+        let mut client = wreq::Client::builder()
+            .cookie_store(true)
+            .emulation(Emulation::Chrome136);
         if let Some(ref proxy) = self.proxy {
             client = client.proxy(proxy.to_owned());
         }
@@ -163,6 +188,12 @@ impl ClaudeCodeState {
     }
 
     pub fn check_token(&self) -> TokenStatus {
+        if let Some(token_info) = &self.oauth_token {
+            if token_info.is_expired() {
+                return TokenStatus::Expired;
+            }
+            return TokenStatus::Valid;
+        }
         let Some(CookieStatus {
             token: Some(token_info),
             ..

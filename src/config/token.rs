@@ -25,22 +25,35 @@ pub struct TokenInfo {
 }
 
 impl TokenInfo {
+    pub fn from_parts(
+        access_token: String,
+        refresh_token: String,
+        expires_in: Duration,
+        organization_uuid: String,
+    ) -> Self {
+        let expires_at = Utc::now() + expires_in;
+        Self {
+            access_token,
+            expires_in,
+            organization: Organization {
+                uuid: organization_uuid,
+            },
+            refresh_token,
+            expires_at,
+        }
+    }
+
     pub fn new(
         raw: StandardTokenResponse<EmptyExtraTokenFields, BasicTokenType>,
         organization_uuid: String,
     ) -> Self {
-        let expires_at = Utc::now() + raw.expires_in().unwrap_or_default();
-        Self {
-            access_token: raw.access_token().secret().to_string(),
-            expires_in: raw.expires_in().unwrap_or_default(),
-            organization: Organization {
-                uuid: organization_uuid,
-            },
-            refresh_token: raw
-                .refresh_token()
+        Self::from_parts(
+            raw.access_token().secret().to_string(),
+            raw.refresh_token()
                 .map_or_else(Default::default, |rt| rt.secret().to_string()),
-            expires_at,
-        }
+            raw.expires_in().unwrap_or_default(),
+            organization_uuid,
+        )
     }
 
     pub fn is_expired(&self) -> bool {

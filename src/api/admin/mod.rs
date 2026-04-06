@@ -35,6 +35,7 @@ pub fn admin_router() -> Router<AppState> {
         // Accounts
         .route("/accounts", get(accounts::list).post(accounts::create))
         .route("/accounts/probe", post(accounts::probe_all))
+        .route("/accounts/oauth/start", post(accounts::start_oauth))
         .route(
             "/accounts/{id}",
             put(accounts::update).delete(accounts::remove),
