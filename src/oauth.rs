@@ -205,9 +205,7 @@ fn oauth_form_body(params: &[(&str, &str)]) -> String {
     serializer.finish()
 }
 
-async fn send_oauth_token_request(
-    body: String,
-) -> Result<OAuthTokenResponse, ClewdrError> {
+async fn send_oauth_token_request(body: String) -> Result<OAuthTokenResponse, ClewdrError> {
     let response = oauth_client()
         .post(CC_TOKEN_URL)
         .header("content-type", "application/x-www-form-urlencoded")
@@ -543,7 +541,8 @@ pub async fn refresh_oauth_token(token: &TokenInfo) -> Result<OAuthExchangeResul
     Ok(OAuthExchangeResult {
         token: TokenInfo::from_parts(
             access_token,
-            raw.refresh_token.unwrap_or_else(|| token.refresh_token.clone()),
+            raw.refresh_token
+                .unwrap_or_else(|| token.refresh_token.clone()),
             Duration::from_secs(raw.expires_in.unwrap_or_default()),
             organization_uuid,
         ),

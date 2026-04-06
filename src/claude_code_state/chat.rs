@@ -50,11 +50,7 @@ impl ClaudeCodeState {
         }
     }
 
-    async fn mark_oauth_account_auth_error(
-        &mut self,
-        account_id: i64,
-        message: String,
-    ) {
+    async fn mark_oauth_account_auth_error(&mut self, account_id: i64, message: String) {
         let Some(db) = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()) else {
             return;
         };
@@ -134,13 +130,16 @@ impl ClaudeCodeState {
             let access_token = match self.check_token() {
                 TokenStatus::Valid => self.oauth_token.as_ref().map(|t| t.access_token.clone()),
                 TokenStatus::Expired => {
-                    if let Err(err) = self.persist_oauth_refresh(account_id.expect("checked above")).await {
+                    if let Err(err) = self
+                        .persist_oauth_refresh(account_id.expect("checked above"))
+                        .await
+                    {
                         if Self::is_oauth_auth_failure(&err) {
                             self.mark_oauth_account_auth_error(
                                 account_id.expect("checked above"),
                                 err.to_string(),
                             )
-                                .await;
+                            .await;
                         }
                         self.release_selected_slot(account_id).await;
                         return Err(err);
@@ -166,7 +165,7 @@ impl ClaudeCodeState {
                             account_id.expect("checked above"),
                             err.to_string(),
                         )
-                            .await;
+                        .await;
                     }
                     self.release_selected_slot(account_id).await;
                     return Err(err);
@@ -417,13 +416,16 @@ impl ClaudeCodeState {
             let access_token = match self.check_token() {
                 TokenStatus::Valid => self.oauth_token.as_ref().map(|t| t.access_token.clone()),
                 TokenStatus::Expired => {
-                    if let Err(err) = self.persist_oauth_refresh(account_id.expect("checked above")).await {
+                    if let Err(err) = self
+                        .persist_oauth_refresh(account_id.expect("checked above"))
+                        .await
+                    {
                         if Self::is_oauth_auth_failure(&err) {
                             self.mark_oauth_account_auth_error(
                                 account_id.expect("checked above"),
                                 err.to_string(),
                             )
-                                .await;
+                            .await;
                         }
                         self.release_selected_slot(account_id).await;
                         return Err(err);
@@ -447,7 +449,7 @@ impl ClaudeCodeState {
                             account_id.expect("checked above"),
                             err.to_string(),
                         )
-                            .await;
+                        .await;
                     }
                     self.release_selected_slot(account_id).await;
                     return Err(err);
