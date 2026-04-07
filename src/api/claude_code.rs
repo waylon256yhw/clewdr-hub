@@ -23,6 +23,7 @@ fn error_to_log_status(err: &ClewdrError) -> Option<(&'static str, u16)> {
         ClewdrError::RpmExceeded => Some(("rpm_rejected", 429)),
         ClewdrError::BoundAccountsUnavailable => Some(("no_account_available", 429)),
         ClewdrError::TooManyRetries => Some(("no_account_available", 504)),
+        ClewdrError::InvalidCookie { .. } => Some(("auth_rejected", 400)),
         ClewdrError::ClaudeHttpError { code, .. } => Some(("upstream_error", code.as_u16())),
         _ => None,
     }

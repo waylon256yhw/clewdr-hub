@@ -12,10 +12,10 @@ use wreq::Method;
 
 use crate::{
     claude_code_state::{ClaudeCodeState, TokenStatus},
-    config::{Claude1mChannel, ModelFamily},
+    config::{Claude1mChannel, ModelFamily, Reason},
     db::accounts::{
-        batch_upsert_runtime_states, set_account_auth_error, update_account_metadata_unchecked,
-        upsert_account_oauth,
+        batch_upsert_runtime_states, set_account_auth_error, set_account_disabled,
+        update_account_metadata_unchecked, upsert_account_oauth,
     },
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
     oauth::refresh_oauth_token,
@@ -50,6 +50,24 @@ impl ClaudeCodeState {
         }
     }
 
+    fn is_oauth_disabled_failure(err: &ClewdrError) -> bool {
+        match err {
+            ClewdrError::InvalidCookie { reason } => matches!(reason, Reason::Disabled),
+            ClewdrError::ClaudeHttpError { code, inner } => {
+                if code.as_u16() != 400 {
+                    return false;
+                }
+                let msg = inner
+                    .message
+                    .as_str()
+                    .map(|s| s.to_ascii_lowercase())
+                    .unwrap_or_else(|| inner.message.to_string().to_ascii_lowercase());
+                msg.contains("organization has been disabled")
+            }
+            _ => false,
+        }
+    }
+
     async fn mark_oauth_account_auth_error(&mut self, account_id: i64, message: String) {
         let Some(db) = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()) else {
             return;
@@ -57,6 +75,15 @@ impl ClaudeCodeState {
         if let Err(db_err) = set_account_auth_error(&db, account_id, &message).await {
             warn!("Failed to set OAuth auth_error for account {account_id}: {db_err}");
             return;
+        }
+    }
+
+    async fn mark_oauth_account_disabled(&mut self, account_id: i64) {
+        let Some(db) = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()) else {
+            return;
+        };
+        if let Err(db_err) = set_account_disabled(&db, account_id, "disabled").await {
+            warn!("Failed to set OAuth account {account_id} disabled: {db_err}");
         }
     }
 
@@ -129,7 +156,10 @@ impl ClaudeCodeState {
                         .persist_oauth_refresh(account_id.expect("checked above"))
                         .await
                     {
-                        if Self::is_oauth_auth_failure(&err) {
+                        if Self::is_oauth_disabled_failure(&err) {
+                            self.mark_oauth_account_disabled(account_id.expect("checked above"))
+                                .await;
+                        } else if Self::is_oauth_auth_failure(&err) {
                             self.mark_oauth_account_auth_error(
                                 account_id.expect("checked above"),
                                 err.to_string(),
@@ -155,7 +185,10 @@ impl ClaudeCodeState {
                     return Ok(response);
                 }
                 Err(err) => {
-                    if Self::is_oauth_auth_failure(&err) {
+                    if Self::is_oauth_disabled_failure(&err) {
+                        self.mark_oauth_account_disabled(account_id.expect("checked above"))
+                            .await;
+                    } else if Self::is_oauth_auth_failure(&err) {
                         self.mark_oauth_account_auth_error(
                             account_id.expect("checked above"),
                             err.to_string(),
@@ -415,7 +448,10 @@ impl ClaudeCodeState {
                         .persist_oauth_refresh(account_id.expect("checked above"))
                         .await
                     {
-                        if Self::is_oauth_auth_failure(&err) {
+                        if Self::is_oauth_disabled_failure(&err) {
+                            self.mark_oauth_account_disabled(account_id.expect("checked above"))
+                                .await;
+                        } else if Self::is_oauth_auth_failure(&err) {
                             self.mark_oauth_account_auth_error(
                                 account_id.expect("checked above"),
                                 err.to_string(),
@@ -439,7 +475,10 @@ impl ClaudeCodeState {
                     return Ok(response);
                 }
                 Err(err) => {
-                    if Self::is_oauth_auth_failure(&err) {
+                    if Self::is_oauth_disabled_failure(&err) {
+                        self.mark_oauth_account_disabled(account_id.expect("checked above"))
+                            .await;
+                    } else if Self::is_oauth_auth_failure(&err) {
                         self.mark_oauth_account_auth_error(
                             account_id.expect("checked above"),
                             err.to_string(),

@@ -4,7 +4,7 @@ use axum::response::Response;
 use colored::Colorize;
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, broadcast};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::LLMProvider;
 use crate::{
@@ -240,7 +240,13 @@ impl LLMProvider for ClaudeCodeProvider {
                 );
                 print_out_json(&params, "claude_code_client_req.json");
                 let stopwatch = Instant::now();
-                let response = state.try_chat(params).await?;
+                let response = match state.try_chat(params).await {
+                    Ok(response) => response,
+                    Err(err) => {
+                        warn!("[ERR] {}", err);
+                        return Err(err);
+                    }
+                };
                 let elapsed = stopwatch.elapsed();
                 info!(
                     "[FIN] elapsed: {}s",

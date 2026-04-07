@@ -385,13 +385,18 @@ impl CheckClaudeErr for Response {
                 inner: error,
             });
         };
-        if status == 400 && err.error.message == json!("This organization has been disabled.") {
+        const OAUTH_PHRASE: &str =
+            "oauth authentication is currently not allowed for this organization";
+        let msg_lower = err
+            .error
+            .message
+            .as_str()
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_else(|| err.error.message.to_string().to_ascii_lowercase());
+        if status == 400 && msg_lower.contains("organization has been disabled") {
             // account disabled
             return Err(Reason::Disabled.into());
         }
-        const OAUTH_PHRASE: &str =
-            "oauth authentication is currently not allowed for this organization";
-        let msg_lower = err.error.message.to_string().to_ascii_lowercase();
         if (status == 401 || status == 403) && msg_lower.contains(OAUTH_PHRASE) {
             return Err(Reason::Null.into());
         }
