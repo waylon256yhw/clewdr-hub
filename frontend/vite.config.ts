@@ -1,6 +1,8 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
+const backendUrl = process.env.VITE_DEV_BACKEND_URL ?? 'http://localhost:8484'
+
 export default defineConfig({
   plugins: [react()],
   build: {
@@ -9,8 +11,8 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      '/api': 'http://localhost:3000',
-      '/auth': 'http://localhost:3000',
+      '/api': backendUrl,
+      '/auth': backendUrl,
     },
   },
 })

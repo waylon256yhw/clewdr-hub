@@ -36,16 +36,24 @@
 ./dev.sh rebuild        # 重建前端 + 启动后端
 ./dev.sh reset          # 删库重建（admin:password）
 ./dev.sh rebuild reset  # 两者都做
+./dev.sh hmr            # 启动后端 + Vite HMR（全栈开发）
+./dev.sh stop           # 停止 dev.sh 启动的后端/Vite 进程
+./dev.sh no-timeout     # 启动时关闭自动停机 watchdog
+./dev.sh timeout=7200   # 启动时将自动停机改为 2 小时
 ```
 
 脚本行为：
 1. 杀掉已有的 clewdr 进程
 2. 可选：删除 `clewdr.db` 重新初始化
 3. 可选：`cd frontend && npx vite build` 构建前端到 `static/`
-4. `cargo run -- --db clewdr.db` 启动后端
-5. 轮询 `/api/version` 等待就绪，超时 60 秒
+4. `cargo run -- --db clewdr.db` 后台启动后端（输出写入 `.dev-backend.log`）
+5. `hmr` 模式下启动 `npm --prefix frontend run dev`（输出写入 `.dev-frontend.log`）
+6. 轮询后端 `/api/version` 和（可选）前端首页等待就绪，超时 60 秒
+7. 默认启动自动停机 watchdog，3 小时后自动执行 `./dev.sh stop`
 
 首次运行会自动触发前端构建（检测 `static/index.html` 不存在时）。
+可通过 `DEV_AUTO_STOP_SECONDS` 环境变量改默认超时；设为 `0` 可全局关闭 watchdog。
+`timeout=SECONDS` 必须是正整数，传错会直接报错退出。
 
 脚本还会自动配置 `git config core.hooksPath .githooks`，启用 pre-commit 的 `cargo fmt --check`。
 
@@ -57,7 +65,7 @@ npm install
 npm run dev         # Vite dev server，自动代理 /api → localhost:8484
 ```
 
-需要后端同时运行。Vite 配置在 `frontend/vite.config.ts`，代理目标端口是 `3000`（dev.sh 默认用 `8484`，如需对接调整 `CLEWDR_PORT` 或 vite config）。
+需要后端同时运行。Vite 代理默认转发到 `http://localhost:8484`。可通过环境变量 `VITE_DEV_BACKEND_URL` 覆盖。
 
 ---
 
