@@ -38,8 +38,12 @@ import {
   type UsageWindow,
 } from "../api";
 
+function normalizeAccountType(t: string): string {
+  return t.trim().toLowerCase().replace(/[\s-]+/g, "_").replace(/^claude_/, "");
+}
+
 function accountTypeColor(t: string): string {
-  switch (t) {
+  switch (normalizeAccountType(t)) {
     case "max": return "violet";
     case "enterprise": return "indigo";
     case "pro": return "blue";
@@ -49,7 +53,7 @@ function accountTypeColor(t: string): string {
 }
 
 function accountTypeLabel(t: string): string {
-  switch (t) {
+  switch (normalizeAccountType(t)) {
     case "max": return "Max";
     case "enterprise": return "Enterprise";
     case "pro": return "Pro";
@@ -284,8 +288,9 @@ function AccountFormModal({
   const mutation = useMutation({
     mutationFn: async (values: FormValues) => {
       const name = values.name.trim();
-      const cookieBlob = values.cookie_blob.trim();
-      const oauthInput = values.oauth_callback_input.trim();
+      const cookieBlob = tab === "cookie" ? values.cookie_blob.trim() : "";
+      const oauthInput = tab === "oauth" ? values.oauth_callback_input.trim() : "";
+      const scopedOauthState = tab === "oauth" ? oauthState : "";
       if (!name) throw new ApiError(400, "名称必填");
       if (!editing && tab === "cookie" && !cookieBlob) throw new ApiError(400, "新账号必须提供 Cookie");
       if (!editing && tab === "oauth" && !oauthInput) throw new ApiError(400, "请粘贴 Callback URL 或 Code");
@@ -296,7 +301,7 @@ function AccountFormModal({
         if (values.rr_order !== editing.rr_order) body.rr_order = values.rr_order;
         if (cookieBlob) body.cookie_blob = cookieBlob;
         if (oauthInput) body.oauth_callback_input = oauthInput;
-        if (oauthState) body.oauth_state = oauthState;
+        if (scopedOauthState) body.oauth_state = scopedOauthState;
         return updateAccount(editing.id, body);
       }
       return createAccount({
@@ -305,7 +310,7 @@ function AccountFormModal({
         auth_source: tab,
         cookie_blob: cookieBlob || undefined,
         oauth_callback_input: oauthInput || undefined,
-        oauth_state: oauthState || undefined,
+        oauth_state: scopedOauthState || undefined,
       });
     },
     onSuccess: () => {
@@ -328,7 +333,20 @@ function AccountFormModal({
           <TextInput label="名称" required key={form.key("name")} {...form.getInputProps("name")} />
           {editing && <NumberInput label="轮询顺序" key={form.key("rr_order")} {...form.getInputProps("rr_order")} />}
           {!editing && <NumberInput label="最大并发" min={1} key={form.key("max_slots")} {...form.getInputProps("max_slots")} />}
-          <Tabs value={tab} onChange={(value) => setTab((value as "oauth" | "cookie") ?? "oauth")}>
+          <Tabs
+            value={tab}
+            onChange={(value) => {
+              const nextTab = (value as "oauth" | "cookie") ?? "oauth";
+              setTab(nextTab);
+              if (nextTab === "cookie") {
+                form.setFieldValue("oauth_callback_input", "");
+                setAuthUrl("");
+                setOauthState("");
+              } else {
+                form.setFieldValue("cookie_blob", "");
+              }
+            }}
+          >
             <Tabs.List>
               <Tabs.Tab value="oauth">OAuth Token</Tabs.Tab>
               <Tabs.Tab value="cookie">Cookie</Tabs.Tab>
