@@ -4,8 +4,13 @@ use tracing::{info, warn};
 use super::ClaudeCodeState;
 use crate::{
     config::{CookieStatus, Reason},
-    db::accounts::update_account_metadata,
+    db::accounts::{
+        AccountWithRuntime, batch_upsert_runtime_states, set_account_active,
+        set_account_auth_error, update_account_metadata, update_account_metadata_unchecked,
+        upsert_account_oauth,
+    },
     error::ClewdrError,
+    oauth::refresh_oauth_token,
     services::cookie_actor::CookieActorHandle,
     stealth::SharedStealthProfile,
 };
@@ -16,6 +21,24 @@ fn extract_cookie_reason(e: &ClewdrError) -> Option<Reason> {
         Some(reason.clone())
     } else {
         None
+    }
+}
+
+fn is_oauth_auth_failure(err: &ClewdrError) -> bool {
+    match err {
+        ClewdrError::ClaudeHttpError { code, .. } => matches!(code.as_u16(), 401 | 403),
+        ClewdrError::Whatever { message, .. } => {
+            let msg = message.to_ascii_lowercase();
+            msg.contains("invalid_grant")
+                || msg.contains("refresh token not found")
+                || msg.contains("refresh token")
+                    && (msg.contains("invalid") || msg.contains("expired"))
+                || msg.contains("status 401")
+                || msg.contains("status 403")
+                || msg.contains("access token")
+                    && (msg.contains("expired") || msg.contains("invalid"))
+        }
+        _ => false,
     }
 }
 
@@ -195,4 +218,99 @@ pub async fn probe_cookie(
     // 6. Return updated cookie to actor
     state.return_cookie(None).await;
     info!("[probe] completed for account {account_id}");
+}
+
+pub async fn probe_oauth_account(
+    account: AccountWithRuntime,
+    handle: CookieActorHandle,
+    db: SqlitePool,
+) {
+    let account_id = account.id;
+    info!("[probe][oauth] starting for account {account_id}");
+
+    let Some(token) = account.oauth_token.clone() else {
+        let msg = "missing stored OAuth token".to_string();
+        warn!("[probe][oauth] account {account_id}: {msg}");
+        handle.set_probe_error(account_id, msg).await;
+        let _ = handle.clear_probing(account_id).await;
+        return;
+    };
+
+    match refresh_oauth_token(&token).await {
+        Ok(refreshed) => {
+            if let Err(err) =
+                upsert_account_oauth(&db, account_id, Some(&refreshed.token), None).await
+            {
+                let msg = format!("failed to persist refreshed token: {err}");
+                warn!("[probe][oauth] account {account_id}: {msg}");
+                handle
+                    .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
+                    .await;
+                let _ = handle.clear_probing(account_id).await;
+                return;
+            }
+            if let Err(err) = update_account_metadata_unchecked(
+                &db,
+                account_id,
+                refreshed.snapshot.email.as_deref(),
+                refreshed.snapshot.account_type.as_deref(),
+                Some(refreshed.snapshot.organization_uuid.as_str()),
+            )
+            .await
+            {
+                let msg = format!("failed to persist metadata: {err}");
+                warn!("[probe][oauth] account {account_id}: {msg}");
+                handle
+                    .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
+                    .await;
+                let _ = handle.clear_probing(account_id).await;
+                return;
+            }
+            if let Err(err) = batch_upsert_runtime_states(
+                &db,
+                &[(account_id, refreshed.snapshot.runtime.clone())],
+            )
+            .await
+            {
+                let msg = format!("failed to persist runtime: {err}");
+                warn!("[probe][oauth] account {account_id}: {msg}");
+                handle
+                    .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
+                    .await;
+                let _ = handle.clear_probing(account_id).await;
+                return;
+            }
+            if account.status == "auth_error"
+                && let Err(err) = set_account_active(&db, account_id).await
+            {
+                let msg = format!("failed to reactivate account: {err}");
+                warn!("[probe][oauth] account {account_id}: {msg}");
+                handle
+                    .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
+                    .await;
+                let _ = handle.clear_probing(account_id).await;
+                return;
+            }
+            handle.clear_probe_error(account_id).await;
+            let _ = handle.clear_probing(account_id).await;
+            info!("[probe][oauth] completed for account {account_id}");
+        }
+        Err(err) => {
+            let msg = err.to_string();
+            warn!("[probe][oauth] account {account_id}: {msg}");
+            if is_oauth_auth_failure(&err) {
+                if let Err(db_err) = set_account_auth_error(&db, account_id, &msg).await {
+                    warn!(
+                        "[probe][oauth] failed to set auth_error for account {account_id}: {db_err}"
+                    );
+                }
+                handle.clear_probe_error(account_id).await;
+            } else {
+                handle
+                    .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
+                    .await;
+            }
+            let _ = handle.clear_probing(account_id).await;
+        }
+    }
 }

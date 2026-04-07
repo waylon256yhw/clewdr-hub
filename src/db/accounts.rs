@@ -76,6 +76,19 @@ fn bool_from_int(v: Option<i64>) -> Option<bool> {
     v.map(|i| i != 0)
 }
 
+pub fn active_reset_time(account: &AccountWithRuntime) -> Option<i64> {
+    let now = chrono::Utc::now().timestamp();
+    account
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.reset_time)
+        .filter(|ts| *ts > now)
+}
+
+pub fn is_temporarily_unavailable(account: &AccountWithRuntime) -> bool {
+    active_reset_time(account).is_some()
+}
+
 fn get_u64(row: &sqlx::sqlite::SqliteRow, col: &str) -> u64 {
     row.get::<i64, _>(col) as u64
 }
@@ -388,14 +401,33 @@ pub async fn set_accounts_active(pool: &SqlitePool, ids: &[i64]) -> Result<(), s
     }
     let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "UPDATE accounts SET status = 'active', invalid_reason = NULL, updated_at = CURRENT_TIMESTAMP \
-         WHERE id IN ({placeholders}) AND status = 'disabled'"
+        "UPDATE accounts
+         SET status = 'active',
+             invalid_reason = NULL,
+             last_error = NULL,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id IN ({placeholders}) AND status IN ('disabled', 'auth_error')"
     );
     let mut q = sqlx::query(&sql);
     for id in ids {
         q = q.bind(id);
     }
     q.execute(pool).await?;
+    Ok(())
+}
+
+pub async fn set_account_active(pool: &SqlitePool, account_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE accounts
+         SET status = 'active',
+             invalid_reason = NULL,
+             last_error = NULL,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?1 AND status != 'disabled'",
+    )
+    .bind(account_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -523,7 +555,8 @@ pub async fn load_pure_oauth_accounts(
     Ok(all
         .into_iter()
         .filter(|account| {
-            account.status == "active"
+            !matches!(account.status.as_str(), "auth_error" | "disabled")
+                && !is_temporarily_unavailable(account)
                 && account.auth_source == "oauth"
                 && account.oauth_token.is_some()
                 && (bound_ids.is_empty() || bound_ids.contains(&account.id))

@@ -49,13 +49,25 @@ export default function Dashboard() {
 
   const cards: { label: string; value: React.ReactNode; link?: string }[] = [
     {
-      label: "Cookie 状态",
+      label: "账号状态",
       link: "/accounts",
       value: (
         <Group gap="xs">
-          <Badge color="green" variant="light">{data.cookies.valid} 可用</Badge>
-          <Badge color="yellow" variant="light">{data.cookies.exhausted} 耗尽</Badge>
-          <Badge color="red" variant="light">{data.cookies.invalid} 失效</Badge>
+          <Badge color="green" variant="light">{data.accounts.statuses.active} active</Badge>
+          <Badge color="yellow" variant="light">{data.accounts.statuses.cooling} cooling</Badge>
+          <Badge color="red" variant="light">{data.accounts.statuses.error} error</Badge>
+          <Badge color="gray" variant="light">{data.accounts.statuses.disabled} disabled</Badge>
+        </Group>
+      ),
+    },
+    {
+      label: "认证结构",
+      link: "/accounts",
+      value: (
+        <Group gap="xs">
+          <Badge color="blue" variant="light">{data.accounts.auth_sources.oauth} OAuth</Badge>
+          <Badge color="dark" variant="outline">{data.accounts.auth_sources.cookie} Cookie</Badge>
+          <Badge color="grape" variant="light">{data.accounts.auth_sources.hybrid} Hybrid</Badge>
         </Group>
       ),
     },

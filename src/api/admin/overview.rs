@@ -2,6 +2,7 @@ use axum::{Extension, Json, extract::State};
 use serde::Serialize;
 use sqlx::SqlitePool;
 
+use crate::db::accounts::{is_temporarily_unavailable, load_all_accounts};
 use crate::db::models::AuthenticatedUser;
 use crate::error::ClewdrError;
 use crate::services::cookie_actor::CookieActorHandle;
@@ -47,8 +48,23 @@ pub struct KeyOverview {
 #[derive(Serialize)]
 pub struct AccountOverview {
     pub total: i64,
+    pub statuses: AccountStatusOverview,
+    pub auth_sources: AccountAuthSourceOverview,
+}
+
+#[derive(Serialize)]
+pub struct AccountStatusOverview {
     pub active: i64,
+    pub cooling: i64,
+    pub error: i64,
     pub disabled: i64,
+}
+
+#[derive(Serialize)]
+pub struct AccountAuthSourceOverview {
+    pub oauth: i64,
+    pub cookie: i64,
+    pub hybrid: i64,
 }
 
 #[derive(Serialize)]
@@ -92,14 +108,30 @@ pub async fn overview(
            FROM api_keys"#,
     ).fetch_one(&db).await?;
 
-    let account_stats: (i64, i64, i64) = sqlx::query_as(
-        r#"SELECT COUNT(*),
-                  COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0),
-                  COALESCE(SUM(CASE WHEN status = 'disabled' THEN 1 ELSE 0 END), 0)
-           FROM accounts"#,
-    )
-    .fetch_one(&db)
-    .await?;
+    let accounts = load_all_accounts(&db).await?;
+    let mut account_active = 0_i64;
+    let mut account_cooling = 0_i64;
+    let mut account_error = 0_i64;
+    let mut account_disabled = 0_i64;
+    let mut oauth_count = 0_i64;
+    let mut cookie_count = 0_i64;
+    let mut hybrid_count = 0_i64;
+
+    for account in &accounts {
+        match account.auth_source.as_str() {
+            "oauth" => oauth_count += 1,
+            "cookie" => cookie_count += 1,
+            "hybrid" => hybrid_count += 1,
+            _ => {}
+        }
+
+        match account.status.as_str() {
+            "disabled" => account_disabled += 1,
+            "auth_error" => account_error += 1,
+            _ if is_temporarily_unavailable(account) => account_cooling += 1,
+            _ => account_active += 1,
+        }
+    }
 
     let (policy_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM policies")
         .fetch_one(&db)
@@ -144,9 +176,18 @@ pub async fn overview(
             disabled: key_stats.2,
         },
         accounts: AccountOverview {
-            total: account_stats.0,
-            active: account_stats.1,
-            disabled: account_stats.2,
+            total: accounts.len() as i64,
+            statuses: AccountStatusOverview {
+                active: account_active,
+                cooling: account_cooling,
+                error: account_error,
+                disabled: account_disabled,
+            },
+            auth_sources: AccountAuthSourceOverview {
+                oauth: oauth_count,
+                cookie: cookie_count,
+                hybrid: hybrid_count,
+            },
         },
         policies: policy_count,
         requests_1h,

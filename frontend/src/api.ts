@@ -65,7 +65,11 @@ export interface OverviewResponse {
   cookies: { valid: number; exhausted: number; invalid: number };
   users: { total: number; admins: number; members: number; disabled: number };
   api_keys: { total: number; active: number; disabled: number };
-  accounts: { total: number; active: number; disabled: number };
+  accounts: {
+    total: number;
+    statuses: { active: number; cooling: number; error: number; disabled: number };
+    auth_sources: { oauth: number; cookie: number; hybrid: number };
+  };
   policies: number;
   requests_1h: number;
   requests_24h: number;
@@ -80,6 +84,7 @@ export interface UsageWindow {
 }
 
 export interface AccountRuntime {
+  reset_time: number | null;
   resets_last_checked_at: number | null;
   session: UsageWindow | null;
   weekly: UsageWindow | null;

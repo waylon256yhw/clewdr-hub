@@ -54,15 +54,10 @@ impl ClaudeCodeState {
         let Some(db) = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()) else {
             return;
         };
-        if let Err(db_err) = upsert_account_oauth(&db, account_id, None, Some(&message)).await {
-            warn!("Failed to clear OAuth token for account {account_id}: {db_err}");
-            return;
-        }
         if let Err(db_err) = set_account_auth_error(&db, account_id, &message).await {
             warn!("Failed to set OAuth auth_error for account {account_id}: {db_err}");
             return;
         }
-        self.oauth_token = None;
     }
 
     async fn release_selected_slot(&self, account_id: Option<i64>) {

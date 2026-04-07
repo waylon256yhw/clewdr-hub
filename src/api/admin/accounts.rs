@@ -10,6 +10,7 @@ use sqlx::SqlitePool;
 
 use super::common::PaginationParams;
 use crate::{
+    claude_code_state::probe::probe_oauth_account,
     db::accounts::{
         AccountWithRuntime, batch_upsert_runtime_states, get_account_by_id, load_all_accounts,
         update_account_metadata_unchecked, upsert_account_oauth,
@@ -17,6 +18,7 @@ use crate::{
     error::ClewdrError,
     oauth::{AdminOAuthStartResponse, exchange_admin_oauth_callback, start_admin_oauth_flow},
     services::cookie_actor::CookieActorHandle,
+    state::AppState,
 };
 
 #[derive(Serialize)]
@@ -38,6 +40,7 @@ pub struct UsageWindowResponse {
 
 #[derive(Serialize)]
 pub struct AccountRuntimeResponse {
+    pub reset_time: Option<i64>,
     pub resets_last_checked_at: Option<i64>,
     pub session: Option<UsageWindowResponse>,
     pub weekly: Option<UsageWindowResponse>,
@@ -67,6 +70,7 @@ pub struct AccountResponse {
 
 fn map_account(row: &AccountWithRuntime) -> AccountResponse {
     let runtime = row.runtime.as_ref().map(|rt| AccountRuntimeResponse {
+        reset_time: rt.reset_time,
         resets_last_checked_at: rt.resets_last_checked_at,
         session: Some(UsageWindowResponse {
             has_reset: rt.session_has_reset,
@@ -474,8 +478,50 @@ pub async fn remove(
 }
 
 pub async fn probe_all(
-    State(actor): State<CookieActorHandle>,
+    State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ClewdrError> {
-    let ids = actor.probe_all().await?;
-    Ok(Json(serde_json::json!({ "probing_ids": ids })))
+    let accounts = load_all_accounts(&state.db).await?;
+    let mut probing_ids = Vec::new();
+    let mut cookie_backed_ids = Vec::new();
+
+    for account in accounts {
+        let auth_source = account.auth_source.as_str();
+
+        if auth_source == "oauth" && account.status != "disabled" && account.oauth_token.is_some() {
+            if !state.cookie_actor.begin_probe(account.id).await? {
+                continue;
+            }
+            probing_ids.push(account.id);
+            let handle = state.cookie_actor.clone();
+            let db = state.db.clone();
+            tokio::spawn(async move {
+                probe_oauth_account(account, handle, db).await;
+            });
+            continue;
+        }
+
+        if account.cookie_blob.is_some() {
+            cookie_backed_ids.push(account.id);
+            continue;
+        }
+
+        if account.status != "disabled" && account.oauth_token.is_some() {
+            if !state.cookie_actor.begin_probe(account.id).await? {
+                continue;
+            }
+            probing_ids.push(account.id);
+            let handle = state.cookie_actor.clone();
+            let db = state.db.clone();
+            tokio::spawn(async move {
+                probe_oauth_account(account, handle, db).await;
+            });
+            continue;
+        }
+    }
+
+    if !cookie_backed_ids.is_empty() {
+        probing_ids.extend(state.cookie_actor.probe_accounts(cookie_backed_ids).await?);
+    }
+
+    Ok(Json(serde_json::json!({ "probing_ids": probing_ids })))
 }

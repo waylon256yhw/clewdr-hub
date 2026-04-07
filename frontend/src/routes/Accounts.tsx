@@ -37,7 +37,6 @@ import {
   type AccountsListResponse,
   type UsageWindow,
 } from "../api";
-import { statusColor } from "../lib/format";
 
 function accountTypeColor(t: string): string {
   switch (t) {
@@ -47,6 +46,42 @@ function accountTypeColor(t: string): string {
     case "free": return "gray";
     default: return "gray";
   }
+}
+
+function accountTypeLabel(t: string): string {
+  switch (t) {
+    case "max": return "Max";
+    case "enterprise": return "Enterprise";
+    case "pro": return "Pro";
+    case "free": return "Free";
+    default: return t;
+  }
+}
+
+function authSourceLabel(source: Account["auth_source"]): string {
+  switch (source) {
+    case "oauth": return "OAuth";
+    case "cookie": return "Cookie";
+    case "hybrid": return "Hybrid";
+    default: return source;
+  }
+}
+
+function accountStatusColor(status: "active" | "cooling" | "error" | "disabled"): string {
+  switch (status) {
+    case "active": return "green";
+    case "cooling": return "yellow";
+    case "error": return "red";
+    case "disabled": return "gray";
+  }
+}
+
+function displayAccountStatus(account: Account): "active" | "cooling" | "error" | "disabled" {
+  if (account.status === "disabled") return "disabled";
+  if (account.status === "auth_error") return "error";
+  if (account.status === "cooldown") return "cooling";
+  if ((account.runtime?.reset_time ?? 0) > Date.now() / 1000) return "cooling";
+  return "active";
 }
 
 function utilizationColor(v: number): string {
@@ -66,6 +101,19 @@ function formatCountdown(epochSecs: number): string {
   }
   const mins = Math.floor((diff % 3600) / 60);
   return hours > 0 ? `${hours}小时${mins}分后` : `${mins}分钟后`;
+}
+
+function formatProbeCheckedAt(epochSecs: number | null | undefined): string | null {
+  if (!epochSecs) return null;
+  return new Date(epochSecs * 1000).toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
 }
 
 function WindowRow({ label, window }: { label: string; window: UsageWindow | null | undefined }) {
@@ -111,6 +159,8 @@ function AccountCard({
   onDelete: () => void;
 }) {
   const rt = account.runtime;
+  const displayStatus = displayAccountStatus(account);
+  const probeCheckedAt = formatProbeCheckedAt(rt?.resets_last_checked_at);
   return (
     <Paper withBorder shadow="xs" radius="md" p="md">
       <Group justify="space-between" mb="xs">
@@ -126,18 +176,24 @@ function AccountCard({
       </Group>
 
       <Group gap="xs" mb="xs">
-        <Badge color={statusColor(account.status)} variant="light" size="sm">{account.status}</Badge>
-        {probing && <Badge color="blue" variant="light" size="sm">探测中</Badge>}
-        <Badge color="dark" variant="outline" size="sm">{account.auth_source}</Badge>
+        <Badge color={accountStatusColor(displayStatus)} variant="light" size="sm">
+          {displayStatus}
+        </Badge>
+        {probing && <Badge color="blue" variant="light" size="sm">probing</Badge>}
+        <Badge color="dark" variant="outline" size="sm">{authSourceLabel(account.auth_source)}</Badge>
         {account.account_type && (
           <Badge color={accountTypeColor(account.account_type)} variant="light" size="sm">
-            {account.account_type}
+            {accountTypeLabel(account.account_type)}
           </Badge>
         )}
       </Group>
 
       {account.email && (
         <Text size="xs" c="dimmed" mb="xs" lineClamp={1}>{account.email}</Text>
+      )}
+
+      {probeCheckedAt && (
+        <Text size="xs" c="dimmed" mb="xs">探测更新时间: {probeCheckedAt}</Text>
       )}
 
       {account.invalid_reason && (
