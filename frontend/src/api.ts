@@ -175,7 +175,7 @@ export interface RequestLog {
   key_label: string | null;
   account_id: number | null;
   account_name: string | null;
-  model_raw: string;
+  model_raw: string | null;
   model_normalized: string | null;
   stream: number;
   started_at: string;
@@ -308,6 +308,9 @@ export const listRequests = (filters: RequestFilters) =>
     params: filters as Record<string, string | number | undefined>,
   });
 
+export const getRequestResponseBody = (id: number) =>
+  apiFetch<{ response_body: string | null }>(`/api/admin/requests/${id}/response_body`);
+
 // Me
 export const changePassword = (data: { current_password: string; new_password: string }) =>
   apiFetch<{ message: string }>("/api/admin/me/password", { method: "PUT", body: data });
@@ -345,4 +348,5 @@ export const qk = {
   settings: ["settings"] as const,
   models: ["models"] as const,
   requests: (filters: RequestFilters) => ["requests", filters] as const,
+  requestBody: (id: number) => ["request_body", id] as const,
 };

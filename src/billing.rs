@@ -58,14 +58,16 @@ pub struct BillingContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestType {
     Messages,
-    CountTokens,
+    ProbeCookie,
+    ProbeOauth,
 }
 
 impl RequestType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Messages => "messages",
-            Self::CountTokens => "count_tokens",
+            Self::ProbeCookie => "probe_cookie",
+            Self::ProbeOauth => "probe_oauth",
         }
     }
 }
@@ -79,6 +81,7 @@ pub struct TerminalLogOptions<'a> {
     pub error_code: Option<&'a str>,
     pub error_message: Option<&'a str>,
     pub update_rollups: bool,
+    pub response_body: Option<&'a str>,
 }
 
 /// Canonical alias table for model normalization.
@@ -212,7 +215,7 @@ pub async fn persist_terminal_request_log(ctx: &BillingContext, opts: TerminalLo
         user_id: ctx.user_id,
         api_key_id: ctx.api_key_id,
         account_id: ctx.account_id,
-        model_raw: &ctx.model_raw,
+        model_raw: (!ctx.model_raw.is_empty()).then_some(ctx.model_raw.as_str()),
         model_normalized: normalized.as_deref(),
         stream: opts.stream,
         started_at: &ctx.started_at.to_rfc3339(),
@@ -232,6 +235,7 @@ pub async fn persist_terminal_request_log(ctx: &BillingContext, opts: TerminalLo
             .error_code
             .or_else(|| (opts.status != "ok").then_some(opts.status)),
         error_message: opts.error_message,
+        response_body: opts.response_body,
     };
 
     if let Err(e) = insert_request_log(&ctx.db, &log).await {
@@ -291,6 +295,33 @@ pub async fn persist_billing_to_db(ctx: &BillingContext, usage: BillingUsage, st
             error_code: None,
             error_message: None,
             update_rollups: true,
+            response_body: None,
+        },
+    )
+    .await;
+}
+
+/// Persist a probe row in request_logs with a raw upstream JSON bundle.
+pub async fn persist_probe_log(
+    ctx: &BillingContext,
+    request_type: RequestType,
+    status: &str,
+    http_status: Option<u16>,
+    response_body: &str,
+    error_message: Option<&str>,
+) {
+    persist_terminal_request_log(
+        ctx,
+        TerminalLogOptions {
+            request_type,
+            stream: false,
+            status,
+            http_status,
+            usage: None,
+            error_code: error_message.map(|_| status),
+            error_message,
+            update_rollups: false,
+            response_body: Some(response_body),
         },
     )
     .await;

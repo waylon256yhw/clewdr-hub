@@ -494,8 +494,9 @@ pub async fn probe_all(
             probing_ids.push(account.id);
             let handle = state.cookie_actor.clone();
             let db = state.db.clone();
+            let event_tx = state.event_tx.clone();
             tokio::spawn(async move {
-                probe_oauth_account(account, handle, db).await;
+                probe_oauth_account(account, handle, db, Some(event_tx)).await;
             });
             continue;
         }
@@ -512,15 +513,21 @@ pub async fn probe_all(
             probing_ids.push(account.id);
             let handle = state.cookie_actor.clone();
             let db = state.db.clone();
+            let event_tx = state.event_tx.clone();
             tokio::spawn(async move {
-                probe_oauth_account(account, handle, db).await;
+                probe_oauth_account(account, handle, db, Some(event_tx)).await;
             });
             continue;
         }
     }
 
     if !cookie_backed_ids.is_empty() {
-        probing_ids.extend(state.cookie_actor.probe_accounts(cookie_backed_ids).await?);
+        probing_ids.extend(
+            state
+                .cookie_actor
+                .probe_accounts(cookie_backed_ids, state.event_tx.clone())
+                .await?,
+        );
     }
 
     Ok(Json(serde_json::json!({ "probing_ids": probing_ids })))

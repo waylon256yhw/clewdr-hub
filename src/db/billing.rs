@@ -9,7 +9,7 @@ pub struct RequestLogRow<'a> {
     pub user_id: Option<i64>,
     pub api_key_id: Option<i64>,
     pub account_id: Option<i64>,
-    pub model_raw: &'a str,
+    pub model_raw: Option<&'a str>,
     pub model_normalized: Option<&'a str>,
     pub stream: bool,
     pub started_at: &'a str,
@@ -27,6 +27,7 @@ pub struct RequestLogRow<'a> {
     pub cost_nanousd: i64,
     pub error_code: Option<&'a str>,
     pub error_message: Option<&'a str>,
+    pub response_body: Option<&'a str>,
 }
 
 /// Look up model pricing by pricing_key. Returns (input_nanousd, output_nanousd).
@@ -57,7 +58,7 @@ pub async fn insert_request_log(
             input_tokens, output_tokens,
             cache_creation_tokens, cache_read_tokens,
             priced_input_nanousd_per_token, priced_output_nanousd_per_token,
-            cost_nanousd, error_code, error_message
+            cost_nanousd, error_code, error_message, response_body
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
             ?6, ?7, ?8,
@@ -66,7 +67,7 @@ pub async fn insert_request_log(
             ?15, ?16,
             ?17, ?18,
             ?19, ?20,
-            ?21, ?22, ?23
+            ?21, ?22, ?23, ?24
         )"#,
     )
     .bind(r.request_id)
@@ -92,6 +93,7 @@ pub async fn insert_request_log(
     .bind(r.cost_nanousd)
     .bind(r.error_code)
     .bind(r.error_message)
+    .bind(r.response_body)
     .execute(pool)
     .await?;
     Ok(())

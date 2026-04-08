@@ -29,3 +29,12 @@ export function statusColor(status: string): string {
     default: return "blue";
   }
 }
+
+export function requestTypeColor(t: string): string {
+  switch (t) {
+    case "messages": return "blue";
+    case "probe_cookie": return "grape";
+    case "probe_oauth": return "teal";
+    default: return "gray";
+  }
+}

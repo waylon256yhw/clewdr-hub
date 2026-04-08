@@ -474,9 +474,8 @@ impl ClaudeCodeState {
             })?;
 
             match self.perform_count_tokens(access_token, p).await {
-                Ok((response, input_tokens)) => {
+                Ok((response, _)) => {
                     self.release_selected_slot(account_id).await;
-                    self.spawn_count_tokens_log(input_tokens);
                     return Ok(response);
                 }
                 Err(err) => {
@@ -512,8 +511,7 @@ impl ClaudeCodeState {
             if cookie_disallows {
                 state.release_selected_slot(account_id).await;
                 state.persist_count_tokens_allowed(false).await;
-                let (response, count) = Self::local_count_tokens_response(&p);
-                state.spawn_count_tokens_log(count.input_tokens as u64);
+                let (response, _) = Self::local_count_tokens_response(&p);
                 return Ok(response);
             }
             let retry = async {
@@ -549,9 +547,8 @@ impl ClaudeCodeState {
                 "cookie" = cookie.cookie.ellipse()
             ));
             match retry.await {
-                Ok((res, input_tokens)) => {
+                Ok((res, _)) => {
                     state.release_selected_slot(account_id).await;
-                    state.spawn_count_tokens_log(input_tokens);
                     return Ok(res);
                 }
                 Err(e) => {
@@ -640,33 +637,6 @@ impl ClaudeCodeState {
         }
 
         Err(ClewdrError::TooManyRetries)
-    }
-
-    fn spawn_count_tokens_log(&self, input_tokens: u64) {
-        if let Some(ctx) = self.billing_ctx.clone() {
-            tokio::spawn(async move {
-                crate::billing::persist_terminal_request_log(
-                    &ctx,
-                    TerminalLogOptions {
-                        request_type: RequestType::CountTokens,
-                        stream: false,
-                        status: "ok",
-                        http_status: Some(200),
-                        usage: Some(crate::billing::BillingUsage {
-                            input_tokens,
-                            output_tokens: 0,
-                            cache_creation_tokens: 0,
-                            cache_read_tokens: 0,
-                            ttft_ms: None,
-                        }),
-                        error_code: None,
-                        error_message: None,
-                        update_rollups: false,
-                    },
-                )
-                .await;
-            });
-        }
     }
 
     async fn handle_success_response(
@@ -990,6 +960,7 @@ impl ClaudeCodeState {
                                             error_code: Some(status),
                                             error_message: Some(error_message.as_str()),
                                             update_rollups: should_persist_usage,
+                                            response_body: None,
                                         },
                                     )
                                     .await;
@@ -1027,6 +998,7 @@ impl ClaudeCodeState {
                                     error_code: Some(status),
                                     error_message: Some(error_message.as_str()),
                                     update_rollups: should_persist_usage,
+                                    response_body: None,
                                 },
                             )
                             .await;

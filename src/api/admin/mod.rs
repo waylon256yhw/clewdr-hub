@@ -53,6 +53,10 @@ pub fn admin_router() -> Router<AppState> {
         .route("/cli-versions", get(settings::cli_versions))
         // Request logs
         .route("/requests", get(requests::list))
+        .route(
+            "/requests/{id}/response_body",
+            get(requests::get_response_body),
+        )
         // SSE events
         .route("/events", get(events::events))
         // Overview

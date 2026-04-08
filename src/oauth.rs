@@ -433,9 +433,18 @@ fn parse_account_type(profile: &OAuthProfile) -> Option<String> {
 }
 
 pub async fn fetch_oauth_snapshot(access_token: &str) -> Result<OAuthAccountSnapshot, ClewdrError> {
+    let (snapshot, _, _) = fetch_oauth_snapshot_raw(access_token).await?;
+    Ok(snapshot)
+}
+
+/// Like [`fetch_oauth_snapshot`] but also returns the raw profile and usage JSON bodies,
+/// so manually-triggered probes can persist them for debugging.
+pub async fn fetch_oauth_snapshot_raw(
+    access_token: &str,
+) -> Result<(OAuthAccountSnapshot, serde_json::Value, serde_json::Value), ClewdrError> {
     let client = oauth_client();
-    let profile = fetch_oauth_profile(&client, access_token).await?;
-    let usage = fetch_oauth_usage(&client, access_token).await?;
+    let (profile, profile_raw) = fetch_oauth_profile(&client, access_token).await?;
+    let (usage, usage_raw) = fetch_oauth_usage(&client, access_token).await?;
 
     let parse_window = |bucket: Option<UsageBucketPayload>| -> (Option<i64>, Option<f64>) {
         let Some(bucket) = bucket else {
@@ -454,7 +463,7 @@ pub async fn fetch_oauth_snapshot(access_token: &str) -> Result<OAuthAccountSnap
     let (weekly_sonnet_resets_at, weekly_sonnet_utilization) = parse_window(usage.seven_day_sonnet);
     let (weekly_opus_resets_at, weekly_opus_utilization) = parse_window(usage.seven_day_opus);
 
-    Ok(OAuthAccountSnapshot {
+    let snapshot = OAuthAccountSnapshot {
         email: profile.account.email.clone(),
         account_type: parse_account_type(&profile),
         organization_uuid: profile
@@ -491,7 +500,8 @@ pub async fn fetch_oauth_snapshot(access_token: &str) -> Result<OAuthAccountSnap
             weekly_opus_utilization,
             buckets: Default::default(),
         },
-    })
+    };
+    Ok((snapshot, profile_raw, usage_raw))
 }
 
 pub async fn exchange_admin_oauth_callback(
@@ -528,33 +538,46 @@ pub async fn exchange_admin_oauth_callback(
 }
 
 pub async fn refresh_oauth_token(token: &TokenInfo) -> Result<OAuthExchangeResult, ClewdrError> {
+    let (result, _, _) = refresh_oauth_token_with_raw(token).await?;
+    Ok(result)
+}
+
+/// Like [`refresh_oauth_token`] but also returns the raw profile and usage JSON bodies,
+/// so manually-triggered probes can persist them for debugging.
+pub async fn refresh_oauth_token_with_raw(
+    token: &TokenInfo,
+) -> Result<(OAuthExchangeResult, serde_json::Value, serde_json::Value), ClewdrError> {
     let raw = refresh_oauth_access_token(&token.refresh_token).await?;
     let access_token =
         token_response_access_token(&raw, "OAuth refresh response missing access_token")?;
-    let snapshot = fetch_oauth_snapshot(&access_token).await?;
+    let (snapshot, profile_raw, usage_raw) = fetch_oauth_snapshot_raw(&access_token).await?;
     let organization_uuid = raw
         .organization
         .uuid
         .clone()
         .or(raw.organization_uuid.clone())
         .unwrap_or_else(|| token.organization.uuid.clone());
-    Ok(OAuthExchangeResult {
-        token: TokenInfo::from_parts(
-            access_token,
-            raw.refresh_token
-                .unwrap_or_else(|| token.refresh_token.clone()),
-            Duration::from_secs(raw.expires_in.unwrap_or_default()),
-            organization_uuid,
-        ),
-        snapshot,
-    })
+    Ok((
+        OAuthExchangeResult {
+            token: TokenInfo::from_parts(
+                access_token,
+                raw.refresh_token
+                    .unwrap_or_else(|| token.refresh_token.clone()),
+                Duration::from_secs(raw.expires_in.unwrap_or_default()),
+                organization_uuid,
+            ),
+            snapshot,
+        },
+        profile_raw,
+        usage_raw,
+    ))
 }
 
 async fn fetch_oauth_profile(
     client: &wreq::Client,
     access_token: &str,
-) -> Result<OAuthProfile, ClewdrError> {
-    client
+) -> Result<(OAuthProfile, serde_json::Value), ClewdrError> {
+    let raw: serde_json::Value = client
         .request(
             wreq::Method::GET,
             "https://api.anthropic.com/api/oauth/profile",
@@ -571,18 +594,24 @@ async fn fetch_oauth_profile(
         })?
         .check_claude()
         .await?
-        .json::<OAuthProfile>()
+        .json::<serde_json::Value>()
         .await
         .context(WreqSnafu {
             msg: "Failed to parse OAuth profile",
-        })
+        })?;
+    let parsed: OAuthProfile =
+        serde_json::from_value(raw.clone()).map_err(|source| ClewdrError::Whatever {
+            message: format!("OAuth profile payload was not valid: {source}"),
+            source: Some(Box::new(source)),
+        })?;
+    Ok((parsed, raw))
 }
 
 async fn fetch_oauth_usage(
     client: &wreq::Client,
     access_token: &str,
-) -> Result<UsagePayload, ClewdrError> {
-    client
+) -> Result<(UsagePayload, serde_json::Value), ClewdrError> {
+    let raw: serde_json::Value = client
         .request(
             wreq::Method::GET,
             "https://api.anthropic.com/api/oauth/usage",
@@ -599,9 +628,15 @@ async fn fetch_oauth_usage(
         })?
         .check_claude()
         .await?
-        .json::<UsagePayload>()
+        .json::<serde_json::Value>()
         .await
         .context(WreqSnafu {
             msg: "Failed to parse OAuth usage",
-        })
+        })?;
+    let parsed: UsagePayload =
+        serde_json::from_value(raw.clone()).map_err(|source| ClewdrError::Whatever {
+            message: format!("OAuth usage payload was not valid: {source}"),
+            source: Some(Box::new(source)),
+        })?;
+    Ok((parsed, raw))
 }

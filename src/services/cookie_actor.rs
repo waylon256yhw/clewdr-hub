@@ -7,6 +7,7 @@ use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 use serde::Serialize;
 use snafu::{GenerateImplicitData, Location};
 use sqlx::SqlitePool;
+use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -17,6 +18,7 @@ use crate::{
         set_accounts_active, upsert_account_oauth,
     },
     error::ClewdrError,
+    state::AdminEvent,
     stealth,
 };
 
@@ -47,7 +49,11 @@ enum CookieActorMessage {
     Update1mSupport(CookieStatus, RpcReplyPort<Result<(), ClewdrError>>),
     ReloadFromDb,
     ProbeAll(RpcReplyPort<Vec<i64>>),
-    ProbeAccounts(Vec<i64>, RpcReplyPort<Vec<i64>>),
+    ProbeAccounts(
+        Vec<i64>,
+        broadcast::Sender<AdminEvent>,
+        RpcReplyPort<Vec<i64>>,
+    ),
     BeginProbe(i64, RpcReplyPort<bool>),
     FlushDirty,
     SetHandle(CookieActorHandle),
@@ -374,11 +380,15 @@ impl CookieActor {
         Self::log(state);
 
         if needs_probe {
-            Self::spawn_probe_guarded(state, &cookie);
+            Self::spawn_probe_guarded(state, &cookie, None);
         }
     }
 
-    fn spawn_probe_guarded(state: &mut CookieActorState, cookie: &CookieStatus) {
+    fn spawn_probe_guarded(
+        state: &mut CookieActorState,
+        cookie: &CookieStatus,
+        log_sink: Option<broadcast::Sender<AdminEvent>>,
+    ) {
         let Some(account_id) = cookie.account_id else {
             return;
         };
@@ -394,7 +404,7 @@ impl CookieActor {
         let db = state.db.clone();
         let profile = stealth::global_profile().clone();
         tokio::spawn(async move {
-            probe_cookie(account_id, cookie, handle, profile, db).await;
+            probe_cookie(account_id, cookie, handle, profile, db, log_sink).await;
         });
     }
 
@@ -406,7 +416,7 @@ impl CookieActor {
             .cloned()
             .collect();
         for cookie in &unprobed {
-            Self::spawn_probe_guarded(state, cookie);
+            Self::spawn_probe_guarded(state, cookie, None);
         }
     }
 
@@ -418,7 +428,7 @@ impl CookieActor {
             .chain(state.exhausted.iter().cloned())
             .collect();
         for cookie in &cookies {
-            Self::spawn_probe_guarded(state, cookie);
+            Self::spawn_probe_guarded(state, cookie, None);
         }
 
         let invalid_cookies: Vec<(ClewdrCookie, Option<i64>)> = state
@@ -429,12 +439,16 @@ impl CookieActor {
         for (cookie_blob, account_id) in invalid_cookies {
             if let Ok(mut cs) = CookieStatus::new(&cookie_blob.to_string(), None) {
                 cs.account_id = account_id;
-                Self::spawn_probe_guarded(state, &cs);
+                Self::spawn_probe_guarded(state, &cs, None);
             }
         }
     }
 
-    fn spawn_probe_accounts(state: &mut CookieActorState, account_ids: &[i64]) {
+    fn spawn_probe_accounts(
+        state: &mut CookieActorState,
+        account_ids: &[i64],
+        log_sink: Option<broadcast::Sender<AdminEvent>>,
+    ) {
         let wanted: HashSet<i64> = account_ids.iter().copied().collect();
         if wanted.is_empty() {
             return;
@@ -448,7 +462,7 @@ impl CookieActor {
             .filter(|cookie| cookie.account_id.is_some_and(|id| wanted.contains(&id)))
             .collect();
         for cookie in &cookies {
-            Self::spawn_probe_guarded(state, cookie);
+            Self::spawn_probe_guarded(state, cookie, log_sink.clone());
         }
 
         let invalid_cookies: Vec<(ClewdrCookie, Option<i64>)> = state
@@ -460,7 +474,7 @@ impl CookieActor {
         for (cookie_blob, account_id) in invalid_cookies {
             if let Ok(mut cs) = CookieStatus::new(&cookie_blob.to_string(), None) {
                 cs.account_id = account_id;
-                Self::spawn_probe_guarded(state, &cs);
+                Self::spawn_probe_guarded(state, &cs, log_sink.clone());
             }
         }
     }
@@ -820,8 +834,8 @@ impl Actor for CookieActor {
                 Self::spawn_probe_all(state);
                 reply_port.send(state.probing.iter().copied().collect())?;
             }
-            CookieActorMessage::ProbeAccounts(account_ids, reply_port) => {
-                Self::spawn_probe_accounts(state, &account_ids);
+            CookieActorMessage::ProbeAccounts(account_ids, event_tx, reply_port) => {
+                Self::spawn_probe_accounts(state, &account_ids, Some(event_tx));
                 let probing: Vec<i64> = account_ids
                     .into_iter()
                     .filter(|id| state.probing.contains(id))
@@ -1040,11 +1054,16 @@ impl CookieActorHandle {
         })
     }
 
-    pub async fn probe_accounts(&self, account_ids: Vec<i64>) -> Result<Vec<i64>, ClewdrError> {
+    pub async fn probe_accounts(
+        &self,
+        account_ids: Vec<i64>,
+        event_tx: broadcast::Sender<AdminEvent>,
+    ) -> Result<Vec<i64>, ClewdrError> {
         ractor::call!(
             self.actor_ref,
             CookieActorMessage::ProbeAccounts,
-            account_ids
+            account_ids,
+            event_tx
         )
         .map_err(|e| ClewdrError::RactorError {
             loc: Location::generate(),

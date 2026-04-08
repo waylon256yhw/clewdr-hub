@@ -14,6 +14,8 @@ import {
 import { Notifications } from "@mantine/notifications";
 import { useDisclosure } from "@mantine/hooks";
 import { Routes, Route, Navigate, useLocation, Link } from "react-router";
+import { useEffect, useRef } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   IconDashboard,
   IconServer,
@@ -59,10 +61,54 @@ function ColorSchemeToggle() {
   );
 }
 
+/**
+ * Subscribe to admin SSE events at the AppShell level so the connection stays
+ * active across page navigations. Per-page hooks would tear down on unmount and
+ * lose any events broadcast while the user was on a different tab — which was
+ * the cause of "manual probe didn't show up in logs" reports.
+ */
+function useGlobalAdminEvents() {
+  const queryClient = useQueryClient();
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    let es: EventSource | null = null;
+
+    function connect() {
+      if (disposed) return;
+      es = new EventSource("/api/admin/events");
+      es.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data) as { topic?: string };
+          if (!payload.topic || payload.topic === "request_logs") {
+            queryClient.invalidateQueries({ queryKey: ["requests"] });
+          }
+        } catch {
+          queryClient.invalidateQueries({ queryKey: ["requests"] });
+        }
+      };
+      es.onerror = () => {
+        es?.close();
+        es = null;
+        if (!disposed) reconnectTimer.current = setTimeout(connect, 5000);
+      };
+    }
+    connect();
+
+    return () => {
+      disposed = true;
+      es?.close();
+      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+    };
+  }, [queryClient]);
+}
+
 function AdminShell() {
   const location = useLocation();
   const [opened, { toggle, close }] = useDisclosure();
   const { logout } = useAuth();
+  useGlobalAdminEvents();
 
   return (
     <AppShell

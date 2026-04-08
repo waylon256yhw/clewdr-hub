@@ -56,6 +56,7 @@ async fn log_error_request(
             error_code: Some(status),
             error_message: Some(err_msg),
             update_rollups: false,
+            response_body: None,
         },
     )
     .await;
@@ -152,20 +153,7 @@ pub async fn api_claude_code_count_tokens(
     {
         match state.user_limiter.acquire(user_id, max_c, rpm).await {
             Ok(permit) => Some(permit),
-            Err(e) => {
-                let (status, http_status) = error_to_log_status(&e);
-                let err_msg = e.to_string();
-                log_error_request(
-                    &state,
-                    &context,
-                    RequestType::CountTokens,
-                    status,
-                    http_status,
-                    &err_msg,
-                )
-                .await;
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         }
     } else {
         None
@@ -178,19 +166,6 @@ pub async fn api_claude_code_count_tokens(
         .await
     {
         Ok(ClaudeProviderResponse { response, .. }) => Ok(response),
-        Err(e) => {
-            let (status, http_status) = error_to_log_status(&e);
-            let err_msg = e.to_string();
-            log_error_request(
-                &state,
-                &context,
-                RequestType::CountTokens,
-                status,
-                http_status,
-                &err_msg,
-            )
-            .await;
-            Err(e)
-        }
+        Err(e) => Err(e),
     }
 }

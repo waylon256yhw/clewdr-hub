@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Query, State},
+    extract::{Path, Query, State},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -19,7 +19,7 @@ pub struct RequestLogResponse {
     pub key_label: Option<String>,
     pub account_id: Option<i64>,
     pub account_name: Option<String>,
-    pub model_raw: String,
+    pub model_raw: Option<String>,
     pub model_normalized: Option<String>,
     pub stream: i32,
     pub started_at: String,
@@ -35,6 +35,11 @@ pub struct RequestLogResponse {
     pub cost_nanousd: i64,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ResponseBodyPayload {
+    pub response_body: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -164,4 +169,24 @@ pub async fn list(
         offset,
         limit,
     }))
+}
+
+/// Lazy-load the upstream `response_body` for a single request log row.
+/// Kept off the list endpoint because probe rows can store ~256KB JSON each
+/// and the list is polled by the admin UI.
+pub async fn get_response_body(
+    State(db): State<SqlitePool>,
+    Path(id): Path<i64>,
+) -> Result<Json<ResponseBodyPayload>, ClewdrError> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT response_body FROM request_logs WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&db)
+            .await?;
+    let response_body = row
+        .ok_or(ClewdrError::NotFound {
+            msg: "request log not found",
+        })?
+        .0;
+    Ok(Json(ResponseBodyPayload { response_body }))
 }

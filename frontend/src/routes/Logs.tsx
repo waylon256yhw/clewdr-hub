@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
   Title,
   Table,
@@ -13,23 +13,52 @@ import {
   ScrollArea,
   Drawer,
   Code,
+  Stack,
 } from "@mantine/core";
 import { IconChevronLeft, IconChevronRight } from "@tabler/icons-react";
-import { listModelsAdmin, listRequests, listUsers, qk, type RequestLog, type RequestFilters } from "../api";
-import { formatCost, formatDate, statusColor } from "../lib/format";
+import {
+  getRequestResponseBody,
+  listModelsAdmin,
+  listRequests,
+  listUsers,
+  qk,
+  type RequestLog,
+  type RequestFilters,
+} from "../api";
+import { formatCost, formatDate, requestTypeColor, statusColor } from "../lib/format";
 
 const PAGE_SIZE = 50;
 
+function isProbeType(t: string): boolean {
+  return t === "probe_cookie" || t === "probe_oauth";
+}
+
+function prettyJson(raw: string): string {
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    return raw;
+  }
+}
+
 function LogDetail({ log, onClose }: { log: RequestLog | null; onClose: () => void }) {
+  const probe = log ? isProbeType(log.request_type) : false;
+  const { data: bodyData, isLoading: bodyLoading } = useQuery({
+    queryKey: log ? qk.requestBody(log.id) : ["request_body", "none"],
+    queryFn: () => getRequestResponseBody(log!.id),
+    enabled: !!log && probe,
+    staleTime: 5 * 60_000,
+  });
+
   if (!log) return null;
 
   const rows: [string, React.ReactNode][] = [
     ["请求 ID", <Code key="rid">{log.request_id}</Code>],
-    ["类型", log.request_type],
+    ["类型", <Badge key="ty" color={requestTypeColor(log.request_type)} variant="light">{log.request_type}</Badge>],
     ["用户", log.username ?? "—"],
     ["Key", log.key_label ?? "—"],
     ["账号", log.account_name ?? "—"],
-    ["模型", log.model_raw],
+    ["模型", probe ? "—" : (log.model_raw ?? "—")],
     ["模型 (标准化)", log.model_normalized ?? "—"],
     ["流式", log.stream ? "是" : "否"],
     ["开始时间", formatDate(log.started_at)],
@@ -38,27 +67,45 @@ function LogDetail({ log, onClose }: { log: RequestLog | null; onClose: () => vo
     ["总耗时", log.duration_ms != null ? `${log.duration_ms}ms` : "—"],
     ["状态", <Badge key="st" color={statusColor(log.status)} variant="light">{log.status}</Badge>],
     ["HTTP 状态", log.http_status != null ? String(log.http_status) : "—"],
-    ["输入 Token", log.input_tokens?.toLocaleString() ?? "—"],
-    ["输出 Token", log.output_tokens?.toLocaleString() ?? "—"],
-    ["缓存创建", log.cache_creation_tokens?.toLocaleString() ?? "—"],
-    ["缓存读取", log.cache_read_tokens?.toLocaleString() ?? "—"],
-    ["费用", log.request_type === "count_tokens" ? `≈${formatCost(log.cost_nanousd)}` : formatCost(log.cost_nanousd)],
+    ["输入 Token", probe ? "—" : (log.input_tokens?.toLocaleString() ?? "—")],
+    ["输出 Token", probe ? "—" : (log.output_tokens?.toLocaleString() ?? "—")],
+    ["缓存创建", probe ? "—" : (log.cache_creation_tokens?.toLocaleString() ?? "—")],
+    ["缓存读取", probe ? "—" : (log.cache_read_tokens?.toLocaleString() ?? "—")],
+    ["费用", probe ? "—" : formatCost(log.cost_nanousd)],
     ["错误码", log.error_code ?? "—"],
     ["错误信息", log.error_message ?? "—"],
   ];
 
   return (
     <Drawer opened={!!log} onClose={onClose} title="请求详情" position="right" size="md">
-      <Table>
-        <Table.Tbody>
-          {rows.map(([label, value]) => (
-            <Table.Tr key={label}>
-              <Table.Td fw={600} w={120}>{label}</Table.Td>
-              <Table.Td>{value}</Table.Td>
-            </Table.Tr>
-          ))}
-        </Table.Tbody>
-      </Table>
+      <Stack gap="md">
+        <Table>
+          <Table.Tbody>
+            {rows.map(([label, value]) => (
+              <Table.Tr key={label}>
+                <Table.Td fw={600} w={120}>{label}</Table.Td>
+                <Table.Td>{value}</Table.Td>
+              </Table.Tr>
+            ))}
+          </Table.Tbody>
+        </Table>
+        {probe && (
+          <div>
+            <Text fw={600} size="sm" mb={4}>上游响应 JSON</Text>
+            {bodyLoading ? (
+              <Skeleton height={120} />
+            ) : bodyData?.response_body ? (
+              <ScrollArea h={360} type="auto">
+                <Code block style={{ whiteSpace: "pre", fontSize: 12 }}>
+                  {prettyJson(bodyData.response_body)}
+                </Code>
+              </ScrollArea>
+            ) : (
+              <Text size="sm" c="dimmed">无响应体</Text>
+            )}
+          </div>
+        )}
+      </Stack>
     </Drawer>
   );
 }
@@ -66,7 +113,6 @@ function LogDetail({ log, onClose }: { log: RequestLog | null; onClose: () => vo
 export default function Logs() {
   const [filters, setFilters] = useState<RequestFilters>({ offset: 0, limit: PAGE_SIZE });
   const [detail, setDetail] = useState<RequestLog | null>(null);
-  const queryClient = useQueryClient();
 
   const { data: usersData } = useQuery({ queryKey: qk.users, queryFn: listUsers });
   const userData = usersData?.items?.map((u) => ({ value: String(u.id), label: u.username })) ?? [];
@@ -81,39 +127,6 @@ export default function Logs() {
   });
 
   const offset = filters.offset ?? 0;
-  const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(null);
-  useEffect(() => {
-    if (offset > 0) return;
-    let disposed = false;
-    let es: EventSource | null = null;
-
-    function connect() {
-      if (disposed) return;
-      es = new EventSource("/api/admin/events");
-      es.onmessage = (event) => {
-        try {
-          const payload = JSON.parse(event.data) as { topic?: string };
-          if (!payload.topic || payload.topic === "request_logs") {
-            queryClient.invalidateQueries({ queryKey: ["requests"] });
-          }
-        } catch {
-          queryClient.invalidateQueries({ queryKey: ["requests"] });
-        }
-      };
-      es.onerror = () => {
-        es?.close();
-        es = null;
-        if (!disposed) reconnectTimer.current = setTimeout(connect, 5000);
-      };
-    }
-    connect();
-
-    return () => {
-      disposed = true;
-      es?.close();
-      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
-    };
-  }, [offset, queryClient]);
 
   const logs = data?.items ?? [];
   const total = data?.total ?? 0;
@@ -155,13 +168,14 @@ export default function Logs() {
           placeholder="全部"
           data={[
             { value: "messages", label: "messages" },
-            { value: "count_tokens", label: "count_tokens" },
+            { value: "probe_cookie", label: "probe (cookie)" },
+            { value: "probe_oauth", label: "probe (oauth)" },
           ]}
           value={filters.request_type ?? null}
           onChange={(v) => updateFilter("request_type", v ?? undefined)}
           clearable
           size="sm"
-          w={150}
+          w={170}
         />
         <Select
           label="用户"
@@ -250,7 +264,9 @@ export default function Logs() {
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>
-                {logs.map((log) => (
+                {logs.map((log) => {
+                  const probe = isProbeType(log.request_type);
+                  return (
                   <Table.Tr
                     key={log.id}
                     style={{ cursor: "pointer" }}
@@ -258,13 +274,13 @@ export default function Logs() {
                   >
                     <Table.Td>{formatDate(log.started_at)}</Table.Td>
                     <Table.Td>
-                      <Badge variant="outline" size="sm">
+                      <Badge color={requestTypeColor(log.request_type)} variant="light" size="sm">
                         {log.request_type}
                       </Badge>
                     </Table.Td>
                     <Table.Td>{log.username ?? "—"}</Table.Td>
                     <Table.Td>
-                      <Text size="xs" lineClamp={1}>{log.model_raw}</Text>
+                      <Text size="xs" lineClamp={1}>{probe ? "—" : (log.model_raw ?? "—")}</Text>
                     </Table.Td>
                     <Table.Td>
                       <Badge color={statusColor(log.status)} variant="light" size="sm">
@@ -279,21 +295,22 @@ export default function Logs() {
                     </Table.Td>
                     <Table.Td visibleFrom="md">
                       <Text size="xs">
-                        {log.request_type === "count_tokens"
-                          ? (log.input_tokens?.toLocaleString() ?? "—")
+                        {probe
+                          ? "—"
                           : log.input_tokens != null
                             ? `${log.input_tokens.toLocaleString()}→${(log.output_tokens ?? 0).toLocaleString()}`
                             : "—"}
-                        {log.request_type !== "count_tokens" && (log.cache_creation_tokens || log.cache_read_tokens)
+                        {!probe && (log.cache_creation_tokens || log.cache_read_tokens)
                           ? ` (w${(log.cache_creation_tokens ?? 0).toLocaleString()}/r${(log.cache_read_tokens ?? 0).toLocaleString()})`
                           : ""}
                       </Text>
                     </Table.Td>
                     <Table.Td>
-                      {log.request_type === "count_tokens" ? `≈${formatCost(log.cost_nanousd)}` : formatCost(log.cost_nanousd)}
+                      {probe ? "—" : formatCost(log.cost_nanousd)}
                     </Table.Td>
                   </Table.Tr>
-                ))}
+                  );
+                })}
               </Table.Tbody>
             </Table>
           </ScrollArea>

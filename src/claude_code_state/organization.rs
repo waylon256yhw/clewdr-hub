@@ -32,6 +32,12 @@ fn derive_account_type(capabilities: &[String]) -> String {
 
 impl ClaudeCodeState {
     pub async fn fetch_bootstrap_info(&self) -> Result<BootstrapInfo, ClewdrError> {
+        self.fetch_bootstrap_info_raw().await.map(|(info, _)| info)
+    }
+
+    /// Same as [`fetch_bootstrap_info`] but also returns the raw JSON body, so
+    /// manual probes can persist it for debugging.
+    pub async fn fetch_bootstrap_info_raw(&self) -> Result<(BootstrapInfo, Value), ClewdrError> {
         let end_point = self
             .endpoint
             .join("api/bootstrap")
@@ -49,47 +55,8 @@ impl ClaudeCodeState {
             msg: "Failed to parse bootstrap response",
         })?;
         print_out_json(&bootstrap, "bootstrap_res.json");
-        if bootstrap["account"].is_null() {
-            return Err(Reason::Null.into());
-        }
-        let memberships = bootstrap["account"]["memberships"]
-            .as_array()
-            .ok_or(Reason::Null)?;
-        let boot_acc_info = memberships
-            .iter()
-            .find(|m| {
-                m["organization"]["capabilities"]
-                    .as_array()
-                    .is_some_and(|c| c.iter().any(|c| c.as_str() == Some("chat")))
-            })
-            .and_then(|m| m["organization"].as_object())
-            .ok_or(Reason::Null)?;
-        let capabilities = boot_acc_info["capabilities"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|c| c.as_str().map(String::from))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let email = bootstrap["account"]["email_address"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        let uuid = boot_acc_info["uuid"]
-            .as_str()
-            .ok_or(ClewdrError::UnexpectedNone {
-                msg: "Failed to get organization UUID",
-            })?
-            .to_string();
-        let account_type = derive_account_type(&capabilities);
-
-        Ok(BootstrapInfo {
-            email,
-            org_uuid: uuid,
-            account_type,
-            capabilities,
-        })
+        let info = parse_bootstrap_info(&bootstrap)?;
+        Ok((info, bootstrap))
     }
 
     pub async fn get_organization(&self) -> Result<String, ClewdrError> {
@@ -105,4 +72,48 @@ impl ClaudeCodeState {
         );
         Ok(info.org_uuid)
     }
+}
+
+fn parse_bootstrap_info(bootstrap: &Value) -> Result<BootstrapInfo, ClewdrError> {
+    if bootstrap["account"].is_null() {
+        return Err(Reason::Null.into());
+    }
+    let memberships = bootstrap["account"]["memberships"]
+        .as_array()
+        .ok_or(Reason::Null)?;
+    let boot_acc_info = memberships
+        .iter()
+        .find(|m| {
+            m["organization"]["capabilities"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|c| c.as_str() == Some("chat")))
+        })
+        .and_then(|m| m["organization"].as_object())
+        .ok_or(Reason::Null)?;
+    let capabilities = boot_acc_info["capabilities"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let email = bootstrap["account"]["email_address"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let uuid = boot_acc_info["uuid"]
+        .as_str()
+        .ok_or(ClewdrError::UnexpectedNone {
+            msg: "Failed to get organization UUID",
+        })?
+        .to_string();
+    let account_type = derive_account_type(&capabilities);
+
+    Ok(BootstrapInfo {
+        email,
+        org_uuid: uuid,
+        account_type,
+        capabilities,
+    })
 }
