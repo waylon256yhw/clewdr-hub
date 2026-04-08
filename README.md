@@ -13,7 +13,7 @@
 ## 特性
 
 - **零依赖部署**：单个静态链接二进制，前端编译嵌入，SQLite WAL 自动建库
-- **透明代理**：直接转发 `/v1/messages`，不注入系统提示词、不改写请求体
+- **透明代理**：直接转发 `/v1/messages`，不注入系统提示词；仅为兼容 Anthropic 模型行为做最小参数归一化
 - **轻量伪装**：可配置 CLI/SDK 版本号和请求头，过上游客户端检测
 - **多账号调度**：cookie 池 + round-robin + 亲和性缓存 + per-account 并发槽（`max_slots`）
 - **团队隔离**：用户 → 策略 → API Key，并发/RPM/周预算/月预算多重限额
@@ -82,6 +82,13 @@ export ANTHROPIC_API_KEY=sk-...    # 从后台创建
 ```
 
 流程：**后台登录 → 账号池添加 Cookie → 创建 API Key → 客户端配置上面两行**。单人到这里就够了。
+
+### 请求参数兼容策略
+
+- 服务端会统一移除 `top_p` 和 `top_k`
+- 如果启用原生 `thinking`（`enabled` / `adaptive`），不符合 Anthropic 要求的 `temperature` 也会被移除
+
+这是有意的兼容性取舍：对这个项目的目标场景，保留 `temperature` 作为主要采样旋钮已经足够，同时可以减少不同客户端和不同 Claude 模型之间的参数兼容问题。
 
 ### 团队扩展
 

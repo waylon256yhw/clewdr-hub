@@ -205,26 +205,27 @@ fn inject_metadata_user_id(
     metadata.fields.insert("user_id".to_string(), user_id);
 }
 
-/// Normalize sampling parameters to comply with Claude API constraints.
+/// Normalize sampling parameters to keep Anthropic-compatible behavior across clients.
+///
+/// We intentionally discard `top_p` and `top_k` for all requests. In practice they
+/// add little value for the target deployment model, while some clients/models send
+/// combinations that Anthropic rejects.
 ///
 /// When thinking is active (enabled or adaptive):
 ///   - `temperature` must be 1 or unset
-///   - `top_p` must be >= 0.95 or unset
-///   - `top_k` must be unset
 fn normalize_sampling_params(body: &mut CreateMessageParams) {
     let thinking_active = matches!(
         body.thinking,
         Some(Thinking::Adaptive) | Some(Thinking::Enabled { .. })
     );
 
+    body.top_p = None;
+    body.top_k = None;
+
     if thinking_active {
         if body.temperature != Some(1.0) {
             body.temperature = None;
         }
-        if !matches!(body.top_p, Some(p) if (0.95..=1.0).contains(&p)) {
-            body.top_p = None;
-        }
-        body.top_k = None;
     }
 }
 
@@ -426,7 +427,8 @@ mod tests {
         let mut body = make_body(Some(Thinking::Adaptive), Some(1.0), Some(0.95), None);
         normalize_sampling_params(&mut body);
         assert_eq!(body.temperature, Some(1.0));
-        assert_eq!(body.top_p, Some(0.95));
+        assert_eq!(body.top_p, None);
+        assert_eq!(body.top_k, None);
     }
 
     #[test]
@@ -449,24 +451,24 @@ mod tests {
     fn normalize_thinking_keeps_top_p_one() {
         let mut body = make_body(Some(Thinking::Adaptive), None, Some(1.0), None);
         normalize_sampling_params(&mut body);
-        assert_eq!(body.top_p, Some(1.0));
+        assert_eq!(body.top_p, None);
     }
 
     #[test]
-    fn normalize_no_thinking_passes_all_through() {
+    fn normalize_no_thinking_strips_top_p_and_top_k() {
         let mut body = make_body(None, Some(0.7), Some(0.9), Some(40));
         normalize_sampling_params(&mut body);
         assert_eq!(body.temperature, Some(0.7));
-        assert_eq!(body.top_p, Some(0.9));
-        assert_eq!(body.top_k, Some(40));
+        assert_eq!(body.top_p, None);
+        assert_eq!(body.top_k, None);
     }
 
     #[test]
-    fn normalize_thinking_disabled_passes_all_through() {
+    fn normalize_thinking_disabled_strips_top_p_and_top_k() {
         let mut body = make_body(Some(Thinking::Disabled), Some(0.7), Some(0.9), Some(40));
         normalize_sampling_params(&mut body);
         assert_eq!(body.temperature, Some(0.7));
-        assert_eq!(body.top_p, Some(0.9));
-        assert_eq!(body.top_k, Some(40));
+        assert_eq!(body.top_p, None);
+        assert_eq!(body.top_k, None);
     }
 }

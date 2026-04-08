@@ -732,6 +732,10 @@ impl ClaudeCodeState {
         let cookie = self.cookie.clone();
         let billing_ctx = self.billing_ctx.clone();
         let billing_ctx_for_stream = billing_ctx.clone();
+        let request_id_for_stream = billing_ctx
+            .as_ref()
+            .map(|ctx| ctx.request_id.clone())
+            .unwrap_or_default();
         let stream_account_id = self
             .account_id
             .or(cookie.as_ref().and_then(|c| c.account_id));
@@ -749,6 +753,9 @@ impl ClaudeCodeState {
         let ttft = ttft_ms.clone();
         let completed = stream_completed.clone();
         let saw_usage = saw_upstream_usage.clone();
+        let upstream_failed_for_events = upstream_failed.clone();
+        let abort_error_for_events = abort_error.clone();
+        let request_id_for_events = request_id_for_stream.clone();
         let stream = response
             .bytes_stream()
             .eventsource()
@@ -793,6 +800,16 @@ impl ClaudeCodeState {
                             }
                             if let Some(cr) = u.cache_read_input_tokens {
                                 crsum.store(cr as u64, Ordering::Relaxed);
+                            }
+                        }
+                        crate::types::claude::StreamEvent::Error { error } => {
+                            upstream_failed_for_events.store(true, Ordering::Relaxed);
+                            warn!(
+                                "[STREAM][ERR] request_id={} upstream returned SSE error: {}",
+                                request_id_for_events, error.message
+                            );
+                            if let Ok(mut msg) = abort_error_for_events.lock() {
+                                *msg = Some(error.message);
                             }
                         }
                         crate::types::claude::StreamEvent::MessageStop => {
@@ -862,8 +879,13 @@ impl ClaudeCodeState {
             .map_err({
                 let upstream_failed = upstream_failed.clone();
                 let abort_error = abort_error.clone();
+                let request_id_for_stream = request_id_for_stream.clone();
                 move |err| {
                     upstream_failed.store(true, Ordering::Relaxed);
+                    warn!(
+                        "[STREAM][ERR] request_id={} eventsource stream error: {}",
+                        request_id_for_stream, err
+                    );
                     if let Ok(mut msg) = abort_error.lock() {
                         *msg = Some(err.to_string());
                     }
