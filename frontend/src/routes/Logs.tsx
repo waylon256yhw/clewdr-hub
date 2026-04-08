@@ -294,16 +294,54 @@ export default function Logs() {
                       {log.duration_ms != null ? `${(log.duration_ms / 1000).toFixed(1)}s` : "—"}
                     </Table.Td>
                     <Table.Td visibleFrom="md">
-                      <Text size="xs">
-                        {probe
-                          ? "—"
-                          : log.input_tokens != null
-                            ? `${log.input_tokens.toLocaleString()}→${(log.output_tokens ?? 0).toLocaleString()}`
-                            : "—"}
-                        {!probe && (log.cache_creation_tokens || log.cache_read_tokens)
-                          ? ` (w${(log.cache_creation_tokens ?? 0).toLocaleString()}/r${(log.cache_read_tokens ?? 0).toLocaleString()})`
-                          : ""}
-                      </Text>
+                      {probe ? (
+                        <Text size="xs" c="dimmed">—</Text>
+                      ) : log.input_tokens != null ? (
+                        <Group gap={4} wrap="nowrap">
+                          <Badge
+                            size="sm"
+                            variant="light"
+                            color="cyan"
+                            radius="sm"
+                            title="输入 token"
+                          >
+                            ↑{log.input_tokens.toLocaleString()}
+                          </Badge>
+                          <Badge
+                            size="sm"
+                            variant="light"
+                            color="teal"
+                            radius="sm"
+                            title="输出 token"
+                          >
+                            ↓{(log.output_tokens ?? 0).toLocaleString()}
+                          </Badge>
+                          {!!log.cache_creation_tokens && (
+                            <Badge
+                              size="sm"
+                              variant="light"
+                              color="grape"
+                              radius="sm"
+                              title="缓存写入 (1.25× 输入价)"
+                            >
+                              +{log.cache_creation_tokens.toLocaleString()}
+                            </Badge>
+                          )}
+                          {!!log.cache_read_tokens && (
+                            <Badge
+                              size="sm"
+                              variant="light"
+                              color="gray"
+                              radius="sm"
+                              title="缓存读取 (0.10× 输入价)"
+                            >
+                              ↻{log.cache_read_tokens.toLocaleString()}
+                            </Badge>
+                          )}
+                        </Group>
+                      ) : (
+                        <Text size="xs" c="dimmed">—</Text>
+                      )}
                     </Table.Td>
                     <Table.Td>
                       {probe ? "—" : formatCost(log.cost_nanousd)}
