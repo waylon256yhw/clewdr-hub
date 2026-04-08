@@ -14,6 +14,7 @@ use crate::{
     error::ClewdrError,
     middleware::claude::ClaudeContext,
     services::cookie_actor::CookieActorHandle,
+    state::AdminEvent,
     stealth::SharedStealthProfile,
     types::claude::CreateMessageParams,
     utils::{enabled, print_out_json},
@@ -59,7 +60,7 @@ struct ClaudeSharedState {
     cookie_actor_handle: CookieActorHandle,
     db: SqlitePool,
     stealth_profile: SharedStealthProfile,
-    event_tx: broadcast::Sender<()>,
+    event_tx: broadcast::Sender<AdminEvent>,
     oauth_pool: Arc<OAuthAccountPool>,
 }
 
@@ -132,7 +133,7 @@ impl ClaudeSharedState {
         cookie_actor_handle: CookieActorHandle,
         db: SqlitePool,
         stealth_profile: SharedStealthProfile,
-        event_tx: broadcast::Sender<()>,
+        event_tx: broadcast::Sender<AdminEvent>,
     ) -> Self {
         Self {
             cookie_actor_handle,
@@ -154,7 +155,7 @@ impl ClaudeProviders {
         cookie_actor_handle: CookieActorHandle,
         db: SqlitePool,
         stealth_profile: SharedStealthProfile,
-        event_tx: broadcast::Sender<()>,
+        event_tx: broadcast::Sender<AdminEvent>,
     ) -> Self {
         let shared = Arc::new(ClaudeSharedState::new(
             cookie_actor_handle,
@@ -277,7 +278,7 @@ pub fn build_providers(
     cookie_actor_handle: CookieActorHandle,
     db: SqlitePool,
     stealth_profile: SharedStealthProfile,
-    event_tx: broadcast::Sender<()>,
+    event_tx: broadcast::Sender<AdminEvent>,
 ) -> ClaudeProviders {
     ClaudeProviders::new(cookie_actor_handle, db, stealth_profile, event_tx)
 }

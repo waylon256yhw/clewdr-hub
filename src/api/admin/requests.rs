@@ -41,6 +41,7 @@ pub struct RequestLogResponse {
 pub struct RequestListParams {
     pub offset: Option<i64>,
     pub limit: Option<i64>,
+    pub request_type: Option<String>,
     pub user_id: Option<i64>,
     pub status: Option<String>,
     pub model: Option<String>,
@@ -58,6 +59,10 @@ pub async fn list(
     let mut where_clauses = Vec::new();
     let mut bind_idx = 1u32;
 
+    if params.request_type.is_some() {
+        where_clauses.push(format!("r.request_type = ?{bind_idx}"));
+        bind_idx += 1;
+    }
     if params.user_id.is_some() {
         where_clauses.push(format!("r.user_id = ?{bind_idx}"));
         bind_idx += 1;
@@ -110,6 +115,9 @@ pub async fn list(
 
     // Build and execute count query
     let mut count_query = sqlx::query_as::<_, (i64,)>(&count_sql);
+    if let Some(ref request_type) = params.request_type {
+        count_query = count_query.bind(request_type);
+    }
     if let Some(uid) = params.user_id {
         count_query = count_query.bind(uid);
     }
@@ -129,6 +137,9 @@ pub async fn list(
 
     // Build and execute list query
     let mut list_query = sqlx::query_as::<_, RequestLogResponse>(&list_sql);
+    if let Some(ref request_type) = params.request_type {
+        list_query = list_query.bind(request_type);
+    }
     if let Some(uid) = params.user_id {
         list_query = list_query.bind(uid);
     }

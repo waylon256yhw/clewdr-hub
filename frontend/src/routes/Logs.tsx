@@ -42,7 +42,7 @@ function LogDetail({ log, onClose }: { log: RequestLog | null; onClose: () => vo
     ["输出 Token", log.output_tokens?.toLocaleString() ?? "—"],
     ["缓存创建", log.cache_creation_tokens?.toLocaleString() ?? "—"],
     ["缓存读取", log.cache_read_tokens?.toLocaleString() ?? "—"],
-    ["费用", formatCost(log.cost_nanousd)],
+    ["费用", log.request_type === "count_tokens" ? `≈${formatCost(log.cost_nanousd)}` : formatCost(log.cost_nanousd)],
     ["错误码", log.error_code ?? "—"],
     ["错误信息", log.error_message ?? "—"],
   ];
@@ -90,7 +90,16 @@ export default function Logs() {
     function connect() {
       if (disposed) return;
       es = new EventSource("/api/admin/events");
-      es.onmessage = () => queryClient.invalidateQueries({ queryKey: ["requests"] });
+      es.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data) as { topic?: string };
+          if (!payload.topic || payload.topic === "request_logs") {
+            queryClient.invalidateQueries({ queryKey: ["requests"] });
+          }
+        } catch {
+          queryClient.invalidateQueries({ queryKey: ["requests"] });
+        }
+      };
       es.onerror = () => {
         es?.close();
         es = null;
@@ -142,6 +151,19 @@ export default function Logs() {
 
       <Group mb="md" gap="sm" align="end">
         <Select
+          label="类型"
+          placeholder="全部"
+          data={[
+            { value: "messages", label: "messages" },
+            { value: "count_tokens", label: "count_tokens" },
+          ]}
+          value={filters.request_type ?? null}
+          onChange={(v) => updateFilter("request_type", v ?? undefined)}
+          clearable
+          size="sm"
+          w={150}
+        />
+        <Select
           label="用户"
           placeholder="全部"
           data={userData}
@@ -163,6 +185,7 @@ export default function Logs() {
             { value: "user_concurrency_rejected", label: "并发超限" },
             { value: "rpm_rejected", label: "RPM 超限" },
             { value: "no_account_available", label: "无可用账号" },
+            { value: "internal_error", label: "内部错误" },
           ]}
           value={filters.status ?? null}
           onChange={(v) => updateFilter("status", v ?? undefined)}
@@ -216,6 +239,7 @@ export default function Logs() {
               <Table.Thead>
                 <Table.Tr>
                   <Table.Th>时间</Table.Th>
+                  <Table.Th>类型</Table.Th>
                   <Table.Th>用户</Table.Th>
                   <Table.Th>模型</Table.Th>
                   <Table.Th>状态</Table.Th>
@@ -233,6 +257,11 @@ export default function Logs() {
                     onClick={() => setDetail(log)}
                   >
                     <Table.Td>{formatDate(log.started_at)}</Table.Td>
+                    <Table.Td>
+                      <Badge variant="outline" size="sm">
+                        {log.request_type}
+                      </Badge>
+                    </Table.Td>
                     <Table.Td>{log.username ?? "—"}</Table.Td>
                     <Table.Td>
                       <Text size="xs" lineClamp={1}>{log.model_raw}</Text>
@@ -250,13 +279,19 @@ export default function Logs() {
                     </Table.Td>
                     <Table.Td visibleFrom="md">
                       <Text size="xs">
-                        {log.input_tokens != null ? `${log.input_tokens.toLocaleString()}→${(log.output_tokens ?? 0).toLocaleString()}` : "—"}
-                        {(log.cache_creation_tokens || log.cache_read_tokens)
+                        {log.request_type === "count_tokens"
+                          ? (log.input_tokens?.toLocaleString() ?? "—")
+                          : log.input_tokens != null
+                            ? `${log.input_tokens.toLocaleString()}→${(log.output_tokens ?? 0).toLocaleString()}`
+                            : "—"}
+                        {log.request_type !== "count_tokens" && (log.cache_creation_tokens || log.cache_read_tokens)
                           ? ` (w${(log.cache_creation_tokens ?? 0).toLocaleString()}/r${(log.cache_read_tokens ?? 0).toLocaleString()})`
                           : ""}
                       </Text>
                     </Table.Td>
-                    <Table.Td>{formatCost(log.cost_nanousd)}</Table.Td>
+                    <Table.Td>
+                      {log.request_type === "count_tokens" ? `≈${formatCost(log.cost_nanousd)}` : formatCost(log.cost_nanousd)}
+                    </Table.Td>
                   </Table.Tr>
                 ))}
               </Table.Tbody>

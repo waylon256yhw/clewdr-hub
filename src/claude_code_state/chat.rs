@@ -11,6 +11,7 @@ use tracing::{Instrument, error, info, warn};
 use wreq::Method;
 
 use crate::{
+    billing::{RequestType, TerminalLogOptions},
     claude_code_state::{ClaudeCodeState, TokenStatus},
     config::{Claude1mChannel, ModelFamily, Reason},
     db::accounts::{
@@ -441,6 +442,9 @@ impl ClaudeCodeState {
     ) -> Result<axum::response::Response, ClewdrError> {
         if self.oauth_token.is_some() && self.cookie.is_none() && self.account_id.is_some() {
             let account_id = self.account_id;
+            if let Some(ref mut ctx) = self.billing_ctx {
+                ctx.account_id = account_id;
+            }
             let access_token = match self.check_token() {
                 TokenStatus::Valid => self.oauth_token.as_ref().map(|t| t.access_token.clone()),
                 TokenStatus::Expired => {
@@ -470,8 +474,9 @@ impl ClaudeCodeState {
             })?;
 
             match self.perform_count_tokens(access_token, p).await {
-                Ok(response) => {
+                Ok((response, input_tokens)) => {
                     self.release_selected_slot(account_id).await;
+                    self.spawn_count_tokens_log(input_tokens);
                     return Ok(response);
                 }
                 Err(err) => {
@@ -500,11 +505,16 @@ impl ClaudeCodeState {
 
             let cookie = state.request_cookie().await?;
             let account_id = cookie.account_id;
+            if let Some(ref mut ctx) = state.billing_ctx {
+                ctx.account_id = cookie.account_id;
+            }
             let cookie_disallows = matches!(cookie.count_tokens_allowed, Some(false));
             if cookie_disallows {
                 state.release_selected_slot(account_id).await;
                 state.persist_count_tokens_allowed(false).await;
-                return Ok(Self::local_count_tokens_response(&p));
+                let (response, count) = Self::local_count_tokens_response(&p);
+                state.spawn_count_tokens_log(count.input_tokens as u64);
+                return Ok(response);
             }
             let retry = async {
                 match state.check_token() {
@@ -539,8 +549,9 @@ impl ClaudeCodeState {
                 "cookie" = cookie.cookie.ellipse()
             ));
             match retry.await {
-                Ok(res) => {
+                Ok((res, input_tokens)) => {
                     state.release_selected_slot(account_id).await;
+                    state.spawn_count_tokens_log(input_tokens);
                     return Ok(res);
                 }
                 Err(e) => {
@@ -565,7 +576,7 @@ impl ClaudeCodeState {
         &mut self,
         access_token: String,
         mut p: CreateMessageParams,
-    ) -> Result<axum::response::Response, ClewdrError> {
+    ) -> Result<(axum::response::Response, u64), ClewdrError> {
         p.stream = Some(false);
         let (base_model, requested_1m) = match p.model.strip_suffix("-1M") {
             Some(stripped) => (stripped.to_string(), true),
@@ -601,8 +612,8 @@ impl ClaudeCodeState {
                         self.persist_claude_1m_support(ch, true).await;
                     }
                     self.persist_count_tokens_allowed(true).await;
-                    let (resp, _) = Self::materialize_non_stream_response(response).await?;
-                    return Ok(resp);
+                    let (resp, count) = Self::materialize_count_tokens_response(response).await?;
+                    return Ok((resp, count.input_tokens as u64));
                 }
                 Err(err) => {
                     let is_last_attempt = idx + 1 == attempts.len();
@@ -629,6 +640,33 @@ impl ClaudeCodeState {
         }
 
         Err(ClewdrError::TooManyRetries)
+    }
+
+    fn spawn_count_tokens_log(&self, input_tokens: u64) {
+        if let Some(ctx) = self.billing_ctx.clone() {
+            tokio::spawn(async move {
+                crate::billing::persist_terminal_request_log(
+                    &ctx,
+                    TerminalLogOptions {
+                        request_type: RequestType::CountTokens,
+                        stream: false,
+                        status: "ok",
+                        http_status: Some(200),
+                        usage: Some(crate::billing::BillingUsage {
+                            input_tokens,
+                            output_tokens: 0,
+                            cache_creation_tokens: 0,
+                            cache_read_tokens: 0,
+                            ttft_ms: None,
+                        }),
+                        error_code: None,
+                        error_message: None,
+                        update_rollups: false,
+                    },
+                )
+                .await;
+            });
+        }
     }
 
     async fn handle_success_response(
@@ -678,7 +716,7 @@ impl ClaudeCodeState {
         family: ModelFamily,
     ) -> Result<axum::response::Response, ClewdrError> {
         use std::sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         };
 
@@ -693,26 +731,63 @@ impl ClaudeCodeState {
         let oauth_pool = self.oauth_pool.clone();
         let cookie = self.cookie.clone();
         let billing_ctx = self.billing_ctx.clone();
+        let billing_ctx_for_stream = billing_ctx.clone();
         let stream_account_id = self
             .account_id
             .or(cookie.as_ref().and_then(|c| c.account_id));
         let slot_released = Arc::new(AtomicBool::new(false));
         let slot_released_inner = slot_released.clone();
+        let stream_completed = Arc::new(AtomicBool::new(false));
+        let saw_upstream_usage = Arc::new(AtomicBool::new(false));
+        let upstream_failed = Arc::new(AtomicBool::new(false));
+        let abort_error = Arc::new(Mutex::new(None::<String>));
 
         let osum = output_sum.clone();
         let isum = input_sum.clone();
         let ccsum = cache_create_sum.clone();
         let crsum = cache_read_sum.clone();
         let ttft = ttft_ms.clone();
-        let stream = response.bytes_stream().eventsource().map_ok(move |event| {
-            if let Ok(parsed) =
-                serde_json::from_str::<crate::types::claude::StreamEvent>(&event.data)
-            {
-                match parsed {
-                    crate::types::claude::StreamEvent::MessageStart { message } => {
-                        // Capture authoritative input/cache usage from upstream
-                        if let Some(u) = message.usage {
-                            isum.store(u.input_tokens as u64, Ordering::Relaxed);
+        let completed = stream_completed.clone();
+        let saw_usage = saw_upstream_usage.clone();
+        let stream = response
+            .bytes_stream()
+            .eventsource()
+            .map_ok(move |event| {
+                if let Ok(parsed) =
+                    serde_json::from_str::<crate::types::claude::StreamEvent>(&event.data)
+                {
+                    match parsed {
+                        crate::types::claude::StreamEvent::MessageStart { message } => {
+                            // Capture authoritative input/cache usage from upstream
+                            if let Some(u) = message.usage {
+                                saw_usage.store(true, Ordering::Relaxed);
+                                isum.store(u.input_tokens as u64, Ordering::Relaxed);
+                                if let Some(cc) = u.cache_creation_input_tokens {
+                                    ccsum.store(cc as u64, Ordering::Relaxed);
+                                }
+                                if let Some(cr) = u.cache_read_input_tokens {
+                                    crsum.store(cr as u64, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        crate::types::claude::StreamEvent::ContentBlockDelta { .. } => {
+                            let _ = ttft.compare_exchange(
+                                -1,
+                                stream_start.elapsed().as_millis() as i64,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            );
+                        }
+                        crate::types::claude::StreamEvent::MessageDelta {
+                            usage: Some(u), ..
+                        } => {
+                            // usage fields in message_delta are cumulative, use store not add
+                            saw_usage.store(true, Ordering::Relaxed);
+                            osum.store(u.output_tokens as u64, Ordering::Relaxed);
+                            // message_delta also carries final input/cache values
+                            if u.input_tokens > 0 {
+                                isum.store(u.input_tokens as u64, Ordering::Relaxed);
+                            }
                             if let Some(cc) = u.cache_creation_input_tokens {
                                 ccsum.store(cc as u64, Ordering::Relaxed);
                             }
@@ -720,107 +795,184 @@ impl ClaudeCodeState {
                                 crsum.store(cr as u64, Ordering::Relaxed);
                             }
                         }
-                    }
-                    crate::types::claude::StreamEvent::ContentBlockDelta { .. } => {
-                        let _ = ttft.compare_exchange(
-                            -1,
-                            stream_start.elapsed().as_millis() as i64,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        );
-                    }
-                    crate::types::claude::StreamEvent::MessageDelta { usage: Some(u), .. } => {
-                        // usage fields in message_delta are cumulative, use store not add
-                        osum.store(u.output_tokens as u64, Ordering::Relaxed);
-                        // message_delta also carries final input/cache values
-                        if u.input_tokens > 0 {
-                            isum.store(u.input_tokens as u64, Ordering::Relaxed);
-                        }
-                        if let Some(cc) = u.cache_creation_input_tokens {
-                            ccsum.store(cc as u64, Ordering::Relaxed);
-                        }
-                        if let Some(cr) = u.cache_read_input_tokens {
-                            crsum.store(cr as u64, Ordering::Relaxed);
-                        }
-                    }
-                    crate::types::claude::StreamEvent::MessageStop => {
-                        let total_input = isum.load(Ordering::Relaxed);
-                        let total_out = osum.load(Ordering::Relaxed);
-                        let total_cc = ccsum.load(Ordering::Relaxed);
-                        let total_cr = crsum.load(Ordering::Relaxed);
+                        crate::types::claude::StreamEvent::MessageStop => {
+                            completed.store(true, Ordering::Relaxed);
+                            let total_input = isum.load(Ordering::Relaxed);
+                            let total_out = osum.load(Ordering::Relaxed);
+                            let total_cc = ccsum.load(Ordering::Relaxed);
+                            let total_cr = crsum.load(Ordering::Relaxed);
 
-                        // Cookie persistence + slot release
-                        if let (Some(cookie), handle) = (cookie.clone(), handle.clone()) {
-                            let mut c = cookie.clone();
-                            let aid = stream_account_id;
-                            let released = slot_released_inner.clone();
-                            tokio::spawn(async move {
-                                ClaudeCodeState::update_cookie_boundaries_if_due(&mut c, &handle)
+                            // Cookie persistence + slot release
+                            if let (Some(cookie), handle) = (cookie.clone(), handle.clone()) {
+                                let mut c = cookie.clone();
+                                let aid = stream_account_id;
+                                let released = slot_released_inner.clone();
+                                tokio::spawn(async move {
+                                    ClaudeCodeState::update_cookie_boundaries_if_due(
+                                        &mut c, &handle,
+                                    )
                                     .await;
-                                c.add_and_bucket_usage(total_input, total_out, family);
-                                let _ = handle.return_cookie(c, None).await;
-                                if let Some(aid) = aid {
-                                    if !released.swap(true, Ordering::Relaxed) {
-                                        handle.release_slot(aid).await;
+                                    c.add_and_bucket_usage(total_input, total_out, family);
+                                    let _ = handle.return_cookie(c, None).await;
+                                    if let Some(aid) = aid {
+                                        if !released.swap(true, Ordering::Relaxed) {
+                                            handle.release_slot(aid).await;
+                                        }
                                     }
-                                }
-                            });
-                        } else if let Some(aid) = stream_account_id {
-                            let released = slot_released_inner.clone();
-                            let oauth_pool = oauth_pool.clone();
-                            tokio::spawn(async move {
-                                if !released.swap(true, Ordering::Relaxed)
-                                    && let Some(pool) = oauth_pool
-                                {
-                                    pool.release(aid).await;
-                                }
-                            });
-                        }
+                                });
+                            } else if let Some(aid) = stream_account_id {
+                                let released = slot_released_inner.clone();
+                                let oauth_pool = oauth_pool.clone();
+                                tokio::spawn(async move {
+                                    if !released.swap(true, Ordering::Relaxed)
+                                        && let Some(pool) = oauth_pool
+                                    {
+                                        pool.release(aid).await;
+                                    }
+                                });
+                            }
 
-                        // Billing persistence
-                        if let Some(ctx) = billing_ctx.clone() {
-                            let ttft_val = ttft.load(Ordering::Relaxed);
-                            let usage = crate::billing::BillingUsage {
-                                input_tokens: total_input,
-                                output_tokens: total_out,
-                                cache_creation_tokens: total_cc,
-                                cache_read_tokens: total_cr,
-                                ttft_ms: if ttft_val >= 0 { Some(ttft_val) } else { None },
-                            };
-                            tokio::spawn(async move {
-                                crate::billing::persist_billing_to_db(&ctx, usage, true).await;
-                            });
+                            // Billing persistence
+                            if let Some(ctx) = billing_ctx_for_stream.clone() {
+                                let ttft_val = ttft.load(Ordering::Relaxed);
+                                let usage = crate::billing::BillingUsage {
+                                    input_tokens: total_input,
+                                    output_tokens: total_out,
+                                    cache_creation_tokens: total_cc,
+                                    cache_read_tokens: total_cr,
+                                    ttft_ms: if ttft_val >= 0 { Some(ttft_val) } else { None },
+                                };
+                                tokio::spawn(async move {
+                                    crate::billing::persist_billing_to_db(&ctx, usage, true).await;
+                                });
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
-            // mirror upstream SSE event unchanged
-            let e = SseEvent::default().event(event.event).id(event.id);
-            let e = if let Some(retry) = event.retry {
-                e.retry(retry)
-            } else {
-                e
-            };
-            e.data(event.data)
-        });
+                // mirror upstream SSE event unchanged
+                let e = SseEvent::default().event(event.event).id(event.id);
+                let e = if let Some(retry) = event.retry {
+                    e.retry(retry)
+                } else {
+                    e
+                };
+                e.data(event.data)
+            })
+            .map_err({
+                let upstream_failed = upstream_failed.clone();
+                let abort_error = abort_error.clone();
+                move |err| {
+                    upstream_failed.store(true, Ordering::Relaxed);
+                    if let Ok(mut msg) = abort_error.lock() {
+                        *msg = Some(err.to_string());
+                    }
+                    err
+                }
+            });
 
         // Drop guard: release slot when stream ends abnormally (client disconnect, upstream error)
         struct SlotDropGuard {
             released: Arc<AtomicBool>,
+            completed: Arc<AtomicBool>,
             account_id: Option<i64>,
             handle: CookieActorHandle,
             oauth_pool: Option<std::sync::Arc<crate::providers::claude::OAuthAccountPool>>,
             oauth_only: bool,
+            cookie: Option<crate::config::CookieStatus>,
+            family: ModelFamily,
+            billing_ctx: Option<crate::billing::BillingContext>,
+            input_sum: Arc<AtomicU64>,
+            output_sum: Arc<AtomicU64>,
+            cache_create_sum: Arc<AtomicU64>,
+            cache_read_sum: Arc<AtomicU64>,
+            ttft_ms: Arc<AtomicI64>,
+            saw_upstream_usage: Arc<AtomicBool>,
+            upstream_failed: Arc<AtomicBool>,
+            abort_error: Arc<Mutex<Option<String>>>,
         }
         impl Drop for SlotDropGuard {
             fn drop(&mut self) {
+                let completed = self.completed.load(Ordering::Relaxed);
+                let total_input = self.input_sum.load(Ordering::Relaxed);
+                let total_output = self.output_sum.load(Ordering::Relaxed);
+                let total_cache_create = self.cache_create_sum.load(Ordering::Relaxed);
+                let total_cache_read = self.cache_read_sum.load(Ordering::Relaxed);
+                let saw_upstream_usage = self.saw_upstream_usage.load(Ordering::Relaxed);
+                let upstream_failed = self.upstream_failed.load(Ordering::Relaxed);
+                let ttft_val = self.ttft_ms.load(Ordering::Relaxed);
+                let status = if upstream_failed {
+                    "upstream_error"
+                } else {
+                    "client_abort"
+                };
+                let http_status = if upstream_failed { 502 } else { 499 };
+                let error_message = self
+                    .abort_error
+                    .lock()
+                    .ok()
+                    .and_then(|msg| msg.clone())
+                    .unwrap_or_else(|| "stream ended before message_stop".to_string());
+                let should_persist_usage = saw_upstream_usage
+                    || total_output > 0
+                    || total_cache_create > 0
+                    || total_cache_read > 0;
+
                 if let Some(aid) = self.account_id {
                     if !self.released.swap(true, Ordering::Relaxed) {
                         let h = self.handle.clone();
                         let oauth_pool = self.oauth_pool.clone();
                         let oauth_only = self.oauth_only;
+                        let cookie = self.cookie.clone();
+                        let family = self.family;
+                        let billing_ctx = self.billing_ctx.clone();
                         tokio::spawn(async move {
+                            if !completed {
+                                if let Some(mut cookie) = cookie {
+                                    if should_persist_usage {
+                                        ClaudeCodeState::update_cookie_boundaries_if_due(
+                                            &mut cookie,
+                                            &h,
+                                        )
+                                        .await;
+                                        cookie.add_and_bucket_usage(
+                                            total_input,
+                                            total_output,
+                                            family,
+                                        );
+                                    }
+                                    let _ = h.return_cookie(cookie, None).await;
+                                }
+                                if let Some(ctx) = billing_ctx {
+                                    let usage = should_persist_usage.then_some(
+                                        crate::billing::BillingUsage {
+                                            input_tokens: total_input,
+                                            output_tokens: total_output,
+                                            cache_creation_tokens: total_cache_create,
+                                            cache_read_tokens: total_cache_read,
+                                            ttft_ms: if ttft_val >= 0 {
+                                                Some(ttft_val)
+                                            } else {
+                                                None
+                                            },
+                                        },
+                                    );
+                                    crate::billing::persist_terminal_request_log(
+                                        &ctx,
+                                        TerminalLogOptions {
+                                            request_type: RequestType::Messages,
+                                            stream: true,
+                                            status,
+                                            http_status: Some(http_status),
+                                            usage,
+                                            error_code: Some(status),
+                                            error_message: Some(error_message.as_str()),
+                                            update_rollups: should_persist_usage,
+                                        },
+                                    )
+                                    .await;
+                                }
+                            }
                             if oauth_only {
                                 if let Some(pool) = oauth_pool {
                                     pool.release(aid).await;
@@ -830,15 +982,55 @@ impl ClaudeCodeState {
                             }
                         });
                     }
+                } else if !completed {
+                    let billing_ctx = self.billing_ctx.clone();
+                    tokio::spawn(async move {
+                        if let Some(ctx) = billing_ctx {
+                            let usage =
+                                should_persist_usage.then_some(crate::billing::BillingUsage {
+                                    input_tokens: total_input,
+                                    output_tokens: total_output,
+                                    cache_creation_tokens: total_cache_create,
+                                    cache_read_tokens: total_cache_read,
+                                    ttft_ms: if ttft_val >= 0 { Some(ttft_val) } else { None },
+                                });
+                            crate::billing::persist_terminal_request_log(
+                                &ctx,
+                                TerminalLogOptions {
+                                    request_type: RequestType::Messages,
+                                    stream: true,
+                                    status,
+                                    http_status: Some(http_status),
+                                    usage,
+                                    error_code: Some(status),
+                                    error_message: Some(error_message.as_str()),
+                                    update_rollups: should_persist_usage,
+                                },
+                            )
+                            .await;
+                        }
+                    });
                 }
             }
         }
         let guard = SlotDropGuard {
             released: slot_released,
+            completed: stream_completed,
             account_id: stream_account_id,
             handle: self.cookie_actor_handle.clone(),
             oauth_pool: self.oauth_pool.clone(),
             oauth_only: self.oauth_token.is_some() && self.cookie.is_none(),
+            cookie: self.cookie.clone(),
+            family,
+            billing_ctx,
+            input_sum,
+            output_sum,
+            cache_create_sum,
+            cache_read_sum,
+            ttft_ms,
+            saw_upstream_usage,
+            upstream_failed,
+            abort_error,
         };
         let stream = stream.map(move |item| {
             let _ = &guard;
@@ -878,6 +1070,31 @@ impl ClaudeCodeState {
                     source: e,
                 })?;
         Ok((response, usage))
+    }
+
+    async fn materialize_count_tokens_response(
+        response: wreq::Response,
+    ) -> Result<(axum::response::Response, CountMessageTokensResponse), ClewdrError> {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response.bytes().await.context(WreqSnafu {
+            msg: "Failed to read Claude count_tokens response body",
+        })?;
+        let parsed = serde_json::from_slice::<CountMessageTokensResponse>(&bytes)
+            .map_err(|source| ClewdrError::JsonError { source })?;
+
+        let mut builder = http::Response::builder().status(status);
+        for (key, value) in headers.iter() {
+            builder = builder.header(key, value);
+        }
+        let response =
+            builder
+                .body(axum::body::Body::from(bytes))
+                .map_err(|e| ClewdrError::HttpError {
+                    loc: snafu::Location::generate(),
+                    source: e,
+                })?;
+        Ok((response, parsed))
     }
 
     fn extract_usage_from_bytes(bytes: &[u8]) -> Option<crate::billing::BillingUsage> {
@@ -1170,11 +1387,13 @@ impl ClaudeCodeState {
         Some((sess_ts, week_ts, opus_ts, sonnet_ts))
     }
 
-    fn local_count_tokens_response(body: &CreateMessageParams) -> axum::response::Response {
+    fn local_count_tokens_response(
+        body: &CreateMessageParams,
+    ) -> (axum::response::Response, CountMessageTokensResponse) {
         let estimate = CountMessageTokensResponse {
             input_tokens: body.count_tokens(),
         };
-        Json(estimate).into_response()
+        (Json(estimate.clone()).into_response(), estimate)
     }
 
     fn is_context_1m_forbidden(error: &ClewdrError) -> bool {

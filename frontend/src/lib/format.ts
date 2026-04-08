@@ -24,7 +24,7 @@ export function statusColor(status: string): string {
   switch (status) {
     case "active": case "ok": return "green";
     case "disabled": return "gray";
-    case "invalid": case "upstream_error": case "auth_rejected": return "red";
+    case "invalid": case "upstream_error": case "auth_rejected": case "internal_error": return "red";
     case "exhausted": case "quota_rejected": return "yellow";
     default: return "blue";
   }

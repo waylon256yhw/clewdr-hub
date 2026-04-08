@@ -897,7 +897,7 @@ pub struct CountMessageTokensParams {
     pub messages: Vec<Message>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CountMessageTokensResponse {
     pub input_tokens: u32,
 }

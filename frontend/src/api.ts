@@ -296,6 +296,7 @@ export const getCliVersions = (force?: boolean) =>
 export interface RequestFilters {
   offset?: number;
   limit?: number;
+  request_type?: string;
   user_id?: number;
   status?: string;
   model?: string;

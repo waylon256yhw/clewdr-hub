@@ -1,11 +1,11 @@
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use sqlx::SqlitePool;
-use tokio::sync::broadcast;
 use tracing::warn;
 
 use crate::db::billing::{
     RequestLogRow, insert_request_log, lookup_model_pricing, upsert_usage_rollup,
 };
+use crate::state::AdminEvent;
 
 /// Cache write multiplier (5-min ephemeral cache, 1.25x base input price).
 /// Stored as integer fraction: numerator=125, denominator=100.
@@ -52,7 +52,33 @@ pub struct BillingContext {
     pub model_raw: String,
     pub request_id: String,
     pub started_at: DateTime<Utc>,
-    pub event_tx: broadcast::Sender<()>,
+    pub event_tx: tokio::sync::broadcast::Sender<AdminEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestType {
+    Messages,
+    CountTokens,
+}
+
+impl RequestType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Messages => "messages",
+            Self::CountTokens => "count_tokens",
+        }
+    }
+}
+
+pub struct TerminalLogOptions<'a> {
+    pub request_type: RequestType,
+    pub stream: bool,
+    pub status: &'a str,
+    pub http_status: Option<u16>,
+    pub usage: Option<BillingUsage>,
+    pub error_code: Option<&'a str>,
+    pub error_message: Option<&'a str>,
+    pub update_rollups: bool,
 }
 
 /// Canonical alias table for model normalization.
@@ -123,16 +149,18 @@ pub fn current_month_bounds(now: DateTime<Utc>) -> (String, String) {
     )
 }
 
-/// Persist billing data to DB. Called after upstream usage is known.
-pub async fn persist_billing_to_db(ctx: &BillingContext, usage: BillingUsage, stream: bool) {
-    let normalized = normalize_model(&ctx.model_raw);
-    let (input_price, output_price) = if let Some(ref key) = normalized {
-        match lookup_model_pricing(&ctx.db, key).await {
+async fn lookup_prices(
+    raw_model: &str,
+    normalized: &Option<String>,
+    db: &SqlitePool,
+) -> (i64, i64) {
+    if let Some(key) = normalized {
+        match lookup_model_pricing(db, key).await {
             Ok(Some(prices)) => prices,
             Ok(None) => {
                 warn!(
                     "No pricing found for normalized model '{}' (raw: '{}'), using fallback",
-                    key, ctx.model_raw
+                    key, raw_model
                 );
                 (FALLBACK_INPUT_PRICE, FALLBACK_OUTPUT_PRICE)
             }
@@ -144,49 +172,80 @@ pub async fn persist_billing_to_db(ctx: &BillingContext, usage: BillingUsage, st
     } else {
         warn!(
             "Unknown model '{}', using fallback (most expensive) pricing",
-            ctx.model_raw
+            raw_model
         );
         (FALLBACK_INPUT_PRICE, FALLBACK_OUTPUT_PRICE)
-    };
+    }
+}
 
-    let cost = usage.cost_nanousd(input_price, output_price);
+pub async fn persist_terminal_request_log(ctx: &BillingContext, opts: TerminalLogOptions<'_>) {
+    let normalized = normalize_model(&ctx.model_raw);
+    let (
+        priced_input,
+        priced_output,
+        cost,
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+    ) = if let Some(ref usage) = opts.usage {
+        let (input_price, output_price) = lookup_prices(&ctx.model_raw, &normalized, &ctx.db).await;
+        (
+            Some(input_price),
+            Some(output_price),
+            usage.cost_nanousd(input_price, output_price),
+            Some(usage.input_tokens as i64),
+            Some(usage.output_tokens as i64),
+            Some(usage.cache_creation_tokens as i64),
+            Some(usage.cache_read_tokens as i64),
+        )
+    } else {
+        (None, None, 0, None, None, None, None)
+    };
     let now = Utc::now();
     let completed_at = now.to_rfc3339();
     let duration_ms = (now - ctx.started_at).num_milliseconds();
 
     let log = RequestLogRow {
         request_id: &ctx.request_id,
-        request_type: "messages",
+        request_type: opts.request_type.as_str(),
         user_id: ctx.user_id,
         api_key_id: ctx.api_key_id,
         account_id: ctx.account_id,
         model_raw: &ctx.model_raw,
         model_normalized: normalized.as_deref(),
-        stream,
+        stream: opts.stream,
         started_at: &ctx.started_at.to_rfc3339(),
         completed_at: Some(&completed_at),
         duration_ms: Some(duration_ms),
-        ttft_ms: usage.ttft_ms,
-        status: "ok",
-        http_status: Some(200),
-        input_tokens: Some(usage.input_tokens as i64),
-        output_tokens: Some(usage.output_tokens as i64),
-        cache_creation_tokens: Some(usage.cache_creation_tokens as i64),
-        cache_read_tokens: Some(usage.cache_read_tokens as i64),
-        priced_input_nanousd_per_token: Some(input_price),
-        priced_output_nanousd_per_token: Some(output_price),
+        ttft_ms: opts.usage.as_ref().and_then(|usage| usage.ttft_ms),
+        status: opts.status,
+        http_status: opts.http_status,
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        priced_input_nanousd_per_token: priced_input,
+        priced_output_nanousd_per_token: priced_output,
         cost_nanousd: cost,
-        error_code: None,
-        error_message: None,
+        error_code: opts
+            .error_code
+            .or_else(|| (opts.status != "ok").then_some(opts.status)),
+        error_message: opts.error_message,
     };
 
     if let Err(e) = insert_request_log(&ctx.db, &log).await {
         warn!("Failed to insert request log: {e}");
     } else {
-        let _ = ctx.event_tx.send(());
+        let _ = ctx.event_tx.send(AdminEvent::request_log(
+            opts.request_type.as_str(),
+            opts.status,
+        ));
     }
 
-    if let Some(user_id) = ctx.user_id {
+    if opts.update_rollups
+        && let (Some(user_id), Some(usage)) = (ctx.user_id, opts.usage.as_ref())
+    {
         let (week_start, week_end) = current_week_bounds(now);
         let (month_start, month_end) = current_month_bounds(now);
 
@@ -196,7 +255,7 @@ pub async fn persist_billing_to_db(ctx: &BillingContext, usage: BillingUsage, st
             "week",
             &week_start,
             &week_end,
-            &usage,
+            usage,
             cost,
         )
         .await
@@ -209,7 +268,7 @@ pub async fn persist_billing_to_db(ctx: &BillingContext, usage: BillingUsage, st
             "month",
             &month_start,
             &month_end,
-            &usage,
+            usage,
             cost,
         )
         .await
@@ -217,6 +276,24 @@ pub async fn persist_billing_to_db(ctx: &BillingContext, usage: BillingUsage, st
             warn!("Failed to upsert monthly rollup: {e}");
         }
     }
+}
+
+/// Persist a successful Claude messages request after upstream usage is known.
+pub async fn persist_billing_to_db(ctx: &BillingContext, usage: BillingUsage, stream: bool) {
+    persist_terminal_request_log(
+        ctx,
+        TerminalLogOptions {
+            request_type: RequestType::Messages,
+            stream,
+            status: "ok",
+            http_status: Some(200),
+            usage: Some(usage),
+            error_code: None,
+            error_message: None,
+            update_rollups: true,
+        },
+    )
+    .await;
 }
 
 /// Check if user has exceeded their budget (soft cap).

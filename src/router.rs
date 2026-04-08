@@ -12,7 +12,7 @@ use crate::{
     api::*,
     middleware::{RequireAdminAuth, RequireFlexibleAuth},
     services::{cookie_actor::CookieActorHandle, user_limiter::UserLimiterMap},
-    state::{AppState, AuthState},
+    state::{AdminEvent, AppState, AuthState},
     stealth,
 };
 
@@ -27,7 +27,7 @@ impl RouterBuilder {
             .await
             .expect("Failed to start CookieActor");
         let stealth_profile = stealth::init_stealth_profile(&db_pool).await;
-        let (event_tx, _) = tokio::sync::broadcast::channel(64);
+        let (event_tx, _) = tokio::sync::broadcast::channel::<AdminEvent>(64);
         let claude_providers = crate::providers::claude::build_providers(
             cookie_handle.clone(),
             db_pool.clone(),
