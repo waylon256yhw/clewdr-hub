@@ -1,5 +1,17 @@
 # Release Notes
 
+## v1.0.8
+
+### 变更
+
+- 请求入口统一做最小采样参数归一化，默认移除 `top_p` 与 `top_k`，降低不同客户端与 Claude 模型之间的参数兼容问题。
+- README 补充参数兼容策略说明，明确这是面向小团队共享场景的有意取舍。
+
+### 修复
+
+- 修复部分客户端在 `claude-opus-4-6` 下因采样参数组合触发 `Invalid request data` 的问题；非 thinking 请求现在也会走兼容兜底。
+- 补充流式转发链路对上游 SSE `error` 事件和 eventsource 级错误的记录，避免被误判为普通 `client_abort`。
+
 ## v1.0.7
 
 ### 变更
