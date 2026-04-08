@@ -1,5 +1,25 @@
 # Release Notes
 
+## v1.0.9
+
+### 新增
+
+- 管理后台手动点击 "Probe All" 后，每个被探测的账号会写入一条 `request_logs` 行（类型 `probe_cookie` / `probe_oauth`），并把上游 bootstrap / profile / usage 原始 JSON 聚合为一个 bundle 存入新的 `response_body` 列，供日志详情抽屉展开查看。
+- 请求日志详情抽屉新增 "上游响应 JSON" 区块，按需懒加载 `GET /api/admin/requests/{id}/response_body`，列表接口自身不再下发响应体。
+- 日志表格 Token 列改为四个彩色 Mantine Badge：`↑input` (cyan) / `↓output` (teal) / `+cache_write` (grape) / `↻cache_read` (gray)；缓存 badge 仅在非零时渲染。
+
+### 变更
+
+- `request_logs.request_type` 枚举替换：移除 `count_tokens`，新增 `probe_cookie` 和 `probe_oauth`。`/v1/messages/count_tokens` 端点仍然可用，但不再写请求日志（生产库此前 607 条 `messages` : 0 条 `count_tokens`，该类型纯属噪音）。
+- `request_logs.model_raw` 改为可空；probe 行没有模型概念。
+- 自动触发的 probe（启动时、cookie 轮换、token 刷新）保持只写 `accounts` / `account_runtime_state`，不再污染请求日志。
+- 管理后台 SSE 订阅从 Logs 页组件提升到 `AdminShell`，现在在任意 tab 触发 probe，Logs 页都能即时收到刷新事件。
+
+### 修复
+
+- 修复 `InvalidCookie`、免费账户被拒、OAuth refresh 认证类错误被误分类为 `upstream_error` 的问题，现在统一归入 `auth_rejected`。
+- 修复 probe cookie 命中免费账户时日志被记为 `status=ok` 的假成功现象。
+
 ## v1.0.8
 
 ### 变更
