@@ -1,5 +1,11 @@
 # Release Notes
 
+## v1.0.11
+
+### 修复
+
+- 修正流式请求「首字耗时」(TTFT) 测量：原算法零点设在上游响应头抵达 clewdr 之后才起算，对开启响应缓冲的反代上游（nginx `proxy_buffering on`、Cloudflare、各类中转）会被低估到只有几百毫秒。现在改为复用中间件入口处的 `started_at` 作为零点，得到真正的端到端首字延迟，同时包含 cookie 选择 / token 刷新 / 上游握手等 clewdr 自身开销。
+
 ## v1.0.10
 
 ### 变更
