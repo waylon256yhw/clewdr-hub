@@ -712,14 +712,6 @@ impl CookieActor {
                 }
             }
 
-            // Normalize 1M defaults
-            if cs.supports_claude_1m_sonnet.is_none() {
-                cs.supports_claude_1m_sonnet = Some(true);
-            }
-            if cs.supports_claude_1m_opus.is_none() {
-                cs.supports_claude_1m_opus = Some(true);
-            }
-
             if cs.reset_time.is_some() {
                 state.exhausted.insert(cs);
             } else {

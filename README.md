@@ -90,6 +90,13 @@ export ANTHROPIC_API_KEY=sk-...    # 从后台创建
 
 这是有意的兼容性取舍：对这个项目的目标场景，保留 `temperature` 作为主要采样旋钮已经足够，同时可以减少不同客户端和不同 Claude 模型之间的参数兼容问题。
 
+### Anthropic 1M Context 说明
+
+- 本项目不再支持 legacy `-1M` 伪模型名，请直接使用 Anthropic 官方标准模型名
+- 本项目不会主动添加 `context-1m-2025-08-07`，也会忽略客户端传入的这个 legacy beta header
+- 截至 `2026-04-09`，`claude-opus-4-6` 与 `claude-sonnet-4-6` 的 1M context 已是原生能力；`claude-opus-4-5` 仍为 `200k`
+- Anthropic 已宣布 `claude-sonnet-4` / `claude-sonnet-4-5` 依赖 `context-1m-2025-08-07` 的过渡 1M beta 将在 `2026-04-30` 退场；本项目不再为这条历史兼容路径做适配
+
 ### 团队扩展
 
 在上面基础上：

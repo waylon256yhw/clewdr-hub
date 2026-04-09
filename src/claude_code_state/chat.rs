@@ -13,7 +13,7 @@ use wreq::Method;
 use crate::{
     billing::{RequestType, TerminalLogOptions},
     claude_code_state::{ClaudeCodeState, TokenStatus},
-    config::{Claude1mChannel, ModelFamily, Reason},
+    config::{ModelFamily, Reason},
     db::accounts::{
         batch_upsert_runtime_states, set_account_auth_error, set_account_disabled,
         update_account_metadata_unchecked, upsert_account_oauth,
@@ -277,75 +277,20 @@ impl ClaudeCodeState {
     pub async fn send_chat(
         &mut self,
         access_token: String,
-        mut p: CreateMessageParams,
+        p: CreateMessageParams,
     ) -> Result<axum::response::Response, ClewdrError> {
-        let (base_model, requested_1m) = match p.model.strip_suffix("-1M") {
-            Some(stripped) => (stripped.to_string(), true),
-            None => (p.model.clone(), false),
-        };
-        p.model = base_model;
-
-        let channel = Self::auto_1m_probe_channel(&p.model);
-        let cookie_support = self
-            .cookie
-            .as_ref()
-            .and_then(|cookie| channel.and_then(|ch| cookie.claude_1m_support(ch)));
-        let attempts: Vec<bool> = if channel.is_some() {
-            match cookie_support {
-                Some(false) => vec![false],
-                _ => vec![true, false],
-            }
-        } else if requested_1m {
-            vec![true, false]
-        } else {
-            vec![false]
-        };
-
         let model_family = Self::classify_model(&p.model);
-        for (idx, use_context_1m) in attempts.iter().copied().enumerate() {
-            match self
-                .execute_claude_request(&access_token, &p, use_context_1m)
-                .await
-            {
-                Ok(response) => {
-                    if let Some(ch) = channel
-                        && use_context_1m
-                    {
-                        self.persist_claude_1m_support(ch, true).await;
-                    }
-                    return self.handle_success_response(response, model_family).await;
-                }
-                Err(err) => {
-                    let is_last_attempt = idx + 1 == attempts.len();
-                    let should_fallback = use_context_1m
-                        && !is_last_attempt
-                        && channel.is_some()
-                        && Self::is_context_1m_forbidden(&err);
-                    if should_fallback {
-                        if let Some(ch) = channel {
-                            self.persist_claude_1m_support(ch, false).await;
-                        }
-                        warn!("1M probe failed, disabling lane and retrying without 1M header");
-                        continue;
-                    }
-                    return Err(err);
-                }
-            }
-        }
-        Err(ClewdrError::TooManyRetries)
+        let response = self.execute_claude_request(&access_token, &p).await?;
+        self.handle_success_response(response, model_family).await
     }
 
     async fn execute_claude_request(
         &mut self,
         access_token: &str,
         body: &CreateMessageParams,
-        use_context_1m: bool,
     ) -> Result<wreq::Response, ClewdrError> {
         let profile = self.stealth_profile.load();
-        let beta_header = Self::merge_anthropic_beta_header(
-            self.anthropic_beta_header.as_deref(),
-            use_context_1m,
-        );
+        let beta_header = Self::merge_anthropic_beta_header(self.anthropic_beta_header.as_deref());
         let mut url = self.endpoint.join("v1/messages").expect("Url parse error");
         url.set_query(Some("beta=true"));
         self.client
@@ -362,19 +307,6 @@ impl ClaudeCodeState {
             })?
             .check_claude()
             .await
-    }
-
-    async fn persist_claude_1m_support(&mut self, channel: Claude1mChannel, value: bool) {
-        if let Some(cookie) = self.cookie.as_mut() {
-            if cookie.claude_1m_support(channel) == Some(value) {
-                return;
-            }
-            cookie.set_claude_1m_support(channel, Some(value));
-            let cloned = cookie.clone();
-            if let Err(err) = self.cookie_actor_handle.return_cookie(cloned, None).await {
-                warn!("Failed to persist Claude 1M support state: {}", err);
-            }
-        }
     }
 
     async fn persist_count_tokens_allowed(&mut self, value: bool) {
@@ -575,68 +507,22 @@ impl ClaudeCodeState {
         mut p: CreateMessageParams,
     ) -> Result<(axum::response::Response, u64), ClewdrError> {
         p.stream = Some(false);
-        let (base_model, requested_1m) = match p.model.strip_suffix("-1M") {
-            Some(stripped) => (stripped.to_string(), true),
-            None => (p.model.clone(), false),
-        };
-        p.model = base_model;
-
-        let channel = Self::auto_1m_probe_channel(&p.model);
-        let cookie_support = self
-            .cookie
-            .as_ref()
-            .and_then(|cookie| channel.and_then(|ch| cookie.claude_1m_support(ch)));
-        let attempts: Vec<bool> = if channel.is_some() {
-            match cookie_support {
-                Some(false) => vec![false],
-                _ => vec![true, false],
+        match self
+            .execute_claude_count_tokens_request(&access_token, &p)
+            .await
+        {
+            Ok(response) => {
+                self.persist_count_tokens_allowed(true).await;
+                let (resp, count) = Self::materialize_count_tokens_response(response).await?;
+                Ok((resp, count.input_tokens as u64))
             }
-        } else if requested_1m {
-            vec![true, false]
-        } else {
-            vec![false]
-        };
-
-        for (idx, use_context_1m) in attempts.iter().copied().enumerate() {
-            match self
-                .execute_claude_count_tokens_request(&access_token, &p, use_context_1m)
-                .await
-            {
-                Ok(response) => {
-                    if let Some(ch) = channel
-                        && use_context_1m
-                    {
-                        self.persist_claude_1m_support(ch, true).await;
-                    }
-                    self.persist_count_tokens_allowed(true).await;
-                    let (resp, count) = Self::materialize_count_tokens_response(response).await?;
-                    return Ok((resp, count.input_tokens as u64));
+            Err(err) => {
+                if Self::is_count_tokens_unauthorized(&err) {
+                    self.persist_count_tokens_allowed(false).await;
                 }
-                Err(err) => {
-                    let is_last_attempt = idx + 1 == attempts.len();
-                    let should_fallback = use_context_1m
-                        && !is_last_attempt
-                        && channel.is_some()
-                        && Self::is_context_1m_forbidden(&err);
-                    if should_fallback {
-                        if let Some(ch) = channel {
-                            self.persist_claude_1m_support(ch, false).await;
-                        }
-                        warn!(
-                            "1M probe failed in count_tokens, disabling lane and retrying without 1M header"
-                        );
-                        continue;
-                    }
-
-                    if Self::is_count_tokens_unauthorized(&err) {
-                        self.persist_count_tokens_allowed(false).await;
-                    }
-                    return Err(err);
-                }
+                Err(err)
             }
         }
-
-        Err(ClewdrError::TooManyRetries)
     }
 
     async fn handle_success_response(
@@ -1132,13 +1018,9 @@ impl ClaudeCodeState {
         &mut self,
         access_token: &str,
         body: &CreateMessageParams,
-        use_context_1m: bool,
     ) -> Result<wreq::Response, ClewdrError> {
         let profile = self.stealth_profile.load();
-        let beta_header = Self::merge_anthropic_beta_header(
-            self.anthropic_beta_header.as_deref(),
-            use_context_1m,
-        );
+        let beta_header = Self::merge_anthropic_beta_header(self.anthropic_beta_header.as_deref());
         let mut url = self
             .endpoint
             .join("v1/messages/count_tokens")
@@ -1160,7 +1042,7 @@ impl ClaudeCodeState {
             .await
     }
 
-    fn merge_anthropic_beta_header(extra: Option<&str>, use_context_1m: bool) -> String {
+    fn merge_anthropic_beta_header(extra: Option<&str>) -> String {
         let mut seen = std::collections::HashSet::new();
         let mut merged = Vec::new();
         let mut push = |token: &str| {
@@ -1169,7 +1051,7 @@ impl ClaudeCodeState {
                 return;
             }
             let key = trimmed.to_ascii_lowercase();
-            if !use_context_1m && key == CLAUDE_BETA_CONTEXT_1M_TOKEN {
+            if key == CLAUDE_BETA_CONTEXT_1M_TOKEN {
                 return;
             }
             if seen.insert(key) {
@@ -1178,9 +1060,6 @@ impl ClaudeCodeState {
         };
 
         push(CLAUDE_BETA_BASE);
-        if use_context_1m {
-            push(CLAUDE_BETA_CONTEXT_1M_TOKEN);
-        }
         if let Some(extra) = extra {
             for token in extra.split(',') {
                 push(token);
@@ -1188,27 +1067,6 @@ impl ClaudeCodeState {
         }
 
         merged.join(",")
-    }
-
-    fn auto_1m_probe_channel(model: &str) -> Option<Claude1mChannel> {
-        let m = model.to_ascii_lowercase();
-        if Self::is_sonnet_1m_probe_model(&m) {
-            Some(Claude1mChannel::Sonnet)
-        } else if Self::is_opus_1m_probe_model(&m) {
-            Some(Claude1mChannel::Opus)
-        } else {
-            None
-        }
-    }
-
-    fn is_sonnet_1m_probe_model(model: &str) -> bool {
-        // Sonnet 4.x lanes (4 / 4.5 / 4.6 and dated variants) trigger 1M probing.
-        model.starts_with("claude-sonnet-4")
-    }
-
-    fn is_opus_1m_probe_model(model: &str) -> bool {
-        // Only Opus 4.6 lane should trigger 1M probing.
-        model.starts_with("claude-opus-4-6")
     }
 
     fn classify_model(model: &str) -> ModelFamily {
@@ -1390,33 +1248,9 @@ impl ClaudeCodeState {
         (Json(estimate.clone()).into_response(), estimate)
     }
 
-    fn is_context_1m_forbidden(error: &ClewdrError) -> bool {
-        if let ClewdrError::ClaudeHttpError { code, inner } = error
-            && matches!(code.as_u16(), 400 | 403 | 429)
-        {
-            let message = inner
-                .message
-                .as_str()
-                .map(|s| s.to_ascii_lowercase())
-                .unwrap_or_default();
-
-            return message
-                .contains("the long context beta is not yet available for this subscription")
-                || message.contains(
-                    "this authentication style is incompatible with the long context beta header",
-                )
-                || message.contains("extra usage is required for long context requests");
-        }
-        false
-    }
-
     fn is_count_tokens_unauthorized(error: &ClewdrError) -> bool {
         if let ClewdrError::ClaudeHttpError { code, .. } = error {
-            return match code.as_u16() {
-                401 | 404 => true,
-                403 => !Self::is_context_1m_forbidden(error),
-                _ => false,
-            };
+            return matches!(code.as_u16(), 401 | 403 | 404);
         }
         false
     }

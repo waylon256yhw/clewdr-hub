@@ -403,8 +403,8 @@ impl CheckClaudeErr for Response {
         let inner_error = err.error;
         // check if the error is a rate limit error
         if status == 429 {
-            // Long-context 1M gating also uses 429; keep it as HTTP error so upper
-            // retry logic can downgrade to non-1M without cooling down the cookie.
+            // Some Anthropic feature-gating errors also use 429; keep them as HTTP
+            // errors instead of cooling down the account as if it were rate-limited.
             let msg_lower = inner_error
                 .message
                 .as_str()

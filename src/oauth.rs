@@ -482,8 +482,8 @@ pub async fn fetch_oauth_snapshot_raw(
             .filter(|(util, ts)| *util == Some(100.0) && ts.is_some())
             .map(|(_, ts)| ts.unwrap())
             .max(),
-            supports_claude_1m_sonnet: Some(true),
-            supports_claude_1m_opus: Some(true),
+            supports_claude_1m_sonnet: None,
+            supports_claude_1m_opus: None,
             count_tokens_allowed: None,
             session_resets_at,
             weekly_resets_at,
