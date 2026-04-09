@@ -1,5 +1,18 @@
 # Release Notes
 
+## v1.0.10
+
+### 变更
+
+- 移除服务端内部的 legacy 1M context 兼容逻辑，不再根据 `-1M` 伪模型名或账号运行时状态自动切换 long-context 行为。
+- 请求头合并策略继续保留通用 `anthropic-beta` 透传，但会忽略已废弃的 `context-1m-2025-08-07` legacy token。
+- README 补充 Anthropic 1M context 时间线说明，明确 `2026-04-30` 为旧 Sonnet 1M beta 退场时间点。
+
+### 修复
+
+- 恢复 `/v1/messages/count_tokens` 在上游返回 `403` 时的本地降级缓存，避免同一账号后续重复硬失败。
+- 清理 cookie / OAuth runtime 中默认标记“支持 1M”的过时状态，避免与 Anthropic 当前模型能力语义混淆。
+
 ## v1.0.9
 
 ### 新增
