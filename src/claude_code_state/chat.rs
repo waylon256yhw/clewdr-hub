@@ -582,12 +582,17 @@ impl ClaudeCodeState {
         let cache_create_sum = Arc::new(AtomicU64::new(0));
         let cache_read_sum = Arc::new(AtomicU64::new(0));
         let ttft_ms = Arc::new(AtomicI64::new(-1));
-        let stream_start = std::time::Instant::now();
         let handle = self.cookie_actor_handle.clone();
         let oauth_pool = self.oauth_pool.clone();
         let cookie = self.cookie.clone();
         let billing_ctx = self.billing_ctx.clone();
         let billing_ctx_for_stream = billing_ctx.clone();
+        // TTFT zero point: earliest time clewdr knew about this request (set in middleware).
+        // Measuring from here (instead of after upstream response headers arrive) makes the
+        // metric immune to reverse-proxy response buffering and also reflects clewdr's own
+        // cookie-selection / token-refresh / handshake overhead — i.e. the real user-perceived
+        // time to first token.
+        let ttft_started_at = billing_ctx.as_ref().map(|c| c.started_at);
         let request_id_for_stream = billing_ctx
             .as_ref()
             .map(|ctx| ctx.request_id.clone())
@@ -634,12 +639,17 @@ impl ClaudeCodeState {
                             }
                         }
                         crate::types::claude::StreamEvent::ContentBlockDelta { .. } => {
-                            let _ = ttft.compare_exchange(
-                                -1,
-                                stream_start.elapsed().as_millis() as i64,
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                            );
+                            if let Some(started) = ttft_started_at {
+                                let elapsed = (chrono::Utc::now() - started).num_milliseconds();
+                                if elapsed >= 0 {
+                                    let _ = ttft.compare_exchange(
+                                        -1,
+                                        elapsed,
+                                        Ordering::Relaxed,
+                                        Ordering::Relaxed,
+                                    );
+                                }
+                            }
                         }
                         crate::types::claude::StreamEvent::MessageDelta {
                             usage: Some(u), ..
