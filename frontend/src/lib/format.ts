@@ -6,6 +6,21 @@ export function formatCost(nanousd: number): string {
   return usd < 0.01 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`;
 }
 
+export function formatTokenCount(tokens: number): string {
+  if (tokens === 0) return "0";
+  if (Math.abs(tokens) >= 1_000_000_000) return `${(tokens / 1_000_000_000).toFixed(1)}B`;
+  if (Math.abs(tokens) >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
+  if (Math.abs(tokens) >= 1_000) return `${(tokens / 1_000).toFixed(1)}K`;
+  return tokens.toLocaleString("zh-CN");
+}
+
+export function formatCompactCount(value: number): string {
+  return new Intl.NumberFormat("zh-CN", {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  }).format(value);
+}
+
 export function formatDate(iso: string | null | undefined): string {
   if (!iso) return "—";
   return new Date(iso).toLocaleString("zh-CN", {
@@ -37,4 +52,8 @@ export function requestTypeColor(t: string): string {
     case "probe_oauth": return "teal";
     default: return "gray";
   }
+}
+
+export function formatShanghaiBucket(bucket: string, bucketUnit: "hour" | "day"): string {
+  return bucketUnit === "hour" ? bucket.slice(5) : bucket.slice(5);
 }

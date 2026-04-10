@@ -206,6 +206,59 @@ export interface CliVersionsResponse {
   fetched_at: string | null;
 }
 
+export interface OpsUsageTotals {
+  request_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  total_tokens: number;
+  cost_nanousd: number;
+}
+
+export interface ModelDistributionItem {
+  model: string;
+  request_count: number;
+  total_tokens: number;
+  cost_nanousd: number;
+}
+
+export interface UserAggregate {
+  user_id: number;
+  username: string;
+  request_count: number;
+  total_tokens: number;
+  cost_nanousd: number;
+}
+
+export interface UserSeriesPoint {
+  bucket: string;
+  request_count: number;
+  total_tokens: number;
+  cost_nanousd: number;
+}
+
+export interface UserSeries {
+  user_id: number;
+  username: string;
+  points: UserSeriesPoint[];
+}
+
+export interface OpsUsageResponse {
+  range: string;
+  bucket_unit: "hour" | "day";
+  selected_user_id: number | null;
+  retention_days: number;
+  coverage_limited: boolean;
+  window_started_at: string;
+  window_ended_at: string;
+  buckets: string[];
+  totals: OpsUsageTotals;
+  model_distribution: ModelDistributionItem[];
+  top_users: UserAggregate[];
+  user_series: UserSeries[];
+}
+
 // --- Endpoints ---
 
 // Auth
@@ -292,6 +345,12 @@ export const updateSettings = (settings: Record<string, string>) =>
 export const getCliVersions = (force?: boolean) =>
   apiFetch<CliVersionsResponse>(`/api/admin/cli-versions${force ? "?force=1" : ""}`);
 
+// Ops
+export const getOpsUsage = (range: string, topUsers = 5, userId?: number) =>
+  apiFetch<OpsUsageResponse>("/api/admin/ops/usage", {
+    params: { range, top_users: topUsers, user_id: userId },
+  });
+
 // Requests
 export interface RequestFilters {
   offset?: number;
@@ -347,6 +406,8 @@ export const qk = {
   keys: (userId?: number) => ["keys", userId] as const,
   settings: ["settings"] as const,
   models: ["models"] as const,
+  opsUsage: (range: string, topUsers: number, userId?: number) =>
+    ["opsUsage", range, topUsers, userId] as const,
   requests: (filters: RequestFilters) => ["requests", filters] as const,
   requestBody: (id: number) => ["request_body", id] as const,
 };

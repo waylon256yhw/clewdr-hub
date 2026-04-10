@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@mantine/charts": "9.0.0",
     "@mantine/core": "9.0.0",
     "@mantine/form": "^9.0.0",
     "@mantine/hooks": "9.0.0",
@@ -17,7 +18,8 @@
     "@tanstack/react-query": "^5.80.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
-    "react-router": "^7.6.0"
+    "react-router": "^7.6.0",
+    "recharts": "^3.3.0"
   },
   "devDependencies": {
     "@types/react": "^19.2.14",

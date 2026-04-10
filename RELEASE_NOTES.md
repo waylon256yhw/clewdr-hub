@@ -1,5 +1,22 @@
 # Release Notes
 
+## Unreleased
+
+### 新增
+
+- 管理后台新增「运维」页（`/ops`）：提供累计请求数 / 累计 Token / 累计金额、模型分布图、Top 用户用量趋势图与用户排行。
+- 新增 `GET /api/admin/ops/usage` 统计接口，支持 `range=24h|7d|30d`、`top_users`、`user_id` 参数。
+- 新增 `usage_lifetime_totals` 表与实时增量写入，用于承载不受日志留存影响的累计口径。
+
+### 变更
+
+- 运维页累计指标口径从 `request_logs` 解耦：累计卡片改为读取 `usage_lifetime_totals`，图表继续读取窗口期 `request_logs`。
+- 运维页交互支持一键下钻日志：点击模型分布、用户折线点、用户排行行可跳转到日志页并自动带上筛选参数。
+- 日志页支持从 URL query 初始化筛选（`request_type/user_id/model/status/started_from/started_to`）。
+- 日志页模型筛选从仅匹配 `model_raw` 扩展为匹配 `model_raw + model_normalized`。
+- 运维页 UI 精简：移除调试型旁白、窗口时间提示、手动刷新按钮与留存限制提示；筛选控件改为 placeholder 风格。
+- 累计 Token 卡片改为复用日志页同款四色 Badge（输入/输出/缓存写入/缓存读取），并移除累计金额卡片中的缓存 token 文本。
+
 ## v1.0.11
 
 ### 修复

@@ -4,6 +4,7 @@ pub mod events;
 pub mod keys;
 mod me;
 pub mod models;
+pub mod ops;
 pub mod overview;
 pub mod policies;
 pub mod requests;
@@ -51,6 +52,8 @@ pub fn admin_router() -> Router<AppState> {
         .route("/settings", get(settings::get_all).post(settings::update))
         // CLI versions (npm)
         .route("/cli-versions", get(settings::cli_versions))
+        // Ops analytics
+        .route("/ops/usage", get(ops::usage))
         // Request logs
         .route("/requests", get(requests::list))
         .route(

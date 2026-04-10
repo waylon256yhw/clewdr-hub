@@ -139,6 +139,44 @@ pub async fn upsert_usage_rollup(
     Ok(())
 }
 
+/// Upsert a per-user lifetime usage total, incrementing counters on conflict.
+pub async fn upsert_usage_lifetime_total(
+    pool: &SqlitePool,
+    user_id: i64,
+    usage: &BillingUsage,
+    cost_nanousd: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO usage_lifetime_totals (
+            user_id,
+            request_count,
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+            cost_nanousd,
+            updated_at
+        ) VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)
+        ON CONFLICT (user_id) DO UPDATE SET
+            request_count = request_count + 1,
+            input_tokens = input_tokens + excluded.input_tokens,
+            output_tokens = output_tokens + excluded.output_tokens,
+            cache_creation_tokens = cache_creation_tokens + excluded.cache_creation_tokens,
+            cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+            cost_nanousd = cost_nanousd + excluded.cost_nanousd,
+            updated_at = CURRENT_TIMESTAMP"#,
+    )
+    .bind(user_id)
+    .bind(usage.input_tokens as i64)
+    .bind(usage.output_tokens as i64)
+    .bind(usage.cache_creation_tokens as i64)
+    .bind(usage.cache_read_tokens as i64)
+    .bind(cost_nanousd)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Get current period cost for quota checking.
 pub async fn get_current_period_cost(
     pool: &SqlitePool,

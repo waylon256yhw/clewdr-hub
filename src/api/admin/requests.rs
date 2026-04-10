@@ -77,7 +77,9 @@ pub async fn list(
         bind_idx += 1;
     }
     if params.model.is_some() {
-        where_clauses.push(format!("r.model_raw LIKE ?{bind_idx}"));
+        where_clauses.push(format!(
+            "(COALESCE(r.model_raw, '') || ' ' || COALESCE(r.model_normalized, '')) LIKE ?{bind_idx}"
+        ));
         bind_idx += 1;
     }
     if params.started_from.is_some() {

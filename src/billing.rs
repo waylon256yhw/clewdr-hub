@@ -3,7 +3,8 @@ use sqlx::SqlitePool;
 use tracing::warn;
 
 use crate::db::billing::{
-    RequestLogRow, insert_request_log, lookup_model_pricing, upsert_usage_rollup,
+    RequestLogRow, insert_request_log, lookup_model_pricing, upsert_usage_lifetime_total,
+    upsert_usage_rollup,
 };
 use crate::state::AdminEvent;
 
@@ -278,6 +279,9 @@ pub async fn persist_terminal_request_log(ctx: &BillingContext, opts: TerminalLo
         .await
         {
             warn!("Failed to upsert monthly rollup: {e}");
+        }
+        if let Err(e) = upsert_usage_lifetime_total(&ctx.db, user_id, usage, cost).await {
+            warn!("Failed to upsert lifetime usage total: {e}");
         }
     }
 }

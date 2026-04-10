@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   Title,
@@ -16,6 +16,7 @@ import {
   Stack,
 } from "@mantine/core";
 import { IconChevronLeft, IconChevronRight } from "@tabler/icons-react";
+import { useLocation } from "react-router";
 import {
   getRequestResponseBody,
   listModelsAdmin,
@@ -111,8 +112,16 @@ function LogDetail({ log, onClose }: { log: RequestLog | null; onClose: () => vo
 }
 
 export default function Logs() {
+  const location = useLocation();
   const [filters, setFilters] = useState<RequestFilters>({ offset: 0, limit: PAGE_SIZE });
   const [detail, setDetail] = useState<RequestLog | null>(null);
+
+  useEffect(() => {
+    const next = parseFiltersFromSearch(location.search);
+    if (!next) return;
+    setFilters({ ...next, offset: 0, limit: PAGE_SIZE });
+    setDetail(null);
+  }, [location.search]);
 
   const { data: usersData } = useQuery({ queryKey: qk.users, queryFn: listUsers });
   const userData = usersData?.items?.map((u) => ({ value: String(u.id), label: u.username })) ?? [];
@@ -384,4 +393,36 @@ export default function Logs() {
       <LogDetail log={detail} onClose={() => setDetail(null)} />
     </>
   );
+}
+
+function parseFiltersFromSearch(search: string): RequestFilters | null {
+  const params = new URLSearchParams(search);
+  const request_type = params.get("request_type") ?? undefined;
+  const status = params.get("status") ?? undefined;
+  const model = params.get("model") ?? undefined;
+  const started_from = params.get("started_from") ?? undefined;
+  const started_to = params.get("started_to") ?? undefined;
+  const rawUserId = params.get("user_id");
+  const user_id = rawUserId != null && Number.isFinite(Number(rawUserId))
+    ? Number(rawUserId)
+    : undefined;
+
+  const hasAny =
+    request_type !== undefined ||
+    status !== undefined ||
+    model !== undefined ||
+    started_from !== undefined ||
+    started_to !== undefined ||
+    user_id !== undefined;
+
+  if (!hasAny) return null;
+
+  return {
+    request_type,
+    status,
+    model,
+    started_from,
+    started_to,
+    user_id,
+  };
 }

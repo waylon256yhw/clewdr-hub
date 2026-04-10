@@ -84,13 +84,13 @@ src/
 │   ├── accounts.rs            # AccountWithRuntime / load_all_accounts / batch_upsert
 │   ├── queries.rs             # authenticate_api_key / touch_api_key / touch_user
 │   ├── api_key.rs             # Key 生成（blake3 哈希 + lookup 前缀）
-│   └── billing.rs             # insert_request_log / upsert_usage_rollup
+│   └── billing.rs             # insert_request_log / upsert_usage_rollup / upsert_usage_lifetime_total
 ├── api/
 │   ├── claude_code.rs         # POST /v1/messages 主处理器
 │   ├── models.rs              # GET /v1/models
 │   ├── health.rs              # GET /health
 │   ├── auth.rs                # POST /auth/login, /auth/logout
-│   └── admin/                 # /api/admin/* 管理 API（accounts, users, keys, policies...）
+│   └── admin/                 # /api/admin/* 管理 API（accounts, users, keys, policies, ops...）
 ├── middleware/
 │   ├── auth.rs                # RequireFlexibleAuth（API Key）/ RequireAdminAuth（session cookie）
 │   └── claude/request.rs      # ClaudeCodePreprocess：请求预处理、billing header 注入
@@ -115,7 +115,7 @@ src/
 frontend/src/
 ├── main.tsx                   # React 入口
 ├── api.ts                     # API client + TypeScript 接口定义
-├── routes/                    # 页面组件（Accounts, Users, Keys, Logs, Settings, Overview）
+├── routes/                    # 页面组件（Dashboard, Ops, Accounts, Users, Keys, Logs, Settings）
 └── lib/                       # 工具函数
 ```
 
@@ -277,6 +277,7 @@ SQLite WAL 模式，通过 sqlx 的编译期 migration 自动建表。
 | `account_runtime_state` | 运行时状态 | reset_time, 4×用量窗口, 5×usage bucket, 4×utilization |
 | `request_logs` | 请求日志 | 全字段（token/cost/ttft/duration/error），保留 7 天 |
 | `usage_rollups` | 费用汇总 | user_id + period_type(week/month) + period_start → cost_nanousd |
+| `usage_lifetime_totals` | 累计汇总 | user_id 维度累计 request/token/cost，独立于日志留存 |
 | `models` | 模型列表 | model_id, source(builtin/admin/discovered), enabled |
 | `settings` | KV 配置 | key → value（stealth 版本、proxy、session_secret 等） |
 
@@ -301,6 +302,14 @@ cd frontend && npm ci && npm run build
 ```
 
 产物约 640KB JS + 210KB CSS（gzip 后 ~225KB）。后续可做路由级拆包优化，当前优先级不高。
+
+### 运维页数据口径
+
+- 路由：`/ops`
+- API：`GET /api/admin/ops/usage?range=24h|7d|30d&top_users=...&user_id=...`
+- 累计卡片：来自 `usage_lifetime_totals`（不受 `request_logs` 7 天清理影响）
+- 图表窗口：来自 `request_logs`，按 `Asia/Shanghai`（UTC+8）按小时/天分桶
+- 自动刷新：`refetchInterval=60_000`，并叠加 `/api/admin/events` 的 SSE invalidation
 
 ### 与后端集成
 

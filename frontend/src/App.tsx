@@ -1,4 +1,5 @@
 import "@mantine/core/styles.css";
+import "@mantine/charts/styles.css";
 import "@mantine/notifications/styles.css";
 import {
   MantineProvider,
@@ -14,7 +15,7 @@ import {
 import { Notifications } from "@mantine/notifications";
 import { useDisclosure } from "@mantine/hooks";
 import { Routes, Route, Navigate, useLocation, Link } from "react-router";
-import { useEffect, useRef } from "react";
+import { Suspense, lazy, useEffect, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   IconDashboard,
@@ -23,11 +24,13 @@ import {
   IconKey,
   IconSettings,
   IconFileText,
+  IconActivity,
   IconSun,
   IconMoon,
   IconLogout,
 } from "@tabler/icons-react";
 import { theme } from "./theme";
+import { qk } from "./api";
 import { RequireAuth, useAuth, ForceChangePasswordModal } from "./auth";
 import Login from "./routes/Login";
 import Dashboard from "./routes/Dashboard";
@@ -36,6 +39,7 @@ import Users from "./routes/Users";
 import Keys from "./routes/Keys";
 import Settings from "./routes/Settings";
 import Logs from "./routes/Logs";
+const Ops = lazy(() => import("./routes/Ops"));
 
 const NAV_ITEMS = [
   { label: "总览", path: "/", icon: IconDashboard },
@@ -44,6 +48,7 @@ const NAV_ITEMS = [
   { label: "API 密钥", path: "/keys", icon: IconKey },
   { label: "设置", path: "/settings", icon: IconSettings },
   { label: "日志", path: "/logs", icon: IconFileText },
+  { label: "运维", path: "/ops", icon: IconActivity },
 ];
 
 function ColorSchemeToggle() {
@@ -83,9 +88,13 @@ function useGlobalAdminEvents() {
           const payload = JSON.parse(event.data) as { topic?: string };
           if (!payload.topic || payload.topic === "request_logs") {
             queryClient.invalidateQueries({ queryKey: ["requests"] });
+            queryClient.invalidateQueries({ queryKey: ["opsUsage"] });
+            queryClient.invalidateQueries({ queryKey: qk.overview });
           }
         } catch {
           queryClient.invalidateQueries({ queryKey: ["requests"] });
+          queryClient.invalidateQueries({ queryKey: ["opsUsage"] });
+          queryClient.invalidateQueries({ queryKey: qk.overview });
         }
       };
       es.onerror = () => {
@@ -151,6 +160,14 @@ function AdminShell() {
           <Route path="/keys" element={<Keys />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/logs" element={<Logs />} />
+          <Route
+            path="/ops"
+            element={(
+              <Suspense fallback={null}>
+                <Ops />
+              </Suspense>
+            )}
+          />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </AppShell.Main>
