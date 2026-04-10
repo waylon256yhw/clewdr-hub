@@ -1,6 +1,6 @@
 # Release Notes
 
-## Unreleased
+## v1.0.12
 
 ### 新增
 
