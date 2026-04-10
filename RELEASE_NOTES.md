@@ -1,5 +1,18 @@
 # Release Notes
 
+## v1.0.13
+
+### 新增
+
+- 管理后台账号卡片新增「凭证测试」按钮（烧瓶图标），对 OAuth 账号发送最小化 `/v1/messages` 请求（Haiku, max_tokens=10），验证消息路径是否存活。
+- 新增 `POST /api/admin/accounts/{id}/test` 管理端点，独立于正常路由管线，不占 inflight slot、不修改账号状态、不计入用量。
+- 请求日志新增 `test` 类型，日志页筛选器和 badge（cyan）同步支持。
+- Token 刷新失败场景也会写入 `test` 日志行，确保最关键的凭证失效信号不丢失。
+
+### 变更
+
+- `request_logs.request_type` CHECK 约束扩展，新增 `'test'` 合法值（新 migration）。
+
 ## v1.0.12
 
 ### 新增
