@@ -31,7 +31,7 @@ import { formatCost, formatDate, requestTypeColor, statusColor } from "../lib/fo
 const PAGE_SIZE = 50;
 
 function isProbeType(t: string): boolean {
-  return t === "probe_cookie" || t === "probe_oauth";
+  return t === "probe_cookie" || t === "probe_oauth" || t === "test";
 }
 
 function prettyJson(raw: string): string {
@@ -179,6 +179,7 @@ export default function Logs() {
             { value: "messages", label: "messages" },
             { value: "probe_cookie", label: "probe (cookie)" },
             { value: "probe_oauth", label: "probe (oauth)" },
+            { value: "test", label: "test" },
           ]}
           value={filters.request_type ?? null}
           onChange={(v) => updateFilter("request_type", v ?? undefined)}

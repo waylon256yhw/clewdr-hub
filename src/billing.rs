@@ -61,6 +61,7 @@ pub enum RequestType {
     Messages,
     ProbeCookie,
     ProbeOauth,
+    Test,
 }
 
 impl RequestType {
@@ -69,6 +70,7 @@ impl RequestType {
             Self::Messages => "messages",
             Self::ProbeCookie => "probe_cookie",
             Self::ProbeOauth => "probe_oauth",
+            Self::Test => "test",
         }
     }
 }

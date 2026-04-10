@@ -23,13 +23,14 @@ import {
 } from "@mantine/core";
 import { useForm } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
-import { IconPlus, IconEdit, IconTrash, IconRefresh, IconLink } from "@tabler/icons-react";
+import { IconPlus, IconEdit, IconTrash, IconRefresh, IconLink, IconFlask } from "@tabler/icons-react";
 import {
   listAccounts,
   createAccount,
   updateAccount,
   deleteAccount,
   probeAllAccounts,
+  testAccount,
   startAccountOAuth,
   qk,
   ApiError,
@@ -165,11 +166,44 @@ function AccountCard({
   const rt = account.runtime;
   const displayStatus = displayAccountStatus(account);
   const probeCheckedAt = formatProbeCheckedAt(rt?.resets_last_checked_at);
+  const testMut = useMutation({
+    mutationFn: () => testAccount(account.id),
+    onSuccess: (resp) => {
+      if (resp.success) {
+        notifications.show({ message: `测试通过 (${resp.latency_ms}ms)`, color: "green" });
+      } else {
+        notifications.show({
+          title: "测试失败",
+          message: resp.error ?? `HTTP ${resp.http_status}`,
+          color: "red",
+          autoClose: 8000,
+        });
+      }
+    },
+    onError: (e) =>
+      notifications.show({
+        message: e instanceof ApiError ? e.message : "测试请求失败",
+        color: "red",
+      }),
+  });
   return (
     <Paper withBorder shadow="xs" radius="md" p="md">
       <Group justify="space-between" mb="xs">
         <Text fw={600}>{account.name}</Text>
         <Group gap={4}>
+          {account.has_oauth && (
+            <Tooltip label="测试 /v1/messages">
+              <ActionIcon
+                variant="subtle"
+                size="sm"
+                color="cyan"
+                loading={testMut.isPending}
+                onClick={() => testMut.mutate()}
+              >
+                <IconFlask size={14} />
+              </ActionIcon>
+            </Tooltip>
+          )}
           <ActionIcon variant="subtle" size="sm" onClick={onEdit}>
             <IconEdit size={14} />
           </ActionIcon>

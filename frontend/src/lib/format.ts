@@ -50,6 +50,7 @@ export function requestTypeColor(t: string): string {
     case "messages": return "blue";
     case "probe_cookie": return "grape";
     case "probe_oauth": return "teal";
+    case "test": return "cyan";
     default: return "gray";
   }
 }

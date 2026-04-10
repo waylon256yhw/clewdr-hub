@@ -300,6 +300,14 @@ export const deleteAccount = (id: number) =>
   apiFetch<void>(`/api/admin/accounts/${id}`, { method: "DELETE" });
 export const probeAllAccounts = () =>
   apiFetch<{ probing_ids: number[] }>("/api/admin/accounts/probe", { method: "POST" });
+export interface TestAccountResponse {
+  success: boolean;
+  latency_ms: number;
+  error?: string;
+  http_status?: number;
+}
+export const testAccount = (id: number) =>
+  apiFetch<TestAccountResponse>(`/api/admin/accounts/${id}/test`, { method: "POST" });
 export const startAccountOAuth = (data?: { redirect_uri?: string }) =>
   apiFetch<{ auth_url: string; state: string; redirect_uri: string }>(
     "/api/admin/accounts/oauth/start",

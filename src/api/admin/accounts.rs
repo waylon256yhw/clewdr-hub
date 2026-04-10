@@ -5,20 +5,28 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
+use http::header::USER_AGENT;
 use serde::{Deserialize, Serialize};
+use snafu::ResultExt;
 use sqlx::SqlitePool;
 
 use super::common::PaginationParams;
 use crate::{
-    claude_code_state::probe::probe_oauth_account,
+    billing::{BillingContext, RequestType, persist_probe_log},
+    claude_code_state::{build_api_client, probe::probe_oauth_account, proxy_from_profile},
+    config::CLAUDE_ENDPOINT,
     db::accounts::{
         AccountWithRuntime, batch_upsert_runtime_states, get_account_by_id, load_all_accounts,
         update_account_metadata_unchecked, upsert_account_oauth,
     },
-    error::ClewdrError,
-    oauth::{AdminOAuthStartResponse, exchange_admin_oauth_callback, start_admin_oauth_flow},
+    error::{ClewdrError, WreqSnafu},
+    oauth::{
+        AdminOAuthStartResponse, exchange_admin_oauth_callback, refresh_oauth_token,
+        start_admin_oauth_flow,
+    },
     services::cookie_actor::CookieActorHandle,
     state::AppState,
+    stealth::SharedStealthProfile,
 };
 
 #[derive(Serialize)]
@@ -531,4 +539,159 @@ pub async fn probe_all(
     }
 
     Ok(Json(serde_json::json!({ "probing_ids": probing_ids })))
+}
+
+// ---------------------------------------------------------------------------
+// Credential test — minimal /v1/messages probe
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct TestAccountResponse {
+    pub success: bool,
+    pub latency_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+}
+
+pub async fn test_account(
+    State(state): State<AppState>,
+    State(profile): State<SharedStealthProfile>,
+    Path(id): Path<i64>,
+) -> Result<Json<TestAccountResponse>, ClewdrError> {
+    // 1. Load account
+    let account = get_account_by_id(&state.db, id)
+        .await?
+        .ok_or(ClewdrError::NotFound {
+            msg: "account not found",
+        })?;
+
+    // 2. Validate: must have OAuth token
+    let token = account.oauth_token.ok_or(ClewdrError::BadRequest {
+        msg: "account has no OAuth token",
+    })?;
+    if account.status == "disabled" {
+        return Err(ClewdrError::BadRequest {
+            msg: "account is disabled",
+        });
+    }
+
+    // 3. Refresh token if expired
+    let started_at = chrono::Utc::now();
+    let access_token = if token.is_expired() {
+        match refresh_oauth_token(&token).await {
+            Ok(refreshed) => {
+                let _ = upsert_account_oauth(&state.db, id, Some(&refreshed.token), None).await;
+                refreshed.token.access_token
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+                let ctx = BillingContext {
+                    db: state.db.clone(),
+                    user_id: None,
+                    api_key_id: None,
+                    account_id: Some(id),
+                    model_raw: String::new(),
+                    request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
+                    started_at,
+                    event_tx: state.event_tx.clone(),
+                };
+                persist_probe_log(
+                    &ctx,
+                    RequestType::Test,
+                    "auth_rejected",
+                    None,
+                    "",
+                    Some(&error_msg),
+                )
+                .await;
+                return Ok(Json(TestAccountResponse {
+                    success: false,
+                    latency_ms: (chrono::Utc::now() - started_at).num_milliseconds(),
+                    error: Some(error_msg),
+                    http_status: None,
+                }));
+            }
+        }
+    } else {
+        token.access_token.clone()
+    };
+
+    // 4. Build minimal request
+    let body = serde_json::json!({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 10,
+        "messages": [{"role": "user", "content": "reply with ok only"}],
+        "stream": false,
+    });
+
+    // 5. Send request
+    let proxy = proxy_from_profile(&profile);
+    let client = build_api_client(proxy.as_ref());
+    let url = format!("{CLAUDE_ENDPOINT}v1/messages?beta=true");
+    let ua = profile.load().user_agent();
+
+    let result = client
+        .post(&url)
+        .bearer_auth(&access_token)
+        .header(USER_AGENT, ua)
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .context(WreqSnafu {
+            msg: "test request failed",
+        });
+    let latency_ms = (chrono::Utc::now() - started_at).num_milliseconds();
+
+    // 6. Process response
+    let (success, http_status, error_msg, response_body) = match result {
+        Ok(resp) => {
+            let status_code = resp.status().as_u16();
+            let body_text = resp.text().await.unwrap_or_default();
+            if (200..300).contains(&status_code) {
+                (true, Some(status_code), None, body_text)
+            } else {
+                (false, Some(status_code), Some(body_text.clone()), body_text)
+            }
+        }
+        Err(e) => (false, None, Some(e.to_string()), String::new()),
+    };
+
+    // 7. Log result
+    let log_status = if success {
+        "ok"
+    } else if matches!(http_status, Some(401) | Some(403)) {
+        "auth_rejected"
+    } else {
+        "upstream_error"
+    };
+    let ctx = BillingContext {
+        db: state.db.clone(),
+        user_id: None,
+        api_key_id: None,
+        account_id: Some(id),
+        model_raw: "claude-haiku-4-5-20251001".to_string(),
+        request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
+        started_at,
+        event_tx: state.event_tx.clone(),
+    };
+    persist_probe_log(
+        &ctx,
+        RequestType::Test,
+        log_status,
+        http_status,
+        &response_body,
+        error_msg.as_deref(),
+    )
+    .await;
+
+    Ok(Json(TestAccountResponse {
+        success,
+        latency_ms,
+        error: error_msg,
+        http_status,
+    }))
 }

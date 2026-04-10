@@ -41,6 +41,7 @@ pub fn admin_router() -> Router<AppState> {
             "/accounts/{id}",
             put(accounts::update).delete(accounts::remove),
         )
+        .route("/accounts/{id}/test", post(accounts::test_account))
         // Models
         .route("/models", get(models::list).post(models::create))
         .route("/models/reset-defaults", post(models::reset_defaults))

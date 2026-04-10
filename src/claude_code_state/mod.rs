@@ -25,7 +25,7 @@ use crate::{
 
 static SUPER_CLIENT: LazyLock<wreq::Client> = LazyLock::new(wreq::Client::new);
 
-fn proxy_from_profile(profile: &SharedStealthProfile) -> Option<wreq::Proxy> {
+pub(crate) fn proxy_from_profile(profile: &SharedStealthProfile) -> Option<wreq::Proxy> {
     profile
         .load()
         .proxy
@@ -38,7 +38,7 @@ fn proxy_from_profile(profile: &SharedStealthProfile) -> Option<wreq::Proxy> {
         })
 }
 
-fn build_api_client(proxy: Option<&wreq::Proxy>) -> wreq::Client {
+pub(crate) fn build_api_client(proxy: Option<&wreq::Proxy>) -> wreq::Client {
     let mut builder = wreq::Client::builder();
     if let Some(proxy) = proxy {
         builder = builder.proxy(proxy.to_owned());
