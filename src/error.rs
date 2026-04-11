@@ -111,8 +111,10 @@ pub enum ClewdrError {
     #[snafu(display("Cookie dispatch error: {}", source))]
     #[snafu(context(false))]
     CookieDispatchError { source: oneshot::error::RecvError },
-    #[snafu(display("No cookie available"))]
-    NoCookieAvailable,
+    #[snafu(display("All upstream accounts are temporarily unavailable"))]
+    UpstreamCoolingDown,
+    #[snafu(display("No valid upstream accounts available"))]
+    NoValidUpstreamAccounts,
     #[snafu(display("Invalid Cookie: {}", reason))]
     #[snafu(context(false))]
     InvalidCookie {
@@ -164,8 +166,7 @@ pub enum ClewdrError {
     RpmExceeded,
     #[snafu(display("Usage quota exceeded"))]
     QuotaExceeded,
-    #[snafu(display("All bound accounts are unavailable"))]
-    BoundAccountsUnavailable,
+
     #[snafu(display("Not found: {}", msg))]
     NotFound { msg: &'static str },
     #[snafu(display("Conflict: {}", msg))]
@@ -234,10 +235,10 @@ impl IntoResponse for ClewdrError {
             ClewdrError::InvalidCookie { .. } => (StatusCode::BAD_REQUEST, json!(self.to_string())),
             ClewdrError::PathNotFound { .. } => (StatusCode::NOT_FOUND, json!(self.to_string())),
             ClewdrError::InvalidAuth => (StatusCode::UNAUTHORIZED, json!(self.to_string())),
-            ClewdrError::UserConcurrencyExceeded
+            ClewdrError::UpstreamCoolingDown
+            | ClewdrError::UserConcurrencyExceeded
             | ClewdrError::RpmExceeded
-            | ClewdrError::QuotaExceeded
-            | ClewdrError::BoundAccountsUnavailable => {
+            | ClewdrError::QuotaExceeded => {
                 let inner = ClaudeErrorBody {
                     message: json!(self.to_string()),
                     r#type: "rate_limit_error".to_string(),
@@ -245,6 +246,18 @@ impl IntoResponse for ClewdrError {
                 };
                 return (
                     StatusCode::TOO_MANY_REQUESTS,
+                    Json(ClaudeError { error: inner }),
+                )
+                    .into_response();
+            }
+            ClewdrError::NoValidUpstreamAccounts => {
+                let inner = ClaudeErrorBody {
+                    message: json!(self.to_string()),
+                    r#type: "api_error".to_string(),
+                    code: Some(503),
+                };
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
                     Json(ClaudeError { error: inner }),
                 )
                     .into_response();

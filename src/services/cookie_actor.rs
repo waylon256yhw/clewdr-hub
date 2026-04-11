@@ -270,15 +270,28 @@ impl CookieActor {
             return Ok(cookie);
         }
 
-        let idx = state
+        let idx = match state
             .valid
             .iter()
             .position(|c| is_allowed(c, &state.inflight))
-            .ok_or(if bound.is_empty() {
-                ClewdrError::NoCookieAvailable
-            } else {
-                ClewdrError::BoundAccountsUnavailable
-            })?;
+        {
+            Some(idx) => idx,
+            None => {
+                // Determine whether this is a temporary (cooling) or permanent (invalid/empty) failure.
+                let has_relevant_valid = state.valid.iter().any(|c| {
+                    bound.is_empty() || c.account_id.is_some_and(|id| bound.contains(&id))
+                });
+                let has_relevant_exhausted = state.exhausted.iter().any(|c| {
+                    bound.is_empty() || c.account_id.is_some_and(|id| bound.contains(&id))
+                });
+                // Valid accounts exist but all slots are full, or some are in cooldown → temporary
+                return Err(if has_relevant_valid || has_relevant_exhausted {
+                    ClewdrError::UpstreamCoolingDown
+                } else {
+                    ClewdrError::NoValidUpstreamAccounts
+                });
+            }
+        };
 
         let cookie = state.valid.remove(idx).unwrap();
         if let Some(aid) = cookie.account_id {
