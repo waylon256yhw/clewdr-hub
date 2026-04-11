@@ -75,9 +75,9 @@ npm run dev         # Vite dev server，自动代理 /api → localhost:8484
 src/
 ├── main.rs                    # 入口：CLI 参数、DB 初始化、启动 HTTP server
 ├── lib.rs                     # 模块注册
-├── config/                    # 配置、常量、CookieStatus 结构体
+├── config/                    # 配置、常量、AccountSlot 结构体
 │   ├── constants.rs           # DB_PATH / CONFIG_PATH / 全局 LazyLock
-│   └── cookie.rs              # CookieStatus：cookie 运行时状态（token、用量、窗口）
+│   └── cookie.rs              # AccountSlot：账号运行时状态（token、用量、窗口）
 ├── db/
 │   ├── mod.rs                 # init_pool / seed_admin / migrations
 │   ├── models.rs              # AuthenticatedUser 等共享类型
@@ -96,13 +96,13 @@ src/
 │   └── claude/request.rs      # ClaudeCodePreprocess：请求预处理、billing header 注入
 ├── providers/claude/mod.rs    # ClaudeProvider：构建 ClaudeCodeState 并调用 try_chat
 ├── claude_code_state/
-│   ├── mod.rs                 # ClaudeCodeState：持有 cookie、client、billing context
+│   ├── mod.rs                 # ClaudeCodeState：持有账号、client、billing context
 │   ├── chat.rs                # try_chat / try_count_tokens / 流式转发 / 用量持久化
 │   ├── exchange.rs            # OAuth token 交换（cookie → access_token）
 │   ├── organization.rs        # 获取组织 UUID
 │   └── probe.rs               # 账号探测（类型、邮箱、用量窗口）
 ├── services/
-│   ├── cookie_actor.rs        # CookieActor（ractor）：调度、回收、inflight 追踪、脏刷盘
+│   ├── account_pool.rs        # AccountPoolActor（ractor）：调度、回收、inflight 追踪、脏刷盘
 │   ├── user_limiter.rs        # UserLimiterMap：per-user 并发 semaphore
 │   └── log_rotation.rs        # 日志轮转（默认保留 7 天）
 ├── router.rs                  # RouterBuilder：路由注册、中间件挂载
@@ -141,8 +141,8 @@ Claude Code / 任意 Anthropic 客户端
    │ ClaudeProvider │  构建 ClaudeCodeState
    └──────┬───────┘
           │
-   CookieActor::dispatch()     ← 选账号（bound 过滤 → inflight 检查 → round-robin）
-   token 交换/刷新              ← cookie → OAuth access_token
+   AccountPoolActor::dispatch() ← 选账号（bound 过滤 → inflight 检查 → round-robin）
+   token 交换/刷新              ← cookie/OAuth → access_token
           │
           ▼
    ┌──────────────┐
@@ -165,14 +165,14 @@ Claude Code / 任意 Anthropic 客户端
    - RPM 检查：滑动窗口
    - 预算检查：查 `usage_rollups` 表的周/月累计
 
-4. **调度**（`CookieActor::dispatch()`）：
+4. **调度**（`AccountPoolActor::dispatch()`）：
    - `bound_account_ids` 非空时只从绑定账号中选
    - 检查 `inflight < max_slots`
    - moka 缓存命中 → 亲和性返回同一账号
    - 否则 round-robin 取第一个可用账号
    - `inflight += 1`
 
-5. **Token 交换**：检查 cookie 的 access_token 状态（None/Expired/Valid），必要时走 OAuth code → token 流程。
+5. **Token 交换**：检查账号的 access_token 状态（None/Expired/Valid），必要时走 cookie → OAuth code → token 或纯 OAuth refresh 流程。
 
 6. **上游请求**：构建伪装请求头（stealth profile）→ `POST api.anthropic.com/v1/messages`
 
@@ -181,25 +181,28 @@ Claude Code / 任意 Anthropic 客户端
    - 流式：返回 SSE stream → 在 `MessageStop` 事件中异步持久化 usage + 释放 slot
    - 流异常终止（客户端断开）：`SlotDropGuard` 的 `Drop` impl 自动释放 slot
 
-8. **重试**：遇到 429/auth 错误时 `return_cookie(Some(reason))` 将账号移入 exhausted 队列 → 换一个账号重试，最多 6 次。
+8. **重试**：遇到 429/auth 错误时 `release(Some(reason))` 将账号移入 exhausted 队列 → 换一个账号重试，最多 6 次。
 
 ---
 
 ## 账号调度器
 
-核心是 `CookieActor`（基于 [ractor](https://github.com/slawlor/ractor) 框架的 actor 模型）。
+核心是 `AccountPoolActor`（基于 [ractor](https://github.com/slawlor/ractor) 框架的 actor 模型）。
 
 ### 状态
 
 ```rust
-struct CookieActorState {
-    valid: VecDeque<CookieStatus>,        // 可用队列
-    exhausted: HashSet<CookieStatus>,     // 冷却中（429）
-    invalid: HashSet<UselessCookie>,      // 失效（auth error）
-    moka: Cache<u64, CookieStatus>,       // 亲和性缓存（1h TTL）
-    inflight: HashMap<i64, (u32, u32)>,   // account_id → (当前并发, max_slots)
-    dirty: HashSet<i64>,                  // 待刷盘的 account_id
+struct AccountPoolState {
+    valid: VecDeque<AccountSlot>,           // 可用队列
+    exhausted: HashSet<AccountSlot>,        // 冷却中（429）
+    invalid: HashSet<InvalidAccountSlot>,   // 失效（auth error）
+    moka: Cache<u64, AccountSlot>,          // 亲和性缓存（1h TTL）
+    inflight: HashMap<i64, (u32, u32)>,     // account_id → (当前并发, max_slots)
+    dirty: HashSet<i64>,                    // 待刷盘的 account_id
     db: SqlitePool,
+    probing: HashSet<i64>,                  // 正在探测中的 account_id
+    reactivated: HashSet<i64>,              // 本轮被重激活的 account_id
+    probe_errors: HashMap<i64, String>,     // 探测失败信息
 }
 ```
 
@@ -207,15 +210,19 @@ struct CookieActorState {
 
 | 消息 | 触发方 | 作用 |
 |------|--------|------|
-| `Request` | 请求处理器 | dispatch 一个 cookie，inflight++ |
-| `Return` | 请求结束 | 回收 cookie（更新 or 移入 exhausted/invalid） |
+| `Request` | 请求处理器 | dispatch 一个账号，inflight++ |
+| `Return` | 请求结束 | 回收账号（更新 or 移入 exhausted/invalid） |
 | `ReleaseSlot` | 请求结束 | inflight-- |
-| `Submit` | admin API | 添加新 cookie |
-| `Delete` | admin API | 删除 cookie |
-| `CheckReset` | 定时器 (5min) | 检查 exhausted cookie 是否可以恢复 |
+| `Submit` | admin API | 添加新账号 |
+| `CheckReset` | 定时器 (5min) | 检查 exhausted 账号是否可以恢复 |
 | `FlushDirty` | 定时器 (15s) | 批量写脏数据到 DB |
 | `ReloadFromDb` | admin API | 重新加载（保留 inflight 计数） |
 | `ProbeAll` | admin API | 重激活所有 disabled 账号并探测 |
+| `ProbeAccounts` | admin API | 探测指定账号列表 |
+| `BeginProbe` | 探测流程 | 标记账号进入探测状态 |
+| `ClearProbing` | 探测完成 | 清除探测状态标记 |
+| `SetProbeError` / `ClearProbeError` | 探测流程 | 记录/清除探测错误信息 |
+| `GetProbingIds` / `GetProbeErrors` | admin API | 查询探测状态 |
 
 ### 并发槽（max_slots）
 
