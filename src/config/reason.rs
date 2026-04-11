@@ -6,7 +6,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::CookieStatus;
+use super::AccountSlot;
 use crate::config::ClewdrCookie;
 
 /// Reason why a cookie is considered useless
@@ -45,34 +45,34 @@ impl Display for Reason {
 /// A struct representing a cookie that can't be used
 /// Contains the cookie and the reason why it's considered unusable
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct UselessCookie {
+pub struct InvalidAccountSlot {
     pub cookie: ClewdrCookie,
     pub reason: Reason,
     #[serde(default)]
     pub account_id: Option<i64>,
 }
 
-impl PartialEq<CookieStatus> for UselessCookie {
-    fn eq(&self, other: &CookieStatus) -> bool {
+impl PartialEq<AccountSlot> for InvalidAccountSlot {
+    fn eq(&self, other: &AccountSlot) -> bool {
         self.cookie == other.cookie
     }
 }
 
-impl PartialEq for UselessCookie {
+impl PartialEq for InvalidAccountSlot {
     fn eq(&self, other: &Self) -> bool {
         self.cookie == other.cookie
     }
 }
 
-impl Eq for UselessCookie {}
+impl Eq for InvalidAccountSlot {}
 
-impl Hash for UselessCookie {
+impl Hash for InvalidAccountSlot {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.cookie.hash(state);
     }
 }
 
-impl UselessCookie {
+impl InvalidAccountSlot {
     pub fn new(cookie: ClewdrCookie, reason: Reason) -> Self {
         Self {
             cookie,

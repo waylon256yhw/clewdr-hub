@@ -7,7 +7,7 @@ use tracing::{info, warn};
 use super::ClaudeCodeState;
 use crate::{
     billing::{BillingContext, RequestType, persist_probe_log},
-    config::{CookieStatus, Reason},
+    config::{AccountSlot, Reason},
     db::accounts::{
         AccountWithRuntime, batch_upsert_runtime_states, set_account_active,
         set_account_auth_error, update_account_metadata, update_account_metadata_unchecked,
@@ -15,7 +15,7 @@ use crate::{
     },
     error::ClewdrError,
     oauth::refresh_oauth_token_with_raw,
-    services::cookie_actor::CookieActorHandle,
+    services::account_pool::AccountPoolHandle,
     state::AdminEvent,
     stealth::SharedStealthProfile,
 };
@@ -139,8 +139,8 @@ async fn persist_probe_row(
 /// `request_logs`. Pass `None` for auto-triggered probes to keep the log clean.
 pub async fn probe_cookie(
     account_id: i64,
-    cookie: CookieStatus,
-    handle: CookieActorHandle,
+    cookie: AccountSlot,
+    handle: AccountPoolHandle,
     profile: SharedStealthProfile,
     db: SqlitePool,
     log_sink: Option<broadcast::Sender<AdminEvent>>,
@@ -178,8 +178,8 @@ pub async fn probe_cookie(
 
 async fn run_cookie_probe(
     account_id: i64,
-    cookie: CookieStatus,
-    handle: CookieActorHandle,
+    cookie: AccountSlot,
+    handle: AccountPoolHandle,
     profile: SharedStealthProfile,
     db: &SqlitePool,
     bundle: &mut Map<String, Value>,
@@ -214,7 +214,7 @@ async fn run_cookie_probe(
         Err(e) => {
             if let Some(reason) = extract_cookie_reason(&e) {
                 warn!("[probe] account {account_id} invalid: {reason}");
-                state.return_cookie(Some(reason)).await;
+                state.release_account(Some(reason)).await;
             } else {
                 let msg = format!("bootstrap failed: {e}");
                 warn!("[probe] account {account_id} (transient): {msg}");
@@ -246,7 +246,7 @@ async fn run_cookie_probe(
 
     // 3. Free account → invalidate
     if info.account_type == "free" {
-        state.return_cookie(Some(Reason::Free)).await;
+        state.release_account(Some(Reason::Free)).await;
         return Err(ProbeFailure {
             stage: "bootstrap",
             message: "cookie belongs to a free-tier account and was rejected".to_string(),
@@ -266,24 +266,24 @@ async fn run_cookie_probe(
         Ok(r) => r,
         Err(e) => {
             if let Some(reason) = extract_cookie_reason(&e) {
-                state.return_cookie(Some(reason)).await;
+                state.release_account(Some(reason)).await;
             } else {
                 let msg = format!("OAuth code exchange failed: {e}");
                 warn!("[probe] account {account_id}: {msg}");
                 handle.set_probe_error(account_id, msg).await;
-                state.return_cookie(None).await;
+                state.release_account(None).await;
             }
             return Err(ProbeFailure::from_err("oauth_code", &e));
         }
     };
     if let Err(e) = state.exchange_token(code_res).await {
         if let Some(reason) = extract_cookie_reason(&e) {
-            state.return_cookie(Some(reason)).await;
+            state.release_account(Some(reason)).await;
         } else {
             let msg = format!("OAuth token exchange failed: {e}");
             warn!("[probe] account {account_id}: {msg}");
             handle.set_probe_error(account_id, msg).await;
-            state.return_cookie(None).await;
+            state.release_account(None).await;
         }
         return Err(ProbeFailure::from_err("oauth_token", &e));
     }
@@ -353,7 +353,7 @@ async fn run_cookie_probe(
         }
         Err(e) => {
             if let Some(reason) = extract_cookie_reason(&e) {
-                state.return_cookie(Some(reason)).await;
+                state.release_account(Some(reason)).await;
                 return Err(ProbeFailure::from_err("usage", &e));
             }
             let msg = format!("usage fetch failed: {e}");
@@ -361,21 +361,21 @@ async fn run_cookie_probe(
             handle.set_probe_error(account_id, msg).await;
             // Usage fetch is non-fatal: we still return the cookie so it can serve traffic,
             // but surface the failure to the probe log.
-            state.return_cookie(None).await;
+            state.release_account(None).await;
             info!("[probe] completed for account {account_id} (usage fetch failed)");
             return Err(ProbeFailure::from_err("usage", &e));
         }
     }
 
     // 6. Return updated cookie to actor
-    state.return_cookie(None).await;
+    state.release_account(None).await;
     info!("[probe] completed for account {account_id}");
     Ok(())
 }
 
 pub async fn probe_oauth_account(
     account: AccountWithRuntime,
-    handle: CookieActorHandle,
+    handle: AccountPoolHandle,
     db: SqlitePool,
     log_sink: Option<broadcast::Sender<AdminEvent>>,
 ) {
@@ -405,7 +405,7 @@ pub async fn probe_oauth_account(
 
 async fn run_oauth_probe(
     account: AccountWithRuntime,
-    handle: CookieActorHandle,
+    handle: AccountPoolHandle,
     db: &SqlitePool,
     bundle: &mut Map<String, Value>,
 ) -> Result<(), ProbeFailure> {

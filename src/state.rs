@@ -6,7 +6,7 @@ use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 
 use crate::providers::claude::ClaudeCodeProvider;
-use crate::services::cookie_actor::CookieActorHandle;
+use crate::services::account_pool::AccountPoolHandle;
 use crate::services::user_limiter::UserLimiterMap;
 use crate::stealth::SharedStealthProfile;
 
@@ -40,7 +40,7 @@ impl AdminEvent {
 #[derive(Clone)]
 pub struct AppState {
     pub db: SqlitePool,
-    pub cookie_actor: CookieActorHandle,
+    pub account_pool: AccountPoolHandle,
     pub code_provider: Arc<ClaudeCodeProvider>,
     pub auth: AuthState,
     pub user_limiter: UserLimiterMap,
@@ -60,9 +60,9 @@ impl FromRef<AppState> for Arc<ClaudeCodeProvider> {
     }
 }
 
-impl FromRef<AppState> for CookieActorHandle {
+impl FromRef<AppState> for AccountPoolHandle {
     fn from_ref(state: &AppState) -> Self {
-        state.cookie_actor.clone()
+        state.account_pool.clone()
     }
 }
 

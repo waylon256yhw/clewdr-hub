@@ -20,7 +20,7 @@ use url::Url;
 
 use crate::{
     claude_code_state::ClaudeCodeState,
-    config::{CC_REDIRECT_URI, CC_TOKEN_URL, CLEWDR_CONFIG, CookieStatus, TokenInfo},
+    config::{AccountSlot, CC_REDIRECT_URI, CC_TOKEN_URL, CLEWDR_CONFIG, TokenInfo},
     error::{CheckClaudeErr, ClewdrError, UnexpectedNoneSnafu, UrlSnafu, WreqSnafu},
 };
 
@@ -213,7 +213,7 @@ impl ClaudeCodeState {
 
     pub async fn refresh_token(&mut self) -> Result<(), ClewdrError> {
         let wreq_client = self.get_wreq_client();
-        let Some(CookieStatus {
+        let Some(AccountSlot {
             token: Some(ref mut token),
             ..
         }) = self.cookie

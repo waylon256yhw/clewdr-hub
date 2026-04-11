@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     claude_code_state::probe::probe_cookie,
-    config::{ClewdrCookie, CookieStatus, Reason, UsageBreakdown, UselessCookie},
+    config::{AccountSlot, ClewdrCookie, InvalidAccountSlot, Reason, UsageBreakdown},
     db::accounts::{
         active_reset_time, batch_upsert_runtime_states, load_all_accounts, set_account_disabled,
         set_accounts_active, upsert_account_oauth,
@@ -28,25 +28,25 @@ const SESSION_WINDOW_SECS: i64 = 5 * 60 * 60; // 5h
 const WEEKLY_WINDOW_SECS: i64 = 7 * 24 * 60 * 60; // 7d
 
 #[derive(Debug, Serialize, Clone)]
-pub struct CookieStatusInfo {
-    pub valid: Vec<CookieStatus>,
-    pub exhausted: Vec<CookieStatus>,
-    pub invalid: Vec<UselessCookie>,
+pub struct AccountPoolStatus {
+    pub valid: Vec<AccountSlot>,
+    pub exhausted: Vec<AccountSlot>,
+    pub invalid: Vec<InvalidAccountSlot>,
 }
 
 #[derive(Debug)]
-enum CookieActorMessage {
-    Return(CookieStatus, Option<Reason>),
-    Submit(CookieStatus),
+enum AccountPoolMessage {
+    Return(AccountSlot, Option<Reason>),
+    Submit(AccountSlot),
     CheckReset,
     Request(
         Option<u64>,
         Vec<i64>,
-        RpcReplyPort<Result<CookieStatus, ClewdrError>>,
+        RpcReplyPort<Result<AccountSlot, ClewdrError>>,
     ),
-    GetStatus(RpcReplyPort<CookieStatusInfo>),
-    Delete(CookieStatus, RpcReplyPort<Result<(), ClewdrError>>),
-    Update1mSupport(CookieStatus, RpcReplyPort<Result<(), ClewdrError>>),
+    GetStatus(RpcReplyPort<AccountPoolStatus>),
+    Delete(AccountSlot, RpcReplyPort<Result<(), ClewdrError>>),
+    Update1mSupport(AccountSlot, RpcReplyPort<Result<(), ClewdrError>>),
     ReloadFromDb,
     ProbeAll(RpcReplyPort<Vec<i64>>),
     ProbeAccounts(
@@ -56,7 +56,7 @@ enum CookieActorMessage {
     ),
     BeginProbe(i64, RpcReplyPort<bool>),
     FlushDirty,
-    SetHandle(CookieActorHandle),
+    SetHandle(AccountPoolHandle),
     ReleaseSlot(i64),
     GetProbingIds(RpcReplyPort<Vec<i64>>),
     ClearProbing(i64),
@@ -66,14 +66,14 @@ enum CookieActorMessage {
 }
 
 #[derive(Debug)]
-struct CookieActorState {
-    valid: VecDeque<CookieStatus>,
-    exhausted: HashSet<CookieStatus>,
-    invalid: HashSet<UselessCookie>,
-    moka: Cache<u64, CookieStatus>,
+struct AccountPoolState {
+    valid: VecDeque<AccountSlot>,
+    exhausted: HashSet<AccountSlot>,
+    invalid: HashSet<InvalidAccountSlot>,
+    moka: Cache<u64, AccountSlot>,
     db: SqlitePool,
     dirty: HashSet<i64>,
-    handle: Option<CookieActorHandle>,
+    handle: Option<AccountPoolHandle>,
     /// Per-account inflight tracking: account_id → (current_inflight, max_slots)
     inflight: HashMap<i64, (u32, u32)>,
     probing: HashSet<i64>,
@@ -82,16 +82,16 @@ struct CookieActorState {
     probe_errors: HashMap<i64, String>,
 }
 
-struct CookieActor;
+struct AccountPoolActor;
 
-impl CookieActor {
-    fn mark_dirty(state: &mut CookieActorState, account_id: Option<i64>) {
+impl AccountPoolActor {
+    fn mark_dirty(state: &mut AccountPoolState, account_id: Option<i64>) {
         if let Some(id) = account_id {
             state.dirty.insert(id);
         }
     }
 
-    fn mark_all_dirty(state: &mut CookieActorState) {
+    fn mark_all_dirty(state: &mut AccountPoolState) {
         for cs in state.valid.iter().chain(state.exhausted.iter()) {
             if let Some(id) = cs.account_id {
                 state.dirty.insert(id);
@@ -104,7 +104,7 @@ impl CookieActor {
         }
     }
 
-    fn log(state: &CookieActorState) {
+    fn log(state: &AccountPoolState) {
         info!(
             "Valid: {}, Exhausted: {}, Invalid: {}",
             state.valid.len().to_string().green(),
@@ -113,7 +113,7 @@ impl CookieActor {
         );
     }
 
-    fn reset(state: &mut CookieActorState) {
+    fn reset(state: &mut AccountPoolState) {
         let mut reset_cookies = Vec::new();
         state.exhausted.retain(|cookie| {
             let reset_cookie = cookie.clone().reset();
@@ -134,7 +134,7 @@ impl CookieActor {
         Self::log(state);
     }
 
-    fn refresh_usage_windows(state: &mut CookieActorState) -> bool {
+    fn refresh_usage_windows(state: &mut AccountPoolState) -> bool {
         fn reset_if_due(
             has_reset: Option<bool>,
             resets_at: &mut Option<i64>,
@@ -155,7 +155,7 @@ impl CookieActor {
         let now = Utc::now().timestamp();
         let mut changed = false;
 
-        let apply_resets = |cookie: &mut CookieStatus| {
+        let apply_resets = |cookie: &mut AccountSlot| {
             let mut cookie_changed = reset_if_due(
                 cookie.session_has_reset,
                 &mut cookie.session_resets_at,
@@ -227,10 +227,10 @@ impl CookieActor {
 
     fn dispatch(
         &self,
-        state: &mut CookieActorState,
+        state: &mut AccountPoolState,
         hash: Option<u64>,
         bound: &[i64],
-    ) -> Result<CookieStatus, ClewdrError> {
+    ) -> Result<AccountSlot, ClewdrError> {
         use std::hash::{DefaultHasher, Hash, Hasher};
         Self::reset(state);
 
@@ -245,7 +245,7 @@ impl CookieActor {
             }
         });
 
-        let is_allowed = |c: &CookieStatus, inflight: &HashMap<i64, (u32, u32)>| -> bool {
+        let is_allowed = |c: &AccountSlot, inflight: &HashMap<i64, (u32, u32)>| -> bool {
             let bound_ok = bound.is_empty() || c.account_id.is_some_and(|id| bound.contains(&id));
             let slot_ok = c.account_id.map_or(true, |id| {
                 inflight.get(&id).map_or(true, |(cur, max)| cur < max)
@@ -306,7 +306,7 @@ impl CookieActor {
         Ok(cookie)
     }
 
-    fn collect(state: &mut CookieActorState, cookie: CookieStatus, reason: Option<Reason>) {
+    fn collect(state: &mut AccountPoolState, cookie: AccountSlot, reason: Option<Reason>) {
         let aid = cookie.account_id;
 
         if let Some(id) = aid {
@@ -320,7 +320,7 @@ impl CookieActor {
             .position(|c| *c == cookie)
             .map(|i| state.valid.remove(i).unwrap());
         let was_exhausted = state.exhausted.take(&cookie);
-        let tmp = UselessCookie::new(cookie.cookie.clone(), Reason::Null);
+        let tmp = InvalidAccountSlot::new(cookie.cookie.clone(), Reason::Null);
         let was_invalid = state.invalid.take(&tmp);
 
         if was_valid.is_none() && was_exhausted.is_none() && was_invalid.is_none() {
@@ -351,7 +351,7 @@ impl CookieActor {
                 let mut cookie = cookie;
                 cookie.reset_window_usage();
                 let was_inv = was_invalid.is_some();
-                state.invalid.insert(UselessCookie::with_account_id(
+                state.invalid.insert(InvalidAccountSlot::with_account_id(
                     cookie.cookie.clone(),
                     reason.clone(),
                     aid,
@@ -378,7 +378,7 @@ impl CookieActor {
         }
     }
 
-    fn accept(state: &mut CookieActorState, cookie: CookieStatus) {
+    fn accept(state: &mut AccountPoolState, cookie: AccountSlot) {
         if state.valid.contains(&cookie)
             || state.exhausted.contains(&cookie)
             || state.invalid.iter().any(|c| *c == cookie)
@@ -398,8 +398,8 @@ impl CookieActor {
     }
 
     fn spawn_probe_guarded(
-        state: &mut CookieActorState,
-        cookie: &CookieStatus,
+        state: &mut AccountPoolState,
+        cookie: &AccountSlot,
         log_sink: Option<broadcast::Sender<AdminEvent>>,
     ) {
         let Some(account_id) = cookie.account_id else {
@@ -421,8 +421,8 @@ impl CookieActor {
         });
     }
 
-    fn spawn_probes_for_unprobed(state: &mut CookieActorState) {
-        let unprobed: Vec<CookieStatus> = state
+    fn spawn_probes_for_unprobed(state: &mut AccountPoolState) {
+        let unprobed: Vec<AccountSlot> = state
             .valid
             .iter()
             .filter(|c| c.email.is_none() || c.account_type.is_none())
@@ -433,8 +433,8 @@ impl CookieActor {
         }
     }
 
-    fn spawn_probe_all(state: &mut CookieActorState) {
-        let cookies: Vec<CookieStatus> = state
+    fn spawn_probe_all(state: &mut AccountPoolState) {
+        let cookies: Vec<AccountSlot> = state
             .valid
             .iter()
             .cloned()
@@ -450,7 +450,7 @@ impl CookieActor {
             .map(|uc| (uc.cookie.clone(), uc.account_id))
             .collect();
         for (cookie_blob, account_id) in invalid_cookies {
-            if let Ok(mut cs) = CookieStatus::new(&cookie_blob.to_string(), None) {
+            if let Ok(mut cs) = AccountSlot::new(&cookie_blob.to_string(), None) {
                 cs.account_id = account_id;
                 Self::spawn_probe_guarded(state, &cs, None);
             }
@@ -458,7 +458,7 @@ impl CookieActor {
     }
 
     fn spawn_probe_accounts(
-        state: &mut CookieActorState,
+        state: &mut AccountPoolState,
         account_ids: &[i64],
         log_sink: Option<broadcast::Sender<AdminEvent>>,
     ) {
@@ -467,7 +467,7 @@ impl CookieActor {
             return;
         }
 
-        let cookies: Vec<CookieStatus> = state
+        let cookies: Vec<AccountSlot> = state
             .valid
             .iter()
             .cloned()
@@ -485,28 +485,28 @@ impl CookieActor {
             .map(|uc| (uc.cookie.clone(), uc.account_id))
             .collect();
         for (cookie_blob, account_id) in invalid_cookies {
-            if let Ok(mut cs) = CookieStatus::new(&cookie_blob.to_string(), None) {
+            if let Ok(mut cs) = AccountSlot::new(&cookie_blob.to_string(), None) {
                 cs.account_id = account_id;
                 Self::spawn_probe_guarded(state, &cs, log_sink.clone());
             }
         }
     }
 
-    fn report(state: &CookieActorState) -> CookieStatusInfo {
-        CookieStatusInfo {
+    fn report(state: &AccountPoolState) -> AccountPoolStatus {
+        AccountPoolStatus {
             valid: state.valid.clone().into(),
             exhausted: state.exhausted.iter().cloned().collect(),
             invalid: state.invalid.iter().cloned().collect(),
         }
     }
 
-    fn delete(state: &mut CookieActorState, cookie: CookieStatus) -> Result<(), ClewdrError> {
+    fn delete(state: &mut AccountPoolState, cookie: AccountSlot) -> Result<(), ClewdrError> {
         let mut found = false;
         state.valid.retain(|c| {
             found |= *c == cookie;
             *c != cookie
         });
-        let useless = UselessCookie::new(cookie.cookie.clone(), Reason::Null);
+        let useless = InvalidAccountSlot::new(cookie.cookie.clone(), Reason::Null);
         found |= state.exhausted.remove(&cookie) | state.invalid.remove(&useless);
 
         if found {
@@ -520,8 +520,8 @@ impl CookieActor {
     }
 
     fn update_1m_support(
-        state: &mut CookieActorState,
-        cookie: CookieStatus,
+        state: &mut AccountPoolState,
+        cookie: AccountSlot,
     ) -> Result<(), ClewdrError> {
         if let Some(existing) = state.valid.iter_mut().find(|c| **c == cookie) {
             existing.supports_claude_1m_sonnet = cookie.supports_claude_1m_sonnet;
@@ -556,7 +556,7 @@ impl CookieActor {
         })
     }
 
-    async fn do_flush(state: &mut CookieActorState) {
+    async fn do_flush(state: &mut AccountPoolState) {
         if state.dirty.is_empty() {
             return;
         }
@@ -610,7 +610,7 @@ impl CookieActor {
         }
     }
 
-    async fn do_reload(state: &mut CookieActorState) {
+    async fn do_reload(state: &mut AccountPoolState) {
         // Flush pending dirty state before reload to avoid losing in-memory changes
         Self::do_flush(state).await;
 
@@ -623,7 +623,7 @@ impl CookieActor {
         };
 
         // Index current in-memory state by account_id
-        let mut mem_cookies: HashMap<i64, CookieStatus> = HashMap::new();
+        let mut mem_cookies: HashMap<i64, AccountSlot> = HashMap::new();
         for cs in state.valid.drain(..) {
             if let Some(id) = cs.account_id {
                 mem_cookies.insert(id, cs);
@@ -648,8 +648,8 @@ impl CookieActor {
                         .as_deref()
                         .map(Reason::from_db_string)
                         .unwrap_or(Reason::Null);
-                    if let Ok(cs) = CookieStatus::new(cookie_str, None) {
-                        state.invalid.insert(UselessCookie::with_account_id(
+                    if let Ok(cs) = AccountSlot::new(cookie_str, None) {
+                        state.invalid.insert(InvalidAccountSlot::with_account_id(
                             cs.cookie,
                             reason,
                             Some(row.id),
@@ -662,7 +662,7 @@ impl CookieActor {
             let Some(cookie_str) = row.cookie_blob.as_deref() else {
                 continue;
             };
-            let mut cs = match CookieStatus::new(cookie_str, None) {
+            let mut cs = match AccountSlot::new(cookie_str, None) {
                 Ok(cs) => cs,
                 Err(e) => {
                     warn!("Invalid cookie for account '{}': {e}", row.name);
@@ -763,9 +763,9 @@ impl CookieActor {
     }
 }
 
-impl Actor for CookieActor {
-    type Msg = CookieActorMessage;
-    type State = CookieActorState;
+impl Actor for AccountPoolActor {
+    type Msg = AccountPoolMessage;
+    type State = AccountPoolState;
     type Arguments = SqlitePool;
 
     async fn pre_start(
@@ -778,7 +778,7 @@ impl Actor for CookieActor {
             .time_to_idle(std::time::Duration::from_secs(60 * 60))
             .build();
 
-        let mut state = CookieActorState {
+        let mut state = AccountPoolState {
             valid: VecDeque::new(),
             exhausted: HashSet::new(),
             invalid: HashSet::new(),
@@ -805,41 +805,41 @@ impl Actor for CookieActor {
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match message {
-            CookieActorMessage::Return(cookie, reason) => {
+            AccountPoolMessage::Return(cookie, reason) => {
                 Self::collect(state, cookie, reason);
             }
-            CookieActorMessage::Submit(cookie) => {
+            AccountPoolMessage::Submit(cookie) => {
                 Self::accept(state, cookie);
             }
-            CookieActorMessage::CheckReset => {
+            AccountPoolMessage::CheckReset => {
                 Self::refresh_usage_windows(state);
                 Self::reset(state);
             }
-            CookieActorMessage::Request(cache_hash, bound, reply_port) => {
+            AccountPoolMessage::Request(cache_hash, bound, reply_port) => {
                 let result = self.dispatch(state, cache_hash, &bound);
                 reply_port.send(result)?;
             }
-            CookieActorMessage::GetStatus(reply_port) => {
+            AccountPoolMessage::GetStatus(reply_port) => {
                 Self::refresh_usage_windows(state);
                 let status_info = Self::report(state);
                 reply_port.send(status_info)?;
             }
-            CookieActorMessage::Delete(cookie, reply_port) => {
+            AccountPoolMessage::Delete(cookie, reply_port) => {
                 let result = Self::delete(state, cookie);
                 reply_port.send(result)?;
             }
-            CookieActorMessage::Update1mSupport(cookie, reply_port) => {
+            AccountPoolMessage::Update1mSupport(cookie, reply_port) => {
                 let result = Self::update_1m_support(state, cookie);
                 reply_port.send(result)?;
             }
-            CookieActorMessage::ReloadFromDb => {
+            AccountPoolMessage::ReloadFromDb => {
                 Self::do_reload(state).await;
             }
-            CookieActorMessage::ProbeAll(reply_port) => {
+            AccountPoolMessage::ProbeAll(reply_port) => {
                 Self::spawn_probe_all(state);
                 reply_port.send(state.probing.iter().copied().collect())?;
             }
-            CookieActorMessage::ProbeAccounts(account_ids, event_tx, reply_port) => {
+            AccountPoolMessage::ProbeAccounts(account_ids, event_tx, reply_port) => {
                 Self::spawn_probe_accounts(state, &account_ids, Some(event_tx));
                 let probing: Vec<i64> = account_ids
                     .into_iter()
@@ -847,36 +847,36 @@ impl Actor for CookieActor {
                     .collect();
                 reply_port.send(probing)?;
             }
-            CookieActorMessage::BeginProbe(account_id, reply_port) => {
+            AccountPoolMessage::BeginProbe(account_id, reply_port) => {
                 let inserted = state.probing.insert(account_id);
                 reply_port.send(inserted)?;
             }
-            CookieActorMessage::FlushDirty => {
+            AccountPoolMessage::FlushDirty => {
                 Self::do_flush(state).await;
             }
-            CookieActorMessage::SetHandle(handle) => {
+            AccountPoolMessage::SetHandle(handle) => {
                 state.handle = Some(handle);
                 // Backfill probes missed during pre_start (handle was None then)
                 Self::spawn_probes_for_unprobed(state);
             }
-            CookieActorMessage::ReleaseSlot(account_id) => {
+            AccountPoolMessage::ReleaseSlot(account_id) => {
                 if let Some((cur, _)) = state.inflight.get_mut(&account_id) {
                     *cur = cur.saturating_sub(1);
                 }
             }
-            CookieActorMessage::GetProbingIds(reply_port) => {
+            AccountPoolMessage::GetProbingIds(reply_port) => {
                 reply_port.send(state.probing.iter().copied().collect())?;
             }
-            CookieActorMessage::ClearProbing(account_id) => {
+            AccountPoolMessage::ClearProbing(account_id) => {
                 state.probing.remove(&account_id);
             }
-            CookieActorMessage::SetProbeError(account_id, msg) => {
+            AccountPoolMessage::SetProbeError(account_id, msg) => {
                 state.probe_errors.insert(account_id, msg);
             }
-            CookieActorMessage::ClearProbeError(account_id) => {
+            AccountPoolMessage::ClearProbeError(account_id) => {
                 state.probe_errors.remove(&account_id);
             }
-            CookieActorMessage::GetProbeErrors(reply_port) => {
+            AccountPoolMessage::GetProbeErrors(reply_port) => {
                 reply_port.send(state.probe_errors.clone())?;
             }
         }
@@ -919,26 +919,26 @@ impl Actor for CookieActor {
 }
 
 #[derive(Clone)]
-pub struct CookieActorHandle {
-    actor_ref: ActorRef<CookieActorMessage>,
+pub struct AccountPoolHandle {
+    actor_ref: ActorRef<AccountPoolMessage>,
 }
 
-impl std::fmt::Debug for CookieActorHandle {
+impl std::fmt::Debug for AccountPoolHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CookieActorHandle").finish()
+        f.debug_struct("AccountPoolHandle").finish()
     }
 }
 
-impl CookieActorHandle {
+impl AccountPoolHandle {
     pub async fn start(db: SqlitePool) -> Result<Self, ractor::SpawnErr> {
-        let (actor_ref, _join_handle) = Actor::spawn(None, CookieActor, db).await?;
+        let (actor_ref, _join_handle) = Actor::spawn(None, AccountPoolActor, db).await?;
 
         let handle = Self {
             actor_ref: actor_ref.clone(),
         };
 
         // Send the handle to the actor so it can spawn probe tasks
-        let _ = ractor::cast!(actor_ref, CookieActorMessage::SetHandle(handle.clone()));
+        let _ = ractor::cast!(actor_ref, AccountPoolMessage::SetHandle(handle.clone()));
 
         handle.spawn_timeout_checker().await;
         handle.spawn_flush_timer().await;
@@ -952,7 +952,7 @@ impl CookieActorHandle {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(INTERVAL));
             loop {
                 interval.tick().await;
-                if ractor::cast!(actor_ref, CookieActorMessage::CheckReset).is_err() {
+                if ractor::cast!(actor_ref, AccountPoolMessage::CheckReset).is_err() {
                     break;
                 }
             }
@@ -966,7 +966,7 @@ impl CookieActorHandle {
                 tokio::time::interval(tokio::time::Duration::from_secs(FLUSH_INTERVAL));
             loop {
                 interval.tick().await;
-                if ractor::cast!(actor_ref, CookieActorMessage::FlushDirty).is_err() {
+                if ractor::cast!(actor_ref, AccountPoolMessage::FlushDirty).is_err() {
                     break;
                 }
             }
@@ -977,84 +977,96 @@ impl CookieActorHandle {
         &self,
         cache_hash: Option<u64>,
         bound_account_ids: &[i64],
-    ) -> Result<CookieStatus, ClewdrError> {
+    ) -> Result<AccountSlot, ClewdrError> {
         ractor::call!(
             self.actor_ref,
-            CookieActorMessage::Request,
+            AccountPoolMessage::Request,
             cache_hash,
             bound_account_ids.to_vec()
         )
         .map_err(|e| ClewdrError::RactorError {
             loc: Location::generate(),
-            msg: format!("Failed to communicate with CookieActor for request operation: {e}"),
+            msg: format!("Failed to communicate with AccountPoolActor for request operation: {e}"),
         })?
     }
 
-    pub async fn return_cookie(
+    pub async fn release(
         &self,
-        cookie: CookieStatus,
+        cookie: AccountSlot,
         reason: Option<Reason>,
     ) -> Result<(), ClewdrError> {
-        ractor::cast!(self.actor_ref, CookieActorMessage::Return(cookie, reason)).map_err(|e| {
-            ClewdrError::RactorError {
-                loc: Location::generate(),
-                msg: format!("Failed to communicate with CookieActor for return operation: {e}"),
-            }
-        })
-    }
-
-    pub async fn submit(&self, cookie: CookieStatus) -> Result<(), ClewdrError> {
-        ractor::cast!(self.actor_ref, CookieActorMessage::Submit(cookie)).map_err(|e| {
-            ClewdrError::RactorError {
-                loc: Location::generate(),
-                msg: format!("Failed to communicate with CookieActor for submit operation: {e}"),
-            }
-        })
-    }
-
-    pub async fn get_status(&self) -> Result<CookieStatusInfo, ClewdrError> {
-        ractor::call!(self.actor_ref, CookieActorMessage::GetStatus).map_err(|e| {
+        ractor::cast!(self.actor_ref, AccountPoolMessage::Return(cookie, reason)).map_err(|e| {
             ClewdrError::RactorError {
                 loc: Location::generate(),
                 msg: format!(
-                    "Failed to communicate with CookieActor for get status operation: {e}"
+                    "Failed to communicate with AccountPoolActor for return operation: {e}"
                 ),
             }
         })
     }
 
-    pub async fn delete_cookie(&self, cookie: CookieStatus) -> Result<(), ClewdrError> {
-        ractor::call!(self.actor_ref, CookieActorMessage::Delete, cookie).map_err(|e| {
+    pub async fn submit(&self, cookie: AccountSlot) -> Result<(), ClewdrError> {
+        ractor::cast!(self.actor_ref, AccountPoolMessage::Submit(cookie)).map_err(|e| {
             ClewdrError::RactorError {
                 loc: Location::generate(),
-                msg: format!("Failed to communicate with CookieActor for delete operation: {e}"),
+                msg: format!(
+                    "Failed to communicate with AccountPoolActor for submit operation: {e}"
+                ),
+            }
+        })
+    }
+
+    pub async fn get_status(&self) -> Result<AccountPoolStatus, ClewdrError> {
+        ractor::call!(self.actor_ref, AccountPoolMessage::GetStatus).map_err(|e| {
+            ClewdrError::RactorError {
+                loc: Location::generate(),
+                msg: format!(
+                    "Failed to communicate with AccountPoolActor for get status operation: {e}"
+                ),
+            }
+        })
+    }
+
+    pub async fn delete_cookie(&self, cookie: AccountSlot) -> Result<(), ClewdrError> {
+        ractor::call!(self.actor_ref, AccountPoolMessage::Delete, cookie).map_err(|e| {
+            ClewdrError::RactorError {
+                loc: Location::generate(),
+                msg: format!(
+                    "Failed to communicate with AccountPoolActor for delete operation: {e}"
+                ),
             }
         })?
     }
 
-    pub async fn update_cookie_1m_support(&self, cookie: CookieStatus) -> Result<(), ClewdrError> {
-        ractor::call!(self.actor_ref, CookieActorMessage::Update1mSupport, cookie).map_err(|e| {
+    pub async fn update_cookie_1m_support(&self, cookie: AccountSlot) -> Result<(), ClewdrError> {
+        ractor::call!(self.actor_ref, AccountPoolMessage::Update1mSupport, cookie).map_err(|e| {
             ClewdrError::RactorError {
                 loc: Location::generate(),
-                msg: format!("Failed to communicate with CookieActor for update operation: {e}"),
+                msg: format!(
+                    "Failed to communicate with AccountPoolActor for update operation: {e}"
+                ),
             }
         })?
     }
 
     pub async fn reload_from_db(&self) -> Result<(), ClewdrError> {
-        ractor::cast!(self.actor_ref, CookieActorMessage::ReloadFromDb).map_err(|e| {
+        ractor::cast!(self.actor_ref, AccountPoolMessage::ReloadFromDb).map_err(|e| {
             ClewdrError::RactorError {
                 loc: Location::generate(),
-                msg: format!("Failed to communicate with CookieActor for reload operation: {e}"),
+                msg: format!(
+                    "Failed to communicate with AccountPoolActor for reload operation: {e}"
+                ),
             }
         })
     }
 
     pub async fn probe_all(&self) -> Result<Vec<i64>, ClewdrError> {
-        ractor::call!(self.actor_ref, CookieActorMessage::ProbeAll).map_err(|e| {
+        ractor::call!(self.actor_ref, AccountPoolMessage::ProbeAll).map_err(|e| {
             ClewdrError::RactorError {
                 loc: Location::generate(),
-                msg: format!("Failed to communicate with CookieActor for probe operation: {e}"),
+                msg: format!(
+                    "Failed to communicate with AccountPoolActor for probe operation: {e}"
+                ),
             }
         })
     }
@@ -1066,43 +1078,45 @@ impl CookieActorHandle {
     ) -> Result<Vec<i64>, ClewdrError> {
         ractor::call!(
             self.actor_ref,
-            CookieActorMessage::ProbeAccounts,
+            AccountPoolMessage::ProbeAccounts,
             account_ids,
             event_tx
         )
         .map_err(|e| ClewdrError::RactorError {
             loc: Location::generate(),
-            msg: format!("Failed to communicate with CookieActor for targeted probe: {e}"),
+            msg: format!("Failed to communicate with AccountPoolActor for targeted probe: {e}"),
         })
     }
 
     pub async fn begin_probe(&self, account_id: i64) -> Result<bool, ClewdrError> {
-        ractor::call!(self.actor_ref, CookieActorMessage::BeginProbe, account_id).map_err(|e| {
+        ractor::call!(self.actor_ref, AccountPoolMessage::BeginProbe, account_id).map_err(|e| {
             ClewdrError::RactorError {
                 loc: Location::generate(),
-                msg: format!("Failed to communicate with CookieActor for begin probe: {e}"),
+                msg: format!("Failed to communicate with AccountPoolActor for begin probe: {e}"),
             }
         })
     }
 
     pub async fn release_slot(&self, account_id: i64) {
-        let _ = ractor::cast!(self.actor_ref, CookieActorMessage::ReleaseSlot(account_id));
+        let _ = ractor::cast!(self.actor_ref, AccountPoolMessage::ReleaseSlot(account_id));
     }
 
     pub async fn get_probing_ids(&self) -> Result<Vec<i64>, ClewdrError> {
-        ractor::call!(self.actor_ref, CookieActorMessage::GetProbingIds).map_err(|e| {
+        ractor::call!(self.actor_ref, AccountPoolMessage::GetProbingIds).map_err(|e| {
             ClewdrError::RactorError {
                 loc: Location::generate(),
-                msg: format!("Failed to communicate with CookieActor for get probing ids: {e}"),
+                msg: format!(
+                    "Failed to communicate with AccountPoolActor for get probing ids: {e}"
+                ),
             }
         })
     }
 
     pub async fn clear_probing(&self, account_id: i64) -> Result<(), ClewdrError> {
-        ractor::cast!(self.actor_ref, CookieActorMessage::ClearProbing(account_id)).map_err(|e| {
+        ractor::cast!(self.actor_ref, AccountPoolMessage::ClearProbing(account_id)).map_err(|e| {
             ClewdrError::RactorError {
                 loc: Location::generate(),
-                msg: format!("Failed to communicate with CookieActor for clear probing: {e}"),
+                msg: format!("Failed to communicate with AccountPoolActor for clear probing: {e}"),
             }
         })
     }
@@ -1110,22 +1124,24 @@ impl CookieActorHandle {
     pub async fn set_probe_error(&self, account_id: i64, msg: String) {
         let _ = ractor::cast!(
             self.actor_ref,
-            CookieActorMessage::SetProbeError(account_id, msg)
+            AccountPoolMessage::SetProbeError(account_id, msg)
         );
     }
 
     pub async fn clear_probe_error(&self, account_id: i64) {
         let _ = ractor::cast!(
             self.actor_ref,
-            CookieActorMessage::ClearProbeError(account_id)
+            AccountPoolMessage::ClearProbeError(account_id)
         );
     }
 
     pub async fn get_probe_errors(&self) -> Result<HashMap<i64, String>, ClewdrError> {
-        ractor::call!(self.actor_ref, CookieActorMessage::GetProbeErrors).map_err(|e| {
+        ractor::call!(self.actor_ref, AccountPoolMessage::GetProbeErrors).map_err(|e| {
             ClewdrError::RactorError {
                 loc: Location::generate(),
-                msg: format!("Failed to communicate with CookieActor for get probe errors: {e}"),
+                msg: format!(
+                    "Failed to communicate with AccountPoolActor for get probe errors: {e}"
+                ),
             }
         })
     }

@@ -20,7 +20,7 @@ use crate::{
     },
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
     oauth::refresh_oauth_token,
-    services::cookie_actor::CookieActorHandle,
+    services::account_pool::AccountPoolHandle,
     types::claude::{CountMessageTokensResponse, CreateMessageParams},
 };
 
@@ -95,7 +95,7 @@ impl ClaudeCodeState {
                     pool.release(aid).await;
                 }
             } else {
-                self.cookie_actor_handle.release_slot(aid).await;
+                self.account_pool_handle.release_slot(aid).await;
             }
         }
     }
@@ -209,7 +209,7 @@ impl ClaudeCodeState {
             let mut state = self.to_owned();
             let p = p.to_owned();
 
-            let cookie = state.request_cookie().await?;
+            let cookie = state.acquire_account().await?;
             let account_id = cookie.account_id;
             // Propagate account_id to billing context
             if let Some(ref mut ctx) = state.billing_ctx {
@@ -222,12 +222,12 @@ impl ClaudeCodeState {
                         let org = state.get_organization().await?;
                         let code_res = state.exchange_code(&org).await?;
                         state.exchange_token(code_res).await?;
-                        state.return_cookie(None).await;
+                        state.release_account(None).await;
                     }
                     TokenStatus::Expired => {
                         info!("Token expired, refreshing token");
                         state.refresh_token().await?;
-                        state.return_cookie(None).await;
+                        state.release_account(None).await;
                     }
                     TokenStatus::Valid => {
                         info!("Token is valid, proceeding with request");
@@ -264,7 +264,7 @@ impl ClaudeCodeState {
                     );
                     // 429 error
                     if let ClewdrError::InvalidCookie { reason } = e {
-                        state.return_cookie(Some(reason.to_owned())).await;
+                        state.release_account(Some(reason.to_owned())).await;
                         continue;
                     }
                     return Err(e);
@@ -316,7 +316,7 @@ impl ClaudeCodeState {
             }
             cookie.set_count_tokens_allowed(Some(value));
             let cloned = cookie.clone();
-            if let Err(err) = self.cookie_actor_handle.return_cookie(cloned, None).await {
+            if let Err(err) = self.account_pool_handle.release(cloned, None).await {
                 warn!("Failed to persist count_tokens permission: {}", err);
             }
         }
@@ -434,7 +434,7 @@ impl ClaudeCodeState {
             let mut state = self.to_owned();
             let p = p.to_owned();
 
-            let cookie = state.request_cookie().await?;
+            let cookie = state.acquire_account().await?;
             let account_id = cookie.account_id;
             if let Some(ref mut ctx) = state.billing_ctx {
                 ctx.account_id = cookie.account_id;
@@ -453,12 +453,12 @@ impl ClaudeCodeState {
                         let org = state.get_organization().await?;
                         let code_res = state.exchange_code(&org).await?;
                         state.exchange_token(code_res).await?;
-                        state.return_cookie(None).await;
+                        state.release_account(None).await;
                     }
                     TokenStatus::Expired => {
                         info!("Token expired, refreshing token");
                         state.refresh_token().await?;
-                        state.return_cookie(None).await;
+                        state.release_account(None).await;
                     }
                     TokenStatus::Valid => {
                         info!("Token is valid, proceeding with count_tokens");
@@ -491,7 +491,7 @@ impl ClaudeCodeState {
                         e
                     );
                     if let ClewdrError::InvalidCookie { reason } = e {
-                        state.return_cookie(Some(reason.to_owned())).await;
+                        state.release_account(Some(reason.to_owned())).await;
                         continue;
                     }
                     return Err(e);
@@ -557,10 +557,10 @@ impl ClaudeCodeState {
         }
         if let Some(cookie) = self.cookie.as_mut() {
             // Lazy boundary refresh if due, then reset period counters and start fresh
-            Self::update_cookie_boundaries_if_due(cookie, &self.cookie_actor_handle).await;
+            Self::update_cookie_boundaries_if_due(cookie, &self.account_pool_handle).await;
             cookie.add_and_bucket_usage(input, output, family);
             let cloned = cookie.clone();
-            if let Err(err) = self.cookie_actor_handle.return_cookie(cloned, None).await {
+            if let Err(err) = self.account_pool_handle.release(cloned, None).await {
                 warn!("Failed to persist usage statistics: {}", err);
             }
         }
@@ -582,7 +582,7 @@ impl ClaudeCodeState {
         let cache_create_sum = Arc::new(AtomicU64::new(0));
         let cache_read_sum = Arc::new(AtomicU64::new(0));
         let ttft_ms = Arc::new(AtomicI64::new(-1));
-        let handle = self.cookie_actor_handle.clone();
+        let handle = self.account_pool_handle.clone();
         let oauth_pool = self.oauth_pool.clone();
         let cookie = self.cookie.clone();
         let billing_ctx = self.billing_ctx.clone();
@@ -696,7 +696,7 @@ impl ClaudeCodeState {
                                     )
                                     .await;
                                     c.add_and_bucket_usage(total_input, total_out, family);
-                                    let _ = handle.return_cookie(c, None).await;
+                                    let _ = handle.release(c, None).await;
                                     if let Some(aid) = aid {
                                         if !released.swap(true, Ordering::Relaxed) {
                                             handle.release_slot(aid).await;
@@ -764,10 +764,10 @@ impl ClaudeCodeState {
             released: Arc<AtomicBool>,
             completed: Arc<AtomicBool>,
             account_id: Option<i64>,
-            handle: CookieActorHandle,
+            handle: AccountPoolHandle,
             oauth_pool: Option<std::sync::Arc<crate::providers::claude::OAuthAccountPool>>,
             oauth_only: bool,
-            cookie: Option<crate::config::CookieStatus>,
+            cookie: Option<crate::config::AccountSlot>,
             family: ModelFamily,
             billing_ctx: Option<crate::billing::BillingContext>,
             input_sum: Arc<AtomicU64>,
@@ -829,7 +829,7 @@ impl ClaudeCodeState {
                                             family,
                                         );
                                     }
-                                    let _ = h.return_cookie(cookie, None).await;
+                                    let _ = h.release(cookie, None).await;
                                 }
                                 if let Some(ctx) = billing_ctx {
                                     let usage = should_persist_usage.then_some(
@@ -907,7 +907,7 @@ impl ClaudeCodeState {
             released: slot_released,
             completed: stream_completed,
             account_id: stream_account_id,
-            handle: self.cookie_actor_handle.clone(),
+            handle: self.account_pool_handle.clone(),
             oauth_pool: self.oauth_pool.clone(),
             oauth_only: self.oauth_token.is_some() && self.cookie.is_none(),
             cookie: self.cookie.clone(),
@@ -1094,8 +1094,8 @@ impl ClaudeCodeState {
     // Lazy boundary refresh (no timers, fetch-on-due)
     // ---------------------------------------------
     async fn update_cookie_boundaries_if_due(
-        cookie: &mut crate::config::CookieStatus,
-        handle: &crate::services::cookie_actor::CookieActorHandle,
+        cookie: &mut crate::config::AccountSlot,
+        handle: &crate::services::account_pool::AccountPoolHandle,
     ) {
         let now = chrono::Utc::now().timestamp();
         const SESSION_WINDOW_SECS: i64 = 5 * 60 * 60; // 5h
@@ -1211,14 +1211,14 @@ impl ClaudeCodeState {
     }
 
     async fn fetch_usage_resets(
-        cookie: &mut crate::config::CookieStatus,
-        handle: &CookieActorHandle,
+        cookie: &mut crate::config::AccountSlot,
+        handle: &AccountPoolHandle,
     ) -> Option<(Option<i64>, Option<i64>, Option<i64>, Option<i64>)> {
         let profile = crate::stealth::global_profile().clone();
         let mut state =
             ClaudeCodeState::from_cookie(handle.clone(), cookie.clone(), profile).ok()?;
         let usage = state.fetch_usage_metrics().await.ok()?;
-        state.return_cookie(None).await;
+        state.release_account(None).await;
         if let Some(updated) = state.cookie.clone() {
             *cookie = updated;
         }

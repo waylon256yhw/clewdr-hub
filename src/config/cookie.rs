@@ -71,7 +71,7 @@ impl<'de> Deserialize<'de> for ClewdrCookie {
 
 /// A struct representing a cookie with its information
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
-pub struct CookieStatus {
+pub struct AccountSlot {
     pub cookie: ClewdrCookie,
     #[serde(default)]
     pub account_id: Option<i64>,
@@ -139,41 +139,41 @@ pub struct CookieStatus {
     pub weekly_opus_utilization: Option<f64>,
 }
 
-impl PartialEq for CookieStatus {
+impl PartialEq for AccountSlot {
     fn eq(&self, other: &Self) -> bool {
         self.cookie == other.cookie
     }
 }
 
-impl Eq for CookieStatus {}
+impl Eq for AccountSlot {}
 
-impl Hash for CookieStatus {
+impl Hash for AccountSlot {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.cookie.hash(state);
     }
 }
 
-impl Ord for CookieStatus {
+impl Ord for AccountSlot {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.cookie.cmp(&other.cookie)
     }
 }
 
-impl PartialOrd for CookieStatus {
+impl PartialOrd for AccountSlot {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl CookieStatus {
-    /// Creates a new CookieStatus instance
+impl AccountSlot {
+    /// Creates a new AccountSlot instance
     ///
     /// # Arguments
     /// * `cookie` - Cookie string
     /// * `reset_time` - Optional timestamp when the cookie can be reused
     ///
     /// # Returns
-    /// A new CookieStatus instance
+    /// A new AccountSlot instance
     pub fn new(cookie: &str, reset_time: Option<i64>) -> Result<Self, ClewdrError> {
         let cookie = ClewdrCookie::from_str(cookie)?;
         Ok(Self {
@@ -212,7 +212,7 @@ impl CookieStatus {
     /// If the reset time has passed, sets it to None so the cookie becomes valid again
     ///
     /// # Returns
-    /// The same CookieStatus with potentially updated reset_time
+    /// The same AccountSlot with potentially updated reset_time
     pub fn reset(self) -> Self {
         if let Some(t) = self.reset_time
             && t < chrono::Utc::now().timestamp()
@@ -412,7 +412,7 @@ pub struct RuntimeStateParams {
     pub buckets: [UsageBreakdown; 5], // session, weekly, weekly_sonnet, weekly_opus, lifetime
 }
 
-impl CookieStatus {
+impl AccountSlot {
     /// Extract runtime state parameters for DB persistence.
     pub fn to_runtime_params(&self) -> RuntimeStateParams {
         RuntimeStateParams {
@@ -443,7 +443,7 @@ impl CookieStatus {
         }
     }
 
-    /// Apply runtime state from a DB row onto this CookieStatus.
+    /// Apply runtime state from a DB row onto this AccountSlot.
     pub fn apply_runtime_state(&mut self, p: &RuntimeStateParams) {
         self.reset_time = p.reset_time;
         self.supports_claude_1m_sonnet = p.supports_claude_1m_sonnet;

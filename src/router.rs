@@ -11,7 +11,7 @@ use tower_http::{compression::CompressionLayer, cors::CorsLayer};
 use crate::{
     api::*,
     middleware::{RequireAdminAuth, RequireFlexibleAuth},
-    services::{cookie_actor::CookieActorHandle, user_limiter::UserLimiterMap},
+    services::{account_pool::AccountPoolHandle, user_limiter::UserLimiterMap},
     state::{AdminEvent, AppState, AuthState},
     stealth,
 };
@@ -23,13 +23,13 @@ pub struct RouterBuilder {
 
 impl RouterBuilder {
     pub async fn new(db_pool: SqlitePool) -> Self {
-        let cookie_handle = CookieActorHandle::start(db_pool.clone())
+        let pool_handle = AccountPoolHandle::start(db_pool.clone())
             .await
-            .expect("Failed to start CookieActor");
+            .expect("Failed to start AccountPoolActor");
         let stealth_profile = stealth::init_stealth_profile(&db_pool).await;
         let (event_tx, _) = tokio::sync::broadcast::channel::<AdminEvent>(64);
         let claude_providers = crate::providers::claude::build_providers(
-            cookie_handle.clone(),
+            pool_handle.clone(),
             db_pool.clone(),
             stealth_profile.clone(),
             event_tx.clone(),
@@ -43,7 +43,7 @@ impl RouterBuilder {
         };
         let state = AppState {
             db: db_pool.clone(),
-            cookie_actor: cookie_handle,
+            account_pool: pool_handle,
             code_provider: claude_providers.code(),
             auth,
             user_limiter: UserLimiterMap::new(),

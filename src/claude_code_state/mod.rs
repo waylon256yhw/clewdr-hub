@@ -15,10 +15,10 @@ use wreq_util::Emulation;
 
 use crate::{
     billing::BillingContext,
-    config::{CLAUDE_ENDPOINT, CookieStatus, Reason, TokenInfo},
+    config::{AccountSlot, CLAUDE_ENDPOINT, Reason, TokenInfo},
     error::{ClewdrError, WreqSnafu},
     providers::claude::OAuthAccountPool,
-    services::cookie_actor::CookieActorHandle,
+    services::account_pool::AccountPoolHandle,
     stealth::SharedStealthProfile,
     types::claude::Usage,
 };
@@ -51,8 +51,8 @@ pub(crate) fn build_api_client(proxy: Option<&wreq::Proxy>) -> wreq::Client {
 
 #[derive(Clone)]
 pub struct ClaudeCodeState {
-    pub cookie_actor_handle: CookieActorHandle,
-    pub cookie: Option<CookieStatus>,
+    pub account_pool_handle: AccountPoolHandle,
+    pub cookie: Option<AccountSlot>,
     pub cookie_header_value: HeaderValue,
     pub proxy: Option<wreq::Proxy>,
     pub endpoint: url::Url,
@@ -73,12 +73,12 @@ pub struct ClaudeCodeState {
 impl ClaudeCodeState {
     /// Create a new ClaudeCodeState instance
     pub fn new(
-        cookie_actor_handle: CookieActorHandle,
+        account_pool_handle: AccountPoolHandle,
         stealth_profile: SharedStealthProfile,
     ) -> Self {
         let proxy = proxy_from_profile(&stealth_profile);
         ClaudeCodeState {
-            cookie_actor_handle,
+            account_pool_handle,
             cookie: None,
             cookie_header_value: HeaderValue::from_static(""),
             client: build_api_client(proxy.as_ref()),
@@ -100,11 +100,11 @@ impl ClaudeCodeState {
 
     /// Build a ClaudeCodeState initialized with an existing cookie snapshot
     pub fn from_cookie(
-        cookie_actor_handle: CookieActorHandle,
-        cookie: CookieStatus,
+        account_pool_handle: AccountPoolHandle,
+        cookie: AccountSlot,
         stealth_profile: SharedStealthProfile,
     ) -> Result<Self, ClewdrError> {
-        let mut state = Self::new(cookie_actor_handle, stealth_profile);
+        let mut state = Self::new(account_pool_handle, stealth_profile);
         state.cookie = Some(cookie);
         let cookie_value = state
             .cookie
@@ -130,11 +130,11 @@ impl ClaudeCodeState {
 
     /// Returns the current cookie to the cookie manager
     /// Optionally provides a reason for returning the cookie (e.g., invalid, banned)
-    pub async fn return_cookie(&self, reason: Option<Reason>) {
+    pub async fn release_account(&self, reason: Option<Reason>) {
         // return the cookie to the cookie manager
         if let Some(ref cookie) = self.cookie {
-            self.cookie_actor_handle
-                .return_cookie(cookie.to_owned(), reason)
+            self.account_pool_handle
+                .release(cookie.to_owned(), reason)
                 .await
                 .unwrap_or_else(|e| {
                     error!("Failed to send cookie: {}", e);
@@ -165,9 +165,9 @@ impl ClaudeCodeState {
 
     /// Requests a new cookie from the cookie manager
     /// Updates the internal state with the new cookie and proxy configuration
-    pub async fn request_cookie(&mut self) -> Result<CookieStatus, ClewdrError> {
+    pub async fn acquire_account(&mut self) -> Result<AccountSlot, ClewdrError> {
         let res = self
-            .cookie_actor_handle
+            .account_pool_handle
             .request(self.system_prompt_hash, &self.bound_account_ids)
             .await?;
         self.cookie = Some(res.to_owned());
@@ -194,7 +194,7 @@ impl ClaudeCodeState {
             }
             return TokenStatus::Valid;
         }
-        let Some(CookieStatus {
+        let Some(AccountSlot {
             token: Some(token_info),
             ..
         }) = &self.cookie

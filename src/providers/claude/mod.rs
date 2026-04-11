@@ -13,7 +13,7 @@ use crate::{
     db::accounts::{AccountWithRuntime, load_pure_oauth_accounts},
     error::ClewdrError,
     middleware::claude::ClaudeContext,
-    services::cookie_actor::CookieActorHandle,
+    services::account_pool::AccountPoolHandle,
     state::AdminEvent,
     stealth::SharedStealthProfile,
     types::claude::CreateMessageParams,
@@ -57,7 +57,7 @@ pub struct ClaudeProviderResponse {
 }
 
 struct ClaudeSharedState {
-    cookie_actor_handle: CookieActorHandle,
+    account_pool_handle: AccountPoolHandle,
     db: SqlitePool,
     stealth_profile: SharedStealthProfile,
     event_tx: broadcast::Sender<AdminEvent>,
@@ -130,13 +130,13 @@ impl OAuthAccountPool {
 
 impl ClaudeSharedState {
     fn new(
-        cookie_actor_handle: CookieActorHandle,
+        account_pool_handle: AccountPoolHandle,
         db: SqlitePool,
         stealth_profile: SharedStealthProfile,
         event_tx: broadcast::Sender<AdminEvent>,
     ) -> Self {
         Self {
-            cookie_actor_handle,
+            account_pool_handle,
             db,
             stealth_profile,
             event_tx,
@@ -152,13 +152,13 @@ pub struct ClaudeProviders {
 
 impl ClaudeProviders {
     pub fn new(
-        cookie_actor_handle: CookieActorHandle,
+        account_pool_handle: AccountPoolHandle,
         db: SqlitePool,
         stealth_profile: SharedStealthProfile,
         event_tx: broadcast::Sender<AdminEvent>,
     ) -> Self {
         let shared = Arc::new(ClaudeSharedState::new(
-            cookie_actor_handle,
+            account_pool_handle,
             db,
             stealth_profile,
             event_tx,
@@ -190,7 +190,7 @@ impl LLMProvider for ClaudeCodeProvider {
 
     async fn invoke(&self, request: Self::Request) -> Result<Self::Output, ClewdrError> {
         let mut state = ClaudeCodeState::new(
-            self.shared.cookie_actor_handle.clone(),
+            self.shared.account_pool_handle.clone(),
             self.shared.stealth_profile.clone(),
         );
         state.stream = request.context.stream;
@@ -275,10 +275,10 @@ impl LLMProvider for ClaudeCodeProvider {
 }
 
 pub fn build_providers(
-    cookie_actor_handle: CookieActorHandle,
+    account_pool_handle: AccountPoolHandle,
     db: SqlitePool,
     stealth_profile: SharedStealthProfile,
     event_tx: broadcast::Sender<AdminEvent>,
 ) -> ClaudeProviders {
-    ClaudeProviders::new(cookie_actor_handle, db, stealth_profile, event_tx)
+    ClaudeProviders::new(account_pool_handle, db, stealth_profile, event_tx)
 }

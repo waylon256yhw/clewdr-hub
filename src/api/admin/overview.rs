@@ -5,7 +5,7 @@ use sqlx::SqlitePool;
 use crate::db::accounts::{is_temporarily_unavailable, load_all_accounts};
 use crate::db::models::AuthenticatedUser;
 use crate::error::ClewdrError;
-use crate::services::cookie_actor::CookieActorHandle;
+use crate::services::account_pool::AccountPoolHandle;
 use crate::stealth;
 
 #[derive(Serialize)]
@@ -74,12 +74,12 @@ pub struct StealthOverview {
 
 pub async fn overview(
     State(db): State<SqlitePool>,
-    State(cookie_handle): State<CookieActorHandle>,
+    State(pool_handle): State<AccountPoolHandle>,
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<Json<OverviewResponse>, ClewdrError> {
-    let cookie_status = cookie_handle.get_status().await.ok();
+    let pool_status = pool_handle.get_status().await.ok();
 
-    let cookies = cookie_status
+    let cookies = pool_status
         .map(|s| CookieOverview {
             valid: s.valid.len(),
             exhausted: s.exhausted.len(),

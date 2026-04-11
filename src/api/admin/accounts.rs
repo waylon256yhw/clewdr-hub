@@ -24,7 +24,7 @@ use crate::{
         AdminOAuthStartResponse, exchange_admin_oauth_callback, refresh_oauth_token,
         start_admin_oauth_flow,
     },
-    services::cookie_actor::CookieActorHandle,
+    services::account_pool::AccountPoolHandle,
     state::AppState,
     stealth::SharedStealthProfile,
 };
@@ -191,7 +191,7 @@ fn derive_auth_source(
 
 pub async fn list(
     State(db): State<SqlitePool>,
-    State(actor): State<CookieActorHandle>,
+    State(actor): State<AccountPoolHandle>,
     Query(_params): Query<PaginationParams>,
 ) -> Result<Json<AccountsListResponse>, ClewdrError> {
     let all = load_all_accounts(&db).await?;
@@ -217,7 +217,7 @@ pub async fn start_oauth(
 
 pub async fn create(
     State(db): State<SqlitePool>,
-    State(actor): State<CookieActorHandle>,
+    State(actor): State<AccountPoolHandle>,
     Json(req): Json<CreateAccountRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ClewdrError> {
     let max_slots = req.max_slots.unwrap_or(5);
@@ -314,7 +314,7 @@ pub async fn create(
 
 pub async fn update(
     State(db): State<SqlitePool>,
-    State(actor): State<CookieActorHandle>,
+    State(actor): State<AccountPoolHandle>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateAccountRequest>,
 ) -> Result<Json<serde_json::Value>, ClewdrError> {
@@ -467,7 +467,7 @@ pub async fn update(
 
 pub async fn remove(
     State(db): State<SqlitePool>,
-    State(actor): State<CookieActorHandle>,
+    State(actor): State<AccountPoolHandle>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ClewdrError> {
     let result = sqlx::query("DELETE FROM accounts WHERE id = ?1")
@@ -496,11 +496,11 @@ pub async fn probe_all(
         let auth_source = account.auth_source.as_str();
 
         if auth_source == "oauth" && account.status != "disabled" && account.oauth_token.is_some() {
-            if !state.cookie_actor.begin_probe(account.id).await? {
+            if !state.account_pool.begin_probe(account.id).await? {
                 continue;
             }
             probing_ids.push(account.id);
-            let handle = state.cookie_actor.clone();
+            let handle = state.account_pool.clone();
             let db = state.db.clone();
             let event_tx = state.event_tx.clone();
             tokio::spawn(async move {
@@ -515,11 +515,11 @@ pub async fn probe_all(
         }
 
         if account.status != "disabled" && account.oauth_token.is_some() {
-            if !state.cookie_actor.begin_probe(account.id).await? {
+            if !state.account_pool.begin_probe(account.id).await? {
                 continue;
             }
             probing_ids.push(account.id);
-            let handle = state.cookie_actor.clone();
+            let handle = state.account_pool.clone();
             let db = state.db.clone();
             let event_tx = state.event_tx.clone();
             tokio::spawn(async move {
@@ -532,7 +532,7 @@ pub async fn probe_all(
     if !cookie_backed_ids.is_empty() {
         probing_ids.extend(
             state
-                .cookie_actor
+                .account_pool
                 .probe_accounts(cookie_backed_ids, state.event_tx.clone())
                 .await?,
         );
