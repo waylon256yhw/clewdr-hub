@@ -128,10 +128,10 @@ impl ClaudeCodeState {
         Ok(state)
     }
 
-    /// Returns the current cookie to the cookie manager
-    /// Optionally provides a reason for returning the cookie (e.g., invalid, banned)
+    /// Returns the current account to the account pool
+    /// Optionally provides a reason for returning the account (e.g., invalid, banned)
     pub async fn release_account(&self, reason: Option<Reason>) {
-        // return the cookie to the cookie manager
+        // return the account to the account pool
         if let Some(ref cookie) = self.cookie {
             self.account_pool_handle
                 .release(cookie.to_owned(), reason)
@@ -163,7 +163,7 @@ impl ClaudeCodeState {
         self.cookie_header_value = value;
     }
 
-    /// Requests a new cookie from the cookie manager
+    /// Requests a new account from the account pool
     /// Updates the internal state with the new cookie and proxy configuration
     pub async fn acquire_account(&mut self) -> Result<AccountSlot, ClewdrError> {
         let res = self

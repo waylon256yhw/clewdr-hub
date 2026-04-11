@@ -108,9 +108,9 @@ pub enum ClewdrError {
     #[snafu(display("ParseInt error: {}", source))]
     #[snafu(context(false))]
     ParseIntError { source: std::num::ParseIntError },
-    #[snafu(display("Cookie dispatch error: {}", source))]
+    #[snafu(display("Account dispatch error: {}", source))]
     #[snafu(context(false))]
-    CookieDispatchError { source: oneshot::error::RecvError },
+    AccountDispatchError { source: oneshot::error::RecvError },
     #[snafu(display("All upstream accounts are temporarily unavailable"))]
     UpstreamCoolingDown,
     #[snafu(display("No valid upstream accounts available"))]

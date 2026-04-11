@@ -62,7 +62,7 @@ export interface Paginated<T> {
 export interface OverviewResponse {
   version: string;
   server_time: string;
-  cookies: { valid: number; exhausted: number; invalid: number };
+  pool: { valid: number; exhausted: number; invalid: number };
   users: { total: number; admins: number; members: number; disabled: number };
   api_keys: { total: number; active: number; disabled: number };
   accounts: {

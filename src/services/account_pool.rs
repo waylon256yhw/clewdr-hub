@@ -45,8 +45,6 @@ enum AccountPoolMessage {
         RpcReplyPort<Result<AccountSlot, ClewdrError>>,
     ),
     GetStatus(RpcReplyPort<AccountPoolStatus>),
-    Delete(AccountSlot, RpcReplyPort<Result<(), ClewdrError>>),
-    Update1mSupport(AccountSlot, RpcReplyPort<Result<(), ClewdrError>>),
     ReloadFromDb,
     ProbeAll(RpcReplyPort<Vec<i64>>),
     ProbeAccounts(
@@ -500,62 +498,6 @@ impl AccountPoolActor {
         }
     }
 
-    fn delete(state: &mut AccountPoolState, cookie: AccountSlot) -> Result<(), ClewdrError> {
-        let mut found = false;
-        state.valid.retain(|c| {
-            found |= *c == cookie;
-            *c != cookie
-        });
-        let useless = InvalidAccountSlot::new(cookie.cookie.clone(), Reason::Null);
-        found |= state.exhausted.remove(&cookie) | state.invalid.remove(&useless);
-
-        if found {
-            Self::log(state);
-            Ok(())
-        } else {
-            Err(ClewdrError::UnexpectedNone {
-                msg: "Delete operation did not find the cookie",
-            })
-        }
-    }
-
-    fn update_1m_support(
-        state: &mut AccountPoolState,
-        cookie: AccountSlot,
-    ) -> Result<(), ClewdrError> {
-        if let Some(existing) = state.valid.iter_mut().find(|c| **c == cookie) {
-            existing.supports_claude_1m_sonnet = cookie.supports_claude_1m_sonnet;
-            existing.supports_claude_1m_opus = cookie.supports_claude_1m_opus;
-            let aid = existing.account_id;
-            Self::mark_dirty(state, aid);
-            return Ok(());
-        }
-
-        if !state.exhausted.is_empty() {
-            let mut updated = false;
-            let mut updated_id = None;
-            let mut new_exhausted = HashSet::with_capacity(state.exhausted.len());
-            for mut existing in state.exhausted.drain() {
-                if existing == cookie {
-                    existing.supports_claude_1m_sonnet = cookie.supports_claude_1m_sonnet;
-                    existing.supports_claude_1m_opus = cookie.supports_claude_1m_opus;
-                    updated = true;
-                    updated_id = existing.account_id;
-                }
-                new_exhausted.insert(existing);
-            }
-            state.exhausted = new_exhausted;
-            if updated {
-                Self::mark_dirty(state, updated_id);
-                return Ok(());
-            }
-        }
-
-        Err(ClewdrError::UnexpectedNone {
-            msg: "Update operation did not find the cookie",
-        })
-    }
-
     async fn do_flush(state: &mut AccountPoolState) {
         if state.dirty.is_empty() {
             return;
@@ -824,14 +766,7 @@ impl Actor for AccountPoolActor {
                 let status_info = Self::report(state);
                 reply_port.send(status_info)?;
             }
-            AccountPoolMessage::Delete(cookie, reply_port) => {
-                let result = Self::delete(state, cookie);
-                reply_port.send(result)?;
-            }
-            AccountPoolMessage::Update1mSupport(cookie, reply_port) => {
-                let result = Self::update_1m_support(state, cookie);
-                reply_port.send(result)?;
-            }
+
             AccountPoolMessage::ReloadFromDb => {
                 Self::do_reload(state).await;
             }
@@ -1025,28 +960,6 @@ impl AccountPoolHandle {
                 ),
             }
         })
-    }
-
-    pub async fn delete_cookie(&self, cookie: AccountSlot) -> Result<(), ClewdrError> {
-        ractor::call!(self.actor_ref, AccountPoolMessage::Delete, cookie).map_err(|e| {
-            ClewdrError::RactorError {
-                loc: Location::generate(),
-                msg: format!(
-                    "Failed to communicate with AccountPoolActor for delete operation: {e}"
-                ),
-            }
-        })?
-    }
-
-    pub async fn update_cookie_1m_support(&self, cookie: AccountSlot) -> Result<(), ClewdrError> {
-        ractor::call!(self.actor_ref, AccountPoolMessage::Update1mSupport, cookie).map_err(|e| {
-            ClewdrError::RactorError {
-                loc: Location::generate(),
-                msg: format!(
-                    "Failed to communicate with AccountPoolActor for update operation: {e}"
-                ),
-            }
-        })?
     }
 
     pub async fn reload_from_db(&self) -> Result<(), ClewdrError> {

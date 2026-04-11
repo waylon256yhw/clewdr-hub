@@ -12,7 +12,7 @@ use crate::stealth;
 pub struct OverviewResponse {
     pub version: String,
     pub server_time: String,
-    pub cookies: CookieOverview,
+    pub pool: PoolOverview,
     pub users: UserOverview,
     pub api_keys: KeyOverview,
     pub accounts: AccountOverview,
@@ -24,7 +24,7 @@ pub struct OverviewResponse {
 }
 
 #[derive(Serialize)]
-pub struct CookieOverview {
+pub struct PoolOverview {
     pub valid: usize,
     pub exhausted: usize,
     pub invalid: usize,
@@ -79,13 +79,13 @@ pub async fn overview(
 ) -> Result<Json<OverviewResponse>, ClewdrError> {
     let pool_status = pool_handle.get_status().await.ok();
 
-    let cookies = pool_status
-        .map(|s| CookieOverview {
+    let pool = pool_status
+        .map(|s| PoolOverview {
             valid: s.valid.len(),
             exhausted: s.exhausted.len(),
             invalid: s.invalid.len(),
         })
-        .unwrap_or(CookieOverview {
+        .unwrap_or(PoolOverview {
             valid: 0,
             exhausted: 0,
             invalid: 0,
@@ -163,7 +163,7 @@ pub async fn overview(
     Ok(Json(OverviewResponse {
         version: crate::VERSION_INFO.clone(),
         server_time: now.to_rfc3339(),
-        cookies,
+        pool,
         users: UserOverview {
             total: user_stats.0,
             admins: user_stats.1,
