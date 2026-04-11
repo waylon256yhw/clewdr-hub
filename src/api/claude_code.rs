@@ -77,13 +77,14 @@ pub async fn api_claude_code(
         )
         .await
         {
+            let (status, http_status) = error_to_log_status(&e);
             let err_msg = e.to_string();
             log_error_request(
                 &state,
                 &context,
                 RequestType::Messages,
-                "quota_rejected",
-                429,
+                status,
+                http_status,
                 &err_msg,
             )
             .await;

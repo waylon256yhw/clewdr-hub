@@ -208,6 +208,53 @@ async fn seed_current_week_cost(pool: &SqlitePool, user_id: i64, cost_nanousd: i
     .unwrap();
 }
 
+async fn seed_pure_oauth_account(pool: &SqlitePool, reset_time: Option<i64>) -> i64 {
+    let name = format!("oauth-{}", uuid::Uuid::new_v4().simple());
+    let expires_at = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+
+    let result = sqlx::query(
+        "INSERT INTO accounts (
+            name, rr_order, max_slots, status, auth_source,
+            oauth_access_token, oauth_refresh_token, oauth_expires_at, organization_uuid
+        ) VALUES (
+            ?1, (SELECT COALESCE(MAX(rr_order), 0) + 1 FROM accounts), 1, 'active', 'oauth',
+            ?2, ?3, ?4, ?5
+        )",
+    )
+    .bind(&name)
+    .bind("test-access-token")
+    .bind("test-refresh-token")
+    .bind(&expires_at)
+    .bind("org-test")
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let account_id = result.last_insert_rowid();
+    if let Some(reset_time) = reset_time {
+        sqlx::query("INSERT INTO account_runtime_state (account_id, reset_time) VALUES (?1, ?2)")
+            .bind(account_id)
+            .bind(reset_time)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    account_id
+}
+
+async fn latest_request_log(pool: &SqlitePool) -> (String, Option<i64>, Option<String>) {
+    sqlx::query_as::<_, (String, Option<i64>, Option<String>)>(
+        "SELECT status, http_status, error_message
+         FROM request_logs
+         ORDER BY id DESC
+         LIMIT 1",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn v1_models_list_is_public_and_seeded() {
     let app = setup_app(PolicyConfig::default()).await;
@@ -345,6 +392,58 @@ async fn v1_messages_rejects_when_weekly_quota_is_exceeded() {
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     let body = response_json(response).await;
     assert_eq!(error_message(&body), "Usage quota exceeded");
+}
+
+#[tokio::test]
+async fn v1_messages_logs_quota_db_failures_as_internal_error() {
+    let app = setup_app(PolicyConfig {
+        weekly_budget_nanousd: 100,
+        ..PolicyConfig::default()
+    })
+    .await;
+    sqlx::query("DROP TABLE usage_rollups")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+
+    let response = app
+        .request(
+            Method::POST,
+            "/v1/messages",
+            Some(real_message_body()),
+            Some(("x-api-key", app.api_key.as_str())),
+            &[],
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let (status, http_status, error_message) = latest_request_log(&app.pool).await;
+    assert_eq!(status, "internal_error");
+    assert_eq!(http_status, Some(500));
+    assert!(error_message.unwrap().contains("usage_rollups"));
+}
+
+#[tokio::test]
+async fn v1_messages_returns_429_for_pure_oauth_accounts_in_cooldown() {
+    let app = setup_app(PolicyConfig::default()).await;
+    seed_pure_oauth_account(&app.pool, Some(chrono::Utc::now().timestamp() + 300)).await;
+
+    let response = app
+        .request(
+            Method::POST,
+            "/v1/messages",
+            Some(real_message_body()),
+            Some(("x-api-key", app.api_key.as_str())),
+            &[],
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = response_json(response).await;
+    assert_eq!(
+        error_message(&body),
+        "All upstream accounts are temporarily unavailable"
+    );
 }
 
 #[tokio::test]

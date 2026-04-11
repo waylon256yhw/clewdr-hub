@@ -10,7 +10,7 @@ use super::LLMProvider;
 use crate::{
     billing::BillingContext,
     claude_code_state::ClaudeCodeState,
-    db::accounts::{AccountWithRuntime, load_pure_oauth_accounts},
+    db::accounts::{AccountWithRuntime, is_temporarily_unavailable, load_all_accounts},
     error::ClewdrError,
     middleware::claude::ClaudeContext,
     services::account_pool::AccountPoolHandle,
@@ -143,6 +143,44 @@ impl ClaudeSharedState {
             oauth_pool: Arc::new(OAuthAccountPool::default()),
         }
     }
+
+    async fn acquire_pure_oauth_account(
+        &self,
+        bound_account_ids: &[i64],
+    ) -> Result<(Option<AccountWithRuntime>, bool), ClewdrError> {
+        let relevant_accounts: Vec<_> = load_all_accounts(&self.db)
+            .await?
+            .into_iter()
+            .filter(|account| {
+                !matches!(account.status.as_str(), "auth_error" | "disabled")
+                    && account.auth_source == "oauth"
+                    && account.oauth_token.is_some()
+                    && (bound_account_ids.is_empty() || bound_account_ids.contains(&account.id))
+            })
+            .collect();
+
+        let available_accounts: Vec<_> = relevant_accounts
+            .iter()
+            .filter(|account| !is_temporarily_unavailable(account))
+            .cloned()
+            .collect();
+        let acquired = self.oauth_pool.acquire(&available_accounts).await;
+        let temporarily_unavailable = relevant_accounts.iter().any(is_temporarily_unavailable)
+            || (!available_accounts.is_empty() && acquired.is_none());
+
+        Ok((acquired, temporarily_unavailable))
+    }
+}
+
+fn reconcile_oauth_fallback_error(
+    err: ClewdrError,
+    oauth_temporarily_unavailable: bool,
+) -> ClewdrError {
+    if oauth_temporarily_unavailable && matches!(err, ClewdrError::NoValidUpstreamAccounts) {
+        ClewdrError::UpstreamCoolingDown
+    } else {
+        err
+    }
 }
 
 #[derive(Clone)]
@@ -200,15 +238,11 @@ impl LLMProvider for ClaudeCodeProvider {
         state.bound_account_ids = request.context.bound_account_ids.clone();
         state.oauth_pool = Some(self.shared.oauth_pool.clone());
 
-        if let Some(account) = self
+        let (oauth_account, oauth_temporarily_unavailable) = self
             .shared
-            .oauth_pool
-            .acquire(
-                &load_pure_oauth_accounts(&self.shared.db, &request.context.bound_account_ids)
-                    .await?,
-            )
-            .await
-        {
+            .acquire_pure_oauth_account(&request.context.bound_account_ids)
+            .await?;
+        if let Some(account) = oauth_account {
             state.account_id = Some(account.id);
             state.oauth_token = account.oauth_token.clone();
             state.organization_uuid = account.organization_uuid.clone();
@@ -244,6 +278,8 @@ impl LLMProvider for ClaudeCodeProvider {
                 let response = match state.try_chat(params).await {
                     Ok(response) => response,
                     Err(err) => {
+                        let err =
+                            reconcile_oauth_fallback_error(err, oauth_temporarily_unavailable);
                         warn!("[ERR] {}", err);
                         return Err(err);
                     }
@@ -262,7 +298,9 @@ impl LLMProvider for ClaudeCodeProvider {
                     params.model.green()
                 );
                 let stopwatch = Instant::now();
-                let response = state.try_count_tokens(params).await?;
+                let response = state.try_count_tokens(params).await.map_err(|err| {
+                    reconcile_oauth_fallback_error(err, oauth_temporarily_unavailable)
+                })?;
                 let elapsed = stopwatch.elapsed();
                 info!(
                     "[TOKENS] elapsed: {}s",
@@ -281,4 +319,22 @@ pub fn build_providers(
     event_tx: broadcast::Sender<AdminEvent>,
 ) -> ClaudeProviders {
     ClaudeProviders::new(account_pool_handle, db, stealth_profile, event_tx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reconcile_oauth_fallback_error;
+    use crate::error::ClewdrError;
+
+    #[test]
+    fn oauth_temporary_fallback_upgrades_cookie_503_to_429() {
+        let err = reconcile_oauth_fallback_error(ClewdrError::NoValidUpstreamAccounts, true);
+        assert!(matches!(err, ClewdrError::UpstreamCoolingDown));
+    }
+
+    #[test]
+    fn oauth_fallback_leaves_other_errors_unchanged() {
+        let err = reconcile_oauth_fallback_error(ClewdrError::QuotaExceeded, true);
+        assert!(matches!(err, ClewdrError::QuotaExceeded));
+    }
 }
