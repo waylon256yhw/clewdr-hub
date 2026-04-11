@@ -344,16 +344,12 @@ pub async fn check_quota(
 
     if let Some(budget) = weekly_budget.filter(|&b| b > 0) {
         let (week_start, _) = current_week_bounds(now);
-        let current =
-            match crate::db::billing::get_current_period_cost(db, user_id, "week", &week_start)
-                .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("Quota check DB error (weekly), failing open: {e}");
-                    0
-                }
-            };
+        let current = crate::db::billing::get_current_period_cost(db, user_id, "week", &week_start)
+            .await
+            .map_err(|e| {
+                warn!("Quota check DB error (weekly), failing closed: {e}");
+                e
+            })?;
         if current >= budget {
             return Err(crate::error::ClewdrError::QuotaExceeded);
         }
@@ -362,15 +358,12 @@ pub async fn check_quota(
     if let Some(budget) = monthly_budget.filter(|&b| b > 0) {
         let (month_start, _) = current_month_bounds(now);
         let current =
-            match crate::db::billing::get_current_period_cost(db, user_id, "month", &month_start)
+            crate::db::billing::get_current_period_cost(db, user_id, "month", &month_start)
                 .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("Quota check DB error (monthly), failing open: {e}");
-                    0
-                }
-            };
+                .map_err(|e| {
+                    warn!("Quota check DB error (monthly), failing closed: {e}");
+                    e
+                })?;
         if current >= budget {
             return Err(crate::error::ClewdrError::QuotaExceeded);
         }
