@@ -1,5 +1,24 @@
 # Release Notes
 
+## v1.0.15
+
+### 修复
+
+- 配额检查改为 fail-closed：数据库查询失败时返回 500 而非放行请求。
+- 修复纯 OAuth 账号全部冷却时误返回 503（永久不可用）的问题，现在正确返回 429 并附带 `retry-after`。
+- 修复配额超限场景下请求日志将数据库错误误标为 `quota_rejected/429` 的问题，现在按实际错误状态记录。
+
+### 变更
+
+- 错误语义重构：移除 `NoCookieAvailable` 等 cookie 语义错误，替换为 `UpstreamCoolingDown`（429）和 `NoValidUpstreamAccounts`（503），`dispatch()` 根据池状态区分临时与永久不可用。
+- 全局命名迁移：cookie-centric 抽象统一迁移到 account pool 语义，涉及类型、方法、模块名、注释（14 文件）。
+- 管理后台 `/api/admin/overview` 响应中 `cookies` 字段更名为 `pool`。
+- 移除无调用者的死代码：`delete_cookie()`、`update_cookie_1m_support()` 及对应 actor 消息。
+
+### 测试
+
+- 新增首套后端集成测试（10 个用例），覆盖 `/v1/messages` 鉴权、配额、OAuth 冷却降级、`/v1/models` 列表等路径。
+
 ## v1.0.14
 
 ### 变更
