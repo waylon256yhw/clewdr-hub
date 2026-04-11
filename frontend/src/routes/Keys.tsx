@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Title,
@@ -16,9 +16,9 @@ import {
   Skeleton,
   Alert,
   ScrollArea,
-  CopyButton,
   Code,
   Tooltip,
+  Textarea,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
@@ -27,6 +27,7 @@ import {
   IconCopy,
   IconCheck,
   IconLink,
+  IconEye,
 } from "@tabler/icons-react";
 import {
   listKeys,
@@ -39,7 +40,15 @@ import {
   ApiError,
   type KeyRow,
 } from "../api";
+import { copyText, getCopyFailureMessage, selectTextField } from "../lib/clipboard";
 import { formatDate } from "../lib/format";
+
+function notifyCopyFailure(prefix: string, error: unknown) {
+  notifications.show({
+    message: `${prefix}${getCopyFailureMessage(error)}`,
+    color: "yellow",
+  });
+}
 
 function CreateKeyModal({
   opened,
@@ -55,6 +64,8 @@ function CreateKeyModal({
   const [label, setLabel] = useState("");
   const [boundIds, setBoundIds] = useState<string[]>([]);
   const [newKey, setNewKey] = useState<string | null>(null);
+  const [newKeyCopied, setNewKeyCopied] = useState(false);
+  const newKeyFieldRef = useRef<HTMLTextAreaElement | null>(null);
 
   const mutation = useMutation({
     mutationFn: () => createKey({
@@ -62,17 +73,42 @@ function CreateKeyModal({
       label: label || undefined,
       bound_account_ids: boundIds.length > 0 ? boundIds.map(Number) : undefined,
     }),
-    onSuccess: (res) => {
+    onSuccess: async (res) => {
       setNewKey(res.plaintext_key);
+      setNewKeyCopied(false);
       queryClient.invalidateQueries({ queryKey: ["keys"] });
       queryClient.invalidateQueries({ queryKey: qk.overview });
+
+      try {
+        await copyText(res.plaintext_key);
+        setNewKeyCopied(true);
+        notifications.show({ message: "Key 已生成并复制", color: "green" });
+      } catch (error) {
+        window.setTimeout(() => selectTextField(newKeyFieldRef.current), 0);
+        notifyCopyFailure("Key 已生成，但自动复制失败。", error);
+      }
     },
     onError: (e) =>
       notifications.show({ message: e instanceof ApiError ? e.message : "创建失败", color: "red" }),
   });
 
+  const handleNewKeyCopy = async () => {
+    if (!newKey) return;
+
+    try {
+      await copyText(newKey);
+      setNewKeyCopied(true);
+      notifications.show({ message: "Key 已复制", color: "green" });
+    } catch (error) {
+      setNewKeyCopied(false);
+      selectTextField(newKeyFieldRef.current);
+      notifyCopyFailure("复制失败，已自动选中文本。", error);
+    }
+  };
+
   const handleClose = () => {
     setNewKey(null);
+    setNewKeyCopied(false);
     setUserId(null);
     setLabel("");
     setBoundIds([]);
@@ -85,25 +121,39 @@ function CreateKeyModal({
   const accountOptions = accounts.map((a) => ({ value: String(a.id), label: a.name }));
 
   return (
-    <Modal opened={opened} onClose={handleClose} title="创建 API Key">
+    <Modal
+      opened={opened}
+      onClose={handleClose}
+      title="创建 API Key"
+      size={newKey ? "sm" : "md"}
+      centered
+    >
       <Stack>
         {newKey ? (
           <>
-            <Alert color="green" title="Key 已生成 — 仅显示一次！">
-              <Code block style={{ wordBreak: "break-all" }}>{newKey}</Code>
+            <Alert
+              color={newKeyCopied ? "green" : "yellow"}
+              title={newKeyCopied ? "已自动复制" : "请复制并保存"}
+            >
+              <Textarea
+                ref={newKeyFieldRef}
+                value={newKey}
+                readOnly
+                minRows={2}
+                maxRows={2}
+                styles={{ input: { fontFamily: "monospace", wordBreak: "break-all" } }}
+              />
             </Alert>
-            <CopyButton value={newKey}>
-              {({ copied, copy }) => (
-                <Button
-                  fullWidth
-                  color={copied ? "teal" : "blue"}
-                  leftSection={copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
-                  onClick={copy}
-                >
-                  {copied ? "已复制" : "复制 Key"}
-                </Button>
-              )}
-            </CopyButton>
+            <Group grow>
+              <Button
+                color={newKeyCopied ? "teal" : "blue"}
+                leftSection={newKeyCopied ? <IconCheck size={16} /> : <IconCopy size={16} />}
+                onClick={handleNewKeyCopy}
+              >
+                {newKeyCopied ? "已复制" : "复制 Key"}
+              </Button>
+              <Button variant="default" onClick={handleClose}>我已保存</Button>
+            </Group>
           </>
         ) : (
           <>
@@ -202,6 +252,9 @@ export default function Keys() {
   const [createOpened, setCreateOpened] = useState(false);
   const [deleting, setDeleting] = useState<KeyRow | null>(null);
   const [binding, setBinding] = useState<KeyRow | null>(null);
+  const [revealed, setRevealed] = useState<KeyRow | null>(null);
+  const [revealedCopied, setRevealedCopied] = useState(false);
+  const revealedFieldRef = useRef<HTMLTextAreaElement | null>(null);
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["keys"],
@@ -221,6 +274,26 @@ export default function Keys() {
   });
 
   const keys: KeyRow[] = data?.items ?? [];
+  const insecureContext = typeof window !== "undefined" && !window.isSecureContext;
+
+  const handleRevealCopy = async () => {
+    if (!revealed?.plaintext_key) return;
+
+    try {
+      await copyText(revealed.plaintext_key);
+      setRevealedCopied(true);
+      notifications.show({ message: "Key 已复制", color: "green" });
+    } catch (error) {
+      setRevealedCopied(false);
+      selectTextField(revealedFieldRef.current);
+      notifyCopyFailure("复制失败，已自动选中文本。", error);
+    }
+  };
+
+  const closeRevealModal = () => {
+    setRevealed(null);
+    setRevealedCopied(false);
+  };
 
   return (
     <>
@@ -230,6 +303,12 @@ export default function Keys() {
           创建密钥
         </Button>
       </Group>
+
+      {insecureContext && (
+        <Alert color="yellow" variant="light" mb="md">
+          当前访问不是安全上下文，复制可能被浏览器拦截。
+        </Alert>
+      )}
 
       {isLoading ? (
         <Skeleton height={300} />
@@ -256,15 +335,7 @@ export default function Keys() {
                 <Table.Tr key={k.id}>
                   <Table.Td>
                     {k.plaintext_key ? (
-                      <CopyButton value={k.plaintext_key}>
-                        {({ copied, copy }) => (
-                          <Tooltip label={copied ? "已复制" : "点击复制完整 Key"}>
-                            <Code style={{ cursor: "pointer" }} onClick={copy}>
-                              {copied ? "已复制!" : `sk-${k.lookup_key}...`}
-                            </Code>
-                          </Tooltip>
-                        )}
-                      </CopyButton>
+                      <Code>{`sk-${k.lookup_key}...`}</Code>
                     ) : (
                       <Code>sk-{k.lookup_key}...</Code>
                     )}
@@ -290,6 +361,20 @@ export default function Keys() {
                           <IconLink size={14} />
                         </ActionIcon>
                       </Tooltip>
+                      {k.plaintext_key && (
+                        <Tooltip label="查看/复制">
+                          <ActionIcon
+                            variant="subtle"
+                            size="sm"
+                            onClick={() => {
+                              setRevealed(k);
+                              setRevealedCopied(false);
+                            }}
+                          >
+                            <IconEye size={14} />
+                          </ActionIcon>
+                        </Tooltip>
+                      )}
                       <Tooltip label="删除">
                         <ActionIcon variant="subtle" color="red" size="sm" onClick={() => setDeleting(k)}>
                           <IconTrash size={14} />
@@ -306,6 +391,40 @@ export default function Keys() {
 
       <CreateKeyModal opened={createOpened} onClose={() => setCreateOpened(false)} />
       <BindingsModal key={binding?.id ?? "none"} keyItem={binding} onClose={() => setBinding(null)} />
+
+      <Modal
+        opened={!!revealed}
+        onClose={closeRevealModal}
+        title={revealed?.label || "查看 / 复制"}
+        size="sm"
+        centered
+      >
+        <Stack>
+          <Alert
+            color={revealedCopied ? "green" : "yellow"}
+            title={revealedCopied ? "已复制" : "完整 Key"}
+          >
+            <Textarea
+              ref={revealedFieldRef}
+              value={revealed?.plaintext_key ?? ""}
+              readOnly
+              minRows={2}
+              maxRows={2}
+              styles={{ input: { fontFamily: "monospace", wordBreak: "break-all" } }}
+            />
+          </Alert>
+          <Group grow>
+            <Button
+              color={revealedCopied ? "teal" : "blue"}
+              leftSection={revealedCopied ? <IconCheck size={16} /> : <IconCopy size={16} />}
+              onClick={handleRevealCopy}
+            >
+              {revealedCopied ? "已复制" : "复制 Key"}
+            </Button>
+            <Button variant="default" onClick={closeRevealModal}>关闭</Button>
+          </Group>
+        </Stack>
+      </Modal>
 
       <Modal opened={!!deleting} onClose={() => setDeleting(null)} title="删除密钥">
         <Stack>
