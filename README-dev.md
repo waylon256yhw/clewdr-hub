@@ -355,27 +355,10 @@ cargo install cargo-edit
 
 1. **确认工作区干净**：`git status` 应该只剩需要发版的已 commit 变更，`git log origin/master..HEAD` 看一眼待发布的 commit。
 
-2. **更新 `RELEASE_NOTES.md`**：在文件顶部（紧跟 `# Release Notes` 标题）插入新版条目，上一版保持原样往下排。模板：
-
-   ```markdown
-   ## vX.Y.Z
-
-   ### 新增
-   - ……
-
-   ### 变更
-   - ……
-
-   ### 修复
-   - ……
-   ```
-
-   三个小节按需保留。整个 `RELEASE_NOTES.md` 文件会被 CI 用作 GitHub Release 的正文，所以历史条目**不要**删。
-
-3. **运行 `./release.sh X.Y.Z`**（注意不带 `v` 前缀）：
+2. **运行 `./release.sh X.Y.Z`**（注意不带 `v` 前缀）：
 
    ```bash
-   ./release.sh 1.0.11
+   ./release.sh 1.0.16
    ```
 
    脚本依次执行：
@@ -385,12 +368,14 @@ cargo install cargo-edit
    - `cargo test`
    - `cd frontend && npm ci && npm run build`（产物写到 `static/`）
    - `cargo check`
-   - `git add RELEASE_NOTES.md Cargo.toml Cargo.lock && git commit -m "Update to vX.Y.Z"`
+   - `git add Cargo.toml Cargo.lock && git commit -m "Update to vX.Y.Z"`
    - `git push`（推 master）
    - `git tag -a vX.Y.Z -m "Release vX.Y.Z"`
    - `git push origin vX.Y.Z`（推 tag）
 
    任何一步失败会直接 `set -e` 退出；失败后按下面的「失败恢复」处理。
+
+   Changelog 不需要手动维护——CI 会通过 git-cliff 从 conventional commits 自动生成当前版本的变更日志作为 GitHub Release body。
 
 4. **验证 CI**：
 
@@ -412,12 +397,12 @@ cargo install cargo-edit
 | `cargo test` / 前端构建 / `cargo check` 失败 | 修代码 → `git add` → `git commit --amend` 或新 commit → 重新跑 `./release.sh`。此时 Cargo.toml 里已经是目标版本，`cargo set-version` 幂等，不会冲突。 |
 | 脚本跑到一半（已 commit 未 push）失败 | 检查 `git log`，如果「Update to vX.Y.Z」这个 commit 已经存在且内容正确，直接手动执行剩余的 `git push`、`git tag`、`git push origin vX.Y.Z`。 |
 | tag 已推送但 CI 构建失败 | 先在 GitHub 上删掉对应 release 和 tag：`gh release delete vX.Y.Z --yes --cleanup-tag`；本地 `git tag -d vX.Y.Z`；修 bug → 补 commit → 重新 `./release.sh X.Y.Z`（版本号不变，因为原 tag 没有任何东西依赖它）。 |
-| 只是 RELEASE_NOTES 写错 | Release 创建后，用 `gh release edit vX.Y.Z --notes-file RELEASE_NOTES.md` 更新 body；不需要重打 tag。 |
+| Release body 内容有误 | Release 创建后，用 `gh release edit vX.Y.Z --notes "corrected content"` 更新 body；不需要重打 tag。 |
 
 #### 设计说明
 
 - **脚本不自建 GitHub Release**：创建动作完全委托给 `build.yml` 里的 `softprops/action-gh-release@v2`，避免本地 `gh release create` 和 CI 并发创建导致冲突。
-- **Release body = 整个 `RELEASE_NOTES.md`**：历史条目会累积，GitHub 页面用户能在一处看到所有版本变更，不需要翻 tag diff。
+- **Release body 由 git-cliff 自动生成**：CI 中通过 `orhun/git-cliff-action` 从上一个 tag 到当前 tag 之间的 conventional commits 生成 changelog，只包含当前版本的变更。配置见 `cliff.toml`。
 - **版本号同时写在 `Cargo.toml` 和 `Cargo.lock`**：`cargo set-version` 两处都改；手动 bump 时别漏了 `Cargo.lock` 第二处 `[[package]] name = "clewdr-hub"` 的 `version` 字段。
 
 ### pre-commit hook

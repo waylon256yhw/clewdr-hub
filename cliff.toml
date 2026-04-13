@@ -1,0 +1,34 @@
+[changelog]
+header = ""
+body = """
+{%- for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {{ commit.message | split(pat="\n") | first | trim }}\
+{% endfor %}
+{% endfor -%}
+"""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+commit_parsers = [
+    { message = "^feat", group = "新增" },
+    { message = "^fix", group = "修复" },
+    { message = "^refactor", group = "变更" },
+    { message = "^perf", group = "变更" },
+    { message = "^test", group = "测试" },
+    { message = "^doc", group = "文档" },
+    { message = "^style", group = "变更" },
+    { message = "^chore", group = "变更" },
+    { message = "^ci", skip = true },
+    { message = "^Update to v", skip = true },
+    { message = "^Bump version", skip = true },
+    { message = "^Update Cargo", skip = true },
+    { body = ".*", group = "其他变更" },
+]
+filter_commits = false
+tag_pattern = "v[0-9].*"
+skip_tags = ""
+sort_commits = "newest"

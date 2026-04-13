@@ -10,7 +10,7 @@ cargo set-version $VERSION
 cargo test
 (cd frontend && npm ci && npm run build)
 cargo check
-git add RELEASE_NOTES.md Cargo.toml Cargo.lock
+git add Cargo.toml Cargo.lock
 git commit -m "Update to v$VERSION"
 git push
 git tag -a "v$VERSION" -m "Release v$VERSION"

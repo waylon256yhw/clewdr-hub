@@ -219,8 +219,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: master # Ensure we get the latest master with RELEASE_NOTES.md
-          fetch-depth: 0 # Full history for consistency
+          ref: master
+          fetch-depth: 0
+
+      - name: Generate changelog
+        id: changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest --strip header
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -235,7 +242,7 @@ jobs:
         with:
           files: artifacts/**/${{ env.BIN_NAME }}*.zip
           name: ${{ github.ref_name }}
-          body_path: RELEASE_NOTES.md # Use release notes file
+          body: ${{ steps.changelog.outputs.content }}
           draft: false
           prerelease: false
           fail_on_unmatched_files: true
