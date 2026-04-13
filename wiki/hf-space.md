@@ -1,118 +1,71 @@
-# ClewdR 部署到 huggingface space
+### 教程：将 clewdr-hub 部署到 Hugging Face Space
 
-**ClewdR** 是一个高性能、功能丰富的 Claude 逆向代理实现，使用 Rust 语言完全重写，旨在克服原版 Clewd 修改版 的局限性。ClewdR 设计注重速度、可靠性和易用性，为用户提供与 Claude AI 模型交互的无缝体验，同时显著改善用户体验。
+#### 步骤 1：创建 Space
 
-## 开始
+1. 前往 [HF Space](https://hf.space)，点击 **New space**。
+2. 填写 Space 名称，Space SDK 选择 **Docker**，可见性按需选择。
+3. 点击创建。
 
-### 创建空间
+#### 步骤 2：上传 Dockerfile
 
-1. 前往 [HF Space](https://hf.space) 点击右侧的 **New space** 创建一个空间
+1. 下载 [Dockerfile.huggingface](https://github.com/waylon256yhw/clewdr-hub/blob/master/Dockerfile.huggingface)。
+2. 重命名为 `Dockerfile`。
+3. 上传到 Space 的 Files 中。
 
-![](https://raw.githubusercontent.com/Goojoe/PicList/master/images/2025-04-26_15-14-31_651.avif)
+`Dockerfile.huggingface` 内容如下，直接基于预构建镜像，无需本地编译：
 
-2. 填写详情页
+```dockerfile
+FROM ghcr.io/waylon256yhw/clewdr-hub:latest
 
-![](https://raw.githubusercontent.com/Goojoe/PicList/master/images/2025-04-26_15-14-35_000.avif)
+ENV CLEWDR_IP=0.0.0.0
+ENV CLEWDR_PORT=${PORT:-7860}
+ENV CLEWDR_NO_FS=TRUE
 
-![](https://raw.githubusercontent.com/Goojoe/PicList/master/images/2025-04-26_15-14-37_973.avif)
-
-### 上传 Dockerfile
-
-![](https://raw.githubusercontent.com/Goojoe/PicList/master/images/2025-04-26_15-14-41_795.avif)
-
-![](https://raw.githubusercontent.com/Goojoe/PicList/master/images/2025-04-26_15-14-44_914.avif)
-
-### [下载 Dockerfile.huggingface](https://github.com/Xerxes-2/clewdr/blob/master/Dockerfile.huggingface)
-
-手动重命名为`Dockerfile`并上传
-![](https://raw.githubusercontent.com/Goojoe/PicList/master/images/2025-04-26_15-14-48_851.avif)
-
-状态为 Running 后打开日志
-![](https://raw.githubusercontent.com/Goojoe/PicList/master/images/2025-04-26_15-14-52_190.avif)
-![](https://raw.githubusercontent.com/Goojoe/PicList/master/images/2025-04-26_15-14-56_188.avif)
-
-`LLM API Password` 为请求 API 的密码
-`Web Admin Password` 为前端管理密码
-
-### API 地址
-
-![](https://raw.githubusercontent.com/Goojoe/PicList/master/images/2025-04-26_15-14-58_660.avif)
-![](https://raw.githubusercontent.com/Goojoe/PicList/master/images/2025-04-26_15-15-02_846.avif)
-
-复制后加上`/v1`后缀即可在酒馆使用,为 claude 加反向代理
-
-举例 API 地址
-
-```
-https://3v4pyve7-clewdr.hf.space/v1
+EXPOSE ${PORT:-7860}
 ```
 
-认证令牌为上文的 `LLM API Password`
+#### 步骤 3：配置环境变量
 
-如果你不想每次重启都要手动加 cookie,请继续看下面的**自定义变量**
+在 Space 的 **Settings → Variables and secrets** 中配置：
 
-### 自定义变量
+| 变量 | 建议位置 | 说明 |
+|------|----------|------|
+| `ADMIN_PASSWORD` | Secrets | 管理员密码（首次登录后强制修改） |
 
-![](https://raw.githubusercontent.com/Goojoe/PicList/master/images/2025-04-26_15-15-05_524.avif)
+其他配置通过管理后台操作，不需要环境变量。
 
-![](https://raw.githubusercontent.com/Goojoe/PicList/master/images/2025-04-26_15-15-08_059.avif)
+#### 步骤 4：等待构建完成
 
-配置如下
+状态变为 **Running** 后即可访问。打开 Space 页面就是管理后台。
 
-> 注意!!! 隐私信息比如 密码 Cookie 请填到 Secrets 里
+#### 步骤 5：初始配置
 
-简单配置
+1. 使用 `ADMIN_PASSWORD` 设置的密码登录管理后台（默认 `password`，首次登录强制改密）。
+2. **账号池** → 添加 Cookie 或 OAuth 账号。
+3. **用户** → 创建团队成员，分配策略。
+4. **API Keys** → 为每个用户创建 Key。
 
-```env
-CLEWDR_COOKIE_ARRAY=[[cookie1],[cookie2]]
-CLEWDR_PASSWORD=your_secure_password
-CLEWDR_ADMIN_PASSWORD=your_admin_password
-```
+#### 步骤 6：客户端配置
 
-由于此cookie多个添加方法有些不同，可以使用js来批量处理(浏览器F12控制台运行)，可处理多行和`,`分割的格式
-
-```
-(async function() {
-  const raw = `
-sk-ant-sidXX-CV27
-sk-ant-sidXX-XYZ9
-`.trim(); // ← 替换为你的 cookie 原始输入
-
-  const cookies = raw
-    .split('\n')
-    .flatMap(line => line.split(','))
-    .map(c => c.trim())
-    .filter(Boolean)
-    .map(c => [c]);
-
-  const json = JSON.stringify(cookies);
-  await navigator.clipboard.writeText(json);
-  console.log("已处理并复制到剪贴板：", json);
-})();
+API 地址为 Space 的 URL：
 
 ```
-
-完整默认配置文件
-
-```env
-clewdr_cookie_array = [[]]
-clewdr_wasted_cookie = [] #这个可以不用管
-clewdr_ip = "127.0.0.1" #此项禁止加入变量
-clewdr_port = 8484  #此项禁止加入变量
-clewdr_check_update = true
-clewdr_auto_update = false
-clewdr_password = "password"
-clewdr_admin_password = "password"
-clewdr_max_retries = 5
-clewdr_preserve_chats = false
-clewdr_skip_first_warning = false
-clewdr_skip_second_warning = false
-clewdr_skip_restricted = false
-clewdr_skip_non_pro = false
-clewdr_use_real_roles = true
-clewdr_custom_prompt = ""
+https://你的用户名-space名称.hf.space
 ```
 
-### 更新
+客户端配置：
 
-前往 Settings -> Factory rebuild 点击按钮即可
+```bash
+export ANTHROPIC_BASE_URL=https://你的用户名-space名称.hf.space
+export ANTHROPIC_API_KEY=sk-...    # 从后台创建的 Key
+```
+
+#### 更新
+
+前往 Space 的 **Settings → Factory rebuild** 点击按钮即可拉取最新镜像。
+
+#### 注意事项
+
+- HF Space 模式下启用 `CLEWDR_NO_FS=TRUE`，配置和数据库存储在内存中，Space 重启后数据会丢失。
+- 如果需要持久化数据，建议使用 Docker Compose 或二进制部署方式。
+- HF Space 免费 tier 会在无流量时休眠，唤醒需要几秒。
