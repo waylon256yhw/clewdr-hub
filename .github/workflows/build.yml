@@ -10,9 +10,15 @@ on:
       - "**.md"
       - "LICENSE"
       - "deploy/**"
+      - "docs/**"
+      - "wiki/**"
       - "docker-compose.yml"
+      - "Dockerfile.huggingface"
       - ".github/**"
       - ".gitignore"
+      - "cliff.toml"
+      - "release.sh"
+      - "dev.sh"
   pull_request:
     branches:
       - master
@@ -20,9 +26,15 @@ on:
       - "**.md"
       - "LICENSE"
       - "deploy/**"
+      - "docs/**"
+      - "wiki/**"
       - "docker-compose.yml"
+      - "Dockerfile.huggingface"
       - ".github/**"
       - ".gitignore"
+      - "cliff.toml"
+      - "release.sh"
+      - "dev.sh"
   workflow_dispatch:
 
 env:
