@@ -126,7 +126,7 @@ jobs:
           echo "triple=${{ matrix.target_arch }}-${{matrix.target_vendor_sys_env}}" >> $GITHUB_OUTPUT
           rustup target add ${{ matrix.target_arch }}-${{matrix.target_vendor_sys_env}} && rustup update
 
-      - uses: nttld/setup-ndk@v1.5.0
+      - uses: nttld/setup-ndk@v1.6.0
         if: ${{ matrix.os == 'android' }}
         id: setup-ndk
         with:
