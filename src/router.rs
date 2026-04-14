@@ -141,8 +141,17 @@ impl RouterBuilder {
                     } else {
                         "application/octet-stream"
                     };
+                    // Hashed assets get long-lived cache; HTML gets no-cache for update freshness
+                    let cc = if path.starts_with("assets/") {
+                        "public, max-age=31536000, immutable"
+                    } else if path.ends_with(".html") {
+                        "no-cache"
+                    } else {
+                        "public, max-age=3600"
+                    };
                     return Response::builder()
                         .header(header::CONTENT_TYPE, ct)
+                        .header(header::CACHE_CONTROL, cc)
                         .body(axum::body::Body::from(file.contents()))
                         .unwrap();
                 }
@@ -155,6 +164,7 @@ impl RouterBuilder {
                 match INCLUDE_STATIC.get_file("index.html") {
                     Some(file) => Response::builder()
                         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                        .header(header::CACHE_CONTROL, "no-cache")
                         .body(axum::body::Body::from(file.contents()))
                         .unwrap(),
                     None => StatusCode::NOT_FOUND.into_response(),
@@ -188,8 +198,16 @@ impl RouterBuilder {
                         } else {
                             "application/octet-stream"
                         };
+                        let cc = if path.starts_with("assets/") {
+                            "public, max-age=31536000, immutable"
+                        } else if path.ends_with(".html") {
+                            "no-cache"
+                        } else {
+                            "public, max-age=3600"
+                        };
                         return Response::builder()
                             .header(header::CONTENT_TYPE, ct)
+                            .header(header::CACHE_CONTROL, cc)
                             .body(axum::body::Body::from(bytes))
                             .unwrap();
                     }
@@ -203,6 +221,7 @@ impl RouterBuilder {
                 match tokio::fs::read(INDEX_HTML).await {
                     Ok(bytes) => Response::builder()
                         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                        .header(header::CACHE_CONTROL, "no-cache")
                         .body(axum::body::Body::from(bytes))
                         .unwrap(),
                     Err(_) => StatusCode::NOT_FOUND.into_response(),

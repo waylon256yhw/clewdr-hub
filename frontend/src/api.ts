@@ -270,9 +270,6 @@ export const logout = () =>
 // Overview
 export const getOverview = () => apiFetch<OverviewResponse>("/api/admin/overview");
 
-// Version (no auth)
-export const getVersion = () => fetch("/api/version").then((r) => r.text());
-
 export interface AccountsListResponse {
   items: Account[];
   total: number;

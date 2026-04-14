@@ -9,13 +9,19 @@ import {
   Burger,
   Group,
   ActionIcon,
+  Alert,
+  Button,
+  SimpleGrid,
+  Skeleton,
+  Stack,
+  Text,
   useMantineColorScheme,
   useComputedColorScheme,
 } from "@mantine/core";
 import { Notifications } from "@mantine/notifications";
 import { useDisclosure } from "@mantine/hooks";
 import { Routes, Route, Navigate, useLocation, Link } from "react-router";
-import { Suspense, lazy, useEffect, useRef } from "react";
+import { Component, Suspense, lazy, useEffect, useRef, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   IconDashboard,
@@ -39,7 +45,72 @@ import Users from "./routes/Users";
 import Keys from "./routes/Keys";
 import Settings from "./routes/Settings";
 import Logs from "./routes/Logs";
-const Ops = lazy(() => import("./routes/Ops"));
+async function retryImport<T>(fn: () => Promise<T>, retries = 2): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (retries <= 0) throw err;
+    await new Promise((r) => setTimeout(r, 1000));
+    return retryImport(fn, retries - 1);
+  }
+}
+
+const Ops = lazy(() => retryImport(() => import("./routes/Ops")));
+
+// Catches failures inside the Ops subtree — lazy chunk load errors AND render
+// errors (e.g. recharts choking on mobile viewport). Named "Ops" not "Chunk"
+// because the scope is broader than just code-splitting failures.
+class OpsErrorBoundary extends Component<
+  { children: ReactNode },
+  { hasError: boolean }
+> {
+  state = { hasError: false };
+
+  static getDerivedStateFromError(): { hasError: boolean } {
+    return { hasError: true };
+  }
+
+  override componentDidCatch(error: Error, info: React.ErrorInfo) {
+    // Log in production too — white-screen reports are useless without this.
+    console.error("[OpsErrorBoundary] caught error:", error, info.componentStack);
+  }
+
+  override render() {
+    if (this.state.hasError) {
+      return (
+        <Alert color="red" title="页面加载失败" variant="light">
+          <Stack gap="xs" align="flex-start">
+            <Text size="sm">资源加载失败，请刷新页面重试。</Text>
+            <Button size="xs" onClick={() => window.location.reload()}>
+              刷新页面
+            </Button>
+          </Stack>
+        </Alert>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// NOTE: kept in sync manually with the in-component skeleton in Ops.tsx.
+// Do NOT import from Ops.tsx — that would pull this into the lazy chunk,
+// defeating the whole point of having a fallback during chunk loading.
+function OpsSkeleton() {
+  return (
+    <>
+      <Title order={3} mb="md">运维</Title>
+      <SimpleGrid cols={{ base: 1, sm: 2, xl: 4 }} spacing="md">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <Skeleton key={i} height={108} radius="md" />
+        ))}
+      </SimpleGrid>
+      <SimpleGrid cols={{ base: 1, xl: 2 }} spacing="md" mt="md">
+        <Skeleton height={360} radius="md" />
+        <Skeleton height={360} radius="md" />
+      </SimpleGrid>
+    </>
+  );
+}
 
 const NAV_ITEMS = [
   { label: "总览", path: "/", icon: IconDashboard },
@@ -163,9 +234,11 @@ function AdminShell() {
           <Route
             path="/ops"
             element={(
-              <Suspense fallback={null}>
-                <Ops />
-              </Suspense>
+              <OpsErrorBoundary>
+                <Suspense fallback={<OpsSkeleton />}>
+                  <Ops />
+                </Suspense>
+              </OpsErrorBoundary>
             )}
           />
           <Route path="*" element={<Navigate to="/" replace />} />

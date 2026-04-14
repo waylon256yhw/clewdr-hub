@@ -21,7 +21,6 @@ export default function Dashboard() {
     queryFn: getOverview,
     refetchInterval: 30_000,
   });
-
   if (isLoading) {
     return (
       <>
@@ -116,12 +115,7 @@ export default function Dashboard() {
     <>
       <Group justify="space-between" mb="md">
         <Title order={3}>总览</Title>
-        <Group gap="xs">
-          <Text size="xs" c="dimmed">{data.version}</Text>
-          <ActionIcon variant="default" onClick={() => refetch()}>
-            <IconRefresh size={16} />
-          </ActionIcon>
-        </Group>
+        <Text size="xs" c="dimmed">{data.version}</Text>
       </Group>
       <SimpleGrid cols={{ base: 1, xs: 2, md: 3 }} spacing="md">
         {cards.map((card) => (
