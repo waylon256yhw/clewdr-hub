@@ -96,6 +96,7 @@ export interface Account {
   id: number;
   name: string;
   rr_order: number;
+  drain_first: boolean;
   status: string;
   auth_source: "cookie" | "oauth" | "hybrid";
   has_cookie: boolean;
@@ -286,6 +287,7 @@ export const createAccount = (data: {
   name: string;
   rr_order?: number;
   max_slots?: number;
+  drain_first?: boolean;
   auth_source?: "cookie" | "oauth" | "hybrid";
   cookie_blob?: string;
   oauth_callback_input?: string;

@@ -61,6 +61,7 @@ pub struct AccountResponse {
     pub id: i64,
     pub name: String,
     pub rr_order: i64,
+    pub drain_first: bool,
     pub status: String,
     pub auth_source: String,
     pub has_cookie: bool,
@@ -106,6 +107,7 @@ fn map_account(row: &AccountWithRuntime) -> AccountResponse {
         id: row.id,
         name: row.name.clone(),
         rr_order: row.rr_order,
+        drain_first: row.drain_first,
         status: row.status.clone(),
         auth_source: row.auth_source.clone(),
         has_cookie: row.cookie_blob.as_ref().is_some_and(|v| !v.is_empty()),
@@ -127,6 +129,7 @@ pub struct CreateAccountRequest {
     pub name: String,
     pub rr_order: Option<i64>,
     pub max_slots: Option<i64>,
+    pub drain_first: Option<bool>,
     pub auth_source: Option<String>,
     pub cookie_blob: Option<String>,
     pub oauth_callback_input: Option<String>,
@@ -139,6 +142,7 @@ pub struct UpdateAccountRequest {
     pub name: Option<String>,
     pub rr_order: Option<i64>,
     pub max_slots: Option<i64>,
+    pub drain_first: Option<bool>,
     pub status: Option<String>,
     pub auth_source: Option<String>,
     pub cookie_blob: Option<String>,
@@ -266,8 +270,9 @@ pub async fn create(
         "INSERT INTO accounts (
             name, rr_order, max_slots, status, auth_source, cookie_blob,
             oauth_access_token, oauth_refresh_token, oauth_expires_at,
-            organization_uuid, last_refresh_at, last_error, email, account_type
-        ) VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12)",
+            organization_uuid, last_refresh_at, last_error, email, account_type,
+            drain_first
+        ) VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?13)",
     )
     .bind(&req.name)
     .bind(rr_order)
@@ -290,6 +295,7 @@ pub async fn create(
             .as_ref()
             .and_then(|v| v.snapshot.account_type.as_deref()),
     )
+    .bind(req.drain_first.unwrap_or(false) as i64)
     .execute(&db)
     .await
     .map_err(|e| {
@@ -391,6 +397,15 @@ pub async fn update(
             "UPDATE accounts SET max_slots = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
         )
         .bind(slots)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if let Some(drain_first) = req.drain_first {
+        sqlx::query(
+            "UPDATE accounts SET drain_first = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        )
+        .bind(drain_first as i64)
         .bind(id)
         .execute(&mut *tx)
         .await?;

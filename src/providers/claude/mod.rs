@@ -67,7 +67,14 @@ struct ClaudeSharedState {
 #[derive(Default)]
 struct OAuthPoolState {
     inflight: HashMap<i64, (u32, u32)>,
-    cursor: Option<i64>,
+    /// Round-robin cursor for the `drain_first = true` subset.
+    drain_cursor: Option<i64>,
+    /// Round-robin cursor for the normal (non-drain_first) subset.
+    /// Tracked independently so that interleaved drain/normal acquires
+    /// do not reset each other's round-robin position to the head of the
+    /// subset (which would concentrate spillover load on the lowest-
+    /// `rr_order` normal account).
+    normal_cursor: Option<i64>,
 }
 
 #[derive(Default)]
@@ -95,22 +102,52 @@ impl OAuthAccountPool {
             .inflight
             .retain(|id, _| accounts.iter().any(|account| account.id == *id));
 
-        let start_idx = inner
-            .cursor
-            .and_then(|cursor| accounts.iter().position(|account| account.id == cursor))
-            .map(|idx| (idx + 1) % accounts.len())
+        // Partition into drain_first subset (preferred) and normal subset,
+        // preserving the input order (which already reflects `rr_order`).
+        // Drain-first accounts are tried first; only when all of them are
+        // saturated do we fall back to the normal subset.
+        let (drain, normal): (Vec<&AccountWithRuntime>, Vec<&AccountWithRuntime>) =
+            accounts.iter().partition(|a| a.drain_first);
+
+        if !drain.is_empty() {
+            let inner = &mut *inner;
+            if let Some(picked) =
+                Self::try_acquire_in_subset(&mut inner.inflight, &mut inner.drain_cursor, &drain)
+            {
+                return Some(picked);
+            }
+        }
+        if !normal.is_empty() {
+            let inner = &mut *inner;
+            if let Some(picked) =
+                Self::try_acquire_in_subset(&mut inner.inflight, &mut inner.normal_cursor, &normal)
+            {
+                return Some(picked);
+            }
+        }
+
+        None
+    }
+
+    fn try_acquire_in_subset(
+        inflight: &mut HashMap<i64, (u32, u32)>,
+        cursor: &mut Option<i64>,
+        subset: &[&AccountWithRuntime],
+    ) -> Option<AccountWithRuntime> {
+        let start_idx = (*cursor)
+            .and_then(|c| subset.iter().position(|a| a.id == c))
+            .map(|idx| (idx + 1) % subset.len())
             .unwrap_or(0);
 
-        for offset in 0..accounts.len() {
-            let idx = (start_idx + offset) % accounts.len();
-            let account = &accounts[idx];
-            let slot = inner
-                .inflight
+        for offset in 0..subset.len() {
+            let idx = (start_idx + offset) % subset.len();
+            let account = subset[idx];
+            let slot = inflight
                 .entry(account.id)
                 .or_insert((0, account.max_slots as u32));
             if slot.0 < slot.1 {
                 slot.0 += 1;
-                inner.cursor = Some(account.id);
+                *cursor = Some(account.id);
                 return Some(account.clone());
             }
         }
@@ -323,8 +360,33 @@ pub fn build_providers(
 
 #[cfg(test)]
 mod tests {
-    use super::reconcile_oauth_fallback_error;
+    use super::{OAuthAccountPool, reconcile_oauth_fallback_error};
+    use crate::db::accounts::AccountWithRuntime;
     use crate::error::ClewdrError;
+
+    fn mk_account(id: i64, drain_first: bool) -> AccountWithRuntime {
+        AccountWithRuntime {
+            id,
+            name: format!("acc-{id}"),
+            rr_order: id,
+            max_slots: 1,
+            drain_first,
+            status: "active".to_string(),
+            auth_source: "oauth".to_string(),
+            cookie_blob: None,
+            oauth_token: None,
+            oauth_expires_at: None,
+            last_refresh_at: None,
+            last_error: None,
+            organization_uuid: None,
+            invalid_reason: None,
+            email: None,
+            account_type: None,
+            created_at: None,
+            updated_at: None,
+            runtime: None,
+        }
+    }
 
     #[test]
     fn oauth_temporary_fallback_upgrades_cookie_503_to_429() {
@@ -336,5 +398,117 @@ mod tests {
     fn oauth_fallback_leaves_other_errors_unchanged() {
         let err = reconcile_oauth_fallback_error(ClewdrError::QuotaExceeded, true);
         assert!(matches!(err, ClewdrError::QuotaExceeded));
+    }
+
+    #[tokio::test]
+    async fn oauth_acquire_prefers_drain_first_until_saturated() {
+        // Two accounts, `a` is drain_first with 1 slot, `b` is normal with 1 slot.
+        // Order in the input reflects rr_order: b (normal) comes first to prove
+        // drain_first overrides list position.
+        let a = mk_account(1, true);
+        let b = mk_account(2, false);
+        let accounts = vec![b.clone(), a.clone()];
+
+        let pool = OAuthAccountPool::default();
+
+        // First acquire must pick `a` (drain_first) even though `b` is first in list.
+        let picked = pool.acquire(&accounts).await.expect("first acquire");
+        assert_eq!(picked.id, a.id, "drain_first account should be preferred");
+
+        // `a`'s only slot is now taken → second acquire falls through to `b`.
+        let picked = pool.acquire(&accounts).await.expect("second acquire");
+        assert_eq!(
+            picked.id, b.id,
+            "should fall back to normal when drain_first saturated"
+        );
+
+        // Both saturated → None (not an error — OAuth layer translates to cooldown).
+        assert!(pool.acquire(&accounts).await.is_none());
+
+        // Release `a`, it should become the preferred pick again.
+        pool.release(a.id).await;
+        let picked = pool.acquire(&accounts).await.expect("after release");
+        assert_eq!(
+            picked.id, a.id,
+            "released drain_first slot should be re-preferred"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_acquire_round_robins_within_drain_first_subset() {
+        // Two drain_first accounts each with capacity 1, one normal with capacity 1.
+        // First two requests should hit the two drain_first accounts, third hits normal.
+        let d1 = mk_account(1, true);
+        let d2 = mk_account(2, true);
+        let n = mk_account(3, false);
+        let accounts = vec![d1.clone(), d2.clone(), n.clone()];
+
+        let pool = OAuthAccountPool::default();
+
+        let p1 = pool.acquire(&accounts).await.expect("1");
+        let p2 = pool.acquire(&accounts).await.expect("2");
+        let p3 = pool.acquire(&accounts).await.expect("3");
+
+        let picks: Vec<i64> = vec![p1.id, p2.id, p3.id];
+        // First two must be drain_first ids (order between them not asserted since cursor).
+        assert!(picks[..2].contains(&d1.id) && picks[..2].contains(&d2.id));
+        // Third must be the normal account.
+        assert_eq!(picks[2], n.id);
+    }
+
+    #[tokio::test]
+    async fn oauth_acquire_behaves_normally_without_drain_first() {
+        // Backward-compat check: no drain_first flag set → pure round-robin.
+        let a = mk_account(1, false);
+        let b = mk_account(2, false);
+        let accounts = vec![a.clone(), b.clone()];
+
+        let pool = OAuthAccountPool::default();
+        let p1 = pool.acquire(&accounts).await.expect("1");
+        let p2 = pool.acquire(&accounts).await.expect("2");
+        // Cold start picks idx=0, then cursor advances; both should be acquired exactly once.
+        let mut ids = vec![p1.id, p2.id];
+        ids.sort();
+        assert_eq!(ids, vec![a.id, b.id]);
+    }
+
+    #[tokio::test]
+    async fn oauth_acquire_preserves_normal_cursor_across_drain_interference() {
+        // D1: drain_first, max_slots=1. N1/N2: normal, max_slots=2.
+        // Interleaving drain picks with spillover to normal must NOT
+        // reset the normal subset's round-robin position — otherwise all
+        // spillover requests concentrate on N1.
+        let d1 = AccountWithRuntime {
+            max_slots: 1,
+            ..mk_account(1, true)
+        };
+        let n1 = AccountWithRuntime {
+            max_slots: 2,
+            ..mk_account(2, false)
+        };
+        let n2 = AccountWithRuntime {
+            max_slots: 2,
+            ..mk_account(3, false)
+        };
+        let accounts = vec![d1.clone(), n1.clone(), n2.clone()];
+        let pool = OAuthAccountPool::default();
+
+        // 1. Preferred pick → D1 (D1 saturated: 1/1).
+        assert_eq!(pool.acquire(&accounts).await.unwrap().id, d1.id);
+        // 2. D1 full, spill to normal → N1 (normal_cursor advances to N1, N1: 1/2).
+        assert_eq!(pool.acquire(&accounts).await.unwrap().id, n1.id);
+        // 3. Free D1.
+        pool.release(d1.id).await;
+        // 4. D1 preferred again. This touches drain_cursor only; normal_cursor
+        //    must remain at N1.
+        assert_eq!(pool.acquire(&accounts).await.unwrap().id, d1.id);
+        // 5. D1 full, spill to normal. With independent cursors, we advance
+        //    from N1 → N2. With a shared cursor, it would reset to idx=0
+        //    (N1) and pick N1 again (still has 1 free slot), skewing load.
+        assert_eq!(
+            pool.acquire(&accounts).await.unwrap().id,
+            n2.id,
+            "normal subset should round-robin independently of drain picks",
+        );
     }
 }

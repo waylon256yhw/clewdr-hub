@@ -168,6 +168,7 @@ Claude Code / 任意 Anthropic 客户端
 4. **调度**（`AccountPoolActor::dispatch()`）：
    - `bound_account_ids` 非空时只从绑定账号中选
    - 检查 `inflight < max_slots`
+   - **Phase 1**：若存在 `drain_first = true` 且满足绑定约束、仍有空闲槽的账号，直接返回（跳过 moka 缓存）
    - moka 缓存命中 → 亲和性返回同一账号
    - 否则 round-robin 取第一个可用账号
    - `inflight += 1`
@@ -203,6 +204,7 @@ struct AccountPoolState {
     probing: HashSet<i64>,                  // 正在探测中的 account_id
     reactivated: HashSet<i64>,              // 本轮被重激活的 account_id
     probe_errors: HashMap<i64, String>,     // 探测失败信息
+    drain_first_ids: HashSet<i64>,          // 标记为优先消耗的 account_id
 }
 ```
 
@@ -236,6 +238,20 @@ struct AccountPoolState {
 ### 脏刷盘
 
 每 15 秒批量 upsert `account_runtime_state` 表（使用 SQLite transaction），只写 dirty set 中的账号。shutdown 时 `post_stop()` 强制刷全量。
+
+### drain_first（优先消耗）
+
+账号级的布尔开关，用于把"限量/试用/促销"账号优先榨干再动主池。行为规则：
+
+- **Cookie 池**（`services/account_pool.rs::dispatch`）：
+  `drain_first` 命中在 moka 缓存之前做一次 Phase 1 查找。只要账号满足 `bound` 约束且 `inflight < max_slots` 就直接返回；都满了/都在冷却就落回正常路径（moka → round-robin）。故意绕过亲和性缓存，以保证"凡是能用 drain 就用 drain"。
+- **OAuth 池**（`providers/claude/mod.rs::OAuthAccountPool::acquire`）：
+  将账号**分区**成 drain 和普通两个子集，每个子集维护**独立**的 round-robin 游标（`drain_cursor` / `normal_cursor`）。优先在 drain 子集里按 RR 取可用账号；全部饱和时才在普通子集按 RR 降级。独立游标是为了避免 drain 账号的释放/重取把普通子集的 RR 位置反复拉回头部，造成某一个普通账号（通常是 `rr_order` 最小的）被集中点名。
+- **索引重建**：`drain_first_ids` 在每次账号池刷新（`ReloadFromDb` / 启动时 `init`）时从 DB 重建，管理后台勾选后立即生效，无需重启。
+- **持久化**：`accounts.drain_first` 列（`INTEGER NOT NULL DEFAULT 0` + CHECK）+ 部分索引 `idx_accounts_drain_first WHERE drain_first = 1`（目前未被 SQL 查询使用，保留为后续潜在批查询做准备）。
+- **回收**：冷却（429）或失效（auth error）发生时，和普通账号走同一套 release/exhausted 路径，`drain_first` 标记不影响冷却恢复逻辑。
+- **与 `bound` 的关系**：Phase 1 仍然调用 `is_allowed()`，`bound` 约束先于 `drain_first` 优先级——绑定到普通账号 A 的 API Key 不会被改派到 drain 账号 B。
+- **默认值**：`false`；存量部署升级迁移后行为完全不变。
 
 ---
 
@@ -280,7 +296,7 @@ SQLite WAL 模式，通过 sqlx 的编译期 migration 自动建表。
 | `policies` | 策略模板 | max_concurrent, rpm_limit, weekly_budget_nanousd, monthly_budget_nanousd |
 | `api_keys` | API Key | user_id, lookup_key, key_hash (blake3), last_used_at, last_used_ip |
 | `api_key_account_bindings` | Key↔账号绑定 | api_key_id, account_id |
-| `accounts` | Claude 账号 | cookie_blob, max_slots, status, email, account_type |
+| `accounts` | Claude 账号 | cookie_blob, max_slots, drain_first, status, email, account_type |
 | `account_runtime_state` | 运行时状态 | reset_time, 4×用量窗口, 5×usage bucket, 4×utilization |
 | `request_logs` | 请求日志 | 全字段（token/cost/ttft/duration/error），保留 7 天 |
 | `usage_rollups` | 费用汇总 | user_id + period_type(week/month) + period_start → cost_nanousd |

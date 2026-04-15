@@ -78,6 +78,9 @@ struct AccountPoolState {
     reactivated: HashSet<i64>,
     /// Last probe error per account (transient errors only, cleared on success)
     probe_errors: HashMap<i64, String>,
+    /// Account IDs marked with `drain_first = true`. These are preferred
+    /// during dispatch until all of them have no available inflight slot.
+    drain_first_ids: HashSet<i64>,
 }
 
 struct AccountPoolActor;
@@ -250,6 +253,31 @@ impl AccountPoolActor {
             });
             bound_ok && slot_ok
         };
+
+        // Phase 1: prefer accounts flagged `drain_first` that are still allowed
+        // and have available inflight slots. This overrides moka cache affinity
+        // on purpose — the intent of `drain_first` is to concentrate usage on
+        // these accounts until they are saturated or cooling down, after which
+        // we fall through to the normal round-robin / cached selection.
+        if !state.drain_first_ids.is_empty()
+            && let Some(idx) = state.valid.iter().position(|c| {
+                is_allowed(c, &state.inflight)
+                    && c.account_id
+                        .is_some_and(|id| state.drain_first_ids.contains(&id))
+            })
+        {
+            let cookie = state.valid.remove(idx).unwrap();
+            if let Some(aid) = cookie.account_id {
+                if let Some((cur, _)) = state.inflight.get_mut(&aid) {
+                    *cur += 1;
+                }
+            }
+            state.valid.push_back(cookie.clone());
+            if let Some(key) = cache_key {
+                state.moka.insert(key, cookie.clone());
+            }
+            return Ok(cookie);
+        }
 
         if let Some(key) = cache_key
             && let Some(cached) = state.moka.get(&key)
@@ -691,6 +719,13 @@ impl AccountPoolActor {
         }
         state.inflight = new_inflight;
 
+        // Rebuild the drain_first index from DB.
+        state.drain_first_ids = accounts
+            .iter()
+            .filter(|r| r.drain_first)
+            .map(|r| r.id)
+            .collect();
+
         // Clean stale probing IDs (deleted accounts + cookie-replaced accounts)
         let current_ids: HashSet<i64> = accounts.iter().map(|r| r.id).collect();
         state.probing.retain(|id| current_ids.contains(id));
@@ -732,6 +767,7 @@ impl Actor for AccountPoolActor {
             probing: HashSet::new(),
             reactivated: HashSet::new(),
             probe_errors: HashMap::new(),
+            drain_first_ids: HashSet::new(),
         };
 
         // Load accounts from DB

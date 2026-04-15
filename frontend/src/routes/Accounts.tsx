@@ -4,6 +4,7 @@ import {
   Title,
   Badge,
   Button,
+  Checkbox,
   Group,
   Modal,
   TextInput,
@@ -23,7 +24,7 @@ import {
 } from "@mantine/core";
 import { useForm } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
-import { IconPlus, IconEdit, IconTrash, IconRefresh, IconLink, IconFlask } from "@tabler/icons-react";
+import { IconPlus, IconEdit, IconTrash, IconRefresh, IconLink, IconFlask, IconStarFilled } from "@tabler/icons-react";
 import {
   listAccounts,
   createAccount,
@@ -189,7 +190,14 @@ function AccountCard({
   return (
     <Paper withBorder shadow="xs" radius="md" p="md">
       <Group justify="space-between" mb="xs">
-        <Text fw={600}>{account.name}</Text>
+        <Group gap={6}>
+          <Text fw={600}>{account.name}</Text>
+          {account.drain_first && (
+            <Tooltip label="优先消耗">
+              <IconStarFilled size={14} color="var(--mantine-color-orange-6)" />
+            </Tooltip>
+          )}
+        </Group>
         <Group gap={4}>
           {account.has_oauth && (
             <Tooltip label="测试 /v1/messages">
@@ -262,6 +270,7 @@ interface FormValues {
   name: string;
   rr_order: number;
   max_slots: number;
+  drain_first: boolean;
   cookie_blob: string;
   oauth_callback_input: string;
 }
@@ -285,6 +294,7 @@ function AccountFormModal({
       name: editing?.name ?? "",
       rr_order: editing?.rr_order ?? 0,
       max_slots: 5,
+      drain_first: editing?.drain_first ?? false,
       cookie_blob: "",
       oauth_callback_input: "",
     },
@@ -298,6 +308,7 @@ function AccountFormModal({
       name: editing?.name ?? "",
       rr_order: editing?.rr_order ?? 0,
       max_slots: 5,
+      drain_first: editing?.drain_first ?? false,
       cookie_blob: "",
       oauth_callback_input: "",
     });
@@ -333,6 +344,7 @@ function AccountFormModal({
         const body: Record<string, unknown> = {};
         if (name !== editing.name) body.name = name;
         if (values.rr_order !== editing.rr_order) body.rr_order = values.rr_order;
+        if (values.drain_first !== editing.drain_first) body.drain_first = values.drain_first;
         if (cookieBlob) body.cookie_blob = cookieBlob;
         if (oauthInput) body.oauth_callback_input = oauthInput;
         if (scopedOauthState) body.oauth_state = scopedOauthState;
@@ -341,6 +353,7 @@ function AccountFormModal({
       return createAccount({
         name,
         max_slots: values.max_slots,
+        drain_first: values.drain_first,
         auth_source: tab,
         cookie_blob: cookieBlob || undefined,
         oauth_callback_input: oauthInput || undefined,
@@ -367,6 +380,12 @@ function AccountFormModal({
           <TextInput label="名称" required key={form.key("name")} {...form.getInputProps("name")} />
           {editing && <NumberInput label="轮询顺序" key={form.key("rr_order")} {...form.getInputProps("rr_order")} />}
           {!editing && <NumberInput label="最大并发" min={1} key={form.key("max_slots")} {...form.getInputProps("max_slots")} />}
+          <Checkbox
+            label="优先消耗"
+            description="打开后此账号会被优先选中"
+            key={form.key("drain_first")}
+            {...form.getInputProps("drain_first", { type: "checkbox" })}
+          />
           <Tabs
             value={tab}
             onChange={(value) => {
