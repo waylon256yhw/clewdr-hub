@@ -31,6 +31,7 @@ pub enum OutputEffort {
     High,
     #[serde(rename = "xhigh")]
     XHigh,
+    Max,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -976,6 +977,25 @@ pub struct StreamError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn output_effort_round_trips_all_levels() {
+        for (value, wire) in [
+            (OutputEffort::Low, "low"),
+            (OutputEffort::Medium, "medium"),
+            (OutputEffort::High, "high"),
+            (OutputEffort::XHigh, "xhigh"),
+            (OutputEffort::Max, "max"),
+        ] {
+            let serialized = serde_json::to_value(&value).unwrap();
+            assert_eq!(serialized, json!(wire), "serialize {wire}");
+            let parsed: OutputEffort = serde_json::from_value(json!(wire)).unwrap();
+            assert!(
+                std::mem::discriminant(&parsed) == std::mem::discriminant(&value),
+                "deserialize {wire}",
+            );
+        }
+    }
 
     #[test]
     fn deserializes_claude_code_builtin_tools_without_input_schema() {
