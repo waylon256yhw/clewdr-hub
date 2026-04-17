@@ -29,7 +29,8 @@ pub enum OutputEffort {
     Low,
     Medium,
     High,
-    Max,
+    #[serde(rename = "xhigh")]
+    XHigh,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

@@ -213,6 +213,12 @@ fn inject_metadata_user_id(
 ///
 /// When thinking is active (enabled or adaptive):
 ///   - `temperature` must be 1 or unset
+///
+/// For Claude Opus 4.7 specifically, legacy `thinking.type=enabled` + `budget_tokens`
+/// is removed upstream: the OAuth surface silently ignores it (client asks for
+/// thinking, gets none), and the public API will 400. Rewrite to `thinking.type=adaptive`
+/// so pre-4.7 clients transparently keep a thinking chain. `output_config.effort` is
+/// left untouched in both directions.
 fn normalize_sampling_params(body: &mut CreateMessageParams) {
     let thinking_active = matches!(
         body.thinking,
@@ -227,6 +233,17 @@ fn normalize_sampling_params(body: &mut CreateMessageParams) {
             body.temperature = None;
         }
     }
+
+    if is_opus_4_7(&body.model) && matches!(body.thinking, Some(Thinking::Enabled { .. })) {
+        body.thinking = Some(Thinking::Adaptive);
+    }
+}
+
+fn is_opus_4_7(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m == "claude-opus-4-7"
+        || m.strip_prefix("claude-opus-4-7-")
+            .is_some_and(|s| s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Predefined test message for connection testing
@@ -470,5 +487,47 @@ mod tests {
         assert_eq!(body.temperature, Some(0.7));
         assert_eq!(body.top_p, None);
         assert_eq!(body.top_k, None);
+    }
+
+    #[test]
+    fn normalize_opus_4_7_rewrites_enabled_thinking_to_adaptive() {
+        let mut body = make_body(Some(Thinking::new(8000)), Some(0.7), None, None);
+        body.model = "claude-opus-4-7".to_string();
+        normalize_sampling_params(&mut body);
+        assert!(matches!(body.thinking, Some(Thinking::Adaptive)));
+        assert_eq!(body.temperature, None);
+    }
+
+    #[test]
+    fn normalize_opus_4_7_with_date_suffix_rewrites_thinking() {
+        let mut body = make_body(Some(Thinking::new(32000)), None, None, None);
+        body.model = "claude-opus-4-7-20260416".to_string();
+        normalize_sampling_params(&mut body);
+        assert!(matches!(body.thinking, Some(Thinking::Adaptive)));
+    }
+
+    #[test]
+    fn normalize_opus_4_7_leaves_adaptive_untouched() {
+        let mut body = make_body(Some(Thinking::Adaptive), Some(1.0), None, None);
+        body.model = "claude-opus-4-7".to_string();
+        normalize_sampling_params(&mut body);
+        assert!(matches!(body.thinking, Some(Thinking::Adaptive)));
+        assert_eq!(body.temperature, Some(1.0));
+    }
+
+    #[test]
+    fn normalize_opus_4_6_keeps_enabled_thinking() {
+        let mut body = make_body(Some(Thinking::new(8000)), None, None, None);
+        body.model = "claude-opus-4-6".to_string();
+        normalize_sampling_params(&mut body);
+        assert!(matches!(body.thinking, Some(Thinking::Enabled { .. })));
+    }
+
+    #[test]
+    fn normalize_opus_4_7_with_invalid_suffix_skips_rewrite() {
+        let mut body = make_body(Some(Thinking::new(8000)), None, None, None);
+        body.model = "claude-opus-4-7-preview1".to_string();
+        normalize_sampling_params(&mut body);
+        assert!(matches!(body.thinking, Some(Thinking::Enabled { .. })));
     }
 }
