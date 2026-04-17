@@ -1,7 +1,9 @@
 FROM node:lts-slim AS frontend-builder
 WORKDIR /build/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
 COPY frontend/ .
-RUN npm ci && npm run build
+RUN npm run build
 
 FROM docker.io/lukemathwalker/cargo-chef:latest-rust-trixie AS chef
 WORKDIR /build
@@ -19,7 +21,6 @@ RUN apt-get update && apt-get install -y \
     libclang-dev \
     perl \
     pkg-config \
-    upx-ucl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /build/recipe.json recipe.json
 
@@ -31,7 +32,6 @@ RUN mkdir -p ~/.cargo \
 COPY . .
 COPY --from=frontend-builder /build/static/ ./static
 RUN cargo build --release --no-default-features --features embed-resource,xdg --bin clewdr \
-    && upx --best --lzma ./target/release/clewdr \
     && cp ./target/release/clewdr /build/clewdr \
     && mkdir -p /etc/clewdr/log \
     && touch /etc/clewdr/clewdr.toml
