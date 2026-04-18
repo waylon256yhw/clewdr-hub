@@ -15,6 +15,7 @@ import {
   logout as apiLogout,
   changePassword,
   getOverview,
+  qk,
   ApiError,
   type LoginResponse,
 } from "./api";
@@ -52,6 +53,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     getOverview()
       .then((data) => {
+        queryClient.setQueryData(qk.overview, data);
         setUser({ user_id: 0, username: "admin", role: "admin" });
         if (data.must_change_password) {
           setMustChangePassword(true);
@@ -61,7 +63,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setUser(null);
       })
       .finally(() => setLoading(false));
-  }, []);
+  }, [queryClient]);
 
   useEffect(() => {
     const handler = () => {
@@ -80,8 +82,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (res.must_change_password) {
       setMustChangePassword(true);
     }
+    void queryClient.prefetchQuery({
+      queryKey: qk.overview,
+      queryFn: getOverview,
+      staleTime: 30_000,
+    });
     return res;
-  }, []);
+  }, [queryClient]);
 
   const logout = useCallback(() => {
     apiLogout();
