@@ -41,7 +41,13 @@ pub async fn get_all(
     Ok(Json(map))
 }
 
-const STEALTH_KEYS: &[&str] = &["cc_cli_version", "cc_billing_salt", "proxy"];
+const RELOADABLE_SETTINGS_KEYS: &[&str] = &[
+    "cc_cli_version",
+    "cc_billing_salt",
+    "proxy",
+    "output_effort_override_enabled",
+    "output_effort_override_level",
+];
 
 pub async fn update(
     State(db): State<SqlitePool>,
@@ -63,7 +69,7 @@ pub async fn update(
         .execute(&mut *tx)
         .await?;
 
-        if STEALTH_KEYS.contains(&key.as_str()) {
+        if RELOADABLE_SETTINGS_KEYS.contains(&key.as_str()) {
             needs_stealth_reload = true;
         }
     }

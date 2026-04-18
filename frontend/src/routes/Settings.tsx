@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Title,
@@ -31,6 +31,28 @@ import {
   type ModelRow,
 } from "../api";
 import { formatDate } from "../lib/format";
+
+const EFFORT_OPTIONS = [
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "XHigh" },
+  { value: "max", label: "Max" },
+];
+
+function parseSettingBool(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
+
+function parseEffortLevel(value: string | undefined): string | null {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) return null;
+  if (EFFORT_OPTIONS.some((option) => option.value === normalized)) {
+    return normalized;
+  }
+  return null;
+}
 
 function VersionSection({ currentVersion }: { currentVersion: string }) {
   const queryClient = useQueryClient();
@@ -107,6 +129,77 @@ function VersionSection({ currentVersion }: { currentVersion: string }) {
           disabled={versionsLoading || mutation.isPending}
           placeholder={versionsLoading ? "加载中..." : "选择版本"}
         />
+      </Stack>
+    </Paper>
+  );
+}
+
+function EffortOverrideSection({
+  enabled,
+  level,
+}: {
+  enabled: boolean;
+  level: string;
+}) {
+  const queryClient = useQueryClient();
+  const [overrideEnabled, setOverrideEnabled] = useState(enabled);
+  const [selectedLevel, setSelectedLevel] = useState(level);
+
+  useEffect(() => {
+    setOverrideEnabled(enabled);
+  }, [enabled]);
+
+  useEffect(() => {
+    setSelectedLevel(level);
+  }, [level]);
+
+  const mutation = useMutation({
+    mutationFn: (values: { enabled: boolean; level: string }) =>
+      updateSettings({
+        output_effort_override_enabled: values.enabled ? "1" : "0",
+        output_effort_override_level: values.level,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: qk.settings });
+      notifications.show({ message: "Effort 覆盖设置已保存", color: "green" });
+    },
+    onError: (e) =>
+      notifications.show({ message: e instanceof ApiError ? e.message : "保存失败", color: "red" }),
+  });
+
+  const dirty = overrideEnabled !== enabled || selectedLevel !== level;
+  const levelMissing = overrideEnabled && !selectedLevel;
+
+  return (
+    <Paper shadow="xs" p="md" radius="md" withBorder>
+      <Stack>
+        <Text fw={600}>Effort 覆盖</Text>
+        <Text size="sm" c="dimmed">
+          开启后覆盖 Opus 请求的 `output_config.effort`。
+        </Text>
+        <Switch
+          label="启用 Opus effort 覆盖"
+          checked={overrideEnabled}
+          onChange={(e) => setOverrideEnabled(e.currentTarget.checked)}
+        />
+        <Select
+          label="Effort 级别"
+          data={EFFORT_OPTIONS}
+          value={selectedLevel}
+          onChange={(value) => value && setSelectedLevel(value)}
+          placeholder="选择级别"
+          error={levelMissing ? "请选择有效的 effort 级别" : undefined}
+          disabled={!overrideEnabled}
+        />
+        <Group justify="flex-end">
+          <Button
+            onClick={() => mutation.mutate({ enabled: overrideEnabled, level: selectedLevel })}
+            loading={mutation.isPending}
+            disabled={!dirty || levelMissing}
+          >
+            保存
+          </Button>
+        </Group>
       </Stack>
     </Paper>
   );
@@ -369,11 +462,20 @@ export default function Settings() {
     );
   }
 
+  const effortOverrideEnabled = parseSettingBool(data["output_effort_override_enabled"]);
+  const effortOverrideLevel =
+    parseEffortLevel(data["output_effort_override_level"])
+    ?? (effortOverrideEnabled ? "" : "high");
+
   return (
     <>
       <Title order={3} mb="md">设置</Title>
       <Stack>
         <VersionSection currentVersion={data["cc_cli_version"] ?? ""} />
+        <EffortOverrideSection
+          enabled={effortOverrideEnabled}
+          level={effortOverrideLevel}
+        />
         <ModelsSection />
         <ProxySection currentProxy={data["proxy"] ?? ""} />
         <PasswordSection />

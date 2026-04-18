@@ -41,6 +41,13 @@ pub enum OutputFormat {
     JsonSchema { schema: serde_json::Value },
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingDisplay {
+    Summarized,
+    Omitted,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceTier {
@@ -157,14 +164,34 @@ impl CreateMessageParams {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Thinking {
-    Enabled { budget_tokens: u64 },
+    Enabled {
+        budget_tokens: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display: Option<ThinkingDisplay>,
+    },
     Disabled,
-    Adaptive,
+    Adaptive {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display: Option<ThinkingDisplay>,
+    },
 }
 
 impl Thinking {
     pub fn new(budget_tokens: u64) -> Self {
-        Self::Enabled { budget_tokens }
+        Self::Enabled {
+            budget_tokens,
+            display: None,
+        }
+    }
+
+    pub fn adaptive() -> Self {
+        Self::Adaptive { display: None }
+    }
+
+    pub fn adaptive_with_display(display: ThinkingDisplay) -> Self {
+        Self::Adaptive {
+            display: Some(display),
+        }
     }
 }
 
@@ -995,6 +1022,30 @@ mod tests {
                 "deserialize {wire}",
             );
         }
+    }
+
+    #[test]
+    fn thinking_adaptive_round_trips_without_display() {
+        let value = serde_json::json!({ "type": "adaptive" });
+        let parsed: Thinking = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(parsed, Thinking::Adaptive { display: None }));
+        assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+    }
+
+    #[test]
+    fn thinking_adaptive_round_trips_with_display() {
+        let value = serde_json::json!({
+            "type": "adaptive",
+            "display": "summarized"
+        });
+        let parsed: Thinking = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(
+            parsed,
+            Thinking::Adaptive {
+                display: Some(ThinkingDisplay::Summarized)
+            }
+        ));
+        assert_eq!(serde_json::to_value(parsed).unwrap(), value);
     }
 
     #[test]

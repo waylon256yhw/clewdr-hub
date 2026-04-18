@@ -87,7 +87,8 @@ export ANTHROPIC_API_KEY=sk-...    # 从后台创建
 
 - 服务端会统一移除 `top_p` 和 `top_k`
 - 如果启用原生 `thinking`（`enabled` / `adaptive`），不符合 Anthropic 要求的 `temperature` 也会被移除
-- `claude-opus-4-7` 专属：`thinking.type=enabled` + `budget_tokens` 会被重写为 `{type:"adaptive"}`；4.7 移除了 extended thinking budgets，保持 enabled 在上游会被静默忽略，客户拿不到思考链。`output_config.effort` 透传不动。
+- `claude-opus-4-7` 专属：`thinking.type=enabled` + `budget_tokens` 会被重写为 `{type:"adaptive","display":"summarized"}`；如果请求里没带 `output_config.effort`，服务端会显式补成 `high`。4.7 移除了 extended thinking budgets，保持 enabled 在上游会被静默忽略，客户拿不到思考链。
+- 后台“设置”页可开启 Opus 专属 `output_config.effort` 覆盖；当前仅对 `claude-opus-4-5` / `claude-opus-4-6` / `claude-opus-4-7`（含 8 位日期后缀）写入所选 effort，其他模型完全透传客户端原始值。
 
 这是有意的兼容性取舍：对这个项目的目标场景，保留 `temperature` 作为主要采样旋钮已经足够，同时可以减少不同客户端和不同 Claude 模型之间的参数兼容问题。
 

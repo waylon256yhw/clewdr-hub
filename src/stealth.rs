@@ -5,6 +5,7 @@ use sqlx::SqlitePool;
 use tracing::warn;
 
 use crate::db::billing::get_setting;
+use crate::types::claude::OutputEffort;
 
 /// Default values (compile-time fallbacks)
 pub const DEFAULT_CLI_VERSION: &str = "2.1.80";
@@ -16,6 +17,7 @@ pub struct StealthProfile {
     pub cli_version: String,
     pub billing_salt: String,
     pub proxy: Option<String>,
+    pub force_output_effort: Option<OutputEffort>,
 }
 
 impl Default for StealthProfile {
@@ -24,6 +26,7 @@ impl Default for StealthProfile {
             cli_version: DEFAULT_CLI_VERSION.into(),
             billing_salt: DEFAULT_BILLING_SALT.into(),
             proxy: None,
+            force_output_effort: None,
         }
     }
 }
@@ -37,6 +40,24 @@ impl StealthProfile {
             v.ok().flatten().filter(|s| !s.is_empty())
         }
 
+        fn parse_bool(v: Option<&str>) -> bool {
+            matches!(
+                v.map(str::trim).filter(|s| !s.is_empty()),
+                Some("1" | "true" | "yes" | "on")
+            )
+        }
+
+        fn parse_effort(v: &str) -> Option<OutputEffort> {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "low" => Some(OutputEffort::Low),
+                "medium" => Some(OutputEffort::Medium),
+                "high" => Some(OutputEffort::High),
+                "xhigh" => Some(OutputEffort::XHigh),
+                "max" => Some(OutputEffort::Max),
+                _ => None,
+            }
+        }
+
         if let Some(v) = non_empty(get_setting(pool, "cc_cli_version").await) {
             profile.cli_version = v;
         }
@@ -44,6 +65,14 @@ impl StealthProfile {
             profile.billing_salt = v;
         }
         profile.proxy = non_empty(get_setting(pool, "proxy").await);
+
+        let effort_override_enabled =
+            non_empty(get_setting(pool, "output_effort_override_enabled").await);
+        let effort_override_level =
+            non_empty(get_setting(pool, "output_effort_override_level").await);
+        if parse_bool(effort_override_enabled.as_deref()) {
+            profile.force_output_effort = effort_override_level.as_deref().and_then(parse_effort);
+        }
 
         profile
     }

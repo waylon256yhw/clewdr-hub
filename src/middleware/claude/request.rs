@@ -18,7 +18,8 @@ use crate::{
     middleware::claude::ClaudeContext,
     stealth::{self, StealthProfile},
     types::claude::{
-        ContentBlock, CreateMessageParams, Message, MessageContent, Role, Thinking, Usage,
+        ContentBlock, CreateMessageParams, Message, MessageContent, OutputConfig, OutputEffort,
+        Role, Thinking, ThinkingDisplay, Usage,
     },
 };
 
@@ -217,12 +218,18 @@ fn inject_metadata_user_id(
 /// For Claude Opus 4.7 specifically, legacy `thinking.type=enabled` + `budget_tokens`
 /// is removed upstream: the OAuth surface silently ignores it (client asks for
 /// thinking, gets none), and the public API will 400. Rewrite to `thinking.type=adaptive`
-/// so pre-4.7 clients transparently keep a thinking chain. `output_config.effort` is
-/// left untouched in both directions.
-fn normalize_sampling_params(body: &mut CreateMessageParams) {
+/// so pre-4.7 clients transparently keep a thinking chain. We pin
+/// `display="summarized"` on the rewritten request so older callers see an explicit
+/// thinking summary instead of depending on upstream defaults, and explicitly pin
+/// `output_config.effort="high"` when the legacy request did not set one.
+///
+/// Operators can also enable an Opus-only effort override from the admin settings
+/// page; when enabled it overwrites `output_config.effort` on supported Opus
+/// requests and leaves other models untouched.
+fn normalize_sampling_params(body: &mut CreateMessageParams, profile: &StealthProfile) {
     let thinking_active = matches!(
         body.thinking,
-        Some(Thinking::Adaptive) | Some(Thinking::Enabled { .. })
+        Some(Thinking::Adaptive { .. }) | Some(Thinking::Enabled { .. })
     );
 
     body.top_p = None;
@@ -234,15 +241,61 @@ fn normalize_sampling_params(body: &mut CreateMessageParams) {
         }
     }
 
-    if is_opus_4_7(&body.model) && matches!(body.thinking, Some(Thinking::Enabled { .. })) {
-        body.thinking = Some(Thinking::Adaptive);
+    let mut rewrote_opus_4_7_legacy_thinking = false;
+    if is_opus_4_7(&body.model) {
+        let (rewritten, rewrote_legacy) = match body.thinking.take() {
+            Some(Thinking::Enabled {
+                budget_tokens: _,
+                display,
+            }) => (
+                Some(Thinking::Adaptive {
+                    display: Some(display.unwrap_or(ThinkingDisplay::Summarized)),
+                }),
+                true,
+            ),
+            other => (other, false),
+        };
+        rewrote_opus_4_7_legacy_thinking = rewrote_legacy;
+        body.thinking = rewritten;
+    }
+
+    if rewrote_opus_4_7_legacy_thinking {
+        body.output_config
+            .get_or_insert_with(default_output_config)
+            .effort
+            .get_or_insert(OutputEffort::High);
+    }
+
+    if is_effort_override_target_model(&body.model)
+        && let Some(force_output_effort) = profile.force_output_effort.clone()
+    {
+        body.output_config
+            .get_or_insert_with(default_output_config)
+            .effort = Some(force_output_effort);
+    }
+}
+
+fn default_output_config() -> OutputConfig {
+    OutputConfig {
+        effort: None,
+        format: None,
     }
 }
 
 fn is_opus_4_7(model: &str) -> bool {
+    matches_model_with_optional_date_suffix(model, "claude-opus-4-7")
+}
+
+fn is_effort_override_target_model(model: &str) -> bool {
+    matches_model_with_optional_date_suffix(model, "claude-opus-4-7")
+        || matches_model_with_optional_date_suffix(model, "claude-opus-4-6")
+        || matches_model_with_optional_date_suffix(model, "claude-opus-4-5")
+}
+
+fn matches_model_with_optional_date_suffix(model: &str, prefix: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    m == "claude-opus-4-7"
-        || m.strip_prefix("claude-opus-4-7-")
+    m == prefix
+        || m.strip_prefix(&format!("{prefix}-"))
             .is_some_and(|s| s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit()))
 }
 
@@ -269,7 +322,11 @@ where
         let Json(mut body) = Json::<CreateMessageParams>::from_request(req, &()).await?;
 
         drop_empty_system(&mut body);
-        normalize_sampling_params(&mut body);
+
+        // Load runtime settings once so request normalization and billing-header
+        // generation see the same profile snapshot.
+        let profile = stealth::global_profile().load();
+        normalize_sampling_params(&mut body, &profile);
 
         // Check for test messages
         if !body.stream.unwrap_or_default()
@@ -280,9 +337,6 @@ where
         }
 
         let stream = body.stream.unwrap_or_default();
-
-        // Load stealth profile for billing header generation
-        let profile = stealth::global_profile().load();
 
         let system_prefixes = vec![ContentBlock::text(claude_code_billing_header(
             &body.messages,
@@ -432,8 +486,8 @@ mod tests {
 
     #[test]
     fn normalize_thinking_adaptive_strips_invalid_params() {
-        let mut body = make_body(Some(Thinking::Adaptive), Some(0.7), Some(0.9), Some(40));
-        normalize_sampling_params(&mut body);
+        let mut body = make_body(Some(Thinking::adaptive()), Some(0.7), Some(0.9), Some(40));
+        normalize_sampling_params(&mut body, &StealthProfile::default());
         assert_eq!(body.temperature, None);
         assert_eq!(body.top_p, None);
         assert_eq!(body.top_k, None);
@@ -441,8 +495,8 @@ mod tests {
 
     #[test]
     fn normalize_thinking_adaptive_keeps_valid_params() {
-        let mut body = make_body(Some(Thinking::Adaptive), Some(1.0), Some(0.95), None);
-        normalize_sampling_params(&mut body);
+        let mut body = make_body(Some(Thinking::adaptive()), Some(1.0), Some(0.95), None);
+        normalize_sampling_params(&mut body, &StealthProfile::default());
         assert_eq!(body.temperature, Some(1.0));
         assert_eq!(body.top_p, None);
         assert_eq!(body.top_k, None);
@@ -451,7 +505,7 @@ mod tests {
     #[test]
     fn normalize_thinking_enabled_strips_invalid_params() {
         let mut body = make_body(Some(Thinking::new(4096)), Some(0.5), Some(0.8), Some(10));
-        normalize_sampling_params(&mut body);
+        normalize_sampling_params(&mut body, &StealthProfile::default());
         assert_eq!(body.temperature, None);
         assert_eq!(body.top_p, None);
         assert_eq!(body.top_k, None);
@@ -459,22 +513,22 @@ mod tests {
 
     #[test]
     fn normalize_thinking_strips_top_p_above_one() {
-        let mut body = make_body(Some(Thinking::Adaptive), None, Some(1.5), None);
-        normalize_sampling_params(&mut body);
+        let mut body = make_body(Some(Thinking::adaptive()), None, Some(1.5), None);
+        normalize_sampling_params(&mut body, &StealthProfile::default());
         assert_eq!(body.top_p, None);
     }
 
     #[test]
     fn normalize_thinking_keeps_top_p_one() {
-        let mut body = make_body(Some(Thinking::Adaptive), None, Some(1.0), None);
-        normalize_sampling_params(&mut body);
+        let mut body = make_body(Some(Thinking::adaptive()), None, Some(1.0), None);
+        normalize_sampling_params(&mut body, &StealthProfile::default());
         assert_eq!(body.top_p, None);
     }
 
     #[test]
     fn normalize_no_thinking_strips_top_p_and_top_k() {
         let mut body = make_body(None, Some(0.7), Some(0.9), Some(40));
-        normalize_sampling_params(&mut body);
+        normalize_sampling_params(&mut body, &StealthProfile::default());
         assert_eq!(body.temperature, Some(0.7));
         assert_eq!(body.top_p, None);
         assert_eq!(body.top_k, None);
@@ -483,7 +537,7 @@ mod tests {
     #[test]
     fn normalize_thinking_disabled_strips_top_p_and_top_k() {
         let mut body = make_body(Some(Thinking::Disabled), Some(0.7), Some(0.9), Some(40));
-        normalize_sampling_params(&mut body);
+        normalize_sampling_params(&mut body, &StealthProfile::default());
         assert_eq!(body.temperature, Some(0.7));
         assert_eq!(body.top_p, None);
         assert_eq!(body.top_k, None);
@@ -493,8 +547,20 @@ mod tests {
     fn normalize_opus_4_7_rewrites_enabled_thinking_to_adaptive() {
         let mut body = make_body(Some(Thinking::new(8000)), Some(0.7), None, None);
         body.model = "claude-opus-4-7".to_string();
-        normalize_sampling_params(&mut body);
-        assert!(matches!(body.thinking, Some(Thinking::Adaptive)));
+        normalize_sampling_params(&mut body, &StealthProfile::default());
+        assert!(matches!(
+            body.thinking,
+            Some(Thinking::Adaptive {
+                display: Some(ThinkingDisplay::Summarized)
+            })
+        ));
+        assert!(matches!(
+            body.output_config,
+            Some(OutputConfig {
+                effort: Some(OutputEffort::High),
+                ..
+            })
+        ));
         assert_eq!(body.temperature, None);
     }
 
@@ -502,24 +568,57 @@ mod tests {
     fn normalize_opus_4_7_with_date_suffix_rewrites_thinking() {
         let mut body = make_body(Some(Thinking::new(32000)), None, None, None);
         body.model = "claude-opus-4-7-20260416".to_string();
-        normalize_sampling_params(&mut body);
-        assert!(matches!(body.thinking, Some(Thinking::Adaptive)));
+        normalize_sampling_params(&mut body, &StealthProfile::default());
+        assert!(matches!(
+            body.thinking,
+            Some(Thinking::Adaptive {
+                display: Some(ThinkingDisplay::Summarized)
+            })
+        ));
+        assert!(matches!(
+            body.output_config,
+            Some(OutputConfig {
+                effort: Some(OutputEffort::High),
+                ..
+            })
+        ));
     }
 
     #[test]
     fn normalize_opus_4_7_leaves_adaptive_untouched() {
-        let mut body = make_body(Some(Thinking::Adaptive), Some(1.0), None, None);
+        let mut body = make_body(Some(Thinking::adaptive()), Some(1.0), None, None);
         body.model = "claude-opus-4-7".to_string();
-        normalize_sampling_params(&mut body);
-        assert!(matches!(body.thinking, Some(Thinking::Adaptive)));
+        normalize_sampling_params(&mut body, &StealthProfile::default());
+        assert!(matches!(body.thinking, Some(Thinking::Adaptive { .. })));
         assert_eq!(body.temperature, Some(1.0));
+    }
+
+    #[test]
+    fn normalize_opus_4_7_preserves_explicit_enabled_display() {
+        let mut body = make_body(
+            Some(Thinking::Enabled {
+                budget_tokens: 8000,
+                display: Some(ThinkingDisplay::Omitted),
+            }),
+            None,
+            None,
+            None,
+        );
+        body.model = "claude-opus-4-7".to_string();
+        normalize_sampling_params(&mut body, &StealthProfile::default());
+        assert!(matches!(
+            body.thinking,
+            Some(Thinking::Adaptive {
+                display: Some(ThinkingDisplay::Omitted)
+            })
+        ));
     }
 
     #[test]
     fn normalize_opus_4_6_keeps_enabled_thinking() {
         let mut body = make_body(Some(Thinking::new(8000)), None, None, None);
         body.model = "claude-opus-4-6".to_string();
-        normalize_sampling_params(&mut body);
+        normalize_sampling_params(&mut body, &StealthProfile::default());
         assert!(matches!(body.thinking, Some(Thinking::Enabled { .. })));
     }
 
@@ -527,7 +626,57 @@ mod tests {
     fn normalize_opus_4_7_with_invalid_suffix_skips_rewrite() {
         let mut body = make_body(Some(Thinking::new(8000)), None, None, None);
         body.model = "claude-opus-4-7-preview1".to_string();
-        normalize_sampling_params(&mut body);
+        normalize_sampling_params(&mut body, &StealthProfile::default());
         assert!(matches!(body.thinking, Some(Thinking::Enabled { .. })));
+    }
+
+    #[test]
+    fn normalize_keeps_explicit_effort_when_rewriting_opus_4_7() {
+        let mut body = make_body(Some(Thinking::new(8000)), None, None, None);
+        body.model = "claude-opus-4-7".to_string();
+        body.output_config = Some(OutputConfig {
+            effort: Some(OutputEffort::Max),
+            format: None,
+        });
+        normalize_sampling_params(&mut body, &StealthProfile::default());
+        assert!(matches!(
+            body.output_config,
+            Some(OutputConfig {
+                effort: Some(OutputEffort::Max),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn normalize_forced_effort_overrides_supported_opus_requests() {
+        let mut body = make_body(None, Some(0.7), None, None);
+        body.model = "claude-opus-4-6".to_string();
+        let profile = StealthProfile {
+            force_output_effort: Some(OutputEffort::XHigh),
+            ..StealthProfile::default()
+        };
+        normalize_sampling_params(&mut body, &profile);
+        assert_eq!(body.temperature, Some(0.7));
+        assert!(matches!(
+            body.output_config,
+            Some(OutputConfig {
+                effort: Some(OutputEffort::XHigh),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn normalize_forced_effort_leaves_non_opus_requests_untouched() {
+        let mut body = make_body(None, Some(0.7), None, None);
+        body.model = "claude-sonnet-4-6".to_string();
+        let profile = StealthProfile {
+            force_output_effort: Some(OutputEffort::XHigh),
+            ..StealthProfile::default()
+        };
+        normalize_sampling_params(&mut body, &profile);
+        assert_eq!(body.temperature, Some(0.7));
+        assert!(body.output_config.is_none());
     }
 }
