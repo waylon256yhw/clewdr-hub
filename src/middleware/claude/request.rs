@@ -225,7 +225,8 @@ fn inject_metadata_user_id(
 ///
 /// Operators can also enable an Opus-only effort override from the admin settings
 /// page; when enabled it overwrites `output_config.effort` on supported Opus
-/// requests and leaves other models untouched.
+/// requests and leaves other models untouched. Older Opus versions receive a
+/// compatible fallback when the configured effort level is no longer supported.
 fn normalize_sampling_params(body: &mut CreateMessageParams, profile: &StealthProfile) {
     let thinking_active = matches!(
         body.thinking,
@@ -266,8 +267,10 @@ fn normalize_sampling_params(body: &mut CreateMessageParams, profile: &StealthPr
             .get_or_insert(OutputEffort::High);
     }
 
-    if is_effort_override_target_model(&body.model)
-        && let Some(force_output_effort) = profile.force_output_effort.clone()
+    if let Some(force_output_effort) = profile
+        .force_output_effort
+        .as_ref()
+        .and_then(|effort| remap_forced_output_effort(&body.model, effort))
     {
         body.output_config
             .get_or_insert_with(default_output_config)
@@ -286,10 +289,38 @@ fn is_opus_4_7(model: &str) -> bool {
     matches_model_with_optional_date_suffix(model, "claude-opus-4-7")
 }
 
-fn is_effort_override_target_model(model: &str) -> bool {
-    matches_model_with_optional_date_suffix(model, "claude-opus-4-7")
-        || matches_model_with_optional_date_suffix(model, "claude-opus-4-6")
-        || matches_model_with_optional_date_suffix(model, "claude-opus-4-5")
+fn is_opus_4_6(model: &str) -> bool {
+    matches_model_with_optional_date_suffix(model, "claude-opus-4-6")
+}
+
+fn is_opus_4_5(model: &str) -> bool {
+    matches_model_with_optional_date_suffix(model, "claude-opus-4-5")
+}
+
+fn remap_forced_output_effort(model: &str, effort: &OutputEffort) -> Option<OutputEffort> {
+    if is_opus_4_7(model) {
+        return Some(effort.clone());
+    }
+
+    if is_opus_4_6(model) {
+        return Some(match effort {
+            OutputEffort::XHigh => OutputEffort::Max,
+            OutputEffort::Low => OutputEffort::Low,
+            OutputEffort::Medium => OutputEffort::Medium,
+            OutputEffort::High => OutputEffort::High,
+            OutputEffort::Max => OutputEffort::Max,
+        });
+    }
+
+    if is_opus_4_5(model) {
+        return Some(match effort {
+            OutputEffort::Low => OutputEffort::Low,
+            OutputEffort::Medium => OutputEffort::Medium,
+            OutputEffort::High | OutputEffort::XHigh | OutputEffort::Max => OutputEffort::High,
+        });
+    }
+
+    None
 }
 
 fn matches_model_with_optional_date_suffix(model: &str, prefix: &str) -> bool {
@@ -661,7 +692,43 @@ mod tests {
         assert!(matches!(
             body.output_config,
             Some(OutputConfig {
+                effort: Some(OutputEffort::Max),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn normalize_forced_effort_keeps_all_levels_for_opus_4_7() {
+        let mut body = make_body(None, Some(0.7), None, None);
+        body.model = "claude-opus-4-7-20260416".to_string();
+        let profile = StealthProfile {
+            force_output_effort: Some(OutputEffort::XHigh),
+            ..StealthProfile::default()
+        };
+        normalize_sampling_params(&mut body, &profile);
+        assert!(matches!(
+            body.output_config,
+            Some(OutputConfig {
                 effort: Some(OutputEffort::XHigh),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn normalize_forced_effort_downgrades_unsupported_opus_4_5_levels() {
+        let mut body = make_body(None, Some(0.7), None, None);
+        body.model = "claude-opus-4-5".to_string();
+        let profile = StealthProfile {
+            force_output_effort: Some(OutputEffort::Max),
+            ..StealthProfile::default()
+        };
+        normalize_sampling_params(&mut body, &profile);
+        assert!(matches!(
+            body.output_config,
+            Some(OutputConfig {
+                effort: Some(OutputEffort::High),
                 ..
             })
         ));
