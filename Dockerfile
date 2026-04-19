@@ -2,6 +2,7 @@ FROM node:lts-slim AS frontend-builder
 WORKDIR /build/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
+COPY Cargo.toml /build/Cargo.toml
 COPY frontend/ .
 RUN npm run build
 

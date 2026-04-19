@@ -3,8 +3,14 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 const backendUrl = process.env.VITE_DEV_BACKEND_URL ?? 'http://localhost:8484'
-const cargoToml = readFileSync(new URL('../Cargo.toml', import.meta.url), 'utf8')
-const cargoVersion = cargoToml.match(/\[package\][\s\S]*?^version\s*=\s*"([^"]+)"/m)?.[1] ?? '0.0.0'
+let cargoVersion = process.env.APP_VERSION ?? '0.0.0'
+
+try {
+  const cargoToml = readFileSync(new URL('../Cargo.toml', import.meta.url), 'utf8')
+  cargoVersion = cargoToml.match(/\[package\][\s\S]*?^version\s*=\s*"([^"]+)"/m)?.[1] ?? cargoVersion
+} catch {
+  // Some build environments only mount the frontend subtree.
+}
 
 export default defineConfig({
   plugins: [react()],
