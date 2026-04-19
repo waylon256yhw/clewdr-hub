@@ -4,17 +4,20 @@ use axum::{
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 use sqlx::SqlitePool;
 use tracing::warn;
 
 use super::common::{Paginated, PaginationParams};
 use crate::{
+    billing::{BillingContext, RequestType, persist_probe_log},
     db::proxies::{
         ProxyRow, ProxyTestResultUpdate, ProxyUpdate, build_proxy_url, create_proxy, delete_proxy,
         get_proxy_by_id, list_proxies, update_proxy, update_proxy_test_result,
     },
     error::ClewdrError,
     services::account_pool::AccountPoolHandle,
+    state::AppState,
 };
 
 #[derive(Serialize)]
@@ -139,6 +142,22 @@ struct Ip2LocationResponse {
     city_name: Option<String>,
 }
 
+struct IpLocationLookupResult {
+    country: Option<String>,
+    region: Option<String>,
+    city: Option<String>,
+    http_status: Option<u16>,
+    raw_body: Option<Value>,
+    error: Option<String>,
+}
+
+struct ProxyProbeOutcome {
+    response: ProxyTestResponse,
+    http_status: Option<u16>,
+    log_status: &'static str,
+    bundle: Value,
+}
+
 fn error_chain_contains(err: &(dyn std::error::Error + 'static), needle: &str) -> bool {
     let needle = needle.to_ascii_lowercase();
     let mut current = Some(err);
@@ -246,9 +265,28 @@ fn normalize_country_name(country_name: Option<String>) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-async fn lookup_ip_location(ip_address: &str) -> (Option<String>, Option<String>, Option<String>) {
+fn parse_json_or_string(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+}
+
+fn proxy_log_status(message: &str, http_status: Option<u16>) -> &'static str {
+    if matches!(http_status, Some(401 | 403 | 407)) || message == "代理鉴权失败" {
+        "auth_rejected"
+    } else {
+        "upstream_error"
+    }
+}
+
+async fn lookup_ip_location(ip_address: &str) -> IpLocationLookupResult {
     let Some(primary_ip) = primary_ip_address(ip_address) else {
-        return (None, None, None);
+        return IpLocationLookupResult {
+            country: None,
+            region: None,
+            city: None,
+            http_status: None,
+            raw_body: None,
+            error: Some("missing primary ip".to_string()),
+        };
     };
 
     let encoded_ip: String = url::form_urlencoded::byte_serialize(primary_ip.as_bytes()).collect();
@@ -260,7 +298,14 @@ async fn lookup_ip_location(ip_address: &str) -> (Option<String>, Option<String>
         Ok(client) => client,
         Err(err) => {
             warn!(error = %err, "failed to build ip2location client");
-            return (None, None, None);
+            return IpLocationLookupResult {
+                country: None,
+                region: None,
+                city: None,
+                http_status: None,
+                raw_body: None,
+                error: Some(err.to_string()),
+            };
         }
     };
 
@@ -274,45 +319,90 @@ async fn lookup_ip_location(ip_address: &str) -> (Option<String>, Option<String>
         Ok(resp) => resp,
         Err(err) => {
             warn!(ip = primary_ip, error = %err, "ip2location lookup failed");
-            return (None, None, None);
+            return IpLocationLookupResult {
+                country: None,
+                region: None,
+                city: None,
+                http_status: None,
+                raw_body: None,
+                error: Some(err.to_string()),
+            };
         }
     };
+    let status = response.status().as_u16();
 
     if !response.status().is_success() {
         warn!(
             ip = primary_ip,
-            status = response.status().as_u16(),
-            "ip2location lookup returned non-success status"
+            status, "ip2location lookup returned non-success status"
         );
-        return (None, None, None);
+        let body = response.text().await.unwrap_or_default();
+        return IpLocationLookupResult {
+            country: None,
+            region: None,
+            city: None,
+            http_status: Some(status),
+            raw_body: (!body.is_empty()).then(|| parse_json_or_string(&body)),
+            error: Some(format!("HTTP {status}")),
+        };
     }
 
     let body = match response.text().await {
         Ok(body) => body,
         Err(err) => {
             warn!(ip = primary_ip, error = %err, "failed to read ip2location response");
-            return (None, None, None);
+            return IpLocationLookupResult {
+                country: None,
+                region: None,
+                city: None,
+                http_status: Some(status),
+                raw_body: None,
+                error: Some(err.to_string()),
+            };
         }
     };
+    let raw_body = parse_json_or_string(&body);
 
     match serde_json::from_str::<Ip2LocationResponse>(&body) {
-        Ok(parsed) => (
-            normalize_country_name(parsed.country_name),
-            parsed.region_name,
-            parsed.city_name,
-        ),
+        Ok(parsed) => IpLocationLookupResult {
+            country: normalize_country_name(parsed.country_name),
+            region: parsed.region_name,
+            city: parsed.city_name,
+            http_status: Some(status),
+            raw_body: Some(raw_body),
+            error: None,
+        },
         Err(err) => {
             warn!(ip = primary_ip, error = %err, "failed to parse ip2location response");
-            (None, None, None)
+            IpLocationLookupResult {
+                country: None,
+                region: None,
+                city: None,
+                http_status: Some(status),
+                raw_body: Some(raw_body),
+                error: Some(err.to_string()),
+            }
         }
     }
 }
 
-async fn probe_proxy(proxy_url: &str) -> ProxyTestResponse {
+async fn probe_proxy(proxy: &ProxyRow, proxy_url: &str) -> ProxyProbeOutcome {
     let probes = [
         ("https://ipwho.is/", "ipwho"),
         ("https://httpbin.org/ip", "httpbin"),
     ];
+    let mut bundle = Map::new();
+    let mut attempts = Vec::new();
+    bundle.insert(
+        "proxy".to_string(),
+        json!({
+            "id": proxy.id,
+            "name": proxy.name,
+            "protocol": proxy.protocol,
+            "host": proxy.host,
+            "port": proxy.port,
+        }),
+    );
     let mut client_builder = wreq::Client::builder().timeout(std::time::Duration::from_secs(10));
     if let Some(proxy) = crate::claude_code_state::proxy_from_url(Some(proxy_url)) {
         client_builder = client_builder.proxy(proxy);
@@ -321,19 +411,34 @@ async fn probe_proxy(proxy_url: &str) -> ProxyTestResponse {
         Ok(client) => client,
         Err(err) => {
             warn!(error = %err, "failed to build proxy test client");
-            return ProxyTestResponse {
-                success: false,
-                message: normalize_proxy_test_error(&err),
-                latency_ms: None,
-                ip_address: None,
-                country: None,
-                region: None,
-                city: None,
+            let message = normalize_proxy_test_error(&err);
+            bundle.insert("attempts".to_string(), Value::Array(attempts));
+            bundle.insert(
+                "result".to_string(),
+                json!({
+                    "success": false,
+                    "message": message,
+                }),
+            );
+            return ProxyProbeOutcome {
+                response: ProxyTestResponse {
+                    success: false,
+                    message: message.clone(),
+                    latency_ms: None,
+                    ip_address: None,
+                    country: None,
+                    region: None,
+                    city: None,
+                },
+                http_status: None,
+                log_status: proxy_log_status(&message, None),
+                bundle: Value::Object(bundle),
             };
         }
     };
 
     let mut last_message = "proxy test failed".to_string();
+    let mut last_http_status = None;
     for (url, parser) in probes {
         let started = std::time::Instant::now();
         let response = client
@@ -349,11 +454,33 @@ async fn probe_proxy(proxy_url: &str) -> ProxyTestResponse {
             Err(err) => {
                 warn!(probe_url = url, error = %err, "proxy test request failed");
                 last_message = normalize_proxy_test_error(&err);
+                last_http_status = err.status().map(|status| status.as_u16());
+                attempts.push(json!({
+                    "url": url,
+                    "parser": parser,
+                    "latency_ms": latency_ms,
+                    "success": false,
+                    "error": err.to_string(),
+                    "normalized_error": last_message,
+                }));
                 continue;
             }
         };
         if !resp.status().is_success() {
-            last_message = describe_probe_status(resp.status());
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            last_message = describe_probe_status(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            );
+            last_http_status = Some(status);
+            attempts.push(json!({
+                "url": url,
+                "parser": parser,
+                "latency_ms": latency_ms,
+                "success": false,
+                "http_status": status,
+                "body": (!body.is_empty()).then(|| parse_json_or_string(&body)),
+            }));
             continue;
         }
 
@@ -362,26 +489,78 @@ async fn probe_proxy(proxy_url: &str) -> ProxyTestResponse {
             Err(err) => {
                 warn!(probe_url = url, error = %err, "failed to read proxy test response");
                 last_message = normalize_proxy_test_error(&err);
+                last_http_status = err.status().map(|status| status.as_u16());
+                attempts.push(json!({
+                    "url": url,
+                    "parser": parser,
+                    "latency_ms": latency_ms,
+                    "success": false,
+                    "error": err.to_string(),
+                    "normalized_error": last_message,
+                }));
                 continue;
             }
         };
+        let raw_body = parse_json_or_string(&body);
 
         match parser {
             "ipwho" => match serde_json::from_str::<IpWhoResponse>(&body) {
                 Ok(parsed) if parsed.success => {
                     let ip_address = parsed.ip;
-                    let (country, region, city) = match ip_address.as_deref() {
-                        Some(ip) => lookup_ip_location(ip).await,
-                        None => (None, None, None),
+                    let geo_lookup = match ip_address.as_deref() {
+                        Some(ip) => Some(lookup_ip_location(ip).await),
+                        None => None,
                     };
-                    return ProxyTestResponse {
+                    let country = geo_lookup
+                        .as_ref()
+                        .and_then(|lookup| lookup.country.clone())
+                        .or_else(|| normalize_country_name(parsed.country));
+                    let region = geo_lookup
+                        .as_ref()
+                        .and_then(|lookup| lookup.region.clone())
+                        .or(parsed.region);
+                    let city = geo_lookup
+                        .as_ref()
+                        .and_then(|lookup| lookup.city.clone())
+                        .or(parsed.city);
+                    attempts.push(json!({
+                        "url": url,
+                        "parser": parser,
+                        "latency_ms": latency_ms,
+                        "success": true,
+                        "http_status": 200,
+                        "body": raw_body,
+                    }));
+                    if let Some(lookup) = geo_lookup {
+                        bundle.insert(
+                            "location_lookup".to_string(),
+                            json!({
+                                "provider": "ip2location",
+                                "http_status": lookup.http_status,
+                                "error": lookup.error,
+                                "body": lookup.raw_body,
+                            }),
+                        );
+                    }
+                    let response = ProxyTestResponse {
                         success: true,
                         message: "基础连通性正常".to_string(),
                         latency_ms: Some(latency_ms),
                         ip_address,
-                        country: country.or_else(|| normalize_country_name(parsed.country)),
-                        region: region.or(parsed.region),
-                        city: city.or(parsed.city),
+                        country,
+                        region,
+                        city,
+                    };
+                    bundle.insert("attempts".to_string(), Value::Array(attempts));
+                    bundle.insert(
+                        "result".to_string(),
+                        serde_json::to_value(&response).unwrap_or(Value::Null),
+                    );
+                    return ProxyProbeOutcome {
+                        response,
+                        http_status: Some(200),
+                        log_status: "ok",
+                        bundle: Value::Object(bundle),
                     };
                 }
                 Ok(parsed) => {
@@ -391,43 +570,112 @@ async fn probe_proxy(proxy_url: &str) -> ProxyTestResponse {
                         "probe target reported failure"
                     );
                     last_message = "探测目标返回异常".to_string();
+                    last_http_status = Some(200);
+                    attempts.push(json!({
+                        "url": url,
+                        "parser": parser,
+                        "latency_ms": latency_ms,
+                        "success": false,
+                        "http_status": 200,
+                        "body": raw_body,
+                        "error": parsed.message,
+                    }));
                 }
                 Err(err) => {
                     warn!(probe_url = url, error = %err, "failed to parse ipwho response");
                     last_message = "探测响应解析失败".to_string();
+                    last_http_status = Some(200);
+                    attempts.push(json!({
+                        "url": url,
+                        "parser": parser,
+                        "latency_ms": latency_ms,
+                        "success": false,
+                        "http_status": 200,
+                        "body": raw_body,
+                        "error": err.to_string(),
+                    }));
                 }
             },
             "httpbin" => match serde_json::from_str::<HttpBinResponse>(&body) {
                 Ok(parsed) => {
                     let ip_address = parsed.origin;
-                    let (country, region, city) = lookup_ip_location(&ip_address).await;
-                    return ProxyTestResponse {
+                    let geo_lookup = lookup_ip_location(&ip_address).await;
+                    attempts.push(json!({
+                        "url": url,
+                        "parser": parser,
+                        "latency_ms": latency_ms,
+                        "success": true,
+                        "http_status": 200,
+                        "body": raw_body,
+                    }));
+                    bundle.insert(
+                        "location_lookup".to_string(),
+                        json!({
+                            "provider": "ip2location",
+                            "http_status": geo_lookup.http_status,
+                            "error": geo_lookup.error,
+                            "body": geo_lookup.raw_body,
+                        }),
+                    );
+                    let response = ProxyTestResponse {
                         success: true,
                         message: "基础连通性正常".to_string(),
                         latency_ms: Some(latency_ms),
                         ip_address: Some(ip_address),
-                        country,
-                        region,
-                        city,
+                        country: geo_lookup.country,
+                        region: geo_lookup.region,
+                        city: geo_lookup.city,
+                    };
+                    bundle.insert("attempts".to_string(), Value::Array(attempts));
+                    bundle.insert(
+                        "result".to_string(),
+                        serde_json::to_value(&response).unwrap_or(Value::Null),
+                    );
+                    return ProxyProbeOutcome {
+                        response,
+                        http_status: Some(200),
+                        log_status: "ok",
+                        bundle: Value::Object(bundle),
                     };
                 }
                 Err(err) => {
                     warn!(probe_url = url, error = %err, "failed to parse httpbin response");
                     last_message = "探测响应解析失败".to_string();
+                    last_http_status = Some(200);
+                    attempts.push(json!({
+                        "url": url,
+                        "parser": parser,
+                        "latency_ms": latency_ms,
+                        "success": false,
+                        "http_status": 200,
+                        "body": raw_body,
+                        "error": err.to_string(),
+                    }));
                 }
             },
             _ => {}
         }
     }
 
-    ProxyTestResponse {
+    let response = ProxyTestResponse {
         success: false,
-        message: last_message,
+        message: last_message.clone(),
         latency_ms: None,
         ip_address: None,
         country: None,
         region: None,
         city: None,
+    };
+    bundle.insert("attempts".to_string(), Value::Array(attempts));
+    bundle.insert(
+        "result".to_string(),
+        serde_json::to_value(&response).unwrap_or(Value::Null),
+    );
+    ProxyProbeOutcome {
+        response,
+        http_status: last_http_status,
+        log_status: proxy_log_status(&last_message, last_http_status),
+        bundle: Value::Object(bundle),
     }
 }
 
@@ -548,10 +796,10 @@ pub async fn remove(
 }
 
 pub async fn test(
-    State(db): State<SqlitePool>,
+    State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<ProxyTestResponse>, ClewdrError> {
-    let proxy = get_proxy_by_id(&db, id)
+    let proxy = get_proxy_by_id(&state.db, id)
         .await?
         .ok_or(ClewdrError::NotFound {
             msg: "proxy not found",
@@ -559,22 +807,44 @@ pub async fn test(
     let proxy_url = build_proxy_url(&proxy).map_err(|_| ClewdrError::BadRequest {
         msg: "Invalid proxy configuration",
     })?;
-    let result = probe_proxy(&proxy_url).await;
+    let started_at = chrono::Utc::now();
+    let outcome = probe_proxy(&proxy, &proxy_url).await;
 
     update_proxy_test_result(
-        &db,
+        &state.db,
         id,
         ProxyTestResultUpdate {
-            success: Some(result.success),
-            latency_ms: result.latency_ms,
-            message: Some(result.message.as_str()),
-            ip_address: result.ip_address.as_deref(),
-            country: result.country.as_deref(),
-            region: result.region.as_deref(),
-            city: result.city.as_deref(),
+            success: Some(outcome.response.success),
+            latency_ms: outcome.response.latency_ms,
+            message: Some(outcome.response.message.as_str()),
+            ip_address: outcome.response.ip_address.as_deref(),
+            country: outcome.response.country.as_deref(),
+            region: outcome.response.region.as_deref(),
+            city: outcome.response.city.as_deref(),
         },
     )
     .await?;
 
-    Ok(Json(result))
+    let response_body = serde_json::to_string(&outcome.bundle).unwrap_or_else(|_| "{}".to_string());
+    let ctx = BillingContext {
+        db: state.db.clone(),
+        user_id: None,
+        api_key_id: None,
+        account_id: None,
+        model_raw: String::new(),
+        request_id: format!("probe-proxy-{}-{}", id, uuid::Uuid::new_v4()),
+        started_at,
+        event_tx: state.event_tx.clone(),
+    };
+    persist_probe_log(
+        &ctx,
+        RequestType::ProbeProxy,
+        outcome.log_status,
+        outcome.http_status,
+        &response_body,
+        (!outcome.response.success).then_some(outcome.response.message.as_str()),
+    )
+    .await;
+
+    Ok(Json(outcome.response))
 }

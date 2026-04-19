@@ -31,7 +31,11 @@ import { formatCost, formatDate, requestTypeColor, statusColor } from "../lib/fo
 const PAGE_SIZE = 50;
 
 function isProbeType(t: string): boolean {
-  return t === "probe_cookie" || t === "probe_oauth" || t === "test";
+  return t === "probe_cookie" || t === "probe_oauth" || t === "probe_proxy" || t === "test";
+}
+
+function hasProbeJsonDetail(t: string): boolean {
+  return t === "probe_cookie" || t === "probe_oauth" || t === "probe_proxy" || t === "test";
 }
 
 function prettyJson(raw: string): string {
@@ -42,40 +46,72 @@ function prettyJson(raw: string): string {
   }
 }
 
+function extractProbeProxyName(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as { proxy?: { name?: unknown } };
+    return typeof parsed.proxy?.name === "string" && parsed.proxy.name.trim()
+      ? parsed.proxy.name.trim()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 function LogDetail({ log, onClose }: { log: RequestLog | null; onClose: () => void }) {
   const probe = log ? isProbeType(log.request_type) : false;
+  const showProbeJson = log ? hasProbeJsonDetail(log.request_type) : false;
   const { data: bodyData, isLoading: bodyLoading } = useQuery({
     queryKey: log ? qk.requestBody(log.id) : ["request_body", "none"],
     queryFn: () => getRequestResponseBody(log!.id),
-    enabled: !!log && probe,
+    enabled: !!log && showProbeJson,
     staleTime: 5 * 60_000,
   });
 
   if (!log) return null;
 
-  const rows: [string, React.ReactNode][] = [
-    ["请求 ID", <Code key="rid">{log.request_id}</Code>],
-    ["类型", <Badge key="ty" color={requestTypeColor(log.request_type)} variant="light">{log.request_type}</Badge>],
-    ["用户", log.username ?? "—"],
-    ["Key", log.key_label ?? "—"],
-    ["账号", log.account_name ?? "—"],
-    ["模型", probe ? "—" : (log.model_raw ?? "—")],
-    ["模型 (标准化)", log.model_normalized ?? "—"],
-    ["流式", log.stream ? "是" : "否"],
-    ["开始时间", formatDate(log.started_at)],
-    ["完成时间", formatDate(log.completed_at)],
-    ["首字耗时", log.ttft_ms != null ? `${log.ttft_ms}ms` : "—"],
-    ["总耗时", log.duration_ms != null ? `${log.duration_ms}ms` : "—"],
-    ["状态", <Badge key="st" color={statusColor(log.status)} variant="light">{log.status}</Badge>],
-    ["HTTP 状态", log.http_status != null ? String(log.http_status) : "—"],
-    ["输入 Token", probe ? "—" : (log.input_tokens?.toLocaleString() ?? "—")],
-    ["输出 Token", probe ? "—" : (log.output_tokens?.toLocaleString() ?? "—")],
-    ["缓存创建", probe ? "—" : (log.cache_creation_tokens?.toLocaleString() ?? "—")],
-    ["缓存读取", probe ? "—" : (log.cache_read_tokens?.toLocaleString() ?? "—")],
-    ["费用", probe ? "—" : formatCost(log.cost_nanousd)],
-    ["错误码", log.error_code ?? "—"],
-    ["错误信息", log.error_message ?? "—"],
-  ];
+  const proxyName =
+    log.request_type === "probe_proxy"
+      ? extractProbeProxyName(bodyData?.response_body)
+      : null;
+
+  const rows: [string, React.ReactNode][] = probe
+    ? [
+        ["请求 ID", <Code key="rid">{log.request_id}</Code>],
+        ["类型", <Badge key="ty" color={requestTypeColor(log.request_type)} variant="light">{log.request_type}</Badge>],
+        ["代理名", log.request_type === "probe_proxy" ? (proxyName ?? (bodyLoading ? "加载中..." : "—")) : "—"],
+        ["开始时间", formatDate(log.started_at)],
+        ["完成时间", formatDate(log.completed_at)],
+        ["总耗时", log.duration_ms != null ? `${log.duration_ms}ms` : "—"],
+        ["状态", <Badge key="st" color={statusColor(log.status)} variant="light">{log.status}</Badge>],
+        ["HTTP 状态", log.http_status != null ? String(log.http_status) : "—"],
+        ["错误码", log.error_code ?? "—"],
+        ["错误信息", log.error_message ?? "—"],
+      ]
+    : [
+        ["请求 ID", <Code key="rid">{log.request_id}</Code>],
+        ["类型", <Badge key="ty" color={requestTypeColor(log.request_type)} variant="light">{log.request_type}</Badge>],
+        ["用户", log.username ?? "—"],
+        ["Key", log.key_label ?? "—"],
+        ["账号", log.account_name ?? "—"],
+        ["代理名", "—"],
+        ["模型", probe ? "—" : (log.model_raw ?? "—")],
+        ["模型 (标准化)", log.model_normalized ?? "—"],
+        ["流式", log.stream ? "是" : "否"],
+        ["开始时间", formatDate(log.started_at)],
+        ["完成时间", formatDate(log.completed_at)],
+        ["首字耗时", log.ttft_ms != null ? `${log.ttft_ms}ms` : "—"],
+        ["总耗时", log.duration_ms != null ? `${log.duration_ms}ms` : "—"],
+        ["状态", <Badge key="st" color={statusColor(log.status)} variant="light">{log.status}</Badge>],
+        ["HTTP 状态", log.http_status != null ? String(log.http_status) : "—"],
+        ["输入 Token", probe ? "—" : (log.input_tokens?.toLocaleString() ?? "—")],
+        ["输出 Token", probe ? "—" : (log.output_tokens?.toLocaleString() ?? "—")],
+        ["缓存创建", probe ? "—" : (log.cache_creation_tokens?.toLocaleString() ?? "—")],
+        ["缓存读取", probe ? "—" : (log.cache_read_tokens?.toLocaleString() ?? "—")],
+        ["费用", probe ? "—" : formatCost(log.cost_nanousd)],
+        ["错误码", log.error_code ?? "—"],
+        ["错误信息", log.error_message ?? "—"],
+      ];
 
   return (
     <Drawer opened={!!log} onClose={onClose} title="请求详情" position="right" size="md">
@@ -90,7 +126,7 @@ function LogDetail({ log, onClose }: { log: RequestLog | null; onClose: () => vo
             ))}
           </Table.Tbody>
         </Table>
-        {probe && (
+        {showProbeJson && (
           <div>
             <Text fw={600} size="sm" mb={4}>上游响应 JSON</Text>
             {bodyLoading ? (
@@ -179,6 +215,7 @@ export default function Logs() {
             { value: "messages", label: "messages" },
             { value: "probe_cookie", label: "probe (cookie)" },
             { value: "probe_oauth", label: "probe (oauth)" },
+            { value: "probe_proxy", label: "probe (proxy)" },
             { value: "test", label: "test" },
           ]}
           value={filters.request_type ?? null}
