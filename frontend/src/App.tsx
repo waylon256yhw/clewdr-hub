@@ -22,7 +22,7 @@ import { Notifications } from "@mantine/notifications";
 import { useDisclosure } from "@mantine/hooks";
 import { Routes, Route, Navigate, useLocation, Link } from "react-router";
 import { Component, Suspense, lazy, useEffect, useRef, type ReactNode } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   IconDashboard,
   IconServer,
@@ -36,8 +36,13 @@ import {
   IconLogout,
 } from "@tabler/icons-react";
 import { theme } from "./theme";
-import { qk } from "./api";
-import { RequireAuth, useAuth, ForceChangePasswordModal } from "./auth";
+import { getOverview, qk } from "./api";
+import {
+  RequireAuth,
+  useAuth,
+  ForceChangePasswordModal,
+  reloadIfFrontendOutdated,
+} from "./auth";
 import Login from "./routes/Login";
 import Dashboard from "./routes/Dashboard";
 import Accounts from "./routes/Accounts";
@@ -184,11 +189,27 @@ function useGlobalAdminEvents() {
   }, [queryClient]);
 }
 
+function useFrontendVersionSync() {
+  const { data } = useQuery({
+    queryKey: qk.overview,
+    queryFn: getOverview,
+    staleTime: 30_000,
+    refetchInterval: 30_000,
+    refetchOnWindowFocus: true,
+    refetchOnReconnect: true,
+  });
+
+  useEffect(() => {
+    reloadIfFrontendOutdated(data?.version);
+  }, [data?.version]);
+}
+
 function AdminShell() {
   const location = useLocation();
   const [opened, { toggle, close }] = useDisclosure();
   const { logout } = useAuth();
   useGlobalAdminEvents();
+  useFrontendVersionSync();
 
   return (
     <AppShell

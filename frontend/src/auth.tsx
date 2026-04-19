@@ -20,6 +20,32 @@ import {
   type LoginResponse,
 } from "./api";
 
+const VERSION_RELOAD_KEY = "clewdr:frontend-version-reload";
+
+export function reloadIfFrontendOutdated(serverVersion: string | undefined): boolean {
+  if (!serverVersion) {
+    return false;
+  }
+
+  if (serverVersion === __APP_VERSION__) {
+    try {
+      sessionStorage.removeItem(VERSION_RELOAD_KEY);
+    } catch {}
+    return false;
+  }
+
+  const reloadToken = `${__APP_VERSION__}->${serverVersion}`;
+  try {
+    if (sessionStorage.getItem(VERSION_RELOAD_KEY) === reloadToken) {
+      return false;
+    }
+    sessionStorage.setItem(VERSION_RELOAD_KEY, reloadToken);
+  } catch {}
+
+  window.location.reload();
+  return true;
+}
+
 interface AuthUser {
   user_id: number;
   username: string;
@@ -53,6 +79,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     getOverview()
       .then((data) => {
+        if (reloadIfFrontendOutdated(data.version)) return;
         queryClient.setQueryData(qk.overview, data);
         setUser({ user_id: 0, username: "admin", role: "admin" });
         if (data.must_change_password) {
@@ -82,11 +109,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (res.must_change_password) {
       setMustChangePassword(true);
     }
-    void queryClient.prefetchQuery({
+    const overview = await queryClient.fetchQuery({
       queryKey: qk.overview,
       queryFn: getOverview,
       staleTime: 30_000,
     });
+    reloadIfFrontendOutdated(overview.version);
     return res;
   }, [queryClient]);
 
