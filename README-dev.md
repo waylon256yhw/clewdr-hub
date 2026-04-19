@@ -13,6 +13,7 @@
 - [账号调度器](#账号调度器)
 - [认证体系](#认证体系)
 - [数据库](#数据库)
+- [代理与测试](#代理与测试)
 - [前端](#前端)
 - [构建与发布](#构建与发布)
 - [已知问题与设计决策](#已知问题与设计决策)
@@ -82,6 +83,7 @@ src/
 │   ├── mod.rs                 # init_pool / seed_admin / migrations
 │   ├── models.rs              # AuthenticatedUser 等共享类型
 │   ├── accounts.rs            # AccountWithRuntime / load_all_accounts / batch_upsert
+│   ├── proxies.rs             # ProxyRow / build_proxy_url / update_proxy_test_result
 │   ├── queries.rs             # authenticate_api_key / touch_api_key / touch_user
 │   ├── api_key.rs             # Key 生成（blake3 哈希 + lookup 前缀）
 │   └── billing.rs             # insert_request_log / upsert_usage_rollup / upsert_usage_lifetime_total
@@ -90,7 +92,7 @@ src/
 │   ├── models.rs              # GET /v1/models
 │   ├── health.rs              # GET /health
 │   ├── auth.rs                # POST /auth/login, /auth/logout
-│   └── admin/                 # /api/admin/* 管理 API（accounts, users, keys, policies, ops...）
+│   └── admin/                 # /api/admin/* 管理 API（accounts, proxies, users, keys, policies, ops...）
 ├── middleware/
 │   ├── auth.rs                # RequireFlexibleAuth（API Key）/ RequireAdminAuth（session cookie）
 │   └── claude/request.rs      # ClaudeCodePreprocess：请求预处理、billing header 注入
@@ -115,7 +117,7 @@ src/
 frontend/src/
 ├── main.tsx                   # React 入口
 ├── api.ts                     # API client + TypeScript 接口定义
-├── routes/                    # 页面组件（Dashboard, Ops, Accounts, Users, Keys, Logs, Settings）
+├── routes/                    # 页面组件（Dashboard, Ops, Accounts, Proxies, Users, Keys, Logs, Settings）
 └── lib/                       # 工具函数
 ```
 
@@ -175,14 +177,16 @@ Claude Code / 任意 Anthropic 客户端
 
 5. **Token 交换**：检查账号的 access_token 状态（None/Expired/Valid），必要时走 cookie → OAuth code → token 或纯 OAuth refresh 流程。
 
-6. **上游请求**：构建伪装请求头（stealth profile）→ `POST api.anthropic.com/v1/messages`
+6. **代理绑定**：如果账号配置了 `proxy_id`，会先解析成账号级 `proxy_url`，后续 Claude 请求、OAuth refresh、OAuth probe 都走这个代理；未绑定则直连。
 
-7. **响应处理**：
+7. **上游请求**：构建伪装请求头（stealth profile）→ `POST api.anthropic.com/v1/messages`
+
+8. **响应处理**：
    - 非流式：读取完整响应 → 提取 usage → 持久化计费 → 返回
    - 流式：返回 SSE stream → 在 `MessageStop` 事件中异步持久化 usage + 释放 slot
    - 流异常终止（客户端断开）：`SlotDropGuard` 的 `Drop` impl 自动释放 slot
 
-8. **重试**：遇到 429/auth 错误时 `release(Some(reason))` 将账号移入 exhausted 队列 → 换一个账号重试，最多 6 次。
+9. **重试**：遇到 429/auth 错误时 `release(Some(reason))` 将账号移入 exhausted 队列 → 换一个账号重试，最多 6 次。
 
 ---
 
@@ -296,13 +300,14 @@ SQLite WAL 模式，通过 sqlx 的编译期 migration 自动建表。
 | `policies` | 策略模板 | max_concurrent, rpm_limit, weekly_budget_nanousd, monthly_budget_nanousd |
 | `api_keys` | API Key | user_id, lookup_key, key_hash (blake3), last_used_at, last_used_ip |
 | `api_key_account_bindings` | Key↔账号绑定 | api_key_id, account_id |
-| `accounts` | Claude 账号 | cookie_blob, max_slots, drain_first, status, email, account_type |
+| `accounts` | Claude 账号 | cookie_blob, proxy_id, max_slots, drain_first, status, email, account_type |
+| `proxies` | 代理资源 | name, protocol, host, port, username, password, last_test_* |
 | `account_runtime_state` | 运行时状态 | reset_time, 4×用量窗口, 5×usage bucket, 4×utilization |
-| `request_logs` | 请求日志 | 全字段（token/cost/ttft/duration/error），保留 7 天 |
+| `request_logs` | 请求日志 | 全字段（token/cost/ttft/duration/error/response_body），保留 7 天 |
 | `usage_rollups` | 费用汇总 | user_id + period_type(week/month) + period_start → cost_nanousd |
 | `usage_lifetime_totals` | 累计汇总 | user_id 维度累计 request/token/cost，独立于日志留存 |
 | `models` | 模型列表 | model_id, source(builtin/admin/discovered), enabled |
-| `settings` | KV 配置 | key → value（stealth 版本、proxy、session_secret 等） |
+| `settings` | KV 配置 | key → value（stealth 版本、session_secret 等） |
 
 ### 费用精度
 
@@ -311,6 +316,59 @@ SQLite WAL 模式，通过 sqlx 的编译期 migration 自动建表。
 ### Migration
 
 位于 `migrations/` 目录，sqlx 启动时自动执行。命名规范：`{YYYYMMDD}{seq}_description.sql`。
+
+### request_logs 类型
+
+当前 `request_logs.request_type` 受 SQLite `CHECK` 约束限制，允许值包括：
+
+- `messages`
+- `probe_cookie`
+- `probe_oauth`
+- `probe_proxy`
+- `test`
+
+新增 probe 类型时，除了改 Rust 枚举 `RequestType`，还必须同步补 migration 更新 `request_logs` 的约束。
+
+---
+
+## 代理与测试
+
+### 代理模型
+
+- 代理已经从旧的全局设置项提升为独立资源，存放在 `proxies` 表。
+- 一个实例可同时维护多个备用代理；当前只做“保存多个、按需选择”，不做自动轮换。
+- 每个账号可通过 `accounts.proxy_id` 绑定一个代理，也可以留空直连。
+
+### 生效路径
+
+账号级代理会影响这些出站路径：
+
+- Claude Messages 请求
+- OAuth callback 交换
+- OAuth refresh
+- OAuth probe / account test
+
+实现上通过 `load_all_accounts()` 组装 `proxy_url`，再传给 `ClaudeCodeState` / `oauth.rs` 统一构建带代理的 `wreq::Client`。
+
+### 代理测试
+
+管理后台“代理”页的测试是服务器侧的通用连通性测试，不是某个特定上游服务的兼容性测试。当前行为：
+
+- 通过代理请求 `https://ipwho.is/`，失败时回退 `https://httpbin.org/ip`
+- 记录延迟、出口 IP、地区信息
+- 地区补全通过 `IP2Location.io` 在线查询完成
+- 成功/失败结果会持久化到 `proxies.last_test_*`
+
+### 代理测试日志
+
+- 每次代理测试都会写一条 `request_logs`
+- 类型为 `probe_proxy`
+- `response_body` 保存结构化 JSON bundle，包含：
+  - 代理基础信息：仅 `id / name / protocol / host / port`
+  - 上游探测尝试列表
+  - 地区补全返回
+  - 最终测试结果
+- 注意：日志 bundle 明确不记录代理用户名、密码，也不记录带凭据的完整代理 URL
 
 ---
 
