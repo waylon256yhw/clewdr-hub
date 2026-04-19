@@ -20,6 +20,7 @@ use tracing::error;
 use url::{Url, form_urlencoded};
 
 use crate::{
+    claude_code_state::proxy_from_url,
     config::{CC_REDIRECT_URI, CC_TOKEN_URL, CLEWDR_CONFIG, RuntimeStateParams, TokenInfo},
     error::{CheckClaudeErr, ClewdrError, UnexpectedNoneSnafu, WreqSnafu},
     stealth,
@@ -178,18 +179,10 @@ fn cleanup_expired_states(states: &mut HashMap<String, AdminOAuthState>) {
     states.retain(|_, item| item.created_at.elapsed() < ADMIN_OAUTH_TTL);
 }
 
-fn oauth_client() -> wreq::Client {
-    let profile = stealth::global_profile().load();
+fn oauth_client(proxy_url: Option<&str>) -> wreq::Client {
     let mut builder = wreq::Client::builder();
-    if let Some(proxy) = profile.proxy.as_deref().filter(|s| !s.trim().is_empty()) {
-        match wreq::Proxy::all(proxy) {
-            Ok(proxy) => {
-                builder = builder.proxy(proxy);
-            }
-            Err(err) => {
-                error!("Failed to parse proxy from settings for OAuth client: {err}");
-            }
-        }
+    if let Some(proxy) = proxy_from_url(proxy_url) {
+        builder = builder.proxy(proxy);
     }
     builder.build().unwrap_or_else(|err| {
         error!("Failed to build OAuth client: {err}");
@@ -205,8 +198,11 @@ fn oauth_form_body(params: &[(&str, &str)]) -> String {
     serializer.finish()
 }
 
-async fn send_oauth_token_request(body: String) -> Result<OAuthTokenResponse, ClewdrError> {
-    let response = oauth_client()
+async fn send_oauth_token_request(
+    body: String,
+    proxy_url: Option<&str>,
+) -> Result<OAuthTokenResponse, ClewdrError> {
+    let response = oauth_client(proxy_url)
         .post(CC_TOKEN_URL)
         .header("content-type", "application/x-www-form-urlencoded")
         .header("accept", "application/json, text/plain, */*")
@@ -256,6 +252,7 @@ async fn exchange_oauth_code(
     state: Option<&str>,
     redirect_uri: &str,
     verifier: &str,
+    proxy_url: Option<&str>,
 ) -> Result<OAuthTokenResponse, ClewdrError> {
     let client_id = CLEWDR_CONFIG.load().cc_client_id();
     let mut params = vec![
@@ -268,11 +265,12 @@ async fn exchange_oauth_code(
     if let Some(state) = state.filter(|s| !s.trim().is_empty()) {
         params.push(("state", state));
     }
-    send_oauth_token_request(oauth_form_body(&params)).await
+    send_oauth_token_request(oauth_form_body(&params), proxy_url).await
 }
 
 async fn refresh_oauth_access_token(
     refresh_token: &str,
+    proxy_url: Option<&str>,
 ) -> Result<OAuthTokenResponse, ClewdrError> {
     let client_id = CLEWDR_CONFIG.load().cc_client_id();
     let params = [
@@ -280,7 +278,7 @@ async fn refresh_oauth_access_token(
         ("client_id", client_id.as_str()),
         ("refresh_token", refresh_token),
     ];
-    send_oauth_token_request(oauth_form_body(&params)).await
+    send_oauth_token_request(oauth_form_body(&params), proxy_url).await
 }
 
 fn token_response_access_token(
@@ -432,8 +430,11 @@ fn parse_account_type(profile: &OAuthProfile) -> Option<String> {
     None
 }
 
-pub async fn fetch_oauth_snapshot(access_token: &str) -> Result<OAuthAccountSnapshot, ClewdrError> {
-    let (snapshot, _, _) = fetch_oauth_snapshot_raw(access_token).await?;
+pub async fn fetch_oauth_snapshot(
+    access_token: &str,
+    proxy_url: Option<&str>,
+) -> Result<OAuthAccountSnapshot, ClewdrError> {
+    let (snapshot, _, _) = fetch_oauth_snapshot_raw(access_token, proxy_url).await?;
     Ok(snapshot)
 }
 
@@ -441,8 +442,9 @@ pub async fn fetch_oauth_snapshot(access_token: &str) -> Result<OAuthAccountSnap
 /// so manually-triggered probes can persist them for debugging.
 pub async fn fetch_oauth_snapshot_raw(
     access_token: &str,
+    proxy_url: Option<&str>,
 ) -> Result<(OAuthAccountSnapshot, serde_json::Value, serde_json::Value), ClewdrError> {
-    let client = oauth_client();
+    let client = oauth_client(proxy_url);
     let (profile, profile_raw) = fetch_oauth_profile(&client, access_token).await?;
     let (usage, usage_raw) = fetch_oauth_usage(&client, access_token).await?;
 
@@ -507,6 +509,7 @@ pub async fn fetch_oauth_snapshot_raw(
 pub async fn exchange_admin_oauth_callback(
     input: &str,
     fallback_state: Option<&str>,
+    proxy_url: Option<&str>,
 ) -> Result<OAuthExchangeResult, ClewdrError> {
     let (code, state) = parse_callback_input(input, fallback_state)?;
     let stored = take_admin_oauth_state(state.as_deref()).await?;
@@ -515,11 +518,12 @@ pub async fn exchange_admin_oauth_callback(
         state.as_deref(),
         &stored.redirect_uri,
         &stored.verifier,
+        proxy_url,
     )
     .await?;
     let access_token =
         token_response_access_token(&token, "OAuth token response missing access_token")?;
-    let snapshot = fetch_oauth_snapshot(&access_token).await?;
+    let snapshot = fetch_oauth_snapshot(&access_token, proxy_url).await?;
     let organization_uuid = token
         .organization
         .uuid
@@ -537,8 +541,11 @@ pub async fn exchange_admin_oauth_callback(
     })
 }
 
-pub async fn refresh_oauth_token(token: &TokenInfo) -> Result<OAuthExchangeResult, ClewdrError> {
-    let (result, _, _) = refresh_oauth_token_with_raw(token).await?;
+pub async fn refresh_oauth_token(
+    token: &TokenInfo,
+    proxy_url: Option<&str>,
+) -> Result<OAuthExchangeResult, ClewdrError> {
+    let (result, _, _) = refresh_oauth_token_with_raw(token, proxy_url).await?;
     Ok(result)
 }
 
@@ -546,11 +553,13 @@ pub async fn refresh_oauth_token(token: &TokenInfo) -> Result<OAuthExchangeResul
 /// so manually-triggered probes can persist them for debugging.
 pub async fn refresh_oauth_token_with_raw(
     token: &TokenInfo,
+    proxy_url: Option<&str>,
 ) -> Result<(OAuthExchangeResult, serde_json::Value, serde_json::Value), ClewdrError> {
-    let raw = refresh_oauth_access_token(&token.refresh_token).await?;
+    let raw = refresh_oauth_access_token(&token.refresh_token, proxy_url).await?;
     let access_token =
         token_response_access_token(&raw, "OAuth refresh response missing access_token")?;
-    let (snapshot, profile_raw, usage_raw) = fetch_oauth_snapshot_raw(&access_token).await?;
+    let (snapshot, profile_raw, usage_raw) =
+        fetch_oauth_snapshot_raw(&access_token, proxy_url).await?;
     let organization_uuid = raw
         .organization
         .uuid

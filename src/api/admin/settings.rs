@@ -22,6 +22,7 @@ const DEPRECATED_KEYS: &[&str] = &[
     "cc_stainless_os",
     "cc_stainless_arch",
     "cc_beta_flags",
+    "proxy",
 ];
 
 pub async fn get_all(
@@ -44,7 +45,6 @@ pub async fn get_all(
 const RELOADABLE_SETTINGS_KEYS: &[&str] = &[
     "cc_cli_version",
     "cc_billing_salt",
-    "proxy",
     "output_effort_override_enabled",
     "output_effort_override_level",
 ];

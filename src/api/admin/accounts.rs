@@ -13,12 +13,13 @@ use sqlx::SqlitePool;
 use super::common::PaginationParams;
 use crate::{
     billing::{BillingContext, RequestType, persist_probe_log},
-    claude_code_state::{build_api_client, probe::probe_oauth_account, proxy_from_profile},
+    claude_code_state::{build_api_client, probe::probe_oauth_account},
     config::CLAUDE_ENDPOINT,
     db::accounts::{
         AccountWithRuntime, batch_upsert_runtime_states, get_account_by_id, load_all_accounts,
         update_account_metadata_unchecked, upsert_account_oauth,
     },
+    db::proxies::{build_proxy_url, get_proxy_by_id},
     error::{ClewdrError, WreqSnafu},
     oauth::{
         AdminOAuthStartResponse, exchange_admin_oauth_callback, refresh_oauth_token,
@@ -61,6 +62,8 @@ pub struct AccountResponse {
     pub id: i64,
     pub name: String,
     pub rr_order: i64,
+    pub proxy_id: Option<i64>,
+    pub proxy_name: Option<String>,
     pub drain_first: bool,
     pub status: String,
     pub auth_source: String,
@@ -107,6 +110,8 @@ fn map_account(row: &AccountWithRuntime) -> AccountResponse {
         id: row.id,
         name: row.name.clone(),
         rr_order: row.rr_order,
+        proxy_id: row.proxy_id,
+        proxy_name: row.proxy_name.clone(),
         drain_first: row.drain_first,
         status: row.status.clone(),
         auth_source: row.auth_source.clone(),
@@ -129,6 +134,7 @@ pub struct CreateAccountRequest {
     pub name: String,
     pub rr_order: Option<i64>,
     pub max_slots: Option<i64>,
+    pub proxy_id: Option<i64>,
     pub drain_first: Option<bool>,
     pub auth_source: Option<String>,
     pub cookie_blob: Option<String>,
@@ -142,6 +148,7 @@ pub struct UpdateAccountRequest {
     pub name: Option<String>,
     pub rr_order: Option<i64>,
     pub max_slots: Option<i64>,
+    pub proxy_id: Option<i64>,
     pub drain_first: Option<bool>,
     pub status: Option<String>,
     pub auth_source: Option<String>,
@@ -161,6 +168,24 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
         let trimmed = v.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     })
+}
+
+async fn resolve_proxy_url(
+    db: &SqlitePool,
+    proxy_id: Option<i64>,
+) -> Result<Option<(i64, String)>, ClewdrError> {
+    let Some(proxy_id) = proxy_id.filter(|id| *id > 0) else {
+        return Ok(None);
+    };
+    let proxy = get_proxy_by_id(db, proxy_id)
+        .await?
+        .ok_or(ClewdrError::NotFound {
+            msg: "proxy not found",
+        })?;
+    let url = build_proxy_url(&proxy).map_err(|_| ClewdrError::BadRequest {
+        msg: "Invalid proxy configuration",
+    })?;
+    Ok(Some((proxy_id, url)))
 }
 
 fn derive_auth_source(
@@ -231,10 +256,18 @@ pub async fn create(
         });
     }
 
+    let proxy_binding = resolve_proxy_url(&db, req.proxy_id).await?;
     let cookie_blob = normalize_optional(req.cookie_blob);
     let oauth_state = normalize_optional(req.oauth_state);
     let oauth = match normalize_optional(req.oauth_callback_input) {
-        Some(input) => Some(exchange_admin_oauth_callback(&input, oauth_state.as_deref()).await?),
+        Some(input) => Some(
+            exchange_admin_oauth_callback(
+                &input,
+                oauth_state.as_deref(),
+                proxy_binding.as_ref().map(|(_, url)| url.as_str()),
+            )
+            .await?,
+        ),
         None => None,
     };
     let auth_source = derive_auth_source(
@@ -268,15 +301,16 @@ pub async fn create(
 
     let id = sqlx::query(
         "INSERT INTO accounts (
-            name, rr_order, max_slots, status, auth_source, cookie_blob,
+            name, rr_order, max_slots, proxy_id, status, auth_source, cookie_blob,
             oauth_access_token, oauth_refresh_token, oauth_expires_at,
             organization_uuid, last_refresh_at, last_error, email, account_type,
             drain_first
-        ) VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12, ?13)",
+        ) VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14)",
     )
     .bind(&req.name)
     .bind(rr_order)
     .bind(max_slots)
+    .bind(proxy_binding.as_ref().map(|(id, _)| *id))
     .bind(auth_source)
     .bind(cookie_blob.as_deref())
     .bind(oauth.as_ref().map(|v| v.token.access_token.as_str()))
@@ -344,10 +378,26 @@ pub async fn update(
         .ok_or(ClewdrError::NotFound {
             msg: "account not found",
         })?;
+    let requested_proxy_id = req.proxy_id.and_then(|value| (value > 0).then_some(value));
+    let proxy_binding = if req.proxy_id.is_some() {
+        resolve_proxy_url(&db, requested_proxy_id).await?
+    } else {
+        match (existing.proxy_id, existing.proxy_url.clone()) {
+            (Some(proxy_id), Some(url)) => Some((proxy_id, url)),
+            _ => None,
+        }
+    };
     let new_cookie_blob = normalize_optional(req.cookie_blob.clone());
     let oauth_state = normalize_optional(req.oauth_state.clone());
     let oauth = match normalize_optional(req.oauth_callback_input.clone()) {
-        Some(input) => Some(exchange_admin_oauth_callback(&input, oauth_state.as_deref()).await?),
+        Some(input) => Some(
+            exchange_admin_oauth_callback(
+                &input,
+                oauth_state.as_deref(),
+                proxy_binding.as_ref().map(|(_, url)| url.as_str()),
+            )
+            .await?,
+        ),
         None => None,
     };
     let has_cookie = new_cookie_blob.is_some() || existing.cookie_blob.is_some();
@@ -397,6 +447,15 @@ pub async fn update(
             "UPDATE accounts SET max_slots = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
         )
         .bind(slots)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if req.proxy_id.is_some() {
+        sqlx::query(
+            "UPDATE accounts SET proxy_id = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        )
+        .bind(requested_proxy_id)
         .bind(id)
         .execute(&mut *tx)
         .await?;
@@ -595,7 +654,7 @@ pub async fn test_account(
     // 3. Refresh token if expired
     let started_at = chrono::Utc::now();
     let access_token = if token.is_expired() {
-        match refresh_oauth_token(&token).await {
+        match refresh_oauth_token(&token, account.proxy_url.as_deref()).await {
             Ok(refreshed) => {
                 let _ = upsert_account_oauth(&state.db, id, Some(&refreshed.token), None).await;
                 refreshed.token.access_token
@@ -642,8 +701,7 @@ pub async fn test_account(
     });
 
     // 5. Send request
-    let proxy = proxy_from_profile(&profile);
-    let client = build_api_client(proxy.as_ref());
+    let client = build_api_client(account.proxy_url.as_deref());
     let url = format!("{CLAUDE_ENDPOINT}v1/messages?beta=true");
     let ua = profile.load().user_agent();
 

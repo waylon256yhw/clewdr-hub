@@ -21,9 +21,19 @@ export function formatCompactCount(value: number): string {
   }).format(value);
 }
 
+function parseTimestamp(value: string): Date {
+  const trimmed = value.trim();
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(trimmed)) {
+    return new Date(trimmed.replace(" ", "T") + "Z");
+  }
+  return new Date(trimmed);
+}
+
 export function formatDate(iso: string | null | undefined): string {
   if (!iso) return "—";
-  return new Date(iso).toLocaleString("zh-CN", {
+  const date = parseTimestamp(iso);
+  if (Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleString("zh-CN", {
     timeZone: "Asia/Shanghai",
     year: "numeric",
     month: "2-digit",
@@ -33,6 +43,11 @@ export function formatDate(iso: string | null | undefined): string {
     second: "2-digit",
     hour12: false,
   });
+}
+
+export function formatEpochSeconds(epochSecs: number | null | undefined): string {
+  if (!epochSecs) return "—";
+  return formatDate(new Date(epochSecs * 1000).toISOString());
 }
 
 export function statusColor(status: string): string {

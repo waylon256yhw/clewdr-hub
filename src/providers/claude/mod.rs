@@ -283,6 +283,7 @@ impl LLMProvider for ClaudeCodeProvider {
             state.account_id = Some(account.id);
             state.oauth_token = account.oauth_token.clone();
             state.organization_uuid = account.organization_uuid.clone();
+            state.set_proxy_url(account.proxy_url.as_deref());
         }
 
         // Set billing context for cost tracking

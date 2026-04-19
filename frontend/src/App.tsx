@@ -26,6 +26,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   IconDashboard,
   IconServer,
+  IconPlug,
   IconUsers,
   IconKey,
   IconSettings,
@@ -46,6 +47,7 @@ import {
 import Login from "./routes/Login";
 import Dashboard from "./routes/Dashboard";
 import Accounts from "./routes/Accounts";
+import Proxies from "./routes/Proxies";
 import Users from "./routes/Users";
 import Keys from "./routes/Keys";
 import Settings from "./routes/Settings";
@@ -120,6 +122,7 @@ function OpsSkeleton() {
 const NAV_ITEMS = [
   { label: "总览", path: "/", icon: IconDashboard },
   { label: "账号池", path: "/accounts", icon: IconServer },
+  { label: "代理", path: "/proxies", icon: IconPlug },
   { label: "用户管理", path: "/users", icon: IconUsers },
   { label: "API 密钥", path: "/keys", icon: IconKey },
   { label: "设置", path: "/settings", icon: IconSettings },
@@ -248,6 +251,7 @@ function AdminShell() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/accounts" element={<Accounts />} />
+          <Route path="/proxies" element={<Proxies />} />
           <Route path="/users" element={<Users />} />
           <Route path="/keys" element={<Keys />} />
           <Route path="/settings" element={<Settings />} />

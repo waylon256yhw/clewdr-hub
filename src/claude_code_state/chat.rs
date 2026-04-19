@@ -104,7 +104,7 @@ impl ClaudeCodeState {
         let Some(token) = self.oauth_token.as_ref() else {
             return Ok(());
         };
-        let refreshed = refresh_oauth_token(token).await?;
+        let refreshed = refresh_oauth_token(token, self.proxy_url.as_deref()).await?;
         let db = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()).ok_or(
             ClewdrError::UnexpectedNone {
                 msg: "Missing billing context database",

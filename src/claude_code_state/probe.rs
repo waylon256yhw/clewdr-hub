@@ -425,7 +425,7 @@ async fn run_oauth_probe(
         });
     };
 
-    match refresh_oauth_token_with_raw(&token).await {
+    match refresh_oauth_token_with_raw(&token, account.proxy_url.as_deref()).await {
         Ok((refreshed, profile_raw, usage_raw)) => {
             bundle.insert("profile".into(), profile_raw);
             bundle.insert("usage".into(), usage_raw);

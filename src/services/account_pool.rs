@@ -640,6 +640,7 @@ impl AccountPoolActor {
                 }
             };
             cs.account_id = Some(row.id);
+            cs.proxy_url = row.proxy_url.clone();
             cs.email = row.email.clone();
             cs.account_type = row.account_type.clone();
             if let Some(token) = row.oauth_token.clone() {
@@ -673,6 +674,7 @@ impl AccountPoolActor {
                     cs.weekly_utilization = mem.weekly_utilization;
                     cs.weekly_sonnet_utilization = mem.weekly_sonnet_utilization;
                     cs.weekly_opus_utilization = mem.weekly_opus_utilization;
+                    cs.proxy_url = row.proxy_url.clone();
                     // Prefer memory email/account_type if DB is null but memory has it
                     if cs.email.is_none() {
                         cs.email = mem.email;

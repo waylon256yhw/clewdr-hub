@@ -7,6 +7,7 @@ pub mod models;
 pub mod ops;
 pub mod overview;
 pub mod policies;
+pub mod proxies;
 pub mod requests;
 pub mod settings;
 pub mod users;
@@ -42,6 +43,13 @@ pub fn admin_router() -> Router<AppState> {
             put(accounts::update).delete(accounts::remove),
         )
         .route("/accounts/{id}/test", post(accounts::test_account))
+        // Proxies
+        .route("/proxies", get(proxies::list).post(proxies::create))
+        .route(
+            "/proxies/{id}",
+            put(proxies::update).delete(proxies::remove),
+        )
+        .route("/proxies/{id}/test", post(proxies::test))
         // Models
         .route("/models", get(models::list).post(models::create))
         .route("/models/reset-defaults", post(models::reset_defaults))

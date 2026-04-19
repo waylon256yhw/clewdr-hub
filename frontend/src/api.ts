@@ -96,6 +96,8 @@ export interface Account {
   id: number;
   name: string;
   rr_order: number;
+  proxy_id: number | null;
+  proxy_name: string | null;
   drain_first: boolean;
   status: string;
   auth_source: "cookie" | "oauth" | "hybrid";
@@ -110,6 +112,26 @@ export interface Account {
   created_at: string | null;
   updated_at: string | null;
   runtime: AccountRuntime | null;
+}
+
+export interface Proxy {
+  id: number;
+  name: string;
+  protocol: "http" | "https" | "socks5" | "socks5h";
+  host: string;
+  port: number;
+  username: string | null;
+  password: string | null;
+  last_test_success: boolean | null;
+  last_test_latency_ms: number | null;
+  last_test_message: string | null;
+  last_test_ip_address: string | null;
+  last_test_country: string | null;
+  last_test_region: string | null;
+  last_test_city: string | null;
+  last_test_at: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface UserRow {
@@ -280,6 +302,37 @@ export interface AccountsListResponse {
   probe_errors: Record<string, string>;
 }
 
+export const listProxies = () =>
+  apiFetch<Paginated<Proxy>>("/api/admin/proxies", { params: { limit: 100 } });
+export const createProxy = (data: {
+  name: string;
+  protocol: Proxy["protocol"];
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+}) => apiFetch<Proxy>("/api/admin/proxies", { method: "POST", body: data });
+export const updateProxy = (id: number, data: {
+  name?: string;
+  protocol?: Proxy["protocol"];
+  host?: string;
+  port?: number;
+  username?: string;
+  password?: string;
+}) => apiFetch<Proxy>(`/api/admin/proxies/${id}`, { method: "PUT", body: data });
+export const deleteProxy = (id: number) =>
+  apiFetch<void>(`/api/admin/proxies/${id}`, { method: "DELETE" });
+export const testProxy = (id: number) =>
+  apiFetch<{
+    success: boolean;
+    message: string;
+    latency_ms?: number;
+    ip_address?: string;
+    country?: string;
+    region?: string;
+    city?: string;
+  }>(`/api/admin/proxies/${id}/test`, { method: "POST" });
+
 // Accounts
 export const listAccounts = () =>
   apiFetch<AccountsListResponse>("/api/admin/accounts", { params: { limit: 100 } });
@@ -287,6 +340,7 @@ export const createAccount = (data: {
   name: string;
   rr_order?: number;
   max_slots?: number;
+  proxy_id?: number;
   drain_first?: boolean;
   auth_source?: "cookie" | "oauth" | "hybrid";
   cookie_blob?: string;
@@ -408,6 +462,7 @@ export const resetDefaultModels = () =>
 export const qk = {
   overview: ["overview"] as const,
   accounts: ["accounts"] as const,
+  proxies: ["proxies"] as const,
   users: ["users"] as const,
   policies: ["policies"] as const,
   keys: (userId?: number) => ["keys", userId] as const,

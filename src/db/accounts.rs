@@ -9,6 +9,9 @@ pub struct AccountWithRuntime {
     pub name: String,
     pub rr_order: i64,
     pub max_slots: i64,
+    pub proxy_id: Option<i64>,
+    pub proxy_name: Option<String>,
+    pub proxy_url: Option<String>,
     pub drain_first: bool,
     pub status: String,
     pub auth_source: String,
@@ -109,7 +112,14 @@ fn make_bucket(row: &sqlx::sqlite::SqliteRow, prefix: &str) -> UsageBreakdown {
 pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRuntime>, sqlx::Error> {
     let rows = sqlx::query(
         r#"SELECT
-            a.id, a.name, a.rr_order, a.max_slots, a.status, a.auth_source, a.cookie_blob,
+            a.id, a.name, a.rr_order, a.max_slots, a.proxy_id,
+            p.name AS proxy_name,
+            p.protocol AS proxy_protocol,
+            p.host AS proxy_host,
+            p.port AS proxy_port,
+            p.username AS proxy_username,
+            p.password AS proxy_password,
+            a.status, a.auth_source, a.cookie_blob,
             a.oauth_access_token, a.oauth_refresh_token, a.oauth_expires_at,
             a.organization_uuid, a.last_refresh_at, a.last_error, a.invalid_reason,
             a.email, a.account_type, a.created_at, a.updated_at,
@@ -152,6 +162,7 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
             COALESCE(rs.lifetime_opus_input, 0) AS lifetime_opus_input,
             COALESCE(rs.lifetime_opus_output, 0) AS lifetime_opus_output
         FROM accounts a
+        LEFT JOIN proxies p ON p.id = a.proxy_id
         LEFT JOIN account_runtime_state rs ON a.id = rs.account_id
         ORDER BY a.rr_order ASC"#,
     )
@@ -215,11 +226,31 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
             _ => None,
         };
 
+        let proxy_protocol: Option<String> = row.get("proxy_protocol");
+        let proxy_host: Option<String> = row.get("proxy_host");
+        let proxy_port: Option<i64> = row.get("proxy_port");
+        let proxy_url = match (proxy_protocol.as_deref(), proxy_host.as_deref(), proxy_port) {
+            (Some(protocol), Some(host), Some(port)) => {
+                crate::db::proxies::build_proxy_url_from_parts(
+                    protocol,
+                    host,
+                    port,
+                    row.get::<Option<String>, _>("proxy_username").as_deref(),
+                    row.get::<Option<String>, _>("proxy_password").as_deref(),
+                )
+                .ok()
+            }
+            _ => None,
+        };
+
         result.push(AccountWithRuntime {
             id: row.get("id"),
             name: row.get("name"),
             rr_order: row.get("rr_order"),
             max_slots: row.get("max_slots"),
+            proxy_id: row.get("proxy_id"),
+            proxy_name: row.get("proxy_name"),
+            proxy_url,
             drain_first: row.get::<i64, _>("drain_first") != 0,
             status: row.get("status"),
             auth_source: row.get("auth_source"),

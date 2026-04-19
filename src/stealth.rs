@@ -16,7 +16,6 @@ pub const DEFAULT_BILLING_SALT: &str = "59cf53e54c78";
 pub struct StealthProfile {
     pub cli_version: String,
     pub billing_salt: String,
-    pub proxy: Option<String>,
     pub force_output_effort: Option<OutputEffort>,
 }
 
@@ -25,7 +24,6 @@ impl Default for StealthProfile {
         Self {
             cli_version: DEFAULT_CLI_VERSION.into(),
             billing_salt: DEFAULT_BILLING_SALT.into(),
-            proxy: None,
             force_output_effort: None,
         }
     }
@@ -64,8 +62,6 @@ impl StealthProfile {
         if let Some(v) = non_empty(get_setting(pool, "cc_billing_salt").await) {
             profile.billing_salt = v;
         }
-        profile.proxy = non_empty(get_setting(pool, "proxy").await);
-
         let effort_override_enabled =
             non_empty(get_setting(pool, "output_effort_override_enabled").await);
         let effort_override_level =

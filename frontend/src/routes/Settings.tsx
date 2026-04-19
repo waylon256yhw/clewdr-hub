@@ -205,42 +205,6 @@ function EffortOverrideSection({
   );
 }
 
-function ProxySection({ currentProxy }: { currentProxy: string }) {
-  const queryClient = useQueryClient();
-  const form = useForm({
-    mode: "uncontrolled",
-    initialValues: { proxy: currentProxy },
-  });
-
-  const mutation = useMutation({
-    mutationFn: (values: { proxy: string }) => updateSettings({ proxy: values.proxy }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: qk.settings });
-      notifications.show({ message: "代理设置已保存", color: "green" });
-    },
-    onError: (e) =>
-      notifications.show({ message: e instanceof ApiError ? e.message : "保存失败", color: "red" }),
-  });
-
-  return (
-    <Paper shadow="xs" p="md" radius="md" withBorder>
-      <form onSubmit={form.onSubmit((v) => mutation.mutate(v))}>
-        <Stack>
-          <Text fw={600}>代理设置</Text>
-          <TextInput
-            label="代理地址"
-            placeholder="socks5://127.0.0.1:1080"
-            {...form.getInputProps("proxy")}
-          />
-          <Group justify="flex-end">
-            <Button type="submit" loading={mutation.isPending}>保存</Button>
-          </Group>
-        </Stack>
-      </form>
-    </Paper>
-  );
-}
-
 function PasswordSection() {
   const form = useForm({
     mode: "uncontrolled",
@@ -477,7 +441,6 @@ export default function Settings() {
           level={effortOverrideLevel}
         />
         <ModelsSection />
-        <ProxySection currentProxy={data["proxy"] ?? ""} />
         <PasswordSection />
       </Stack>
     </>

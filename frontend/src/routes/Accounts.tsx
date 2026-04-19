@@ -18,6 +18,7 @@ import {
   Paper,
   SimpleGrid,
   Progress,
+  Select,
   Divider,
   Tooltip,
   Tabs,
@@ -27,6 +28,7 @@ import { notifications } from "@mantine/notifications";
 import { IconPlus, IconEdit, IconTrash, IconRefresh, IconLink, IconFlask, IconStarFilled } from "@tabler/icons-react";
 import {
   listAccounts,
+  listProxies,
   createAccount,
   updateAccount,
   deleteAccount,
@@ -37,8 +39,10 @@ import {
   ApiError,
   type Account,
   type AccountsListResponse,
+  type Proxy,
   type UsageWindow,
 } from "../api";
+import { formatEpochSeconds } from "../lib/format";
 
 function normalizeAccountType(t: string): string {
   return t.trim().toLowerCase().replace(/[\s-]+/g, "_").replace(/^claude_/, "");
@@ -111,15 +115,7 @@ function formatCountdown(epochSecs: number): string {
 
 function formatProbeCheckedAt(epochSecs: number | null | undefined): string | null {
   if (!epochSecs) return null;
-  return new Date(epochSecs * 1000).toLocaleString("zh-CN", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
+  return formatEpochSeconds(epochSecs);
 }
 
 function WindowRow({ label, window }: { label: string; window: UsageWindow | null | undefined }) {
@@ -232,6 +228,11 @@ function AccountCard({
             {accountTypeLabel(account.account_type)}
           </Badge>
         )}
+        {account.proxy_name && (
+          <Badge color="grape" variant="light" size="sm">
+            代理: {account.proxy_name}
+          </Badge>
+        )}
       </Group>
 
       {account.email && (
@@ -270,6 +271,7 @@ interface FormValues {
   name: string;
   rr_order: number;
   max_slots: number;
+  proxy_id: string | null;
   drain_first: boolean;
   cookie_blob: string;
   oauth_callback_input: string;
@@ -279,10 +281,12 @@ function AccountFormModal({
   opened,
   onClose,
   editing,
+  proxies,
 }: {
   opened: boolean;
   onClose: () => void;
   editing: Account | null;
+  proxies: Proxy[];
 }) {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<"oauth" | "cookie">(editing?.auth_source === "cookie" ? "cookie" : "oauth");
@@ -294,6 +298,7 @@ function AccountFormModal({
       name: editing?.name ?? "",
       rr_order: editing?.rr_order ?? 0,
       max_slots: 5,
+      proxy_id: editing?.proxy_id ? String(editing.proxy_id) : null,
       drain_first: editing?.drain_first ?? false,
       cookie_blob: "",
       oauth_callback_input: "",
@@ -308,6 +313,7 @@ function AccountFormModal({
       name: editing?.name ?? "",
       rr_order: editing?.rr_order ?? 0,
       max_slots: 5,
+      proxy_id: editing?.proxy_id ? String(editing.proxy_id) : null,
       drain_first: editing?.drain_first ?? false,
       cookie_blob: "",
       oauth_callback_input: "",
@@ -333,6 +339,7 @@ function AccountFormModal({
   const mutation = useMutation({
     mutationFn: async (values: FormValues) => {
       const name = values.name.trim();
+      const proxyId = values.proxy_id ? Number(values.proxy_id) : null;
       const cookieBlob = tab === "cookie" ? values.cookie_blob.trim() : "";
       const oauthInput = tab === "oauth" ? values.oauth_callback_input.trim() : "";
       const scopedOauthState = tab === "oauth" ? oauthState : "";
@@ -344,6 +351,7 @@ function AccountFormModal({
         const body: Record<string, unknown> = {};
         if (name !== editing.name) body.name = name;
         if (values.rr_order !== editing.rr_order) body.rr_order = values.rr_order;
+        if ((editing.proxy_id ?? null) !== proxyId) body.proxy_id = proxyId ?? 0;
         if (values.drain_first !== editing.drain_first) body.drain_first = values.drain_first;
         if (cookieBlob) body.cookie_blob = cookieBlob;
         if (oauthInput) body.oauth_callback_input = oauthInput;
@@ -353,6 +361,7 @@ function AccountFormModal({
       return createAccount({
         name,
         max_slots: values.max_slots,
+        proxy_id: proxyId ?? undefined,
         drain_first: values.drain_first,
         auth_source: tab,
         cookie_blob: cookieBlob || undefined,
@@ -380,6 +389,17 @@ function AccountFormModal({
           <TextInput label="名称" required key={form.key("name")} {...form.getInputProps("name")} />
           {editing && <NumberInput label="轮询顺序" key={form.key("rr_order")} {...form.getInputProps("rr_order")} />}
           {!editing && <NumberInput label="最大并发" min={1} key={form.key("max_slots")} {...form.getInputProps("max_slots")} />}
+          <Select
+            label="代理"
+            data={proxies.map((proxy) => ({
+              value: String(proxy.id),
+              label: proxy.name,
+            }))}
+            clearable
+            placeholder="不使用代理"
+            key={form.key("proxy_id")}
+            {...form.getInputProps("proxy_id")}
+          />
           <Checkbox
             label="优先消耗"
             description="打开后此账号会被优先选中"
@@ -515,6 +535,10 @@ export default function Accounts() {
       return ids.length > 0 ? 3000 : 30_000;
     },
   });
+  const { data: proxiesData } = useQuery({
+    queryKey: qk.proxies,
+    queryFn: listProxies,
+  });
   const [formOpened, setFormOpened] = useState(false);
   const [editing, setEditing] = useState<Account | null>(null);
   const [deleting, setDeleting] = useState<Account | null>(null);
@@ -541,6 +565,7 @@ export default function Accounts() {
   }
 
   const accounts = data?.items ?? [];
+  const proxies = proxiesData?.items ?? [];
   const probingIds = new Set(data?.probing_ids ?? []);
   const probeErrors = data?.probe_errors ?? {};
 
@@ -597,6 +622,7 @@ export default function Accounts() {
         opened={formOpened}
         onClose={() => setFormOpened(false)}
         editing={editing}
+        proxies={proxies}
       />
       <DeleteModal account={deleting} onClose={() => setDeleting(null)} />
     </>

@@ -25,23 +25,21 @@ use crate::{
 
 static SUPER_CLIENT: LazyLock<wreq::Client> = LazyLock::new(wreq::Client::new);
 
-pub(crate) fn proxy_from_profile(profile: &SharedStealthProfile) -> Option<wreq::Proxy> {
-    profile
-        .load()
-        .proxy
-        .as_deref()
+pub(crate) fn proxy_from_url(proxy_url: Option<&str>) -> Option<wreq::Proxy> {
+    proxy_url
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .and_then(|p| {
             wreq::Proxy::all(p)
-                .inspect_err(|e| error!("Failed to parse proxy from settings: {e}"))
+                .inspect_err(|e| error!("Failed to parse proxy URL: {e}"))
                 .ok()
         })
 }
 
-pub(crate) fn build_api_client(proxy: Option<&wreq::Proxy>) -> wreq::Client {
+pub(crate) fn build_api_client(proxy_url: Option<&str>) -> wreq::Client {
     let mut builder = wreq::Client::builder();
-    if let Some(proxy) = proxy {
-        builder = builder.proxy(proxy.to_owned());
+    if let Some(proxy) = proxy_from_url(proxy_url) {
+        builder = builder.proxy(proxy);
     }
     builder.build().unwrap_or_else(|e| {
         error!("Failed to build API client: {e}");
@@ -54,6 +52,7 @@ pub struct ClaudeCodeState {
     pub account_pool_handle: AccountPoolHandle,
     pub cookie: Option<AccountSlot>,
     pub cookie_header_value: HeaderValue,
+    pub proxy_url: Option<String>,
     pub proxy: Option<wreq::Proxy>,
     pub endpoint: url::Url,
     pub client: wreq::Client,
@@ -76,13 +75,13 @@ impl ClaudeCodeState {
         account_pool_handle: AccountPoolHandle,
         stealth_profile: SharedStealthProfile,
     ) -> Self {
-        let proxy = proxy_from_profile(&stealth_profile);
         ClaudeCodeState {
             account_pool_handle,
             cookie: None,
             cookie_header_value: HeaderValue::from_static(""),
-            client: build_api_client(proxy.as_ref()),
-            proxy,
+            proxy_url: None,
+            client: build_api_client(None),
+            proxy: None,
             endpoint: crate::config::ENDPOINT_URL.to_owned(),
             stream: false,
             system_prompt_hash: None,
@@ -116,6 +115,11 @@ impl ClaudeCodeState {
             .to_string();
         let header_value = HeaderValue::from_str(cookie_value.as_str())?;
         state.cookie_header_value = header_value.clone();
+        state.proxy_url = state
+            .cookie
+            .as_ref()
+            .and_then(|slot| slot.proxy_url.clone());
+        state.proxy = proxy_from_url(state.proxy_url.as_deref());
         let mut client = wreq::Client::builder()
             .cookie_store(true)
             .emulation(Emulation::Chrome136);
@@ -172,8 +176,8 @@ impl ClaudeCodeState {
             .await?;
         self.cookie = Some(res.to_owned());
         self.cookie_header_value = HeaderValue::from_str(res.cookie.to_string().as_str())?;
-        // Always pull latest proxy from stealth profile
-        self.proxy = proxy_from_profile(&self.stealth_profile);
+        self.proxy_url = res.proxy_url.clone();
+        self.proxy = proxy_from_url(self.proxy_url.as_deref());
         self.endpoint = crate::config::ENDPOINT_URL.to_owned();
         let mut client = wreq::Client::builder()
             .cookie_store(true)
@@ -185,6 +189,12 @@ impl ClaudeCodeState {
             msg: "Failed to build client with new cookie",
         })?;
         Ok(res)
+    }
+
+    pub fn set_proxy_url(&mut self, proxy_url: Option<&str>) {
+        self.proxy_url = proxy_url.map(|s| s.to_string());
+        self.proxy = proxy_from_url(proxy_url);
+        self.client = build_api_client(proxy_url);
     }
 
     pub fn check_token(&self) -> TokenStatus {

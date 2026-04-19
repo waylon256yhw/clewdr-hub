@@ -76,6 +76,8 @@ pub struct AccountSlot {
     #[serde(default)]
     pub account_id: Option<i64>,
     #[serde(default)]
+    pub proxy_url: Option<String>,
+    #[serde(default)]
     pub token: Option<TokenInfo>,
     #[serde(default)]
     pub reset_time: Option<i64>,
@@ -179,6 +181,7 @@ impl AccountSlot {
         Ok(Self {
             cookie,
             account_id: None,
+            proxy_url: None,
             token: None,
             reset_time,
             supports_claude_1m_sonnet: None,
