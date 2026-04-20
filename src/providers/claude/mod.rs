@@ -274,6 +274,7 @@ impl LLMProvider for ClaudeCodeProvider {
         state.usage = request.context.usage.to_owned();
         state.bound_account_ids = request.context.bound_account_ids.clone();
         state.oauth_pool = Some(self.shared.oauth_pool.clone());
+        state.selected_account_id = Some(request.context.selected_account_id.clone());
 
         let (oauth_account, oauth_temporarily_unavailable) = self
             .shared
@@ -281,6 +282,7 @@ impl LLMProvider for ClaudeCodeProvider {
             .await?;
         if let Some(account) = oauth_account {
             state.account_id = Some(account.id);
+            request.context.set_selected_account_id(Some(account.id));
             state.oauth_token = account.oauth_token.clone();
             state.organization_uuid = account.organization_uuid.clone();
             state.set_proxy_url(account.proxy_url.as_deref());

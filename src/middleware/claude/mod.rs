@@ -2,6 +2,8 @@ mod request;
 
 pub use request::*;
 
+use std::sync::{Arc, Mutex};
+
 use crate::types::claude::Usage;
 
 /// Context carried through the request pipeline for Claude Code
@@ -26,4 +28,20 @@ pub struct ClaudeContext {
     /// Monthly budget from policy (nanousd)
     pub monthly_budget_nanousd: Option<i64>,
     pub bound_account_ids: Vec<i64>,
+    pub selected_account_id: Arc<Mutex<Option<i64>>>,
+}
+
+impl ClaudeContext {
+    pub fn selected_account_id(&self) -> Option<i64> {
+        self.selected_account_id
+            .lock()
+            .map(|slot| *slot)
+            .unwrap_or(None)
+    }
+
+    pub fn set_selected_account_id(&self, account_id: Option<i64>) {
+        if let Ok(mut slot) = self.selected_account_id.lock() {
+            *slot = account_id;
+        }
+    }
 }

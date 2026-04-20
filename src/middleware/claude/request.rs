@@ -424,6 +424,7 @@ where
                 .as_ref()
                 .map(|u| u.bound_account_ids.clone())
                 .unwrap_or_default(),
+            selected_account_id: Default::default(),
         };
 
         Ok(Self(body, context))

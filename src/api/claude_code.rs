@@ -39,7 +39,7 @@ async fn log_error_request(
         db: state.db.clone(),
         user_id: ctx.user_id,
         api_key_id: ctx.api_key_id,
-        account_id: None,
+        account_id: ctx.selected_account_id(),
         model_raw: ctx.model_raw.clone(),
         request_id: ctx.request_id.clone(),
         started_at: ctx.started_at,

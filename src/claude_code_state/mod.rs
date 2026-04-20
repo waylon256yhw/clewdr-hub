@@ -67,6 +67,7 @@ pub struct ClaudeCodeState {
     pub billing_ctx: Option<BillingContext>,
     pub stealth_profile: SharedStealthProfile,
     pub bound_account_ids: Vec<i64>,
+    pub selected_account_id: Option<std::sync::Arc<std::sync::Mutex<Option<i64>>>>,
 }
 
 impl ClaudeCodeState {
@@ -94,6 +95,7 @@ impl ClaudeCodeState {
             billing_ctx: None,
             stealth_profile,
             bound_account_ids: Vec::new(),
+            selected_account_id: None,
         }
     }
 
@@ -170,6 +172,11 @@ impl ClaudeCodeState {
     /// Requests a new account from the account pool
     /// Updates the internal state with the new cookie and proxy configuration
     pub async fn acquire_account(&mut self) -> Result<AccountSlot, ClewdrError> {
+        if let Some(selected_account_id) = &self.selected_account_id
+            && let Ok(mut slot) = selected_account_id.lock()
+        {
+            *slot = None;
+        }
         let res = self
             .account_pool_handle
             .request(self.system_prompt_hash, &self.bound_account_ids)
@@ -188,6 +195,11 @@ impl ClaudeCodeState {
         self.client = client.build().context(WreqSnafu {
             msg: "Failed to build client with new cookie",
         })?;
+        if let Some(selected_account_id) = &self.selected_account_id
+            && let Ok(mut slot) = selected_account_id.lock()
+        {
+            *slot = res.account_id;
+        }
         Ok(res)
     }
 
@@ -216,6 +228,44 @@ impl ClaudeCodeState {
         } else {
             TokenStatus::Valid
         }
+    }
+}
+
+pub(crate) fn is_oauth_auth_failure(err: &ClewdrError) -> bool {
+    match err {
+        ClewdrError::InvalidCookie { reason } => matches!(reason, Reason::Null | Reason::Banned),
+        ClewdrError::ClaudeHttpError { code, .. } => matches!(code.as_u16(), 401 | 403),
+        ClewdrError::Whatever { message, .. } => {
+            let msg = message.to_ascii_lowercase();
+            msg.contains("invalid_grant")
+                || msg.contains("refresh token not found")
+                || msg.contains("refresh token")
+                    && (msg.contains("invalid") || msg.contains("expired"))
+                || msg.contains("status 401")
+                || msg.contains("status 403")
+                || msg.contains("access token")
+                    && (msg.contains("expired") || msg.contains("invalid"))
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_oauth_auth_failure;
+    use crate::{config::Reason, error::ClewdrError};
+
+    #[test]
+    fn oauth_auth_failure_detects_invalid_cookie_null_and_banned() {
+        assert!(is_oauth_auth_failure(&ClewdrError::InvalidCookie {
+            reason: Reason::Null,
+        }));
+        assert!(is_oauth_auth_failure(&ClewdrError::InvalidCookie {
+            reason: Reason::Banned,
+        }));
+        assert!(!is_oauth_auth_failure(&ClewdrError::InvalidCookie {
+            reason: Reason::Disabled,
+        }));
     }
 }
 

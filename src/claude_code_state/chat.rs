@@ -32,23 +32,7 @@ const CLAUDE_API_VERSION: &str = "2023-06-01";
 
 impl ClaudeCodeState {
     fn is_oauth_auth_failure(err: &ClewdrError) -> bool {
-        match err {
-            ClewdrError::ClaudeHttpError { code, .. } => {
-                matches!(code.as_u16(), 401 | 403)
-            }
-            ClewdrError::Whatever { message, .. } => {
-                let msg = message.to_ascii_lowercase();
-                msg.contains("invalid_grant")
-                    || msg.contains("refresh token not found")
-                    || msg.contains("refresh token")
-                        && (msg.contains("invalid") || msg.contains("expired"))
-                    || msg.contains("status 401")
-                    || msg.contains("status 403")
-                    || msg.contains("access token")
-                        && (msg.contains("expired") || msg.contains("invalid"))
-            }
-            _ => false,
-        }
+        super::is_oauth_auth_failure(err)
     }
 
     fn is_oauth_disabled_failure(err: &ClewdrError) -> bool {
