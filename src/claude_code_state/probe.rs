@@ -7,7 +7,7 @@ use tracing::{info, warn};
 use super::ClaudeCodeState;
 use crate::{
     billing::{BillingContext, RequestType, persist_probe_log},
-    config::{AccountSlot, Reason},
+    config::{AccountSlot, CLEWDR_CONFIG, Reason},
     db::accounts::{
         AccountWithRuntime, batch_upsert_runtime_states, set_account_active,
         set_account_auth_error, update_account_metadata, update_account_metadata_unchecked,
@@ -18,9 +18,171 @@ use crate::{
     services::account_pool::AccountPoolHandle,
     state::AdminEvent,
     stealth::SharedStealthProfile,
+    utils::print_out_text,
 };
 
 const PROBE_BODY_MAX_BYTES: usize = 262_144;
+
+fn probe_bundle_component_sizes(bundle: &Map<String, Value>) -> Map<String, Value> {
+    let mut sizes = Map::new();
+    for (key, value) in bundle {
+        let bytes = serde_json::to_vec(value)
+            .map(|buf| buf.len())
+            .unwrap_or_default();
+        sizes.insert(key.clone(), Value::from(bytes as u64));
+    }
+    sizes
+}
+
+fn dump_probe_bundle(
+    request_type: RequestType,
+    account_id: i64,
+    started_at: chrono::DateTime<Utc>,
+    body_pretty: &str,
+) -> Option<String> {
+    if CLEWDR_CONFIG.load().no_fs {
+        return None;
+    }
+    let stamp = started_at.format("%Y%m%dT%H%M%S%.3fZ");
+    let rel_path = format!(
+        "probe-dumps/{}-account-{}-{}.json",
+        request_type.as_str(),
+        account_id,
+        stamp
+    );
+    print_out_text(body_pretty.to_string(), &rel_path);
+    Some(rel_path)
+}
+
+fn insert_if_present(dst: &mut Map<String, Value>, key: &str, value: Option<&Value>) {
+    if let Some(value) = value.filter(|v| !v.is_null()) {
+        dst.insert(key.to_string(), value.clone());
+    }
+}
+
+fn summarize_cookie_bootstrap(bootstrap: &Value, derived_account_type: &str) -> Value {
+    let mut summary = Map::new();
+
+    let account = bootstrap.get("account").and_then(Value::as_object);
+    if let Some(account) = account {
+        let mut account_summary = Map::new();
+        insert_if_present(
+            &mut account_summary,
+            "email_address",
+            account.get("email_address"),
+        );
+        insert_if_present(
+            &mut account_summary,
+            "display_name",
+            account.get("display_name"),
+        );
+        insert_if_present(&mut account_summary, "full_name", account.get("full_name"));
+        insert_if_present(
+            &mut account_summary,
+            "created_at",
+            account.get("created_at"),
+        );
+        insert_if_present(
+            &mut account_summary,
+            "updated_at",
+            account.get("updated_at"),
+        );
+        insert_if_present(&mut account_summary, "uuid", account.get("uuid"));
+        insert_if_present(
+            &mut account_summary,
+            "is_verified",
+            account.get("is_verified"),
+        );
+        if !account_summary.is_empty() {
+            summary.insert("account".to_string(), Value::Object(account_summary));
+        }
+    }
+
+    let memberships = account
+        .and_then(|acc| acc.get("memberships"))
+        .and_then(Value::as_array);
+    let selected_membership = memberships.and_then(|memberships| {
+        memberships.iter().find(|membership| {
+            membership["organization"]["capabilities"]
+                .as_array()
+                .is_some_and(|caps| caps.iter().any(|cap| cap.as_str() == Some("chat")))
+        })
+    });
+
+    if let Some(selected_membership) = selected_membership.and_then(Value::as_object) {
+        let mut membership_summary = Map::new();
+        insert_if_present(
+            &mut membership_summary,
+            "role",
+            selected_membership.get("role"),
+        );
+        insert_if_present(
+            &mut membership_summary,
+            "created_at",
+            selected_membership.get("created_at"),
+        );
+
+        if let Some(organization) = selected_membership
+            .get("organization")
+            .and_then(Value::as_object)
+        {
+            let mut organization_summary = Map::new();
+            insert_if_present(&mut organization_summary, "uuid", organization.get("uuid"));
+            insert_if_present(&mut organization_summary, "name", organization.get("name"));
+            insert_if_present(
+                &mut organization_summary,
+                "billing_type",
+                organization.get("billing_type"),
+            );
+            insert_if_present(
+                &mut organization_summary,
+                "rate_limit_tier",
+                organization.get("rate_limit_tier"),
+            );
+            insert_if_present(
+                &mut organization_summary,
+                "merchant_of_record",
+                organization.get("merchant_of_record"),
+            );
+            insert_if_present(
+                &mut organization_summary,
+                "free_credits_status",
+                organization.get("free_credits_status"),
+            );
+            insert_if_present(
+                &mut organization_summary,
+                "capabilities",
+                organization.get("capabilities"),
+            );
+            if !organization_summary.is_empty() {
+                membership_summary.insert(
+                    "organization".to_string(),
+                    Value::Object(organization_summary),
+                );
+            }
+        }
+
+        if !membership_summary.is_empty() {
+            summary.insert(
+                "selected_membership".to_string(),
+                Value::Object(membership_summary),
+            );
+        }
+    }
+
+    let mut derived = Map::new();
+    derived.insert(
+        "account_type".to_string(),
+        Value::String(derived_account_type.to_string()),
+    );
+    derived.insert(
+        "memberships_count".to_string(),
+        Value::from(memberships.map(|v| v.len()).unwrap_or_default() as u64),
+    );
+    summary.insert("derived".to_string(), Value::Object(derived));
+
+    Value::Object(summary)
+}
 
 /// Propagate InvalidCookie errors, treat everything else as transient.
 fn extract_cookie_reason(e: &ClewdrError) -> Option<Reason> {
@@ -108,7 +270,24 @@ async fn persist_probe_row(
     };
     let mut body = serde_json::to_string(bundle).unwrap_or_else(|_| "{}".to_string());
     if body.len() > PROBE_BODY_MAX_BYTES {
-        body = format!(r#"{{"truncated":true,"bytes":{}}}"#, body.len());
+        let mut truncated = Map::new();
+        truncated.insert("truncated".to_string(), Value::Bool(true));
+        truncated.insert("bytes".to_string(), Value::from(body.len() as u64));
+        truncated.insert(
+            "component_bytes".to_string(),
+            Value::Object(probe_bundle_component_sizes(bundle)),
+        );
+        insert_if_present(
+            &mut truncated,
+            "debug_dump_file",
+            bundle.get("debug_dump_file"),
+        );
+        insert_if_present(
+            &mut truncated,
+            "debug_component_bytes",
+            bundle.get("debug_component_bytes"),
+        );
+        body = Value::Object(truncated).to_string();
     }
     let ctx = BillingContext {
         db: db.clone(),
@@ -147,6 +326,8 @@ pub async fn probe_cookie(
 ) {
     let started_at = Utc::now();
     let mut bundle: Map<String, Value> = Map::new();
+    let debug_cookie = CLEWDR_CONFIG.load().debug_cookie;
+    let mut debug_raw_bundle = debug_cookie.then(Map::new);
 
     let outcome: Result<(), ProbeFailure> = run_cookie_probe(
         account_id,
@@ -155,11 +336,33 @@ pub async fn probe_cookie(
         profile,
         &db,
         &mut bundle,
+        debug_raw_bundle.as_mut(),
     )
     .await;
 
     if let Err(ref failure) = outcome {
         bundle.insert("error".into(), failure.to_bundle_entry());
+    }
+
+    if log_sink.is_some()
+        && let Some(debug_raw_bundle) = debug_raw_bundle
+            .as_ref()
+            .filter(|bundle| !bundle.is_empty())
+    {
+        let body_pretty =
+            serde_json::to_string_pretty(debug_raw_bundle).unwrap_or_else(|_| "{}".to_string());
+        if let Some(dump_file) = dump_probe_bundle(
+            RequestType::ProbeCookie,
+            account_id,
+            started_at,
+            &body_pretty,
+        ) {
+            bundle.insert("debug_dump_file".into(), Value::String(dump_file));
+            bundle.insert(
+                "debug_component_bytes".into(),
+                Value::Object(probe_bundle_component_sizes(debug_raw_bundle)),
+            );
+        }
     }
 
     if let Some(tx) = log_sink {
@@ -183,6 +386,7 @@ async fn run_cookie_probe(
     profile: SharedStealthProfile,
     db: &SqlitePool,
     bundle: &mut Map<String, Value>,
+    mut debug_raw_bundle: Option<&mut Map<String, Value>>,
 ) -> Result<(), ProbeFailure> {
     let cookie_ellipse = cookie.cookie.ellipse();
     let cookie_prefix = &cookie.cookie[..20.min(cookie.cookie.len())];
@@ -208,7 +412,13 @@ async fn run_cookie_probe(
     // 1. Bootstrap probe
     let info = match state.fetch_bootstrap_info_raw().await {
         Ok((info, raw)) => {
-            bundle.insert("bootstrap".into(), raw);
+            bundle.insert(
+                "bootstrap_summary".into(),
+                summarize_cookie_bootstrap(&raw, &info.account_type),
+            );
+            if let Some(debug_raw_bundle) = debug_raw_bundle.as_mut() {
+                debug_raw_bundle.insert("bootstrap".into(), raw);
+            }
             info
         }
         Err(e) => {
@@ -292,6 +502,9 @@ async fn run_cookie_probe(
     match state.fetch_usage_metrics().await {
         Ok(usage) => {
             bundle.insert("usage".into(), usage.clone());
+            if let Some(debug_raw_bundle) = debug_raw_bundle.as_mut() {
+                debug_raw_bundle.insert("usage".into(), usage.clone());
+            }
             if let Some(ref mut cs) = state.cookie {
                 let parse_window = |key: &str| -> (Option<i64>, Option<f64>) {
                     let obj = usage.get(key);

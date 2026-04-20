@@ -15,7 +15,7 @@ import {
   Code,
   Stack,
 } from "@mantine/core";
-import { IconChevronLeft, IconChevronRight } from "@tabler/icons-react";
+import { IconCheck, IconChevronLeft, IconChevronRight, IconCopy } from "@tabler/icons-react";
 import { useLocation } from "react-router";
 import {
   getRequestResponseBody,
@@ -26,6 +26,7 @@ import {
   type RequestLog,
   type RequestFilters,
 } from "../api";
+import { copyText, getCopyFailureMessage } from "../lib/clipboard";
 import { formatCost, formatDate, requestTypeColor, statusColor } from "../lib/format";
 
 const PAGE_SIZE = 50;
@@ -61,6 +62,8 @@ function extractProbeProxyName(raw: string | null | undefined): string | null {
 function LogDetail({ log, onClose }: { log: RequestLog | null; onClose: () => void }) {
   const probe = log ? isProbeType(log.request_type) : false;
   const showProbeJson = log ? hasProbeJsonDetail(log.request_type) : false;
+  const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
+  const [copyError, setCopyError] = useState<string | null>(null);
   const { data: bodyData, isLoading: bodyLoading } = useQuery({
     queryKey: log ? qk.requestBody(log.id) : ["request_body", "none"],
     queryFn: () => getRequestResponseBody(log!.id),
@@ -68,12 +71,31 @@ function LogDetail({ log, onClose }: { log: RequestLog | null; onClose: () => vo
     staleTime: 5 * 60_000,
   });
 
+  useEffect(() => {
+    setCopyState("idle");
+    setCopyError(null);
+  }, [log?.id]);
+
   if (!log) return null;
 
+  const rawProbeJson = bodyData?.response_body ?? "";
+  const formattedProbeJson = rawProbeJson ? prettyJson(rawProbeJson) : "";
   const proxyName =
     log.request_type === "probe_proxy"
       ? extractProbeProxyName(bodyData?.response_body)
       : null;
+
+  const handleCopy = async () => {
+    if (!formattedProbeJson) return;
+    try {
+      await copyText(formattedProbeJson);
+      setCopyState("copied");
+      setCopyError(null);
+      window.setTimeout(() => setCopyState("idle"), 1500);
+    } catch (error) {
+      setCopyError(getCopyFailureMessage(error));
+    }
+  };
 
   const rows: [string, React.ReactNode][] = probe
     ? [
@@ -128,18 +150,42 @@ function LogDetail({ log, onClose }: { log: RequestLog | null; onClose: () => vo
         </Table>
         {showProbeJson && (
           <div>
-            <Text fw={600} size="sm" mb={4}>上游响应 JSON</Text>
+            <Group justify="space-between" align="center" mb={4}>
+              <Text fw={600} size="sm">上游响应 JSON</Text>
+              {!bodyLoading && formattedProbeJson && (
+                <Button
+                  size="xs"
+                  variant="light"
+                  leftSection={copyState === "copied" ? <IconCheck size={14} /> : <IconCopy size={14} />}
+                  onClick={() => void handleCopy()}
+                >
+                  {copyState === "copied" ? "已复制" : "复制"}
+                </Button>
+              )}
+            </Group>
             {bodyLoading ? (
               <Skeleton height={120} />
-            ) : bodyData?.response_body ? (
+            ) : formattedProbeJson ? (
               <ScrollArea h={360} type="auto">
-                <Code block style={{ whiteSpace: "pre", fontSize: 12 }}>
-                  {prettyJson(bodyData.response_body)}
+                <Code
+                  block
+                  style={{
+                    width: "100%",
+                    minWidth: 0,
+                    boxSizing: "border-box",
+                    whiteSpace: "pre-wrap",
+                    overflowWrap: "anywhere",
+                    wordBreak: "break-word",
+                    fontSize: 12,
+                  }}
+                >
+                  {formattedProbeJson}
                 </Code>
               </ScrollArea>
             ) : (
               <Text size="sm" c="dimmed">无响应体</Text>
             )}
+            {copyError && <Text size="xs" c="red" mt={6}>{copyError}</Text>}
           </div>
         )}
       </Stack>

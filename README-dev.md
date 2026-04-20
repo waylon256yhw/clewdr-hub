@@ -68,6 +68,19 @@ npm run dev         # Vite dev server，自动代理 /api → localhost:8484
 
 需要后端同时运行。Vite 代理默认转发到 `http://localhost:8484`。可通过环境变量 `VITE_DEV_BACKEND_URL` 覆盖。
 
+### 调试配置
+
+常用开发配置写在根目录 `clewdr.toml`，也可通过 `CLEWDR_` 前缀环境变量覆盖。
+
+- `debug_cookie = false`（默认）：
+  控制手动 `probe_cookie` 是否额外把原始上游 JSON dump 到 `log/probe-dumps/`。
+  关闭时，`request_logs` 只保存 `bootstrap_summary + usage`；
+  开启时，日志里会额外出现 `debug_dump_file` / `debug_component_bytes`，便于排查超大 bootstrap 响应。
+  推荐只在临时排障时通过 `CLEWDR_DEBUG_COOKIE=true` 或直接修改 `clewdr.toml` 开启，不要做成后台常驻开关。
+- `no_fs = false`（默认）：
+  遗留的“无文件系统”运行模式。开启后会切到内存 SQLite（`:memory:`），并关闭配置落盘、文件日志、JSON dump 等所有文件写入行为。
+  该模式不适合当前后台管理/调试工作流，日常开发与排障不要开启。后续应考虑清理这套遗留语义。
+
 ---
 
 ## 项目结构
@@ -328,6 +341,30 @@ SQLite WAL 模式，通过 sqlx 的编译期 migration 自动建表。
 - `test`
 
 新增 probe 类型时，除了改 Rust 枚举 `RequestType`，还必须同步补 migration 更新 `request_logs` 的约束。
+
+### Cookie Probe 调试
+
+手动触发 `probe_cookie` 时，正式日志默认只保存精简后的：
+
+- `bootstrap_summary`
+- `usage`
+
+这样可以避免把 `growthbook` / `system_prompts` 一类超大 console bootstrap 原文写进 `request_logs`。
+
+如果要抓原始上游 JSON：
+
+1. 在 `clewdr.toml` 里把 `debug_cookie = true`
+   也可以用环境变量：`CLEWDR_DEBUG_COOKIE=true ./dev.sh`
+2. 重启后端
+3. 从后台手动触发目标账号的 cookie probe
+4. 到日志详情查看 `debug_dump_file`
+5. 打开 `log/probe-dumps/*.json`
+
+补充说明：
+
+- 只有手动 probe 会带 `debug_dump_file`，自动后台探测默认不写 dump
+- 如果 probe 日志本身超过 `PROBE_BODY_MAX_BYTES`，日志行会显示 `truncated=true`，但仍会保留 `debug_dump_file`
+- `no_fs = true` 时不会写 dump 文件，因此也不会生成 `debug_dump_file`
 
 ---
 

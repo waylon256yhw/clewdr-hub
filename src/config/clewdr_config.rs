@@ -40,6 +40,8 @@ pub struct ClewdrConfig {
     pub no_fs: bool,
     #[serde(default)]
     pub log_to_file: bool,
+    #[serde(default)]
+    pub debug_cookie: bool,
 
     // Network settings
     #[serde(default)]
@@ -63,6 +65,7 @@ impl Default for ClewdrConfig {
             auto_update: false,
             no_fs: false,
             log_to_file: false,
+            debug_cookie: false,
             proxy: None,
             claude_code_client_id: None,
             wreq_proxy: None,
