@@ -1,10 +1,11 @@
 -- Finalize credential-replacement semantics by removing `hybrid` from the
 -- accounts.auth_source enum. Every account carries exactly one active
--- credential: either cookie_blob, or an OAuth token set.
+-- credential: either cookie_blob, or a complete OAuth token set
+-- (access_token, refresh_token, expires_at).
 --
--- Legacy hybrid rows are normalized first (OAuth wins when present,
--- cookie is the fallback), then the table is rebuilt to tighten the
--- auth_source CHECK and add a credential-mutex CHECK.
+-- Legacy hybrid rows are normalized first, then any rows whose credential
+-- columns drifted out of the canonical shape are canonicalized so the
+-- post-rebuild mutex CHECK accepts every surviving row.
 
 PRAGMA foreign_keys=OFF;
 
@@ -12,7 +13,10 @@ PRAGMA foreign_keys=OFF;
 UPDATE accounts
 SET cookie_blob = NULL,
     auth_source = 'oauth'
-WHERE auth_source = 'hybrid' AND oauth_access_token IS NOT NULL;
+WHERE auth_source = 'hybrid'
+  AND oauth_access_token IS NOT NULL
+  AND oauth_refresh_token IS NOT NULL
+  AND oauth_expires_at IS NOT NULL;
 
 UPDATE accounts
 SET oauth_access_token = NULL,
@@ -22,18 +26,48 @@ SET oauth_access_token = NULL,
     auth_source = 'cookie'
 WHERE auth_source = 'hybrid';
 
--- 2. Defensive cleanup for any rows whose credential columns drifted out
--- of sync with their declared auth_source.
+-- 2. Canonicalize every remaining row against the final CHECK shape:
+--
+--    cookie row:  cookie_blob NOT NULL, every oauth_* column NULL
+--    oauth row:   cookie_blob NULL,     oauth_access_token / refresh_token /
+--                                        expires_at all NOT NULL
+--
+-- A naive cleanup that only looked at oauth_access_token or cookie_blob
+-- would miss partial-drift shapes such as a cookie row carrying a residual
+-- oauth_refresh_token, or an oauth row missing oauth_expires_at. Those
+-- would trip the new mutex CHECK during the table rebuild below.
+
+-- 2a. Rows with a complete OAuth token set take the oauth shape and shed
+-- any cookie residue, regardless of their declared auth_source.
 UPDATE accounts
-SET oauth_access_token = NULL,
+SET auth_source = 'oauth',
+    cookie_blob = NULL
+WHERE oauth_access_token IS NOT NULL
+  AND oauth_refresh_token IS NOT NULL
+  AND oauth_expires_at IS NOT NULL;
+
+-- 2b. Rows with a cookie_blob but an incomplete OAuth token set take the
+-- cookie shape and shed whatever oauth columns drifted in.
+UPDATE accounts
+SET auth_source = 'cookie',
+    oauth_access_token = NULL,
     oauth_refresh_token = NULL,
     oauth_expires_at = NULL,
     last_refresh_at = NULL
-WHERE auth_source = 'cookie' AND oauth_access_token IS NOT NULL;
+WHERE cookie_blob IS NOT NULL
+  AND NOT (oauth_access_token IS NOT NULL
+           AND oauth_refresh_token IS NOT NULL
+           AND oauth_expires_at IS NOT NULL);
 
-UPDATE accounts
-SET cookie_blob = NULL
-WHERE auth_source = 'oauth' AND cookie_blob IS NOT NULL;
+-- 2c. Rows without a cookie_blob AND without a complete OAuth token set
+-- cannot authenticate under either branch of the new CHECK. They were
+-- already unusable in production (no credential to present to Anthropic),
+-- so they are dropped rather than failing the whole migration.
+DELETE FROM accounts
+WHERE cookie_blob IS NULL
+  AND NOT (oauth_access_token IS NOT NULL
+           AND oauth_refresh_token IS NOT NULL
+           AND oauth_expires_at IS NOT NULL);
 
 -- 3. Rebuild the accounts table with:
 --    a) auth_source CHECK tightened to ('cookie', 'oauth')

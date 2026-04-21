@@ -1126,4 +1126,213 @@ mod tests {
             "clearing cookie_blob on a cookie row without switching auth_source must fail CHECK",
         );
     }
+
+    /// Regression guard for the reviewer-flagged drift shapes that tripped
+    /// the C3 migration. Builds a pre-C3 accounts schema, seeds rows that
+    /// can only exist before the mutex CHECK lands, runs the real migration
+    /// file end to end, and asserts every survivor sits in the canonical
+    /// cookie / oauth shape that the new CHECK expects.
+    #[tokio::test]
+    async fn migration_canonicalizes_partial_credential_drift() {
+        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
+
+        sqlx::query("CREATE TABLE proxies (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                rr_order INTEGER NOT NULL UNIQUE,
+                max_slots INTEGER NOT NULL DEFAULT 5,
+                status TEXT NOT NULL DEFAULT 'active',
+                auth_source TEXT NOT NULL CHECK (auth_source IN ('cookie', 'oauth', 'hybrid')),
+                cookie_blob BLOB,
+                oauth_access_token BLOB,
+                oauth_refresh_token BLOB,
+                oauth_expires_at TEXT,
+                organization_uuid TEXT,
+                last_refresh_at TEXT,
+                last_used_at TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                invalid_reason TEXT,
+                email TEXT,
+                account_type TEXT,
+                drain_first INTEGER NOT NULL DEFAULT 0,
+                proxy_id INTEGER REFERENCES proxies(id) ON DELETE SET NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Seed every drift shape that could exist before C3:
+        //   1. reviewer case 1: cookie row with a stray oauth_refresh_token
+        //   2. reviewer case 2: oauth row with only access_token, no cookie → unrecoverable
+        //   3. oauth-labeled row missing expires_at but with a cookie_blob → salvage as cookie
+        //   4. cookie-labeled row carrying a full oauth set → salvage as oauth
+        //   5. normal cookie row (control)
+        //   6. normal oauth row (control)
+        //   7. legacy hybrid row with full oauth + cookie → oauth wins
+        //   8. legacy hybrid row with only cookie → falls back to cookie
+        sqlx::query(
+            "INSERT INTO accounts (name, rr_order, auth_source, cookie_blob, oauth_refresh_token)
+             VALUES ('case1_cookie_with_residual_rt', 1, 'cookie', 'ck1', 'residual-rt')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO accounts (name, rr_order, auth_source, oauth_access_token)
+             VALUES ('case2_oauth_incomplete_no_cookie', 2, 'oauth', 'at2')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO accounts (name, rr_order, auth_source, cookie_blob, oauth_access_token, oauth_refresh_token)
+             VALUES ('case3_oauth_incomplete_with_cookie', 3, 'oauth', 'ck3', 'at3', 'rt3')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO accounts (name, rr_order, auth_source, cookie_blob, oauth_access_token, oauth_refresh_token, oauth_expires_at)
+             VALUES ('case4_cookie_with_full_oauth', 4, 'cookie', 'ck4', 'at4', 'rt4', '2030-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO accounts (name, rr_order, auth_source, cookie_blob)
+             VALUES ('case5_normal_cookie', 5, 'cookie', 'ck5')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO accounts (name, rr_order, auth_source, oauth_access_token, oauth_refresh_token, oauth_expires_at)
+             VALUES ('case6_normal_oauth', 6, 'oauth', 'at6', 'rt6', '2030-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO accounts (name, rr_order, auth_source, cookie_blob, oauth_access_token, oauth_refresh_token, oauth_expires_at)
+             VALUES ('case7_legacy_hybrid_both', 7, 'hybrid', 'ck7', 'at7', 'rt7', '2030-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO accounts (name, rr_order, auth_source, cookie_blob)
+             VALUES ('case8_legacy_hybrid_cookie_only', 8, 'hybrid', 'ck8')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Apply the real C3 migration — splitting on ';' is safe because the
+        // file has no statement-internal semicolons (CHECK bodies only hold
+        // column references and boolean ops).
+        let migration_sql =
+            include_str!("../../migrations/20260421000003_drop_hybrid_auth_source.sql");
+        for statement in migration_sql.split(';') {
+            let trimmed = statement.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            sqlx::query(trimmed)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("migration statement failed: {e}\n---\n{trimmed}\n"));
+        }
+
+        let survivors: Vec<(i64, String, String, Option<String>, Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT id, name, auth_source, cookie_blob, oauth_access_token, oauth_refresh_token, oauth_expires_at
+                 FROM accounts ORDER BY id",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+
+        // case 2 is the only unrecoverable row — it should be gone.
+        let names: Vec<&str> = survivors.iter().map(|row| row.1.as_str()).collect();
+        assert!(
+            !names.contains(&"case2_oauth_incomplete_no_cookie"),
+            "unrecoverable row (no cookie + incomplete oauth) must be deleted",
+        );
+
+        // Every survivor must match the canonical cookie-or-oauth shape
+        // that the new CHECK enforces.
+        for (id, name, auth_source, cookie_blob, at, rt, expires) in &survivors {
+            match auth_source.as_str() {
+                "cookie" => {
+                    assert!(
+                        cookie_blob.is_some(),
+                        "{name}: cookie row must have cookie_blob"
+                    );
+                    assert!(
+                        at.is_none() && rt.is_none() && expires.is_none(),
+                        "{name}: cookie row must have all oauth_* NULL"
+                    );
+                }
+                "oauth" => {
+                    assert!(
+                        cookie_blob.is_none(),
+                        "{name}: oauth row must have cookie_blob NULL"
+                    );
+                    assert!(
+                        at.is_some() && rt.is_some() && expires.is_some(),
+                        "{name}: oauth row must have full oauth token set"
+                    );
+                }
+                other => panic!("{name} (id={id}): unexpected auth_source {other:?}"),
+            }
+        }
+
+        // Spot-check the salvage decisions case by case.
+        let by_name: std::collections::HashMap<&str, &str> = survivors
+            .iter()
+            .map(|row| (row.1.as_str(), row.2.as_str()))
+            .collect();
+        assert_eq!(
+            by_name.get("case1_cookie_with_residual_rt"),
+            Some(&"cookie")
+        );
+        assert_eq!(
+            by_name.get("case3_oauth_incomplete_with_cookie"),
+            Some(&"cookie"),
+            "incomplete oauth with cookie should salvage as cookie"
+        );
+        assert_eq!(
+            by_name.get("case4_cookie_with_full_oauth"),
+            Some(&"oauth"),
+            "complete oauth wins over stale cookie label"
+        );
+        assert_eq!(by_name.get("case5_normal_cookie"), Some(&"cookie"));
+        assert_eq!(by_name.get("case6_normal_oauth"), Some(&"oauth"));
+        assert_eq!(
+            by_name.get("case7_legacy_hybrid_both"),
+            Some(&"oauth"),
+            "hybrid with full oauth should normalize to oauth"
+        );
+        assert_eq!(
+            by_name.get("case8_legacy_hybrid_cookie_only"),
+            Some(&"cookie"),
+            "hybrid with only cookie should normalize to cookie"
+        );
+    }
 }
