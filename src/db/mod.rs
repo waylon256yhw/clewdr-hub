@@ -66,10 +66,8 @@ pub async fn seed_admin(pool: &SqlitePool) -> Result<(), ClewdrError> {
             }
             _ => {
                 println!(
-                    "{}\n  {} {}\n  {} {}",
-                    "Default admin credentials:".green().bold(),
-                    "Username:".bold(),
-                    "admin".yellow().bold(),
+                    "{}\n  {} {}",
+                    "Admin panel initial password:".green().bold(),
                     "Password:".bold(),
                     "password".yellow().bold(),
                 );

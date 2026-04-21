@@ -7,7 +7,7 @@ use clewdr_hub::{
 use colored::Colorize;
 #[cfg(feature = "mimalloc")]
 use mimalloc::MiMalloc;
-use std::io::IsTerminal;
+use std::{io::IsTerminal, net::SocketAddr};
 use tracing::Subscriber;
 use tracing_subscriber::{
     Layer, Registry,
@@ -41,6 +41,17 @@ where
         subscriber.with(console_layer.with_filter(tokio_console_filter))
     };
     tracing::subscriber::set_global_default(subscriber).expect("unable to set global subscriber");
+}
+
+fn admin_panel_url(addr: SocketAddr) -> String {
+    let host = if addr.ip().is_unspecified() {
+        "localhost".to_string()
+    } else if addr.ip().is_ipv6() {
+        format!("[{}]", addr.ip())
+    } else {
+        addr.ip().to_string()
+    };
+    format!("http://{}:{}", host, addr.port())
 }
 
 /// Application entry point
@@ -145,10 +156,15 @@ async fn main() -> Result<(), ClewdrError> {
     // build axum router
     let addr = CLEWDR_CONFIG.load().address();
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let local_addr = listener.local_addr()?;
     let router = clewdr_hub::router::RouterBuilder::new(db_pool)
         .await
         .with_default_setup()
         .build();
+    println!(
+        "Admin panel: {}",
+        admin_panel_url(local_addr).green().underline()
+    );
     // serve the application
     Ok(axum::serve(listener, router)
         .with_graceful_shutdown(async {

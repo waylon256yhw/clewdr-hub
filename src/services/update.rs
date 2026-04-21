@@ -18,6 +18,9 @@ use crate::{
     error::{ClewdrError, WreqSnafu},
 };
 
+const DEFAULT_REPO_OWNER: &str = "waylon256yhw";
+const DEFAULT_REPO_NAME: &str = "clewdr-hub";
+
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
@@ -35,8 +38,8 @@ struct GitHubAsset {
 pub struct ClewdrUpdater {
     client: Client,
     user_agent: String,
-    repo_owner: &'static str,
-    repo_name: &'static str,
+    repo_owner: String,
+    repo_name: String,
 }
 
 impl ClewdrUpdater {
@@ -45,15 +48,12 @@ impl ClewdrUpdater {
     /// # Returns
     /// * `Result<Self, ClewdrError>` - A new updater instance or an error
     pub fn new() -> Result<Self, ClewdrError> {
-        let authors = option_env!("CARGO_PKG_AUTHORS").unwrap_or_default();
-        let repo_owner = authors
-            .split(':')
-            .next()
-            .and_then(|author| author.split('<').next())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("Xerxes-2");
-        let repo_name = env!("CARGO_PKG_NAME");
+        let (repo_owner, repo_name) = package_github_repo().unwrap_or_else(|| {
+            (
+                DEFAULT_REPO_OWNER.to_string(),
+                DEFAULT_REPO_NAME.to_string(),
+            )
+        });
         let policy = wreq::redirect::Policy::default();
         let client = wreq::Client::builder()
             .redirect(policy)
@@ -316,4 +316,23 @@ impl ClewdrUpdater {
         let latest = parse_version(latest)?;
         Ok(current < latest)
     }
+}
+
+fn package_github_repo() -> Option<(String, String)> {
+    let repo = option_env!("CARGO_PKG_REPOSITORY")?.trim();
+    let repo = repo
+        .trim_end_matches(".git")
+        .trim_end_matches('/')
+        .trim_start_matches("git+");
+    let suffix = repo
+        .strip_prefix("https://github.com/")
+        .or_else(|| repo.strip_prefix("http://github.com/"))
+        .or_else(|| repo.strip_prefix("git@github.com:"))?;
+    let mut parts = suffix.split('/');
+    let owner = parts.next()?.trim();
+    let name = parts.next()?.trim();
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some((owner.to_string(), name.to_string()))
 }
