@@ -883,4 +883,93 @@ mod tests {
         assert_eq!(embedded.get::<Option<String>, _>("account_type"), None);
         assert_eq!(embedded.get::<Option<String>, _>("organization_uuid"), None);
     }
+
+    #[tokio::test]
+    async fn accounts_check_rejects_legacy_hybrid_auth_source() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        let result = sqlx::query(
+            "INSERT INTO accounts (
+                name, rr_order, max_slots, status, auth_source, cookie_blob, drain_first
+            ) VALUES ('h', 1, 5, 'active', 'hybrid', 'ck', 0)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            result.is_err(),
+            "auth_source='hybrid' must be rejected by CHECK",
+        );
+    }
+
+    #[tokio::test]
+    async fn accounts_check_rejects_cookie_row_with_oauth_tokens() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        let result = sqlx::query(
+            "INSERT INTO accounts (
+                name, rr_order, max_slots, status, auth_source,
+                cookie_blob, oauth_access_token, oauth_refresh_token, oauth_expires_at,
+                drain_first
+            ) VALUES ('dual', 1, 5, 'active', 'cookie', 'ck', 'at', 'rt', '2030-01-01T00:00:00Z', 0)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            result.is_err(),
+            "cookie row with oauth tokens must be rejected by mutex CHECK",
+        );
+    }
+
+    #[tokio::test]
+    async fn accounts_check_rejects_cookie_auth_without_cookie_blob() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        let result = sqlx::query(
+            "INSERT INTO accounts (
+                name, rr_order, max_slots, status, auth_source, drain_first
+            ) VALUES ('c', 1, 5, 'active', 'cookie', 0)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            result.is_err(),
+            "cookie auth without cookie_blob must be rejected by mutex CHECK",
+        );
+    }
+
+    #[tokio::test]
+    async fn accounts_check_rejects_oauth_auth_without_tokens() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        let result = sqlx::query(
+            "INSERT INTO accounts (
+                name, rr_order, max_slots, status, auth_source, drain_first
+            ) VALUES ('o', 1, 5, 'active', 'oauth', 0)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            result.is_err(),
+            "oauth auth without tokens must be rejected by mutex CHECK",
+        );
+    }
+
+    #[tokio::test]
+    async fn accounts_check_accepts_valid_cookie_and_oauth_rows() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (
+                name, rr_order, max_slots, status, auth_source, cookie_blob, drain_first
+            ) VALUES ('c', 1, 5, 'active', 'cookie', 'ck', 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("cookie-only row should satisfy mutex CHECK");
+
+        sqlx::query(
+            "INSERT INTO accounts (
+                name, rr_order, max_slots, status, auth_source,
+                oauth_access_token, oauth_refresh_token, oauth_expires_at, drain_first
+            ) VALUES ('o', 2, 5, 'active', 'oauth', 'at', 'rt', '2030-01-01T00:00:00Z', 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("oauth-only row should satisfy mutex CHECK");
+    }
 }

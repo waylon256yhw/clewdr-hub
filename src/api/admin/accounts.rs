@@ -851,3 +851,83 @@ pub async fn test_account(
         http_status,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derives_cookie_when_only_cookie_submitted() {
+        assert_eq!(
+            derive_auth_source(None, true, false, None).unwrap(),
+            "cookie"
+        );
+        assert_eq!(
+            derive_auth_source(None, true, false, Some("oauth")).unwrap(),
+            "cookie"
+        );
+    }
+
+    #[test]
+    fn derives_oauth_when_only_oauth_submitted() {
+        assert_eq!(
+            derive_auth_source(None, false, true, None).unwrap(),
+            "oauth"
+        );
+        assert_eq!(
+            derive_auth_source(None, false, true, Some("cookie")).unwrap(),
+            "oauth"
+        );
+    }
+
+    #[test]
+    fn preserves_existing_when_nothing_submitted() {
+        assert_eq!(
+            derive_auth_source(None, false, false, Some("cookie")).unwrap(),
+            "cookie"
+        );
+        assert_eq!(
+            derive_auth_source(None, false, false, Some("oauth")).unwrap(),
+            "oauth"
+        );
+    }
+
+    #[test]
+    fn errors_when_nothing_submitted_and_no_existing() {
+        let err = derive_auth_source(None, false, false, None).unwrap_err();
+        assert!(matches!(err, ClewdrError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn errors_when_existing_is_legacy_hybrid_without_new_credentials() {
+        // Post-C3 migration no hybrid rows should remain, but the derivation
+        // is defensive: if one slips through, updating without new credentials
+        // must fail rather than silently preserve an invalid value.
+        let err = derive_auth_source(None, false, false, Some("hybrid")).unwrap_err();
+        assert!(matches!(err, ClewdrError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn accepts_requested_that_matches_derived() {
+        assert_eq!(
+            derive_auth_source(Some("cookie"), true, false, None).unwrap(),
+            "cookie"
+        );
+        assert_eq!(
+            derive_auth_source(Some("oauth"), false, true, None).unwrap(),
+            "oauth"
+        );
+    }
+
+    #[test]
+    fn errors_on_requested_mismatch() {
+        let err = derive_auth_source(Some("oauth"), true, false, None).unwrap_err();
+        assert!(matches!(err, ClewdrError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn rejects_legacy_hybrid_request() {
+        let err = derive_auth_source(Some("hybrid"), true, true, None).unwrap_err();
+        assert!(matches!(err, ClewdrError::BadRequest { .. }));
+    }
+}
