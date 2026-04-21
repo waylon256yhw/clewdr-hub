@@ -195,19 +195,17 @@ function AccountCard({
           )}
         </Group>
         <Group gap={4}>
-          {account.has_oauth && (
-            <Tooltip label="测试 /v1/messages">
-              <ActionIcon
-                variant="subtle"
-                size="sm"
-                color="cyan"
-                loading={testMut.isPending}
-                onClick={() => testMut.mutate()}
-              >
-                <IconFlask size={14} />
-              </ActionIcon>
-            </Tooltip>
-          )}
+          <Tooltip label="测试 /v1/messages">
+            <ActionIcon
+              variant="subtle"
+              size="sm"
+              color="cyan"
+              loading={testMut.isPending}
+              onClick={() => testMut.mutate()}
+            >
+              <IconFlask size={14} />
+            </ActionIcon>
+          </Tooltip>
           <ActionIcon variant="subtle" size="sm" onClick={onEdit}>
             <IconEdit size={14} />
           </ActionIcon>
