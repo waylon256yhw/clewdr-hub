@@ -72,7 +72,6 @@ function authSourceLabel(source: Account["auth_source"]): string {
   switch (source) {
     case "oauth": return "OAuth";
     case "cookie": return "Cookie";
-    case "hybrid": return "Hybrid";
     default: return source;
   }
 }

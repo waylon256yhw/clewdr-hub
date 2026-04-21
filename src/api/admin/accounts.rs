@@ -213,26 +213,33 @@ async fn resolve_proxy_url(
 
 fn derive_auth_source(
     requested: Option<&str>,
-    has_cookie: bool,
-    has_oauth: bool,
+    submitted_cookie: bool,
+    submitted_oauth: bool,
+    existing: Option<&str>,
 ) -> Result<&'static str, ClewdrError> {
-    let inferred = match (has_cookie, has_oauth) {
-        (true, true) => "hybrid",
-        (true, false) => "cookie",
-        (false, true) => "oauth",
-        (false, false) => {
+    let derived: &'static str = match (submitted_cookie, submitted_oauth) {
+        (true, true) => {
             return Err(ClewdrError::BadRequest {
-                msg: "Either cookie or OAuth callback input is required",
+                msg: "Submit exactly one of cookie or OAuth callback input",
             });
         }
+        (true, false) => "cookie",
+        (false, true) => "oauth",
+        (false, false) => match existing {
+            Some("cookie") => "cookie",
+            Some("oauth") => "oauth",
+            _ => {
+                return Err(ClewdrError::BadRequest {
+                    msg: "Either cookie or OAuth callback input is required",
+                });
+            }
+        },
     };
 
     match requested {
-        None => Ok(inferred),
-        Some("cookie") if has_cookie => Ok("cookie"),
-        Some("oauth") if has_oauth => Ok("oauth"),
-        Some("hybrid") if has_cookie && has_oauth => Ok("hybrid"),
-        Some("cookie" | "oauth" | "hybrid") => Err(ClewdrError::BadRequest {
+        None => Ok(derived),
+        Some(r) if r == derived => Ok(derived),
+        Some("cookie" | "oauth") => Err(ClewdrError::BadRequest {
             msg: "Requested auth_source does not match provided credentials",
         }),
         Some(_) => Err(ClewdrError::BadRequest {
@@ -282,7 +289,16 @@ pub async fn create(
     let proxy_binding = resolve_proxy_url(&db, req.proxy_id).await?;
     let cookie_blob = normalize_cookie_blob(req.cookie_blob)?;
     let oauth_state = normalize_optional(req.oauth_state);
-    let oauth = match normalize_optional(req.oauth_callback_input) {
+    let oauth_callback_input = normalize_optional(req.oauth_callback_input);
+    // Reject dual submission before spending the one-time OAuth callback
+    // code — the DB CHECK would also catch it, but a clear 400 is friendlier
+    // and avoids a wasted Anthropic round-trip.
+    if cookie_blob.is_some() && oauth_callback_input.is_some() {
+        return Err(ClewdrError::BadRequest {
+            msg: "Submit exactly one of cookie or OAuth callback input",
+        });
+    }
+    let oauth = match oauth_callback_input {
         Some(input) => Some(
             exchange_admin_oauth_callback(
                 &input,
@@ -297,6 +313,7 @@ pub async fn create(
         req.auth_source.as_deref(),
         cookie_blob.is_some(),
         oauth.is_some(),
+        None,
     )?;
 
     if let Some(ref cookie_blob) = cookie_blob {
@@ -412,7 +429,13 @@ pub async fn update(
     };
     let new_cookie_blob = normalize_cookie_blob(req.cookie_blob.clone())?;
     let oauth_state = normalize_optional(req.oauth_state.clone());
-    let oauth = match normalize_optional(req.oauth_callback_input.clone()) {
+    let oauth_callback_input = normalize_optional(req.oauth_callback_input.clone());
+    if new_cookie_blob.is_some() && oauth_callback_input.is_some() {
+        return Err(ClewdrError::BadRequest {
+            msg: "Submit exactly one of cookie or OAuth callback input",
+        });
+    }
+    let oauth = match oauth_callback_input {
         Some(input) => Some(
             exchange_admin_oauth_callback(
                 &input,
@@ -423,9 +446,12 @@ pub async fn update(
         ),
         None => None,
     };
-    let has_cookie = new_cookie_blob.is_some() || existing.cookie_blob.is_some();
-    let has_oauth = oauth.is_some() || existing.oauth_token.is_some();
-    let auth_source = derive_auth_source(req.auth_source.as_deref(), has_cookie, has_oauth)?;
+    derive_auth_source(
+        req.auth_source.as_deref(),
+        new_cookie_blob.is_some(),
+        oauth.is_some(),
+        Some(existing.auth_source.as_str()),
+    )?;
 
     let mut tx = db.begin().await?;
 
@@ -518,21 +544,54 @@ pub async fn update(
                 msg: "该 Cookie 已被其他账号使用",
             });
         }
+        // Single-statement credential replacement: cookie_blob, auth_source,
+        // and cleared oauth fields are written together so the row-level
+        // credential-mutex CHECK is only evaluated against the final state.
+        // Piecewise updates (write cookie first, then clear oauth, then switch
+        // auth_source) would trip the CHECK mid-transaction.
         sqlx::query(
-            "UPDATE accounts SET cookie_blob = ?1, invalid_reason = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            "UPDATE accounts
+             SET cookie_blob = ?1,
+                 oauth_access_token = NULL,
+                 oauth_refresh_token = NULL,
+                 oauth_expires_at = NULL,
+                 last_refresh_at = NULL,
+                 auth_source = 'cookie',
+                 invalid_reason = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2",
         )
         .bind(blob)
         .bind(id)
         .execute(&mut *tx)
         .await?;
+    } else if let Some(ref oauth_data) = oauth {
+        // Mirror of the cookie branch: all credential + auth_source columns
+        // move together in a single UPDATE so the mutex CHECK sees only the
+        // consistent post-write state.
+        sqlx::query(
+            "UPDATE accounts
+             SET cookie_blob = NULL,
+                 oauth_access_token = ?1,
+                 oauth_refresh_token = ?2,
+                 oauth_expires_at = ?3,
+                 last_refresh_at = ?4,
+                 organization_uuid = ?5,
+                 auth_source = 'oauth',
+                 last_error = NULL,
+                 invalid_reason = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?6",
+        )
+        .bind(oauth_data.token.access_token.as_str())
+        .bind(oauth_data.token.refresh_token.as_str())
+        .bind(oauth_data.token.expires_at.to_rfc3339())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(oauth_data.snapshot.organization_uuid.as_str())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     }
-    sqlx::query(
-        "UPDATE accounts SET auth_source = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
-    )
-    .bind(auth_source)
-    .bind(id)
-    .execute(&mut *tx)
-    .await?;
     if let Some(ref org) = req.organization_uuid {
         sqlx::query(
             "UPDATE accounts SET organization_uuid = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
@@ -546,7 +605,6 @@ pub async fn update(
     tx.commit().await?;
 
     if let Some(ref oauth) = oauth {
-        upsert_account_oauth(&db, id, Some(&oauth.token), None).await?;
         update_account_metadata_unchecked(
             &db,
             id,
@@ -790,4 +848,92 @@ pub async fn test_account(
         error: error_msg,
         http_status,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derives_cookie_when_only_cookie_submitted() {
+        assert_eq!(
+            derive_auth_source(None, true, false, None).unwrap(),
+            "cookie"
+        );
+        assert_eq!(
+            derive_auth_source(None, true, false, Some("oauth")).unwrap(),
+            "cookie"
+        );
+    }
+
+    #[test]
+    fn derives_oauth_when_only_oauth_submitted() {
+        assert_eq!(
+            derive_auth_source(None, false, true, None).unwrap(),
+            "oauth"
+        );
+        assert_eq!(
+            derive_auth_source(None, false, true, Some("cookie")).unwrap(),
+            "oauth"
+        );
+    }
+
+    #[test]
+    fn preserves_existing_when_nothing_submitted() {
+        assert_eq!(
+            derive_auth_source(None, false, false, Some("cookie")).unwrap(),
+            "cookie"
+        );
+        assert_eq!(
+            derive_auth_source(None, false, false, Some("oauth")).unwrap(),
+            "oauth"
+        );
+    }
+
+    #[test]
+    fn errors_when_nothing_submitted_and_no_existing() {
+        let err = derive_auth_source(None, false, false, None).unwrap_err();
+        assert!(matches!(err, ClewdrError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn errors_when_existing_is_legacy_hybrid_without_new_credentials() {
+        // Post-C3 migration no hybrid rows should remain, but the derivation
+        // is defensive: if one slips through, updating without new credentials
+        // must fail rather than silently preserve an invalid value.
+        let err = derive_auth_source(None, false, false, Some("hybrid")).unwrap_err();
+        assert!(matches!(err, ClewdrError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn accepts_requested_that_matches_derived() {
+        assert_eq!(
+            derive_auth_source(Some("cookie"), true, false, None).unwrap(),
+            "cookie"
+        );
+        assert_eq!(
+            derive_auth_source(Some("oauth"), false, true, None).unwrap(),
+            "oauth"
+        );
+    }
+
+    #[test]
+    fn errors_on_requested_mismatch() {
+        let err = derive_auth_source(Some("oauth"), true, false, None).unwrap_err();
+        assert!(matches!(err, ClewdrError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn rejects_legacy_hybrid_request() {
+        // Requesting auth_source="hybrid" with a single valid credential must
+        // fail at the requested-vs-derived mismatch check.
+        let err = derive_auth_source(Some("hybrid"), true, false, None).unwrap_err();
+        assert!(matches!(err, ClewdrError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn rejects_dual_credential_submission() {
+        let err = derive_auth_source(None, true, true, None).unwrap_err();
+        assert!(matches!(err, ClewdrError::BadRequest { .. }));
+    }
 }
