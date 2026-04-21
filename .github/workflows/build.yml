@@ -50,6 +50,7 @@ permissions:
 jobs:
   build-frontend:
     name: Build Frontend
+    if: github.event_name != 'push' || github.ref_type == 'tag' || !startsWith(github.event.head_commit.message, 'Update to v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

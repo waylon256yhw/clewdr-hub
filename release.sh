@@ -5,7 +5,9 @@ if [ -z "$VERSION" ]; then
     echo "Usage: ./release.sh <version> (e.g., 1.0.0)"
     exit 1
 fi
-cargo update
+if [ "${RELEASE_UPDATE_DEPS:-0}" = "1" ]; then
+    cargo update
+fi
 cargo set-version $VERSION
 cargo test
 (cd frontend && npm ci && npm run build)
