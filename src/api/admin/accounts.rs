@@ -213,26 +213,28 @@ async fn resolve_proxy_url(
 
 fn derive_auth_source(
     requested: Option<&str>,
-    has_cookie: bool,
-    has_oauth: bool,
+    submitted_cookie: bool,
+    submitted_oauth: bool,
+    existing: Option<&str>,
 ) -> Result<&'static str, ClewdrError> {
-    let inferred = match (has_cookie, has_oauth) {
-        (true, true) => "hybrid",
-        (true, false) => "cookie",
+    let derived: &'static str = match (submitted_cookie, submitted_oauth) {
+        (true, _) => "cookie",
         (false, true) => "oauth",
-        (false, false) => {
-            return Err(ClewdrError::BadRequest {
-                msg: "Either cookie or OAuth callback input is required",
-            });
-        }
+        (false, false) => match existing {
+            Some("cookie") => "cookie",
+            Some("oauth") => "oauth",
+            _ => {
+                return Err(ClewdrError::BadRequest {
+                    msg: "Either cookie or OAuth callback input is required",
+                });
+            }
+        },
     };
 
     match requested {
-        None => Ok(inferred),
-        Some("cookie") if has_cookie => Ok("cookie"),
-        Some("oauth") if has_oauth => Ok("oauth"),
-        Some("hybrid") if has_cookie && has_oauth => Ok("hybrid"),
-        Some("cookie" | "oauth" | "hybrid") => Err(ClewdrError::BadRequest {
+        None => Ok(derived),
+        Some(r) if r == derived => Ok(derived),
+        Some("cookie" | "oauth") => Err(ClewdrError::BadRequest {
             msg: "Requested auth_source does not match provided credentials",
         }),
         Some(_) => Err(ClewdrError::BadRequest {
@@ -297,6 +299,7 @@ pub async fn create(
         req.auth_source.as_deref(),
         cookie_blob.is_some(),
         oauth.is_some(),
+        None,
     )?;
 
     if let Some(ref cookie_blob) = cookie_blob {
@@ -423,9 +426,12 @@ pub async fn update(
         ),
         None => None,
     };
-    let has_cookie = new_cookie_blob.is_some() || existing.cookie_blob.is_some();
-    let has_oauth = oauth.is_some() || existing.oauth_token.is_some();
-    let auth_source = derive_auth_source(req.auth_source.as_deref(), has_cookie, has_oauth)?;
+    let auth_source = derive_auth_source(
+        req.auth_source.as_deref(),
+        new_cookie_blob.is_some(),
+        oauth.is_some(),
+        Some(existing.auth_source.as_str()),
+    )?;
 
     let mut tx = db.begin().await?;
 
@@ -526,6 +532,36 @@ pub async fn update(
         .execute(&mut *tx)
         .await?;
     }
+    // Credential replacement: an account has exactly one active auth method.
+    // Submitting a cookie clears any oauth state; submitting oauth clears the cookie.
+    if auth_source == "cookie" {
+        sqlx::query(
+            "UPDATE accounts
+             SET oauth_access_token = NULL,
+                 oauth_refresh_token = NULL,
+                 oauth_expires_at = NULL,
+                 last_refresh_at = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1
+               AND (oauth_access_token IS NOT NULL
+                    OR oauth_refresh_token IS NOT NULL
+                    OR oauth_expires_at IS NOT NULL
+                    OR last_refresh_at IS NOT NULL)",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    } else if auth_source == "oauth" {
+        sqlx::query(
+            "UPDATE accounts
+             SET cookie_blob = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND cookie_blob IS NOT NULL",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
     sqlx::query(
         "UPDATE accounts SET auth_source = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
     )
@@ -542,11 +578,35 @@ pub async fn update(
         .execute(&mut *tx)
         .await?;
     }
+    // When a new OAuth credential is submitted, write it inside the same tx as
+    // the cookie clearing / auth_source switch. This prevents a torn state where
+    // auth_source='oauth' and cookie_blob=NULL but oauth tokens are absent.
+    if let Some(ref oauth_data) = oauth {
+        sqlx::query(
+            "UPDATE accounts
+             SET oauth_access_token = ?1,
+                 oauth_refresh_token = ?2,
+                 oauth_expires_at = ?3,
+                 last_refresh_at = ?4,
+                 organization_uuid = ?5,
+                 last_error = NULL,
+                 invalid_reason = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?6",
+        )
+        .bind(oauth_data.token.access_token.as_str())
+        .bind(oauth_data.token.refresh_token.as_str())
+        .bind(oauth_data.token.expires_at.to_rfc3339())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(oauth_data.snapshot.organization_uuid.as_str())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
 
     tx.commit().await?;
 
     if let Some(ref oauth) = oauth {
-        upsert_account_oauth(&db, id, Some(&oauth.token), None).await?;
         update_account_metadata_unchecked(
             &db,
             id,
