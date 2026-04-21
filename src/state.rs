@@ -35,6 +35,14 @@ impl AdminEvent {
             status: None,
         }
     }
+
+    pub fn accounts_refresh() -> Self {
+        Self {
+            topic: "accounts".to_string(),
+            request_type: None,
+            status: None,
+        }
+    }
 }
 
 #[derive(Clone)]

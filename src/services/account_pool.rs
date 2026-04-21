@@ -70,6 +70,7 @@ struct AccountPoolState {
     invalid: HashSet<InvalidAccountSlot>,
     moka: Cache<u64, AccountSlot>,
     db: SqlitePool,
+    event_tx: broadcast::Sender<AdminEvent>,
     dirty: HashSet<i64>,
     handle: Option<AccountPoolHandle>,
     /// Per-account inflight tracking: account_id → (current_inflight, max_slots)
@@ -86,6 +87,10 @@ struct AccountPoolState {
 struct AccountPoolActor;
 
 impl AccountPoolActor {
+    fn emit_accounts_refresh(state: &AccountPoolState) {
+        let _ = state.event_tx.send(AdminEvent::accounts_refresh());
+    }
+
     fn mark_dirty(state: &mut AccountPoolState, account_id: Option<i64>) {
         if let Some(id) = account_id {
             state.dirty.insert(id);
@@ -332,12 +337,10 @@ impl AccountPoolActor {
         Ok(cookie)
     }
 
-    fn collect(state: &mut AccountPoolState, cookie: AccountSlot, reason: Option<Reason>) {
+    fn collect(state: &mut AccountPoolState, cookie: AccountSlot, reason: Option<Reason>) -> bool {
         let aid = cookie.account_id;
 
-        if let Some(id) = aid {
-            state.probing.remove(&id);
-        }
+        let removed_probe = aid.is_some_and(|id| state.probing.remove(&id));
 
         // Remove from whichever set the cookie currently lives in
         let was_valid = state
@@ -350,7 +353,7 @@ impl AccountPoolActor {
         let was_invalid = state.invalid.take(&tmp);
 
         if was_valid.is_none() && was_exhausted.is_none() && was_invalid.is_none() {
-            return;
+            return removed_probe;
         }
 
         let changed_set = match &reason {
@@ -402,6 +405,7 @@ impl AccountPoolActor {
         if changed_set {
             Self::log(state);
         }
+        removed_probe
     }
 
     fn accept(state: &mut AccountPoolState, cookie: AccountSlot) {
@@ -438,6 +442,8 @@ impl AccountPoolActor {
             return;
         };
         state.probing.insert(account_id);
+        state.probe_errors.remove(&account_id);
+        Self::emit_accounts_refresh(state);
         let handle = handle.clone();
         let cookie = cookie.clone();
         let db = state.db.clone();
@@ -739,19 +745,21 @@ impl AccountPoolActor {
 
         // Spawn probes for unprobed cookies
         Self::spawn_probes_for_unprobed(state);
+        Self::emit_accounts_refresh(state);
     }
 }
 
 impl Actor for AccountPoolActor {
     type Msg = AccountPoolMessage;
     type State = AccountPoolState;
-    type Arguments = SqlitePool;
+    type Arguments = (SqlitePool, broadcast::Sender<AdminEvent>);
 
     async fn pre_start(
         &self,
         _myself: ActorRef<Self::Msg>,
-        db: Self::Arguments,
+        args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
+        let (db, event_tx) = args;
         let moka = Cache::builder()
             .max_capacity(1000)
             .time_to_idle(std::time::Duration::from_secs(60 * 60))
@@ -763,6 +771,7 @@ impl Actor for AccountPoolActor {
             invalid: HashSet::new(),
             moka,
             db,
+            event_tx,
             dirty: HashSet::new(),
             handle: None,
             inflight: HashMap::new(),
@@ -786,7 +795,11 @@ impl Actor for AccountPoolActor {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             AccountPoolMessage::Return(cookie, reason) => {
-                Self::collect(state, cookie, reason);
+                let completed_probe = Self::collect(state, cookie, reason);
+                if completed_probe {
+                    Self::do_flush(state).await;
+                    Self::emit_accounts_refresh(state);
+                }
             }
             AccountPoolMessage::Submit(cookie) => {
                 Self::accept(state, cookie);
@@ -822,6 +835,10 @@ impl Actor for AccountPoolActor {
             }
             AccountPoolMessage::BeginProbe(account_id, reply_port) => {
                 let inserted = state.probing.insert(account_id);
+                if inserted {
+                    state.probe_errors.remove(&account_id);
+                    Self::emit_accounts_refresh(state);
+                }
                 reply_port.send(inserted)?;
             }
             AccountPoolMessage::FlushDirty => {
@@ -841,13 +858,18 @@ impl Actor for AccountPoolActor {
                 reply_port.send(state.probing.iter().copied().collect())?;
             }
             AccountPoolMessage::ClearProbing(account_id) => {
-                state.probing.remove(&account_id);
+                if state.probing.remove(&account_id) {
+                    Self::emit_accounts_refresh(state);
+                }
             }
             AccountPoolMessage::SetProbeError(account_id, msg) => {
                 state.probe_errors.insert(account_id, msg);
+                Self::emit_accounts_refresh(state);
             }
             AccountPoolMessage::ClearProbeError(account_id) => {
-                state.probe_errors.remove(&account_id);
+                if state.probe_errors.remove(&account_id).is_some() {
+                    Self::emit_accounts_refresh(state);
+                }
             }
             AccountPoolMessage::GetProbeErrors(reply_port) => {
                 reply_port.send(state.probe_errors.clone())?;
@@ -903,8 +925,12 @@ impl std::fmt::Debug for AccountPoolHandle {
 }
 
 impl AccountPoolHandle {
-    pub async fn start(db: SqlitePool) -> Result<Self, ractor::SpawnErr> {
-        let (actor_ref, _join_handle) = Actor::spawn(None, AccountPoolActor, db).await?;
+    pub async fn start(
+        db: SqlitePool,
+        event_tx: broadcast::Sender<AdminEvent>,
+    ) -> Result<Self, ractor::SpawnErr> {
+        let (actor_ref, _join_handle) =
+            Actor::spawn(None, AccountPoolActor, (db, event_tx)).await?;
 
         let handle = Self {
             actor_ref: actor_ref.clone(),

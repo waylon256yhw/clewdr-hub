@@ -609,7 +609,7 @@ export default function Accounts() {
               key={a.id}
               account={a}
               probing={probingIds.has(a.id)}
-              probeError={probeErrors[a.id]}
+              probeError={probingIds.has(a.id) ? undefined : probeErrors[a.id]}
               onEdit={() => openEdit(a)}
               onDelete={() => setDeleting(a)}
             />

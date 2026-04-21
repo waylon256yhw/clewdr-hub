@@ -24,10 +24,10 @@ pub struct RouterBuilder {
 impl RouterBuilder {
     pub async fn new(db_pool: SqlitePool) -> Self {
         let stealth_profile = stealth::init_stealth_profile(&db_pool).await;
-        let pool_handle = AccountPoolHandle::start(db_pool.clone())
+        let (event_tx, _) = tokio::sync::broadcast::channel::<AdminEvent>(64);
+        let pool_handle = AccountPoolHandle::start(db_pool.clone(), event_tx.clone())
             .await
             .expect("Failed to start AccountPoolActor");
-        let (event_tx, _) = tokio::sync::broadcast::channel::<AdminEvent>(64);
         let claude_providers = crate::providers::claude::build_providers(
             pool_handle.clone(),
             db_pool.clone(),

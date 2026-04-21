@@ -169,11 +169,17 @@ function useGlobalAdminEvents() {
             queryClient.invalidateQueries({ queryKey: ["requests"] });
             queryClient.invalidateQueries({ queryKey: ["opsUsage"] });
             queryClient.invalidateQueries({ queryKey: qk.overview });
+            queryClient.invalidateQueries({ queryKey: qk.accounts });
+          }
+          if (payload.topic === "accounts") {
+            queryClient.invalidateQueries({ queryKey: qk.accounts });
+            queryClient.invalidateQueries({ queryKey: qk.overview });
           }
         } catch {
           queryClient.invalidateQueries({ queryKey: ["requests"] });
           queryClient.invalidateQueries({ queryKey: ["opsUsage"] });
           queryClient.invalidateQueries({ queryKey: qk.overview });
+          queryClient.invalidateQueries({ queryKey: qk.accounts });
         }
       };
       es.onerror = () => {
