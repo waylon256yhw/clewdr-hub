@@ -5,8 +5,10 @@ import {
   Table,
   Badge,
   Button,
+  Collapse,
   Group,
   Select,
+  SimpleGrid,
   Text,
   Skeleton,
   Alert,
@@ -197,6 +199,7 @@ export default function Logs() {
   const location = useLocation();
   const [filters, setFilters] = useState<RequestFilters>({ offset: 0, limit: PAGE_SIZE });
   const [detail, setDetail] = useState<RequestLog | null>(null);
+  const [filtersOpened, setFiltersOpened] = useState(false);
 
   useEffect(() => {
     const next = parseFiltersFromSearch(location.search);
@@ -249,89 +252,111 @@ export default function Logs() {
     }));
   };
 
+  const activeFilterCount = [
+    filters.request_type,
+    filters.user_id,
+    filters.status,
+    filters.model,
+    filters.started_from,
+  ].filter((value) => value !== undefined && value !== null && value !== "").length;
+
+  const renderFilters = () => (
+    <>
+      <Select
+        label="类型"
+        placeholder="全部"
+        data={[
+          { value: "messages", label: "messages" },
+          { value: "probe_cookie", label: "probe (cookie)" },
+          { value: "probe_oauth", label: "probe (oauth)" },
+          { value: "probe_proxy", label: "probe (proxy)" },
+          { value: "test", label: "test" },
+        ]}
+        value={filters.request_type ?? null}
+        onChange={(v) => updateFilter("request_type", v ?? undefined)}
+        clearable
+        size="sm"
+      />
+      <Select
+        label="用户"
+        placeholder="全部"
+        data={userData}
+        value={filters.user_id != null ? String(filters.user_id) : null}
+        onChange={(v) => updateFilter("user_id", v ? Number(v) : undefined)}
+        clearable
+        size="sm"
+      />
+      <Select
+        label="状态"
+        placeholder="全部"
+        data={[
+          { value: "ok", label: "成功" },
+          { value: "upstream_error", label: "上游错误" },
+          { value: "client_abort", label: "客户端中断" },
+          { value: "auth_rejected", label: "认证拒绝" },
+          { value: "quota_rejected", label: "配额超限" },
+          { value: "user_concurrency_rejected", label: "并发超限" },
+          { value: "rpm_rejected", label: "RPM 超限" },
+          { value: "no_account_available", label: "无可用账号" },
+          { value: "internal_error", label: "内部错误" },
+        ]}
+        value={filters.status ?? null}
+        onChange={(v) => updateFilter("status", v ?? undefined)}
+        clearable
+        size="sm"
+      />
+      <Select
+        label="模型"
+        placeholder="全部"
+        data={modelData}
+        value={filters.model ?? null}
+        onChange={(v) => updateFilter("model", v ?? undefined)}
+        clearable
+        size="sm"
+      />
+      <Select
+        label="时间"
+        placeholder="全部"
+        data={[
+          { value: "today", label: "今天" },
+          { value: "7d", label: "近 7 天" },
+          { value: "30d", label: "近 30 天" },
+        ]}
+        value={
+          filters.started_from
+            ? (new Date().getTime() - new Date(filters.started_from).getTime() < 86400_000 ? "today"
+              : new Date().getTime() - new Date(filters.started_from).getTime() < 7 * 86400_000 + 60_000 ? "7d"
+              : "30d")
+            : null
+        }
+        onChange={setTimeRange}
+        clearable
+        size="sm"
+      />
+    </>
+  );
+
   return (
     <>
       <Title order={3} mb="md">请求日志</Title>
 
-      <Group mb="md" gap="sm" align="end">
-        <Select
-          label="类型"
-          placeholder="全部"
-          data={[
-            { value: "messages", label: "messages" },
-            { value: "probe_cookie", label: "probe (cookie)" },
-            { value: "probe_oauth", label: "probe (oauth)" },
-            { value: "probe_proxy", label: "probe (proxy)" },
-            { value: "test", label: "test" },
-          ]}
-          value={filters.request_type ?? null}
-          onChange={(v) => updateFilter("request_type", v ?? undefined)}
-          clearable
-          size="sm"
-          w={170}
-        />
-        <Select
-          label="用户"
-          placeholder="全部"
-          data={userData}
-          value={filters.user_id != null ? String(filters.user_id) : null}
-          onChange={(v) => updateFilter("user_id", v ? Number(v) : undefined)}
-          clearable
-          size="sm"
-          w={150}
-        />
-        <Select
-          label="状态"
-          placeholder="全部"
-          data={[
-            { value: "ok", label: "成功" },
-            { value: "upstream_error", label: "上游错误" },
-            { value: "client_abort", label: "客户端中断" },
-            { value: "auth_rejected", label: "认证拒绝" },
-            { value: "quota_rejected", label: "配额超限" },
-            { value: "user_concurrency_rejected", label: "并发超限" },
-            { value: "rpm_rejected", label: "RPM 超限" },
-            { value: "no_account_available", label: "无可用账号" },
-            { value: "internal_error", label: "内部错误" },
-          ]}
-          value={filters.status ?? null}
-          onChange={(v) => updateFilter("status", v ?? undefined)}
-          clearable
-          size="sm"
-          w={130}
-        />
-        <Select
-          label="模型"
-          placeholder="全部"
-          data={modelData}
-          value={filters.model ?? null}
-          onChange={(v) => updateFilter("model", v ?? undefined)}
-          clearable
-          searchable
-          size="sm"
-          w={200}
-        />
-        <Select
-          label="时间"
-          placeholder="全部"
-          data={[
-            { value: "today", label: "今天" },
-            { value: "7d", label: "近 7 天" },
-            { value: "30d", label: "近 30 天" },
-          ]}
-          value={
-            filters.started_from
-              ? (new Date().getTime() - new Date(filters.started_from).getTime() < 86400_000 ? "today"
-                : new Date().getTime() - new Date(filters.started_from).getTime() < 7 * 86400_000 + 60_000 ? "7d"
-                : "30d")
-              : null
-          }
-          onChange={setTimeRange}
-          clearable
-          size="sm"
-          w={120}
-        />
-      </Group>
+      <Button
+        hiddenFrom="sm"
+        variant="light"
+        fullWidth
+        mb="sm"
+        onClick={() => setFiltersOpened((opened) => !opened)}
+      >
+        {filtersOpened ? "收起筛选" : `筛选${activeFilterCount > 0 ? ` (${activeFilterCount})` : ""}`}
+      </Button>
+      <Collapse expanded={filtersOpened} hiddenFrom="sm">
+        <SimpleGrid cols={1} spacing="sm" mb="md">
+          {renderFilters()}
+        </SimpleGrid>
+      </Collapse>
+      <SimpleGrid visibleFrom="sm" cols={{ sm: 2, lg: 5 }} spacing="sm" mb="md">
+        {renderFilters()}
+      </SimpleGrid>
 
       {isLoading ? (
         <Skeleton height={300} />
