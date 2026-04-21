@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use axum::{
     Json,
@@ -14,7 +15,7 @@ use super::common::PaginationParams;
 use crate::{
     billing::{BillingContext, RequestType, persist_probe_log},
     claude_code_state::{build_api_client, probe::probe_oauth_account},
-    config::CLAUDE_ENDPOINT,
+    config::{CLAUDE_ENDPOINT, ClewdrCookie},
     db::accounts::{
         AccountWithRuntime, batch_upsert_runtime_states, get_account_by_id, load_all_accounts,
         update_account_metadata_unchecked, upsert_account_oauth,
@@ -178,6 +179,20 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
     })
 }
 
+// Parse a user-supplied cookie into its canonical inner form
+// (sk-ant-sid...AA), so downstream comparisons and the stale-write guard in
+// update_account_metadata stay consistent with what ClewdrCookie::from_str
+// produces when the pool is (re)loaded.
+fn normalize_cookie_blob(value: Option<String>) -> Result<Option<String>, ClewdrError> {
+    let Some(trimmed) = normalize_optional(value) else {
+        return Ok(None);
+    };
+    let parsed = ClewdrCookie::from_str(&trimmed).map_err(|_| ClewdrError::BadRequest {
+        msg: "cookie format invalid",
+    })?;
+    Ok(Some((*parsed).to_owned()))
+}
+
 async fn resolve_proxy_url(
     db: &SqlitePool,
     proxy_id: Option<i64>,
@@ -265,7 +280,7 @@ pub async fn create(
     }
 
     let proxy_binding = resolve_proxy_url(&db, req.proxy_id).await?;
-    let cookie_blob = normalize_optional(req.cookie_blob);
+    let cookie_blob = normalize_cookie_blob(req.cookie_blob)?;
     let oauth_state = normalize_optional(req.oauth_state);
     let oauth = match normalize_optional(req.oauth_callback_input) {
         Some(input) => Some(
@@ -395,7 +410,7 @@ pub async fn update(
             _ => None,
         }
     };
-    let new_cookie_blob = normalize_optional(req.cookie_blob.clone());
+    let new_cookie_blob = normalize_cookie_blob(req.cookie_blob.clone())?;
     let oauth_state = normalize_optional(req.oauth_state.clone());
     let oauth = match normalize_optional(req.oauth_callback_input.clone()) {
         Some(input) => Some(

@@ -574,16 +574,23 @@ pub async fn update_account_metadata(
     org_uuid: &str,
     expected_cookie_prefix: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE accounts SET email = ?1, account_type = ?2, organization_uuid = ?3, updated_at = CURRENT_TIMESTAMP WHERE id = ?4 AND cookie_blob LIKE ?5",
+    let result = sqlx::query(
+        "UPDATE accounts SET email = ?1, account_type = ?2, organization_uuid = ?3, updated_at = CURRENT_TIMESTAMP WHERE id = ?4 AND (cookie_blob LIKE ?5 OR cookie_blob LIKE ?6)",
     )
     .bind(email)
     .bind(account_type)
     .bind(org_uuid)
     .bind(account_id)
     .bind(format!("{}%", expected_cookie_prefix))
+    .bind(format!("sessionKey={}%", expected_cookie_prefix))
     .execute(pool)
     .await?;
+    if result.rows_affected() == 0 {
+        tracing::warn!(
+            account_id,
+            "update_account_metadata guard missed: cookie_blob does not start with the expected prefix, metadata not persisted"
+        );
+    }
     Ok(())
 }
 
@@ -698,15 +705,18 @@ pub async fn load_pure_oauth_accounts(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::time::Duration;
 
     use chrono::Utc;
+    use sqlx::Row;
 
     use super::{
         AccountAuthSourceSummary, AccountPoolSummary, AccountStatusSummary, AccountSummary,
-        AccountWithRuntime, RuntimeStateRow, summarize_accounts,
+        AccountWithRuntime, RuntimeStateRow, summarize_accounts, update_account_metadata,
     };
     use crate::config::{Organization, TokenInfo, UsageBreakdown};
+    use crate::db::init_pool;
 
     fn runtime(reset_time: Option<i64>) -> RuntimeStateRow {
         RuntimeStateRow {
@@ -813,5 +823,84 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[tokio::test]
+    async fn update_account_metadata_allows_normal_and_legacy_prefix_only() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (
+                id, name, rr_order, max_slots, status, auth_source, cookie_blob, drain_first
+            ) VALUES
+                (1, 'normal', 1, 5, 'active', 'cookie', ?1, 0),
+                (2, 'legacy', 2, 5, 'active', 'cookie', ?2, 0),
+                (3, 'embedded', 3, 5, 'active', 'cookie', ?3, 0)",
+        )
+        .bind("sk-ant-sid02-ABCDEFG-rest")
+        .bind("sessionKey=sk-ant-sid02-ABCDEFG-rest")
+        .bind("xxsk-ant-sid02-ABCDEFG-rest")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let prefix = "sk-ant-sid02-ABCDEFG";
+        update_account_metadata(&pool, 1, "n@example.com", "pro", "org-normal", prefix)
+            .await
+            .unwrap();
+        update_account_metadata(&pool, 2, "l@example.com", "pro", "org-legacy", prefix)
+            .await
+            .unwrap();
+        update_account_metadata(&pool, 3, "e@example.com", "pro", "org-embedded", prefix)
+            .await
+            .unwrap();
+
+        let normal =
+            sqlx::query("SELECT email, account_type, organization_uuid FROM accounts WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            normal.get::<Option<String>, _>("email").as_deref(),
+            Some("n@example.com")
+        );
+        assert_eq!(
+            normal.get::<Option<String>, _>("account_type").as_deref(),
+            Some("pro")
+        );
+        assert_eq!(
+            normal
+                .get::<Option<String>, _>("organization_uuid")
+                .as_deref(),
+            Some("org-normal")
+        );
+
+        let legacy =
+            sqlx::query("SELECT email, account_type, organization_uuid FROM accounts WHERE id = 2")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            legacy.get::<Option<String>, _>("email").as_deref(),
+            Some("l@example.com")
+        );
+        assert_eq!(
+            legacy.get::<Option<String>, _>("account_type").as_deref(),
+            Some("pro")
+        );
+        assert_eq!(
+            legacy
+                .get::<Option<String>, _>("organization_uuid")
+                .as_deref(),
+            Some("org-legacy")
+        );
+
+        let embedded =
+            sqlx::query("SELECT email, account_type, organization_uuid FROM accounts WHERE id = 3")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(embedded.get::<Option<String>, _>("email"), None);
+        assert_eq!(embedded.get::<Option<String>, _>("account_type"), None);
+        assert_eq!(embedded.get::<Option<String>, _>("organization_uuid"), None);
     }
 }
