@@ -68,7 +68,7 @@ export interface OverviewResponse {
   accounts: {
     total: number;
     statuses: { active: number; cooling: number; error: number; disabled: number };
-    auth_sources: { oauth: number; cookie: number; hybrid: number };
+    auth_sources: { oauth: number; cookie: number };
   };
   policies: number;
   requests_1h: number;
@@ -100,7 +100,7 @@ export interface Account {
   proxy_name: string | null;
   drain_first: boolean;
   status: string;
-  auth_source: "cookie" | "oauth" | "hybrid";
+  auth_source: "cookie" | "oauth";
   has_cookie: boolean;
   has_oauth: boolean;
   oauth_expires_at: string | null;
@@ -342,7 +342,7 @@ export const createAccount = (data: {
   max_slots?: number;
   proxy_id?: number;
   drain_first?: boolean;
-  auth_source?: "cookie" | "oauth" | "hybrid";
+  auth_source?: "cookie" | "oauth";
   cookie_blob?: string;
   oauth_callback_input?: string;
   oauth_state?: string;
