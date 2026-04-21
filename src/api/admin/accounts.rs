@@ -218,7 +218,12 @@ fn derive_auth_source(
     existing: Option<&str>,
 ) -> Result<&'static str, ClewdrError> {
     let derived: &'static str = match (submitted_cookie, submitted_oauth) {
-        (true, _) => "cookie",
+        (true, true) => {
+            return Err(ClewdrError::BadRequest {
+                msg: "Submit exactly one of cookie or OAuth callback input",
+            });
+        }
+        (true, false) => "cookie",
         (false, true) => "oauth",
         (false, false) => match existing {
             Some("cookie") => "cookie",
@@ -284,7 +289,16 @@ pub async fn create(
     let proxy_binding = resolve_proxy_url(&db, req.proxy_id).await?;
     let cookie_blob = normalize_cookie_blob(req.cookie_blob)?;
     let oauth_state = normalize_optional(req.oauth_state);
-    let oauth = match normalize_optional(req.oauth_callback_input) {
+    let oauth_callback_input = normalize_optional(req.oauth_callback_input);
+    // Reject dual submission before spending the one-time OAuth callback
+    // code — the DB CHECK would also catch it, but a clear 400 is friendlier
+    // and avoids a wasted Anthropic round-trip.
+    if cookie_blob.is_some() && oauth_callback_input.is_some() {
+        return Err(ClewdrError::BadRequest {
+            msg: "Submit exactly one of cookie or OAuth callback input",
+        });
+    }
+    let oauth = match oauth_callback_input {
         Some(input) => Some(
             exchange_admin_oauth_callback(
                 &input,
@@ -415,7 +429,13 @@ pub async fn update(
     };
     let new_cookie_blob = normalize_cookie_blob(req.cookie_blob.clone())?;
     let oauth_state = normalize_optional(req.oauth_state.clone());
-    let oauth = match normalize_optional(req.oauth_callback_input.clone()) {
+    let oauth_callback_input = normalize_optional(req.oauth_callback_input.clone());
+    if new_cookie_blob.is_some() && oauth_callback_input.is_some() {
+        return Err(ClewdrError::BadRequest {
+            msg: "Submit exactly one of cookie or OAuth callback input",
+        });
+    }
+    let oauth = match oauth_callback_input {
         Some(input) => Some(
             exchange_admin_oauth_callback(
                 &input,
@@ -905,7 +925,15 @@ mod tests {
 
     #[test]
     fn rejects_legacy_hybrid_request() {
-        let err = derive_auth_source(Some("hybrid"), true, true, None).unwrap_err();
+        // Requesting auth_source="hybrid" with a single valid credential must
+        // fail at the requested-vs-derived mismatch check.
+        let err = derive_auth_source(Some("hybrid"), true, false, None).unwrap_err();
+        assert!(matches!(err, ClewdrError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn rejects_dual_credential_submission() {
+        let err = derive_auth_source(None, true, true, None).unwrap_err();
         assert!(matches!(err, ClewdrError::BadRequest { .. }));
     }
 }
