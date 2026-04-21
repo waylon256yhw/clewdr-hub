@@ -4,6 +4,7 @@ use crate::{
     billing::{
         BillingContext, RequestType, TerminalLogOptions, check_quota, persist_terminal_request_log,
     },
+    config::Reason,
     error::ClewdrError,
     middleware::claude::{ClaudeCodePreprocess, ClaudeContext},
     providers::{
@@ -21,6 +22,9 @@ fn error_to_log_status(err: &ClewdrError) -> (&'static str, u16) {
         ClewdrError::UpstreamCoolingDown => ("no_account_available", 429),
         ClewdrError::NoValidUpstreamAccounts => ("no_account_available", 503),
         ClewdrError::TooManyRetries => ("no_account_available", 504),
+        ClewdrError::InvalidCookie {
+            reason: Reason::TooManyRequest(_) | Reason::Restricted(_),
+        } => ("no_account_available", 429),
         ClewdrError::InvalidCookie { .. } => ("auth_rejected", 400),
         ClewdrError::ClaudeHttpError { code, .. } => ("upstream_error", code.as_u16()),
         _ => ("internal_error", 500),
@@ -168,5 +172,27 @@ pub async fn api_claude_code_count_tokens(
     {
         Ok(ClaudeProviderResponse { response, .. }) => Ok(response),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_to_log_status;
+    use crate::{config::Reason, error::ClewdrError};
+
+    #[test]
+    fn cooldown_invalid_cookie_logs_as_no_account_available() {
+        assert_eq!(
+            error_to_log_status(&ClewdrError::InvalidCookie {
+                reason: Reason::TooManyRequest(123),
+            }),
+            ("no_account_available", 429)
+        );
+        assert_eq!(
+            error_to_log_status(&ClewdrError::InvalidCookie {
+                reason: Reason::Restricted(456),
+            }),
+            ("no_account_available", 429)
+        );
     }
 }

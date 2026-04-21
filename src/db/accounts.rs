@@ -413,6 +413,26 @@ pub async fn batch_upsert_runtime_states(
     Ok(())
 }
 
+/// Update only the dispatch cooldown timestamp without clobbering usage buckets.
+pub async fn set_account_reset_time(
+    pool: &SqlitePool,
+    account_id: i64,
+    reset_time: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO account_runtime_state (account_id, reset_time, updated_at)
+           VALUES (?1, ?2, CURRENT_TIMESTAMP)
+           ON CONFLICT(account_id) DO UPDATE SET
+             reset_time = excluded.reset_time,
+             updated_at = CURRENT_TIMESTAMP"#,
+    )
+    .bind(account_id)
+    .bind(reset_time)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Mark an account as disabled with a reason.
 pub async fn set_account_disabled(
     pool: &SqlitePool,

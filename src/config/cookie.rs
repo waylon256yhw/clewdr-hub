@@ -218,7 +218,7 @@ impl AccountSlot {
     /// The same AccountSlot with potentially updated reset_time
     pub fn reset(self) -> Self {
         if let Some(t) = self.reset_time
-            && t < chrono::Utc::now().timestamp()
+            && t <= chrono::Utc::now().timestamp()
         {
             info!("Cookie reset time expired");
             return Self {

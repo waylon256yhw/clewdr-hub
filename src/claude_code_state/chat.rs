@@ -16,7 +16,7 @@ use crate::{
     config::{ModelFamily, Reason},
     db::accounts::{
         batch_upsert_runtime_states, set_account_auth_error, set_account_disabled,
-        update_account_metadata_unchecked, upsert_account_oauth,
+        set_account_reset_time, update_account_metadata_unchecked, upsert_account_oauth,
     },
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
     oauth::refresh_oauth_token,
@@ -53,6 +53,15 @@ impl ClaudeCodeState {
         }
     }
 
+    fn oauth_cooldown_until(err: &ClewdrError) -> Option<i64> {
+        match err {
+            ClewdrError::InvalidCookie {
+                reason: Reason::TooManyRequest(ts) | Reason::Restricted(ts),
+            } => Some(*ts),
+            _ => None,
+        }
+    }
+
     async fn mark_oauth_account_auth_error(&mut self, account_id: i64, message: String) {
         let Some(db) = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()) else {
             return;
@@ -69,6 +78,15 @@ impl ClaudeCodeState {
         };
         if let Err(db_err) = set_account_disabled(&db, account_id, "disabled").await {
             warn!("Failed to set OAuth account {account_id} disabled: {db_err}");
+        }
+    }
+
+    async fn mark_oauth_account_cooldown(&mut self, account_id: i64, reset_time: i64) {
+        let Some(db) = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()) else {
+            return;
+        };
+        if let Err(db_err) = set_account_reset_time(&db, account_id, reset_time).await {
+            warn!("Failed to set OAuth cooldown for account {account_id}: {db_err}");
         }
     }
 
@@ -144,6 +162,14 @@ impl ClaudeCodeState {
                         if Self::is_oauth_disabled_failure(&err) {
                             self.mark_oauth_account_disabled(account_id.expect("checked above"))
                                 .await;
+                        } else if let Some(reset_time) = Self::oauth_cooldown_until(&err) {
+                            self.mark_oauth_account_cooldown(
+                                account_id.expect("checked above"),
+                                reset_time,
+                            )
+                            .await;
+                            self.release_selected_slot(account_id).await;
+                            return Err(ClewdrError::UpstreamCoolingDown);
                         } else if Self::is_oauth_auth_failure(&err) {
                             self.mark_oauth_account_auth_error(
                                 account_id.expect("checked above"),
@@ -173,6 +199,14 @@ impl ClaudeCodeState {
                     if Self::is_oauth_disabled_failure(&err) {
                         self.mark_oauth_account_disabled(account_id.expect("checked above"))
                             .await;
+                    } else if let Some(reset_time) = Self::oauth_cooldown_until(&err) {
+                        self.mark_oauth_account_cooldown(
+                            account_id.expect("checked above"),
+                            reset_time,
+                        )
+                        .await;
+                        self.release_selected_slot(account_id).await;
+                        return Err(ClewdrError::UpstreamCoolingDown);
                     } else if Self::is_oauth_auth_failure(&err) {
                         self.mark_oauth_account_auth_error(
                             account_id.expect("checked above"),
@@ -371,6 +405,14 @@ impl ClaudeCodeState {
                         if Self::is_oauth_disabled_failure(&err) {
                             self.mark_oauth_account_disabled(account_id.expect("checked above"))
                                 .await;
+                        } else if let Some(reset_time) = Self::oauth_cooldown_until(&err) {
+                            self.mark_oauth_account_cooldown(
+                                account_id.expect("checked above"),
+                                reset_time,
+                            )
+                            .await;
+                            self.release_selected_slot(account_id).await;
+                            return Err(ClewdrError::UpstreamCoolingDown);
                         } else if Self::is_oauth_auth_failure(&err) {
                             self.mark_oauth_account_auth_error(
                                 account_id.expect("checked above"),
@@ -398,6 +440,14 @@ impl ClaudeCodeState {
                     if Self::is_oauth_disabled_failure(&err) {
                         self.mark_oauth_account_disabled(account_id.expect("checked above"))
                             .await;
+                    } else if let Some(reset_time) = Self::oauth_cooldown_until(&err) {
+                        self.mark_oauth_account_cooldown(
+                            account_id.expect("checked above"),
+                            reset_time,
+                        )
+                        .await;
+                        self.release_selected_slot(account_id).await;
+                        return Err(ClewdrError::UpstreamCoolingDown);
                     } else if Self::is_oauth_auth_failure(&err) {
                         self.mark_oauth_account_auth_error(
                             account_id.expect("checked above"),
@@ -1247,5 +1297,33 @@ impl ClaudeCodeState {
             return matches!(code.as_u16(), 401 | 403 | 404);
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClaudeCodeState;
+    use crate::{config::Reason, error::ClewdrError};
+
+    #[test]
+    fn oauth_cooldown_detects_temporary_invalid_cookie_reasons() {
+        assert_eq!(
+            ClaudeCodeState::oauth_cooldown_until(&ClewdrError::InvalidCookie {
+                reason: Reason::TooManyRequest(123),
+            }),
+            Some(123)
+        );
+        assert_eq!(
+            ClaudeCodeState::oauth_cooldown_until(&ClewdrError::InvalidCookie {
+                reason: Reason::Restricted(456),
+            }),
+            Some(456)
+        );
+        assert_eq!(
+            ClaudeCodeState::oauth_cooldown_until(&ClewdrError::InvalidCookie {
+                reason: Reason::Null,
+            }),
+            None
+        );
     }
 }
