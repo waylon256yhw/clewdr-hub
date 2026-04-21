@@ -121,10 +121,10 @@ function OpsSkeleton() {
 
 const NAV_ITEMS = [
   { label: "总览", path: "/", icon: IconDashboard },
-  { label: "账号池", path: "/accounts", icon: IconServer },
+  { label: "账号", path: "/accounts", icon: IconServer },
   { label: "代理", path: "/proxies", icon: IconPlug },
-  { label: "用户管理", path: "/users", icon: IconUsers },
-  { label: "API 密钥", path: "/keys", icon: IconKey },
+  { label: "用户", path: "/users", icon: IconUsers },
+  { label: "API", path: "/keys", icon: IconKey },
   { label: "设置", path: "/settings", icon: IconSettings },
   { label: "日志", path: "/logs", icon: IconFileText },
   { label: "运维", path: "/ops", icon: IconActivity },

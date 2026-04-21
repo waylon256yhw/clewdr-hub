@@ -342,7 +342,6 @@ export default function Proxies() {
       <Group justify="space-between" mb="md">
         <div>
           <Title order={3}>代理</Title>
-          <Text size="sm" c="dimmed">仅测试基础连通性，不代表一定适用于特定上游服务。</Text>
         </div>
         <Button leftSection={<IconPlus size={16} />} onClick={() => {
           setEditing(null);

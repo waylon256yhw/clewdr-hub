@@ -8,7 +8,7 @@ use crate::db::billing::get_setting;
 use crate::types::claude::OutputEffort;
 
 /// Default values (compile-time fallbacks)
-pub const DEFAULT_CLI_VERSION: &str = "2.1.80";
+pub const DEFAULT_CLI_VERSION: &str = "2.1.100";
 pub const DEFAULT_BILLING_SALT: &str = "59cf53e54c78";
 
 /// Cached stealth configuration loaded from DB settings.

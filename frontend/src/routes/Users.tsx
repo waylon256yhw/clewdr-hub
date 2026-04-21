@@ -168,9 +168,9 @@ function PolicyFormModal({
     initialValues: {
       name: editing?.name ?? "",
       max_concurrent: editing?.max_concurrent ?? 2,
-      rpm_limit: editing?.rpm_limit ?? 10,
-      weekly_budget: editing ? editing.weekly_budget_nanousd / NANO : 50,
-      monthly_budget: editing ? editing.monthly_budget_nanousd / NANO : 200,
+      rpm_limit: editing?.rpm_limit ?? 50,
+      weekly_budget: editing ? editing.weekly_budget_nanousd / NANO : 200,
+      monthly_budget: editing ? editing.monthly_budget_nanousd / NANO : 2000,
     },
     validate: {
       name: (v) => (v.trim() ? null : "必填"),
@@ -221,11 +221,9 @@ function PolicyFormModal({
 
 // ─── Users Tab ───
 
-function UsersTab({ policies }: { policies: Policy[] }) {
+function UsersTab({ onEdit }: { onEdit: (user: UserRow) => void }) {
   const queryClient = useQueryClient();
   const { data, isLoading, error } = useQuery({ queryKey: qk.users, queryFn: listUsers });
-  const [formOpened, setFormOpened] = useState(false);
-  const [editing, setEditing] = useState<UserRow | null>(null);
   const [deleting, setDeleting] = useState<UserRow | null>(null);
 
   const toggleMut = useMutation({
@@ -258,12 +256,6 @@ function UsersTab({ policies }: { policies: Policy[] }) {
 
   return (
     <>
-      <Group justify="flex-end" mb="md">
-        <Button leftSection={<IconPlus size={16} />} onClick={() => { setEditing(null); setFormOpened(true); }}>
-          添加用户
-        </Button>
-      </Group>
-
       {users.length === 0 ? (
         <Text c="dimmed">暂无用户。</Text>
       ) : (
@@ -297,7 +289,7 @@ function UsersTab({ policies }: { policies: Policy[] }) {
                     <Group gap={4} wrap="nowrap">
                       {u.role !== "admin" && (
                         <Tooltip label="编辑">
-                          <ActionIcon variant="subtle" size="sm" onClick={() => { setEditing(u); setFormOpened(true); }}>
+                          <ActionIcon variant="subtle" size="sm" onClick={() => onEdit(u)}>
                             <IconEdit size={14} />
                           </ActionIcon>
                         </Tooltip>
@@ -330,13 +322,6 @@ function UsersTab({ policies }: { policies: Policy[] }) {
         </ScrollArea>
       )}
 
-      <UserFormModal
-        key={editing?.id ?? "new"}
-        opened={formOpened}
-        onClose={() => setFormOpened(false)}
-        editing={editing}
-        policies={policies}
-      />
       <DeleteConfirm
         label="用户"
         item={deleting}
@@ -350,11 +335,9 @@ function UsersTab({ policies }: { policies: Policy[] }) {
 
 // ─── Policies Tab ───
 
-function PoliciesTab() {
+function PoliciesTab({ onEdit }: { onEdit: (policy: Policy) => void }) {
   const queryClient = useQueryClient();
   const { data, isLoading, error } = useQuery({ queryKey: qk.policies, queryFn: listPolicies });
-  const [formOpened, setFormOpened] = useState(false);
-  const [editing, setEditing] = useState<Policy | null>(null);
   const [deleting, setDeleting] = useState<Policy | null>(null);
 
   const deleteMut = useMutation({
@@ -375,12 +358,6 @@ function PoliciesTab() {
 
   return (
     <>
-      <Group justify="flex-end" mb="md">
-        <Button leftSection={<IconPlus size={16} />} onClick={() => { setEditing(null); setFormOpened(true); }}>
-          添加策略
-        </Button>
-      </Group>
-
       {policies.length === 0 ? (
         <Text c="dimmed">暂无策略。</Text>
       ) : (
@@ -408,7 +385,7 @@ function PoliciesTab() {
                   <Table.Td visibleFrom="md">{p.assigned_user_count}</Table.Td>
                   <Table.Td>
                     <Group gap={4} wrap="nowrap">
-                      <ActionIcon variant="subtle" size="sm" onClick={() => { setEditing(p); setFormOpened(true); }}>
+                      <ActionIcon variant="subtle" size="sm" onClick={() => onEdit(p)}>
                         <IconEdit size={14} />
                       </ActionIcon>
                       <Tooltip label={p.assigned_user_count > 0 ? "有关联用户" : "删除"}>
@@ -431,12 +408,6 @@ function PoliciesTab() {
         </ScrollArea>
       )}
 
-      <PolicyFormModal
-        key={editing?.id ?? "new"}
-        opened={formOpened}
-        onClose={() => setFormOpened(false)}
-        editing={editing}
-      />
       <DeleteConfirm
         label="策略"
         item={deleting}
@@ -453,22 +424,66 @@ function PoliciesTab() {
 export default function Users() {
   const { data: policiesData } = useQuery({ queryKey: qk.policies, queryFn: listPolicies });
   const policies = policiesData?.items ?? [];
+  const [activeTab, setActiveTab] = useState<string | null>("users");
+  const [userFormOpened, setUserFormOpened] = useState(false);
+  const [editingUser, setEditingUser] = useState<UserRow | null>(null);
+  const [policyFormOpened, setPolicyFormOpened] = useState(false);
+  const [editingPolicy, setEditingPolicy] = useState<Policy | null>(null);
+
+  const openCreateUser = () => {
+    setEditingUser(null);
+    setUserFormOpened(true);
+  };
+  const openEditUser = (user: UserRow) => {
+    setEditingUser(user);
+    setUserFormOpened(true);
+  };
+  const openCreatePolicy = () => {
+    setEditingPolicy(null);
+    setPolicyFormOpened(true);
+  };
+  const openEditPolicy = (policy: Policy) => {
+    setEditingPolicy(policy);
+    setPolicyFormOpened(true);
+  };
+  const isPolicyTab = activeTab === "policies";
 
   return (
     <>
-      <Title order={3} mb="md">用户与策略</Title>
-      <Tabs defaultValue="users">
+      <Group justify="space-between" align="center" mb="md">
+        <Title order={3}>用户与策略</Title>
+        <Button
+          leftSection={<IconPlus size={16} />}
+          onClick={isPolicyTab ? openCreatePolicy : openCreateUser}
+        >
+          {isPolicyTab ? "添加策略" : "添加用户"}
+        </Button>
+      </Group>
+      <Tabs value={activeTab} onChange={setActiveTab}>
         <Tabs.List>
           <Tabs.Tab value="users">用户</Tabs.Tab>
           <Tabs.Tab value="policies">策略</Tabs.Tab>
         </Tabs.List>
         <Tabs.Panel value="users" pt="md">
-          <UsersTab policies={policies} />
+          <UsersTab onEdit={openEditUser} />
         </Tabs.Panel>
         <Tabs.Panel value="policies" pt="md">
-          <PoliciesTab />
+          <PoliciesTab onEdit={openEditPolicy} />
         </Tabs.Panel>
       </Tabs>
+      <UserFormModal
+        key={editingUser?.id ?? "new"}
+        opened={userFormOpened}
+        onClose={() => setUserFormOpened(false)}
+        editing={editingUser}
+        policies={policies}
+      />
+      <PolicyFormModal
+        key={editingPolicy?.id ?? "new"}
+        opened={policyFormOpened}
+        onClose={() => setPolicyFormOpened(false)}
+        editing={editingPolicy}
+      />
     </>
   );
 }
