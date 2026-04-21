@@ -14,8 +14,8 @@ use crate::{
     claude_code_state::probe::probe_cookie,
     config::{AccountSlot, ClewdrCookie, InvalidAccountSlot, Reason, UsageBreakdown},
     db::accounts::{
-        active_reset_time, batch_upsert_runtime_states, load_all_accounts, set_account_disabled,
-        set_accounts_active, upsert_account_oauth,
+        AccountSummary, active_reset_time, batch_upsert_runtime_states, load_all_accounts,
+        set_account_disabled, set_accounts_active, summarize_accounts, upsert_account_oauth,
     },
     error::ClewdrError,
     state::AdminEvent,
@@ -116,6 +116,15 @@ impl AccountPoolActor {
             state.valid.len().to_string().green(),
             state.exhausted.len().to_string().yellow(),
             state.invalid.len().to_string().red(),
+        );
+    }
+
+    fn log_account_summary(summary: AccountSummary) {
+        info!(
+            "Valid: {}, Exhausted: {}, Invalid: {}",
+            summary.pool.valid.to_string().green(),
+            summary.pool.exhausted.to_string().yellow(),
+            summary.pool.invalid.to_string().red(),
         );
     }
 
@@ -741,7 +750,7 @@ impl AccountPoolActor {
             state.probing.remove(id);
         }
 
-        Self::log(state);
+        Self::log_account_summary(summarize_accounts(&accounts));
 
         // Spawn probes for unprobed cookies
         Self::spawn_probes_for_unprobed(state);
