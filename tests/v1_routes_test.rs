@@ -41,6 +41,7 @@ struct TestApp {
     api_key: String,
     api_key_id: i64,
     user_id: i64,
+    account_pool: clewdr_hub::services::account_pool::AccountPoolHandle,
 }
 
 impl TestApp {
@@ -149,10 +150,9 @@ async fn setup_app(policy: PolicyConfig) -> TestApp {
         .await
         .unwrap();
 
-    let router = RouterBuilder::new(pool.clone())
-        .await
-        .with_default_setup()
-        .build();
+    let builder = RouterBuilder::new(pool.clone()).await.with_default_setup();
+    let account_pool = builder.state().account_pool.clone();
+    let router = builder.build();
 
     TestApp {
         _tempdir: tempdir,
@@ -161,6 +161,7 @@ async fn setup_app(policy: PolicyConfig) -> TestApp {
         api_key,
         api_key_id,
         user_id,
+        account_pool,
     }
 }
 
@@ -427,6 +428,10 @@ async fn v1_messages_logs_quota_db_failures_as_internal_error() {
 async fn v1_messages_returns_429_for_pure_oauth_accounts_in_cooldown() {
     let app = setup_app(PolicyConfig::default()).await;
     seed_pure_oauth_account(&app.pool, Some(chrono::Utc::now().timestamp() + 300)).await;
+    app.account_pool.reload_from_db().await.unwrap();
+    // `get_status` is a call! after the reload cast! — actor serializes messages FIFO,
+    // so awaiting it guarantees the reload has been processed before we issue traffic.
+    app.account_pool.get_status().await.unwrap();
 
     let response = app
         .request(

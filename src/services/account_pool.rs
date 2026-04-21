@@ -27,6 +27,26 @@ const FLUSH_INTERVAL: u64 = 15;
 const SESSION_WINDOW_SECS: i64 = 5 * 60 * 60; // 5h
 const WEEKLY_WINDOW_SECS: i64 = 7 * 24 * 60 * 60; // 7d
 
+/// Build a unique placeholder cookie string for an oauth-only account so its
+/// `AccountSlot` stays distinguishable in HashSet/moka keyed on the cookie value.
+/// The format satisfies `ClewdrCookie`'s regex (`sk-ant-sid\d{2}-[A-Za-z0-9_-]{86,120}-[A-Za-z0-9_-]{6}AA`).
+fn oauth_placeholder_cookie(account_id: i64) -> String {
+    format!("sk-ant-sid99-o{:0>85}-pool00AA", account_id)
+}
+
+/// Returns true if `cookie` was minted by `oauth_placeholder_cookie`. Used to
+/// keep the pool's cookie-style probe paths (`spawn_probes_for_unprobed`,
+/// `spawn_probe_all`, `spawn_probe_accounts`) from running `probe_cookie`
+/// against an oauth-only slot — the placeholder is not a real session cookie,
+/// so a cookie probe would fail and drive a healthy oauth account to invalid.
+/// Oauth accounts have a separate probe path (`probe_oauth_account`) invoked
+/// directly from the admin API.
+pub(crate) fn is_oauth_placeholder_slot(cookie: &AccountSlot) -> bool {
+    let raw = cookie.cookie.to_string();
+    // `ClewdrCookie::Display` produces `sessionKey=<inner>`; match the inner pattern.
+    raw.contains("sk-ant-sid99-o") && raw.ends_with("-pool00AA")
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct AccountPoolStatus {
     pub valid: Vec<AccountSlot>,
@@ -466,6 +486,7 @@ impl AccountPoolActor {
         let unprobed: Vec<AccountSlot> = state
             .valid
             .iter()
+            .filter(|c| !is_oauth_placeholder_slot(c))
             .filter(|c| c.email.is_none() || c.account_type.is_none())
             .cloned()
             .collect();
@@ -480,6 +501,7 @@ impl AccountPoolActor {
             .iter()
             .cloned()
             .chain(state.exhausted.iter().cloned())
+            .filter(|c| !is_oauth_placeholder_slot(c))
             .collect();
         for cookie in &cookies {
             Self::spawn_probe_guarded(state, cookie, None);
@@ -493,6 +515,9 @@ impl AccountPoolActor {
         for (cookie_blob, account_id) in invalid_cookies {
             if let Ok(mut cs) = AccountSlot::new(&cookie_blob.to_string(), None) {
                 cs.account_id = account_id;
+                if is_oauth_placeholder_slot(&cs) {
+                    continue;
+                }
                 Self::spawn_probe_guarded(state, &cs, None);
             }
         }
@@ -514,6 +539,7 @@ impl AccountPoolActor {
             .cloned()
             .chain(state.exhausted.iter().cloned())
             .filter(|cookie| cookie.account_id.is_some_and(|id| wanted.contains(&id)))
+            .filter(|cookie| !is_oauth_placeholder_slot(cookie))
             .collect();
         for cookie in &cookies {
             Self::spawn_probe_guarded(state, cookie, log_sink.clone());
@@ -528,6 +554,9 @@ impl AccountPoolActor {
         for (cookie_blob, account_id) in invalid_cookies {
             if let Ok(mut cs) = AccountSlot::new(&cookie_blob.to_string(), None) {
                 cs.account_id = account_id;
+                if is_oauth_placeholder_slot(&cs) {
+                    continue;
+                }
                 Self::spawn_probe_guarded(state, &cs, log_sink.clone());
             }
         }
@@ -538,6 +567,41 @@ impl AccountPoolActor {
             valid: state.valid.clone().into(),
             exhausted: state.exhausted.iter().cloned().collect(),
             invalid: state.invalid.iter().cloned().collect(),
+        }
+    }
+
+    fn apply_in_memory_runtime(dst: &mut AccountSlot, mem: AccountSlot, preserve_token: bool) {
+        if preserve_token {
+            dst.token = mem.token;
+        }
+        dst.reset_time = mem.reset_time;
+        dst.session_usage = mem.session_usage;
+        dst.weekly_usage = mem.weekly_usage;
+        dst.weekly_sonnet_usage = mem.weekly_sonnet_usage;
+        dst.weekly_opus_usage = mem.weekly_opus_usage;
+        dst.lifetime_usage = mem.lifetime_usage;
+        dst.session_resets_at = mem.session_resets_at;
+        dst.weekly_resets_at = mem.weekly_resets_at;
+        dst.weekly_sonnet_resets_at = mem.weekly_sonnet_resets_at;
+        dst.weekly_opus_resets_at = mem.weekly_opus_resets_at;
+        dst.resets_last_checked_at = mem.resets_last_checked_at;
+        dst.session_has_reset = mem.session_has_reset;
+        dst.weekly_has_reset = mem.weekly_has_reset;
+        dst.weekly_sonnet_has_reset = mem.weekly_sonnet_has_reset;
+        dst.weekly_opus_has_reset = mem.weekly_opus_has_reset;
+        dst.supports_claude_1m_sonnet = mem.supports_claude_1m_sonnet;
+        dst.supports_claude_1m_opus = mem.supports_claude_1m_opus;
+        dst.count_tokens_allowed = mem.count_tokens_allowed;
+        dst.session_utilization = mem.session_utilization;
+        dst.weekly_utilization = mem.weekly_utilization;
+        dst.weekly_sonnet_utilization = mem.weekly_sonnet_utilization;
+        dst.weekly_opus_utilization = mem.weekly_opus_utilization;
+        // Prefer memory email/account_type if DB is null but memory has it.
+        if dst.email.is_none() {
+            dst.email = mem.email;
+        }
+        if dst.account_type.is_none() {
+            dst.account_type = mem.account_type;
         }
     }
 
@@ -627,27 +691,41 @@ impl AccountPoolActor {
         // Rebuild from DB
         for row in &accounts {
             if matches!(row.status.as_str(), "disabled" | "auth_error") {
-                if let Some(cookie_str) = row.cookie_blob.as_deref() {
+                let cookie_for_invalid = match row.cookie_blob.as_deref() {
+                    Some(cookie_str) => AccountSlot::new(cookie_str, None).ok().map(|cs| cs.cookie),
+                    None if row.oauth_token.is_some() => {
+                        AccountSlot::new(&oauth_placeholder_cookie(row.id), None)
+                            .ok()
+                            .map(|cs| cs.cookie)
+                    }
+                    None => None,
+                };
+                if let Some(cookie) = cookie_for_invalid {
                     let reason = row
                         .invalid_reason
                         .as_deref()
                         .map(Reason::from_db_string)
                         .unwrap_or(Reason::Null);
-                    if let Ok(cs) = AccountSlot::new(cookie_str, None) {
-                        state.invalid.insert(InvalidAccountSlot::with_account_id(
-                            cs.cookie,
-                            reason,
-                            Some(row.id),
-                        ));
-                    }
+                    state.invalid.insert(InvalidAccountSlot::with_account_id(
+                        cookie,
+                        reason,
+                        Some(row.id),
+                    ));
                 }
                 continue;
             }
 
-            let Some(cookie_str) = row.cookie_blob.as_deref() else {
-                continue;
+            let cs_result = match row.cookie_blob.as_deref() {
+                Some(cookie_str) => AccountSlot::new(cookie_str, None),
+                None if row.oauth_token.is_some() => {
+                    // OAuth-only account: synthesize a per-account placeholder cookie so the
+                    // slot is still hashable/equal-distinct in the pool's HashSet and moka cache.
+                    // The real credential is in `row.oauth_token` and is attached below.
+                    AccountSlot::new(&oauth_placeholder_cookie(row.id), None)
+                }
+                None => continue,
             };
-            let mut cs = match AccountSlot::new(cookie_str, None) {
+            let mut cs = match cs_result {
                 Ok(cs) => cs,
                 Err(e) => {
                     warn!("Invalid cookie for account '{}': {e}", row.name);
@@ -665,38 +743,12 @@ impl AccountPoolActor {
             // Merge: if memory has same account_id with same cookie, preserve runtime
             if let Some(mem) = mem_cookies.remove(&row.id) {
                 if mem.cookie == cs.cookie {
-                    // Same credential — preserve runtime state from memory
-                    cs.token = mem.token;
-                    cs.reset_time = mem.reset_time;
-                    cs.session_usage = mem.session_usage;
-                    cs.weekly_usage = mem.weekly_usage;
-                    cs.weekly_sonnet_usage = mem.weekly_sonnet_usage;
-                    cs.weekly_opus_usage = mem.weekly_opus_usage;
-                    cs.lifetime_usage = mem.lifetime_usage;
-                    cs.session_resets_at = mem.session_resets_at;
-                    cs.weekly_resets_at = mem.weekly_resets_at;
-                    cs.weekly_sonnet_resets_at = mem.weekly_sonnet_resets_at;
-                    cs.weekly_opus_resets_at = mem.weekly_opus_resets_at;
-                    cs.resets_last_checked_at = mem.resets_last_checked_at;
-                    cs.session_has_reset = mem.session_has_reset;
-                    cs.weekly_has_reset = mem.weekly_has_reset;
-                    cs.weekly_sonnet_has_reset = mem.weekly_sonnet_has_reset;
-                    cs.weekly_opus_has_reset = mem.weekly_opus_has_reset;
-                    cs.supports_claude_1m_sonnet = mem.supports_claude_1m_sonnet;
-                    cs.supports_claude_1m_opus = mem.supports_claude_1m_opus;
-                    cs.count_tokens_allowed = mem.count_tokens_allowed;
-                    cs.session_utilization = mem.session_utilization;
-                    cs.weekly_utilization = mem.weekly_utilization;
-                    cs.weekly_sonnet_utilization = mem.weekly_sonnet_utilization;
-                    cs.weekly_opus_utilization = mem.weekly_opus_utilization;
+                    // Same credential — preserve runtime state from memory.
+                    // OAuth credentials are replaced out-of-band by reconnect/edit flows; when
+                    // DB has a token, it is the source of truth even if the placeholder cookie is
+                    // deterministic and therefore matches the in-memory slot.
+                    Self::apply_in_memory_runtime(&mut cs, mem, row.oauth_token.is_none());
                     cs.proxy_url = row.proxy_url.clone();
-                    // Prefer memory email/account_type if DB is null but memory has it
-                    if cs.email.is_none() {
-                        cs.email = mem.email;
-                    }
-                    if cs.account_type.is_none() {
-                        cs.account_type = mem.account_type;
-                    }
                 }
                 // Cookie changed = credential replacement → use fresh defaults from new()
                 else {
@@ -728,7 +780,7 @@ impl AccountPoolActor {
         // Rebuild inflight map: preserve current counts, update max_slots from DB
         let mut new_inflight = HashMap::new();
         for row in &accounts {
-            if row.cookie_blob.is_none() {
+            if row.cookie_blob.is_none() && row.oauth_token.is_none() {
                 continue;
             }
             let current = state.inflight.get(&row.id).map_or(0, |(cur, _)| *cur);
@@ -1130,5 +1182,78 @@ impl AccountPoolHandle {
                 ),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AccountPoolActor, is_oauth_placeholder_slot, oauth_placeholder_cookie};
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    use crate::config::{AccountSlot, ClewdrCookie, TokenInfo};
+
+    #[test]
+    fn oauth_placeholder_cookie_is_unique_per_account_and_accepted_by_parser() {
+        // The synthesized placeholder must (a) satisfy `ClewdrCookie::from_str`'s
+        // regex so the loader can construct an `AccountSlot`, and (b) be distinct
+        // per account_id so slots remain hashable/equal-distinct in the pool's
+        // HashSet<AccountSlot> (exhausted) and moka affinity cache.
+        let c1 = oauth_placeholder_cookie(1);
+        let c2 = oauth_placeholder_cookie(2);
+        let c_big = oauth_placeholder_cookie(i64::MAX);
+
+        assert_ne!(c1, c2);
+        assert_ne!(c1, c_big);
+        for raw in [&c1, &c2, &c_big] {
+            ClewdrCookie::from_str(raw)
+                .unwrap_or_else(|e| panic!("placeholder {raw:?} failed regex: {e}"));
+        }
+    }
+
+    #[test]
+    fn oauth_placeholder_detection_distinguishes_synthetic_from_real_cookies() {
+        // The detector is what keeps cookie-style probes (`probe_cookie`) from
+        // running against oauth-only slots. If a real cookie accidentally matches
+        // the placeholder pattern, probes would be skipped for a real account,
+        // so the detector must stay tight.
+        let synthetic = AccountSlot::new(&oauth_placeholder_cookie(42), None).unwrap();
+        assert!(is_oauth_placeholder_slot(&synthetic));
+
+        // Shape of a real-looking Claude session cookie — uses sid01, not sid99.
+        let real_raw = format!("sk-ant-sid01-{}-abcdefAA", "a".repeat(86));
+        let real = AccountSlot::new(&real_raw, None).unwrap();
+        assert!(!is_oauth_placeholder_slot(&real));
+    }
+
+    #[test]
+    fn in_memory_runtime_merge_keeps_db_oauth_token_when_present() {
+        let mut reloaded = AccountSlot::new(&oauth_placeholder_cookie(7), None).unwrap();
+        reloaded.token = Some(TokenInfo::from_parts(
+            "db-access".to_string(),
+            "db-refresh".to_string(),
+            Duration::from_secs(3600),
+            "org-db".to_string(),
+        ));
+
+        let mut mem = AccountSlot::new(&oauth_placeholder_cookie(7), None).unwrap();
+        mem.token = Some(TokenInfo::from_parts(
+            "mem-access".to_string(),
+            "mem-refresh".to_string(),
+            Duration::from_secs(3600),
+            "org-mem".to_string(),
+        ));
+        mem.email = Some("mem@example.com".to_string());
+
+        AccountPoolActor::apply_in_memory_runtime(&mut reloaded, mem, false);
+
+        assert_eq!(
+            reloaded
+                .token
+                .as_ref()
+                .map(|token| token.access_token.as_str()),
+            Some("db-access")
+        );
+        assert_eq!(reloaded.email.as_deref(), Some("mem@example.com"));
     }
 }

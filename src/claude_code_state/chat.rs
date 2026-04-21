@@ -20,7 +20,7 @@ use crate::{
     },
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
     oauth::refresh_oauth_token,
-    services::account_pool::AccountPoolHandle,
+    services::account_pool::{AccountPoolHandle, is_oauth_placeholder_slot},
     types::claude::{CountMessageTokensResponse, CreateMessageParams},
 };
 
@@ -62,6 +62,20 @@ impl ClaudeCodeState {
         }
     }
 
+    fn oauth_pool_reason(err: &ClewdrError) -> Option<Reason> {
+        if let ClewdrError::InvalidCookie { reason } = err {
+            Some(reason.clone())
+        } else if Self::is_oauth_disabled_failure(err) {
+            Some(Reason::Disabled)
+        } else if let Some(reset_time) = Self::oauth_cooldown_until(err) {
+            Some(Reason::TooManyRequest(reset_time))
+        } else if Self::is_oauth_auth_failure(err) {
+            Some(Reason::Null)
+        } else {
+            None
+        }
+    }
+
     async fn mark_oauth_account_auth_error(&mut self, account_id: i64, message: String) {
         let Some(db) = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()) else {
             return;
@@ -92,13 +106,7 @@ impl ClaudeCodeState {
 
     async fn release_selected_slot(&self, account_id: Option<i64>) {
         if let Some(aid) = account_id {
-            if self.oauth_token.is_some() && self.cookie.is_none() {
-                if let Some(pool) = &self.oauth_pool {
-                    pool.release(aid).await;
-                }
-            } else {
-                self.account_pool_handle.release_slot(aid).await;
-            }
+            self.account_pool_handle.release_slot(aid).await;
         }
     }
 
@@ -150,76 +158,6 @@ impl ClaudeCodeState {
         &mut self,
         p: CreateMessageParams,
     ) -> Result<axum::response::Response, ClewdrError> {
-        if self.oauth_token.is_some() && self.cookie.is_none() && self.account_id.is_some() {
-            let account_id = self.account_id;
-            let access_token = match self.check_token() {
-                TokenStatus::Valid => self.oauth_token.as_ref().map(|t| t.access_token.clone()),
-                TokenStatus::Expired => {
-                    if let Err(err) = self
-                        .persist_oauth_refresh(account_id.expect("checked above"))
-                        .await
-                    {
-                        if Self::is_oauth_disabled_failure(&err) {
-                            self.mark_oauth_account_disabled(account_id.expect("checked above"))
-                                .await;
-                        } else if let Some(reset_time) = Self::oauth_cooldown_until(&err) {
-                            self.mark_oauth_account_cooldown(
-                                account_id.expect("checked above"),
-                                reset_time,
-                            )
-                            .await;
-                            self.release_selected_slot(account_id).await;
-                            return Err(ClewdrError::UpstreamCoolingDown);
-                        } else if Self::is_oauth_auth_failure(&err) {
-                            self.mark_oauth_account_auth_error(
-                                account_id.expect("checked above"),
-                                err.to_string(),
-                            )
-                            .await;
-                        }
-                        self.release_selected_slot(account_id).await;
-                        return Err(err);
-                    }
-                    self.oauth_token.as_ref().map(|t| t.access_token.clone())
-                }
-                TokenStatus::None => None,
-            }
-            .ok_or(ClewdrError::UnexpectedNone {
-                msg: "No OAuth access token available",
-            })?;
-
-            match self.send_chat(access_token, p).await {
-                Ok(response) => {
-                    if !self.stream {
-                        self.release_selected_slot(account_id).await;
-                    }
-                    return Ok(response);
-                }
-                Err(err) => {
-                    if Self::is_oauth_disabled_failure(&err) {
-                        self.mark_oauth_account_disabled(account_id.expect("checked above"))
-                            .await;
-                    } else if let Some(reset_time) = Self::oauth_cooldown_until(&err) {
-                        self.mark_oauth_account_cooldown(
-                            account_id.expect("checked above"),
-                            reset_time,
-                        )
-                        .await;
-                        self.release_selected_slot(account_id).await;
-                        return Err(ClewdrError::UpstreamCoolingDown);
-                    } else if Self::is_oauth_auth_failure(&err) {
-                        self.mark_oauth_account_auth_error(
-                            account_id.expect("checked above"),
-                            err.to_string(),
-                        )
-                        .await;
-                    }
-                    self.release_selected_slot(account_id).await;
-                    return Err(err);
-                }
-            }
-        }
-
         for i in 0..MAX_RETRIES + 1 {
             if i > 0 {
                 info!("[RETRY] attempt: {}", i.to_string().green());
@@ -229,13 +167,29 @@ impl ClaudeCodeState {
 
             let cookie = state.acquire_account().await?;
             let account_id = cookie.account_id;
-            // Propagate account_id to billing context
-            if let Some(ref mut ctx) = state.billing_ctx {
-                ctx.account_id = cookie.account_id;
+            let has_cookie_credential = !is_oauth_placeholder_slot(&cookie);
+            let is_pure_oauth_slot = cookie.token.is_some() && !has_cookie_credential;
+            // Pure oauth slots have no real cookie-backed reauth path, so hoist
+            // their token into `oauth_token`. Cookie-backed slots keep using the
+            // historic cookie/token path so hybrid accounts retain cookie reauth.
+            if is_pure_oauth_slot {
+                state.oauth_token = cookie.token.clone();
+            } else {
+                state.oauth_token = None;
             }
+            state.account_id = account_id;
+            if let Some(ref mut ctx) = state.billing_ctx {
+                ctx.account_id = account_id;
+            }
+
             let retry = async {
                 match state.check_token() {
                     TokenStatus::None => {
+                        if is_pure_oauth_slot {
+                            return Err(ClewdrError::UnexpectedNone {
+                                msg: "OAuth token missing for oauth-bearing slot",
+                            });
+                        }
                         info!("No token found, requesting new token");
                         let org = state.get_organization().await?;
                         let code_res = state.exchange_code(&org).await?;
@@ -243,23 +197,42 @@ impl ClaudeCodeState {
                         state.release_account(None).await;
                     }
                     TokenStatus::Expired => {
-                        info!("Token expired, refreshing token");
-                        state.refresh_token().await?;
-                        state.release_account(None).await;
+                        if is_pure_oauth_slot {
+                            info!("OAuth token expired, refreshing");
+                            let aid = account_id.ok_or(ClewdrError::UnexpectedNone {
+                                msg: "OAuth refresh requires account id",
+                            })?;
+                            state.persist_oauth_refresh(aid).await?;
+                            // Keep the slot's copy in sync so a later release/flush
+                            // doesn't overwrite the DB with the stale token.
+                            if let Some(slot) = state.cookie.as_mut() {
+                                slot.token = state.oauth_token.clone();
+                            }
+                        } else {
+                            info!("Token expired, refreshing token");
+                            state.refresh_token().await?;
+                            state.release_account(None).await;
+                        }
                     }
                     TokenStatus::Valid => {
                         info!("Token is valid, proceeding with request");
                     }
                 }
-                let Some(access_token) = state.cookie.as_ref().and_then(|c| c.token.to_owned())
-                else {
-                    return Err(ClewdrError::UnexpectedNone {
+                let access_token = state
+                    .oauth_token
+                    .as_ref()
+                    .map(|t| t.access_token.clone())
+                    .or_else(|| {
+                        state
+                            .cookie
+                            .as_ref()
+                            .and_then(|c| c.token.as_ref())
+                            .map(|t| t.access_token.clone())
+                    })
+                    .ok_or(ClewdrError::UnexpectedNone {
                         msg: "No access token found in cookie",
-                    });
-                };
-                state
-                    .send_chat(access_token.access_token.to_owned(), p)
-                    .await
+                    })?;
+                state.send_chat(access_token, p).await
             }
             .instrument(tracing::info_span!(
                 "claude_code",
@@ -274,6 +247,28 @@ impl ClaudeCodeState {
                     return Ok(res);
                 }
                 Err(e) => {
+                    if is_pure_oauth_slot {
+                        let pool_reason = Self::oauth_pool_reason(&e);
+                        if let Some(aid) = account_id {
+                            if Self::is_oauth_disabled_failure(&e) {
+                                state.mark_oauth_account_disabled(aid).await;
+                            } else if let Some(reset_time) = Self::oauth_cooldown_until(&e) {
+                                state.mark_oauth_account_cooldown(aid, reset_time).await;
+                            } else if Self::is_oauth_auth_failure(&e) {
+                                state
+                                    .mark_oauth_account_auth_error(aid, e.to_string())
+                                    .await;
+                            }
+                        }
+                        state.release_selected_slot(account_id).await;
+                        if pool_reason.is_some() {
+                            state.release_account(pool_reason).await;
+                        }
+                        if Self::oauth_cooldown_until(&e).is_some() {
+                            return Err(ClewdrError::UpstreamCoolingDown);
+                        }
+                        return Err(e);
+                    }
                     state.release_selected_slot(account_id).await;
                     error!(
                         "[{}] {}",
@@ -390,77 +385,6 @@ impl ClaudeCodeState {
         &mut self,
         p: CreateMessageParams,
     ) -> Result<axum::response::Response, ClewdrError> {
-        if self.oauth_token.is_some() && self.cookie.is_none() && self.account_id.is_some() {
-            let account_id = self.account_id;
-            if let Some(ref mut ctx) = self.billing_ctx {
-                ctx.account_id = account_id;
-            }
-            let access_token = match self.check_token() {
-                TokenStatus::Valid => self.oauth_token.as_ref().map(|t| t.access_token.clone()),
-                TokenStatus::Expired => {
-                    if let Err(err) = self
-                        .persist_oauth_refresh(account_id.expect("checked above"))
-                        .await
-                    {
-                        if Self::is_oauth_disabled_failure(&err) {
-                            self.mark_oauth_account_disabled(account_id.expect("checked above"))
-                                .await;
-                        } else if let Some(reset_time) = Self::oauth_cooldown_until(&err) {
-                            self.mark_oauth_account_cooldown(
-                                account_id.expect("checked above"),
-                                reset_time,
-                            )
-                            .await;
-                            self.release_selected_slot(account_id).await;
-                            return Err(ClewdrError::UpstreamCoolingDown);
-                        } else if Self::is_oauth_auth_failure(&err) {
-                            self.mark_oauth_account_auth_error(
-                                account_id.expect("checked above"),
-                                err.to_string(),
-                            )
-                            .await;
-                        }
-                        self.release_selected_slot(account_id).await;
-                        return Err(err);
-                    }
-                    self.oauth_token.as_ref().map(|t| t.access_token.clone())
-                }
-                TokenStatus::None => None,
-            }
-            .ok_or(ClewdrError::UnexpectedNone {
-                msg: "No OAuth access token available",
-            })?;
-
-            match self.perform_count_tokens(access_token, p).await {
-                Ok((response, _)) => {
-                    self.release_selected_slot(account_id).await;
-                    return Ok(response);
-                }
-                Err(err) => {
-                    if Self::is_oauth_disabled_failure(&err) {
-                        self.mark_oauth_account_disabled(account_id.expect("checked above"))
-                            .await;
-                    } else if let Some(reset_time) = Self::oauth_cooldown_until(&err) {
-                        self.mark_oauth_account_cooldown(
-                            account_id.expect("checked above"),
-                            reset_time,
-                        )
-                        .await;
-                        self.release_selected_slot(account_id).await;
-                        return Err(ClewdrError::UpstreamCoolingDown);
-                    } else if Self::is_oauth_auth_failure(&err) {
-                        self.mark_oauth_account_auth_error(
-                            account_id.expect("checked above"),
-                            err.to_string(),
-                        )
-                        .await;
-                    }
-                    self.release_selected_slot(account_id).await;
-                    return Err(err);
-                }
-            }
-        }
-
         for i in 0..MAX_RETRIES + 1 {
             if i > 0 {
                 info!("[TOKENS][RETRY] attempt: {}", i.to_string().green());
@@ -470,8 +394,16 @@ impl ClaudeCodeState {
 
             let cookie = state.acquire_account().await?;
             let account_id = cookie.account_id;
+            let has_cookie_credential = !is_oauth_placeholder_slot(&cookie);
+            let is_pure_oauth_slot = cookie.token.is_some() && !has_cookie_credential;
+            if is_pure_oauth_slot {
+                state.oauth_token = cookie.token.clone();
+            } else {
+                state.oauth_token = None;
+            }
+            state.account_id = account_id;
             if let Some(ref mut ctx) = state.billing_ctx {
-                ctx.account_id = cookie.account_id;
+                ctx.account_id = account_id;
             }
             let cookie_disallows = matches!(cookie.count_tokens_allowed, Some(false));
             if cookie_disallows {
@@ -483,6 +415,11 @@ impl ClaudeCodeState {
             let retry = async {
                 match state.check_token() {
                     TokenStatus::None => {
+                        if is_pure_oauth_slot {
+                            return Err(ClewdrError::UnexpectedNone {
+                                msg: "OAuth token missing for oauth-bearing slot",
+                            });
+                        }
                         info!("No token found, requesting new token");
                         let org = state.get_organization().await?;
                         let code_res = state.exchange_code(&org).await?;
@@ -490,23 +427,40 @@ impl ClaudeCodeState {
                         state.release_account(None).await;
                     }
                     TokenStatus::Expired => {
-                        info!("Token expired, refreshing token");
-                        state.refresh_token().await?;
-                        state.release_account(None).await;
+                        if is_pure_oauth_slot {
+                            info!("OAuth token expired, refreshing");
+                            let aid = account_id.ok_or(ClewdrError::UnexpectedNone {
+                                msg: "OAuth refresh requires account id",
+                            })?;
+                            state.persist_oauth_refresh(aid).await?;
+                            if let Some(slot) = state.cookie.as_mut() {
+                                slot.token = state.oauth_token.clone();
+                            }
+                        } else {
+                            info!("Token expired, refreshing token");
+                            state.refresh_token().await?;
+                            state.release_account(None).await;
+                        }
                     }
                     TokenStatus::Valid => {
                         info!("Token is valid, proceeding with count_tokens");
                     }
                 }
-                let Some(access_token) = state.cookie.as_ref().and_then(|c| c.token.to_owned())
-                else {
-                    return Err(ClewdrError::UnexpectedNone {
+                let access_token = state
+                    .oauth_token
+                    .as_ref()
+                    .map(|t| t.access_token.clone())
+                    .or_else(|| {
+                        state
+                            .cookie
+                            .as_ref()
+                            .and_then(|c| c.token.as_ref())
+                            .map(|t| t.access_token.clone())
+                    })
+                    .ok_or(ClewdrError::UnexpectedNone {
                         msg: "No access token found in cookie",
-                    });
-                };
-                state
-                    .perform_count_tokens(access_token.access_token.to_owned(), p)
-                    .await
+                    })?;
+                state.perform_count_tokens(access_token, p).await
             }
             .instrument(tracing::info_span!(
                 "claude_code_tokens",
@@ -518,6 +472,28 @@ impl ClaudeCodeState {
                     return Ok(res);
                 }
                 Err(e) => {
+                    if is_pure_oauth_slot {
+                        let pool_reason = Self::oauth_pool_reason(&e);
+                        if let Some(aid) = account_id {
+                            if Self::is_oauth_disabled_failure(&e) {
+                                state.mark_oauth_account_disabled(aid).await;
+                            } else if let Some(reset_time) = Self::oauth_cooldown_until(&e) {
+                                state.mark_oauth_account_cooldown(aid, reset_time).await;
+                            } else if Self::is_oauth_auth_failure(&e) {
+                                state
+                                    .mark_oauth_account_auth_error(aid, e.to_string())
+                                    .await;
+                            }
+                        }
+                        state.release_selected_slot(account_id).await;
+                        if pool_reason.is_some() {
+                            state.release_account(pool_reason).await;
+                        }
+                        if Self::oauth_cooldown_until(&e).is_some() {
+                            return Err(ClewdrError::UpstreamCoolingDown);
+                        }
+                        return Err(e);
+                    }
                     state.release_selected_slot(account_id).await;
                     error!(
                         "[{}][TOKENS] {}",
@@ -617,7 +593,6 @@ impl ClaudeCodeState {
         let cache_read_sum = Arc::new(AtomicU64::new(0));
         let ttft_ms = Arc::new(AtomicI64::new(-1));
         let handle = self.account_pool_handle.clone();
-        let oauth_pool = self.oauth_pool.clone();
         let cookie = self.cookie.clone();
         let billing_ctx = self.billing_ctx.clone();
         let billing_ctx_for_stream = billing_ctx.clone();
@@ -737,16 +712,6 @@ impl ClaudeCodeState {
                                         }
                                     }
                                 });
-                            } else if let Some(aid) = stream_account_id {
-                                let released = slot_released_inner.clone();
-                                let oauth_pool = oauth_pool.clone();
-                                tokio::spawn(async move {
-                                    if !released.swap(true, Ordering::Relaxed)
-                                        && let Some(pool) = oauth_pool
-                                    {
-                                        pool.release(aid).await;
-                                    }
-                                });
                             }
 
                             // Billing persistence
@@ -799,8 +764,6 @@ impl ClaudeCodeState {
             completed: Arc<AtomicBool>,
             account_id: Option<i64>,
             handle: AccountPoolHandle,
-            oauth_pool: Option<std::sync::Arc<crate::providers::claude::OAuthAccountPool>>,
-            oauth_only: bool,
             cookie: Option<crate::config::AccountSlot>,
             family: ModelFamily,
             billing_ctx: Option<crate::billing::BillingContext>,
@@ -843,8 +806,6 @@ impl ClaudeCodeState {
                 if let Some(aid) = self.account_id {
                     if !self.released.swap(true, Ordering::Relaxed) {
                         let h = self.handle.clone();
-                        let oauth_pool = self.oauth_pool.clone();
-                        let oauth_only = self.oauth_only;
                         let cookie = self.cookie.clone();
                         let family = self.family;
                         let billing_ctx = self.billing_ctx.clone();
@@ -896,13 +857,7 @@ impl ClaudeCodeState {
                                     .await;
                                 }
                             }
-                            if oauth_only {
-                                if let Some(pool) = oauth_pool {
-                                    pool.release(aid).await;
-                                }
-                            } else {
-                                h.release_slot(aid).await;
-                            }
+                            h.release_slot(aid).await;
                         });
                     }
                 } else if !completed {
@@ -942,8 +897,6 @@ impl ClaudeCodeState {
             completed: stream_completed,
             account_id: stream_account_id,
             handle: self.account_pool_handle.clone(),
-            oauth_pool: self.oauth_pool.clone(),
-            oauth_only: self.oauth_token.is_some() && self.cookie.is_none(),
             cookie: self.cookie.clone(),
             family,
             billing_ctx,
@@ -1324,6 +1277,29 @@ mod tests {
                 reason: Reason::Null,
             }),
             None
+        );
+    }
+
+    #[test]
+    fn oauth_pool_reason_maps_auth_and_cooldown_errors_for_pool_eviction() {
+        assert_eq!(
+            ClaudeCodeState::oauth_pool_reason(&ClewdrError::InvalidCookie {
+                reason: Reason::Restricted(456),
+            }),
+            Some(Reason::Restricted(456))
+        );
+        assert_eq!(
+            ClaudeCodeState::oauth_pool_reason(&ClewdrError::InvalidCookie {
+                reason: Reason::Disabled,
+            }),
+            Some(Reason::Disabled)
+        );
+        assert_eq!(
+            ClaudeCodeState::oauth_pool_reason(&ClewdrError::Whatever {
+                message: "invalid_grant".to_string(),
+                source: None,
+            }),
+            Some(Reason::Null)
         );
     }
 }

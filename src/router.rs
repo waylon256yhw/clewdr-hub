@@ -262,4 +262,10 @@ impl RouterBuilder {
     pub fn build(self) -> Router {
         self.inner.layer(DefaultBodyLimit::max(32 * 1024 * 1024))
     }
+
+    /// Access the underlying `AppState` — primarily for integration tests that
+    /// need to drive the account pool or billing paths directly.
+    pub fn state(&self) -> &AppState {
+        &self.state
+    }
 }

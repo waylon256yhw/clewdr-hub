@@ -686,23 +686,6 @@ pub async fn get_account_by_id(
         .find(|account| account.id == account_id))
 }
 
-pub async fn load_pure_oauth_accounts(
-    pool: &SqlitePool,
-    bound_ids: &[i64],
-) -> Result<Vec<AccountWithRuntime>, sqlx::Error> {
-    let all = load_all_accounts(pool).await?;
-    Ok(all
-        .into_iter()
-        .filter(|account| {
-            !matches!(account.status.as_str(), "auth_error" | "disabled")
-                && !is_temporarily_unavailable(account)
-                && account.auth_source == "oauth"
-                && account.oauth_token.is_some()
-                && (bound_ids.is_empty() || bound_ids.contains(&account.id))
-        })
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
