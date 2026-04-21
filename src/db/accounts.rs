@@ -972,4 +972,158 @@ mod tests {
         .await
         .expect("oauth-only row should satisfy mutex CHECK");
     }
+
+    async fn insert_oauth_account(pool: &sqlx::SqlitePool, id: i64, name: &str, rr: i64) {
+        sqlx::query(
+            "INSERT INTO accounts (
+                id, name, rr_order, max_slots, status, auth_source,
+                oauth_access_token, oauth_refresh_token, oauth_expires_at, drain_first
+            ) VALUES (?1, ?2, ?3, 5, 'active', 'oauth', 'old-at', 'old-rt', '2030-01-01T00:00:00Z', 0)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(rr)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_cookie_account(pool: &sqlx::SqlitePool, id: i64, name: &str, rr: i64) {
+        sqlx::query(
+            "INSERT INTO accounts (
+                id, name, rr_order, max_slots, status, auth_source, cookie_blob, drain_first
+            ) VALUES (?1, ?2, ?3, 5, 'active', 'cookie', 'old-ck', 0)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(rr)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Mirrors the consolidated single-statement oauth-row-to-cookie replacement
+    /// run by `src/api/admin/accounts.rs::update`. Any regression that splits
+    /// this into multiple UPDATEs will fail the mutex CHECK mid-transaction.
+    #[tokio::test]
+    async fn update_sql_replaces_oauth_account_with_cookie_atomically() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        insert_oauth_account(&pool, 1, "a", 1).await;
+
+        sqlx::query(
+            "UPDATE accounts
+             SET cookie_blob = ?1,
+                 oauth_access_token = NULL,
+                 oauth_refresh_token = NULL,
+                 oauth_expires_at = NULL,
+                 last_refresh_at = NULL,
+                 auth_source = 'cookie',
+                 invalid_reason = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2",
+        )
+        .bind("new-ck")
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .expect("consolidated oauth->cookie replacement must satisfy CHECK");
+
+        let row = sqlx::query(
+            "SELECT auth_source, cookie_blob, oauth_access_token FROM accounts WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("auth_source"), "cookie");
+        assert_eq!(
+            row.get::<Option<String>, _>("cookie_blob").as_deref(),
+            Some("new-ck"),
+        );
+        assert_eq!(row.get::<Option<String>, _>("oauth_access_token"), None);
+    }
+
+    #[tokio::test]
+    async fn update_sql_replaces_cookie_account_with_oauth_atomically() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        insert_cookie_account(&pool, 1, "a", 1).await;
+
+        sqlx::query(
+            "UPDATE accounts
+             SET cookie_blob = NULL,
+                 oauth_access_token = ?1,
+                 oauth_refresh_token = ?2,
+                 oauth_expires_at = ?3,
+                 last_refresh_at = ?4,
+                 organization_uuid = ?5,
+                 auth_source = 'oauth',
+                 last_error = NULL,
+                 invalid_reason = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?6",
+        )
+        .bind("new-at")
+        .bind("new-rt")
+        .bind("2031-01-01T00:00:00Z")
+        .bind("2026-04-21T00:00:00Z")
+        .bind("org-new")
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .expect("consolidated cookie->oauth replacement must satisfy CHECK");
+
+        let row = sqlx::query(
+            "SELECT auth_source, cookie_blob, oauth_access_token, organization_uuid
+             FROM accounts WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("auth_source"), "oauth");
+        assert_eq!(row.get::<Option<String>, _>("cookie_blob"), None);
+        assert_eq!(
+            row.get::<Option<String>, _>("oauth_access_token")
+                .as_deref(),
+            Some("new-at"),
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("organization_uuid").as_deref(),
+            Some("org-new"),
+        );
+    }
+
+    /// Regression guard: piecewise credential writes — the pre-fix shape of
+    /// update() — trip the mutex CHECK when the DB still disagrees with the
+    /// column being changed. Documents why the replacement SQL must stay
+    /// consolidated in a single UPDATE.
+    #[tokio::test]
+    async fn update_sql_piecewise_cookie_write_on_oauth_row_trips_check() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        insert_oauth_account(&pool, 1, "a", 1).await;
+
+        let result = sqlx::query(
+            "UPDATE accounts SET cookie_blob = 'new-ck', updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            result.is_err(),
+            "writing cookie_blob onto an oauth row without also switching auth_source must fail CHECK",
+        );
+    }
+
+    #[tokio::test]
+    async fn update_sql_piecewise_cookie_clear_on_cookie_row_trips_check() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        insert_cookie_account(&pool, 1, "a", 1).await;
+
+        let result = sqlx::query(
+            "UPDATE accounts SET cookie_blob = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            result.is_err(),
+            "clearing cookie_blob on a cookie row without switching auth_source must fail CHECK",
+        );
+    }
 }

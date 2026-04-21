@@ -426,7 +426,7 @@ pub async fn update(
         ),
         None => None,
     };
-    let auth_source = derive_auth_source(
+    derive_auth_source(
         req.auth_source.as_deref(),
         new_cookie_blob.is_some(),
         oauth.is_some(),
@@ -524,71 +524,40 @@ pub async fn update(
                 msg: "该 Cookie 已被其他账号使用",
             });
         }
+        // Single-statement credential replacement: cookie_blob, auth_source,
+        // and cleared oauth fields are written together so the row-level
+        // credential-mutex CHECK is only evaluated against the final state.
+        // Piecewise updates (write cookie first, then clear oauth, then switch
+        // auth_source) would trip the CHECK mid-transaction.
         sqlx::query(
-            "UPDATE accounts SET cookie_blob = ?1, invalid_reason = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            "UPDATE accounts
+             SET cookie_blob = ?1,
+                 oauth_access_token = NULL,
+                 oauth_refresh_token = NULL,
+                 oauth_expires_at = NULL,
+                 last_refresh_at = NULL,
+                 auth_source = 'cookie',
+                 invalid_reason = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2",
         )
         .bind(blob)
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    }
-    // Credential replacement: an account has exactly one active auth method.
-    // Submitting a cookie clears any oauth state; submitting oauth clears the cookie.
-    if auth_source == "cookie" {
-        sqlx::query(
-            "UPDATE accounts
-             SET oauth_access_token = NULL,
-                 oauth_refresh_token = NULL,
-                 oauth_expires_at = NULL,
-                 last_refresh_at = NULL,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?1
-               AND (oauth_access_token IS NOT NULL
-                    OR oauth_refresh_token IS NOT NULL
-                    OR oauth_expires_at IS NOT NULL
-                    OR last_refresh_at IS NOT NULL)",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    } else if auth_source == "oauth" {
+    } else if let Some(ref oauth_data) = oauth {
+        // Mirror of the cookie branch: all credential + auth_source columns
+        // move together in a single UPDATE so the mutex CHECK sees only the
+        // consistent post-write state.
         sqlx::query(
             "UPDATE accounts
              SET cookie_blob = NULL,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?1 AND cookie_blob IS NOT NULL",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    }
-    sqlx::query(
-        "UPDATE accounts SET auth_source = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
-    )
-    .bind(auth_source)
-    .bind(id)
-    .execute(&mut *tx)
-    .await?;
-    if let Some(ref org) = req.organization_uuid {
-        sqlx::query(
-            "UPDATE accounts SET organization_uuid = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
-        )
-        .bind(org)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    }
-    // When a new OAuth credential is submitted, write it inside the same tx as
-    // the cookie clearing / auth_source switch. This prevents a torn state where
-    // auth_source='oauth' and cookie_blob=NULL but oauth tokens are absent.
-    if let Some(ref oauth_data) = oauth {
-        sqlx::query(
-            "UPDATE accounts
-             SET oauth_access_token = ?1,
+                 oauth_access_token = ?1,
                  oauth_refresh_token = ?2,
                  oauth_expires_at = ?3,
                  last_refresh_at = ?4,
                  organization_uuid = ?5,
+                 auth_source = 'oauth',
                  last_error = NULL,
                  invalid_reason = NULL,
                  updated_at = CURRENT_TIMESTAMP
@@ -599,6 +568,15 @@ pub async fn update(
         .bind(oauth_data.token.expires_at.to_rfc3339())
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(oauth_data.snapshot.organization_uuid.as_str())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if let Some(ref org) = req.organization_uuid {
+        sqlx::query(
+            "UPDATE accounts SET organization_uuid = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        )
+        .bind(org)
         .bind(id)
         .execute(&mut *tx)
         .await?;
