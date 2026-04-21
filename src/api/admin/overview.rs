@@ -63,7 +63,6 @@ pub struct AccountStatusOverview {
 pub struct AccountAuthSourceOverview {
     pub oauth: i64,
     pub cookie: i64,
-    pub hybrid: i64,
 }
 
 #[derive(Serialize)]
@@ -153,7 +152,6 @@ pub async fn overview(
             auth_sources: AccountAuthSourceOverview {
                 oauth: account_summary.auth_sources.oauth,
                 cookie: account_summary.auth_sources.cookie,
-                hybrid: account_summary.auth_sources.hybrid,
             },
         },
         policies: policy_count,

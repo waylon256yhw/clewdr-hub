@@ -70,7 +70,6 @@ pub struct AccountStatusSummary {
 pub struct AccountAuthSourceSummary {
     pub oauth: i64,
     pub cookie: i64,
-    pub hybrid: i64,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +132,6 @@ pub fn summarize_accounts(accounts: &[AccountWithRuntime]) -> AccountSummary {
         match account.auth_source.as_str() {
             "oauth" => summary.auth_sources.oauth += 1,
             "cookie" => summary.auth_sources.cookie += 1,
-            "hybrid" => summary.auth_sources.hybrid += 1,
             _ => {}
         }
 
@@ -779,7 +777,7 @@ mod tests {
                 false,
                 Some(now + 300),
             ),
-            account(3, "hybrid", "auth_error", Some("cookie=yes"), true, None),
+            account(3, "cookie", "auth_error", Some("cookie=yes"), false, None),
             account(4, "oauth", "disabled", None, true, None),
             account(5, "oauth", "active", None, false, None),
         ]);
@@ -801,8 +799,7 @@ mod tests {
                 },
                 auth_sources: AccountAuthSourceSummary {
                     oauth: 3,
-                    cookie: 1,
-                    hybrid: 1,
+                    cookie: 2,
                 },
             }
         );

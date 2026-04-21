@@ -171,7 +171,7 @@ impl ClaudeCodeState {
             let is_pure_oauth_slot = cookie.token.is_some() && !has_cookie_credential;
             // Pure oauth slots have no real cookie-backed reauth path, so hoist
             // their token into `oauth_token`. Cookie-backed slots keep using the
-            // historic cookie/token path so hybrid accounts retain cookie reauth.
+            // historic cookie/token path.
             if is_pure_oauth_slot {
                 state.oauth_token = cookie.token.clone();
             } else {
