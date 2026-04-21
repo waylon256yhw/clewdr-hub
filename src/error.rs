@@ -115,7 +115,7 @@ pub enum ClewdrError {
     UpstreamCoolingDown,
     #[snafu(display("No valid upstream accounts available"))]
     NoValidUpstreamAccounts,
-    #[snafu(display("Invalid Cookie: {}", reason))]
+    #[snafu(display("{}", reason))]
     #[snafu(context(false))]
     InvalidCookie {
         #[snafu(source)]
@@ -191,6 +191,46 @@ pub enum ClewdrError {
         #[snafu(source(from(Box<dyn std::error::Error + Send>, Some)))]
         source: Option<Box<dyn std::error::Error + Send>>,
     },
+}
+
+pub fn display_account_invalid_reason(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    Reason::from_db_string_checked(trimmed)
+        .map(|reason| reason.to_string())
+        .unwrap_or_else(|| sanitize_account_error_message(trimmed))
+}
+
+pub fn sanitize_account_error_message(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let replacements = [
+        ("Invalid Cookie: Null", Reason::Null.to_string()),
+        ("Invalid Cookie: Banned", Reason::Banned.to_string()),
+        ("Invalid Cookie: Free account", Reason::Free.to_string()),
+        (
+            "Invalid Cookie: Organization Disabled",
+            Reason::Disabled.to_string(),
+        ),
+    ];
+    let mut message = trimmed.to_string();
+    for (legacy, replacement) in replacements {
+        message = message.replace(legacy, &replacement);
+    }
+    message = message.replace(
+        "Invalid Cookie: Restricted/Warning: until",
+        "Account restricted until",
+    );
+    message = message.replace(
+        "Invalid Cookie: 429 Too many request: until",
+        "Account cooling down until",
+    );
+    message
 }
 
 impl IntoResponse for ClewdrError {
@@ -459,5 +499,41 @@ impl CheckClaudeErr for Response {
             code: status,
             inner: inner_error,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{display_account_invalid_reason, sanitize_account_error_message};
+
+    #[test]
+    fn sanitizes_legacy_invalid_cookie_messages() {
+        assert_eq!(
+            sanitize_account_error_message("Invalid Cookie: Null"),
+            "Account unavailable"
+        );
+        assert_eq!(
+            sanitize_account_error_message("OAuth: Invalid Cookie: Banned"),
+            "OAuth: Account banned"
+        );
+        assert_eq!(
+            sanitize_account_error_message(
+                "Invalid Cookie: 429 Too many request: until UTC 2026-04-21 11:00:00",
+            ),
+            "Account cooling down until UTC 2026-04-21 11:00:00"
+        );
+    }
+
+    #[test]
+    fn renders_stored_invalid_reasons_as_account_messages() {
+        assert_eq!(
+            display_account_invalid_reason("null"),
+            "Account unavailable"
+        );
+        assert_eq!(display_account_invalid_reason("banned"), "Account banned");
+        assert_eq!(
+            display_account_invalid_reason("too_many_request:1735689600"),
+            "Account cooling down until UTC 2025-01-01 00:00:00"
+        );
     }
 }

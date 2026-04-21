@@ -9,7 +9,7 @@
 //!
 //! ## Fixed Issues
 //! - VERSION_INFO: Removed colors to fix /api/version endpoint
-//! - Reason::Display: Removed colors to fix InvalidCookie error responses
+//! - Reason::Display: Removed colors to fix account error responses
 
 #[cfg(test)]
 mod tests {
@@ -21,15 +21,15 @@ mod tests {
     #[test]
     fn test_reason_display_no_ansi_codes() {
         // Reason::Display should NOT contain ANSI escape codes
-        // This is used in InvalidCookie errors that go into JSON responses
+        // This is used in account-related error responses that go into JSON
 
         let test_cases = vec![
-            (Reason::Disabled, "Organization Disabled"),
-            (Reason::Free, "Free account"),
-            (Reason::Banned, "Banned"),
-            (Reason::Null, "Null"),
-            (Reason::Restricted(1735689600), "Restricted/Warning"),
-            (Reason::TooManyRequest(1735689600), "429 Too many request"),
+            (Reason::Disabled, "Organization disabled"),
+            (Reason::Free, "Free-tier account"),
+            (Reason::Banned, "Account banned"),
+            (Reason::Null, "Account unavailable"),
+            (Reason::Restricted(1735689600), "Account restricted"),
+            (Reason::TooManyRequest(1735689600), "Account cooling down"),
         ];
 
         for (reason, expected_substring) in test_cases {

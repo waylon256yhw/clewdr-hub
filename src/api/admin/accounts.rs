@@ -20,7 +20,9 @@ use crate::{
         update_account_metadata_unchecked, upsert_account_oauth,
     },
     db::proxies::{build_proxy_url, get_proxy_by_id},
-    error::{ClewdrError, WreqSnafu},
+    error::{
+        ClewdrError, WreqSnafu, display_account_invalid_reason, sanitize_account_error_message,
+    },
     oauth::{
         AdminOAuthStartResponse, exchange_admin_oauth_callback, refresh_oauth_token,
         start_admin_oauth_flow,
@@ -119,10 +121,16 @@ fn map_account(row: &AccountWithRuntime) -> AccountResponse {
         has_oauth: row.oauth_token.is_some(),
         oauth_expires_at: row.oauth_expires_at.clone(),
         last_refresh_at: row.last_refresh_at.clone(),
-        last_error: row.last_error.clone(),
+        last_error: row
+            .last_error
+            .as_deref()
+            .map(sanitize_account_error_message),
         email: row.email.clone(),
         account_type: row.account_type.clone(),
-        invalid_reason: row.invalid_reason.clone(),
+        invalid_reason: row
+            .invalid_reason
+            .as_deref()
+            .map(display_account_invalid_reason),
         created_at: row.created_at.clone(),
         updated_at: row.updated_at.clone(),
         runtime,

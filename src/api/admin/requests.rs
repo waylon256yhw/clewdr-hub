@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use super::common::Paginated;
-use crate::error::ClewdrError;
+use crate::error::{ClewdrError, sanitize_account_error_message};
 
 #[derive(Serialize, sqlx::FromRow)]
 pub struct RequestLogResponse {
@@ -163,7 +163,12 @@ pub async fn list(
         list_query = list_query.bind(t);
     }
     list_query = list_query.bind(limit).bind(offset);
-    let items = list_query.fetch_all(&db).await?;
+    let mut items = list_query.fetch_all(&db).await?;
+    for item in &mut items {
+        if let Some(message) = item.error_message.as_deref() {
+            item.error_message = Some(sanitize_account_error_message(message));
+        }
+    }
 
     Ok(Json(Paginated {
         items,
