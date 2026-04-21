@@ -48,9 +48,38 @@ permissions:
   contents: write
 
 jobs:
+  verify:
+    name: Verify
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/master' && !startsWith(github.event.head_commit.message, 'Update to v'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "lts/*"
+          check-latest: true
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Run Rust tests
+        run: cargo test
+
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm ci
+          npm run build
+
+      - name: Run cargo check
+        run: cargo check
+
   build-frontend:
     name: Build Frontend
-    if: github.event_name != 'push' || github.ref_type == 'tag' || !startsWith(github.event.head_commit.message, 'Update to v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -78,6 +107,7 @@ jobs:
 
   build:
     name: Build binary
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: build-frontend
     strategy:
       matrix:

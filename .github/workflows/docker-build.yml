@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
-    branches: ["master"]
     paths-ignore:
       - "**.md"
       - "LICENSE"
@@ -18,21 +17,7 @@ on:
       - "cliff.toml"
       - "release.sh"
       - "dev.sh"
-  pull_request:
-    branches: ["master"]
-    paths-ignore:
-      - "**.md"
-      - "LICENSE"
-      - "deploy/**"
-      - "docs/**"
-      - "wiki/**"
-      - "docker-compose.yml"
-      - "Dockerfile.huggingface"
-      - ".github/**"
-      - ".gitignore"
-      - "cliff.toml"
-      - "release.sh"
-      - "dev.sh"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -41,7 +26,6 @@ permissions:
 jobs:
   build:
     name: Build (${{ matrix.arch }})
-    if: github.event_name != 'push' || github.ref_type == 'tag' || !startsWith(github.event.head_commit.message, 'Update to v')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -99,7 +83,6 @@ jobs:
 
   manifest:
     name: Create multi-arch manifests
-    if: github.event_name != 'push' || github.ref_type == 'tag' || !startsWith(github.event.head_commit.message, 'Update to v')
     runs-on: ubuntu-latest
     needs: build
     steps:
