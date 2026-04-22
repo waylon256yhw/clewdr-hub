@@ -9,12 +9,12 @@ use crate::{
     billing::{BillingContext, RequestType, persist_probe_log},
     config::{AccountSlot, CLEWDR_CONFIG, Reason},
     db::accounts::{
-        AccountWithRuntime, batch_upsert_runtime_states, set_account_active,
+        AccountWithRuntime, batch_upsert_runtime_states, get_account_by_id, set_account_active,
         set_account_auth_error, update_account_metadata, update_account_metadata_unchecked,
         upsert_account_oauth,
     },
     error::ClewdrError,
-    oauth::refresh_oauth_token_with_raw,
+    oauth::{fetch_oauth_snapshot_raw, refresh_oauth_token_with_raw},
     services::account_pool::AccountPoolHandle,
     state::AdminEvent,
     stealth::SharedStealthProfile,
@@ -611,7 +611,7 @@ async fn run_oauth_probe(
     let account_id = account.id;
     info!("[probe][oauth] starting for account {account_id}");
 
-    let Some(token) = account.oauth_token.clone() else {
+    let Some(fallback_token) = account.oauth_token.clone() else {
         let msg = "missing stored OAuth token".to_string();
         warn!("[probe][oauth] account {account_id}: {msg}");
         handle.set_probe_error(account_id, msg.clone()).await;
@@ -624,69 +624,117 @@ async fn run_oauth_probe(
         });
     };
 
-    match refresh_oauth_token_with_raw(&token, account.proxy_url.as_deref()).await {
-        Ok((refreshed, profile_raw, usage_raw)) => {
-            bundle.insert("profile".into(), profile_raw);
-            bundle.insert("usage".into(), usage_raw);
+    // Serialize refreshes for this account so concurrent probes / chat
+    // refreshes don't burn the single-use refresh token twice.
+    let _guard = crate::services::oauth_refresh_guard::guard()
+        .lock(account_id)
+        .await;
 
-            if let Err(err) =
-                upsert_account_oauth(db, account_id, Some(&refreshed.token), None).await
-            {
-                let msg = format!("failed to persist refreshed token: {err}");
-                warn!("[probe][oauth] account {account_id}: {msg}");
-                handle
-                    .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
-                    .await;
-                let _ = handle.clear_probing(account_id).await;
-                return Err(ProbeFailure {
-                    stage: "persist_token",
-                    message: msg,
-                    http_status: None,
-                    is_auth: false,
-                });
-            }
-            if let Err(err) = update_account_metadata_unchecked(
-                db,
-                account_id,
-                refreshed.snapshot.email.as_deref(),
-                refreshed.snapshot.account_type.as_deref(),
-                Some(refreshed.snapshot.organization_uuid.as_str()),
-            )
-            .await
-            {
-                let msg = format!("failed to persist metadata: {err}");
-                warn!("[probe][oauth] account {account_id}: {msg}");
-                handle
-                    .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
-                    .await;
-                let _ = handle.clear_probing(account_id).await;
-                return Err(ProbeFailure {
-                    stage: "persist_metadata",
-                    message: msg,
-                    http_status: None,
-                    is_auth: false,
-                });
-            }
-            if let Err(err) =
-                batch_upsert_runtime_states(db, &[(account_id, refreshed.snapshot.runtime.clone())])
-                    .await
-            {
-                let msg = format!("failed to persist runtime: {err}");
-                warn!("[probe][oauth] account {account_id}: {msg}");
-                handle
-                    .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
-                    .await;
-                let _ = handle.clear_probing(account_id).await;
-                return Err(ProbeFailure {
-                    stage: "persist_runtime",
-                    message: msg,
-                    http_status: None,
-                    is_auth: false,
-                });
-            }
-            if account.status == "auth_error"
-                && let Err(err) = set_account_active(db, account_id).await
-            {
+    // After acquiring the guard, pick the authoritative current token. Prefer
+    // the pool's in-memory copy (fast, matches dispatch-time state). If the
+    // pool has no entry — typically because the account sits in
+    // `state.invalid` after a prior auth_error, which is exactly where admin-
+    // triggered probes retry from — fall back to a fresh DB read. DB is
+    // authoritative for credentials (docs §"容易漏掉 #5"); the `fallback_token`
+    // clone loaded before the guard may be stale if a peer rotated the token
+    // while we were queued.
+    let token = if let Some(t) = handle.get_token(account_id).await.unwrap_or(None) {
+        t
+    } else {
+        match get_account_by_id(db, account_id).await {
+            Ok(Some(acc)) => acc.oauth_token.unwrap_or(fallback_token),
+            _ => fallback_token,
+        }
+    };
+
+    // A probe's job is to refresh the account's health signal (profile + usage
+    // + metadata), not to force a refresh-token rotation. If the current access
+    // token is still fresh, we fetch the snapshot directly without rotating —
+    // this avoids burning a refresh-token cycle on healthy accounts while
+    // still populating the bundle, updating metadata, and driving
+    // auth_error → active reactivation.
+    let (refreshed_token, profile_raw, usage_raw, snapshot) = if token.is_expired() {
+        match refresh_oauth_token_with_raw(&token, account.proxy_url.as_deref()).await {
+            Ok((refreshed, profile_raw, usage_raw)) => (
+                Some(refreshed.token),
+                profile_raw,
+                usage_raw,
+                refreshed.snapshot,
+            ),
+            Err(err) => return probe_oauth_upstream_failure(&handle, db, account_id, err).await,
+        }
+    } else {
+        match fetch_oauth_snapshot_raw(&token.access_token, account.proxy_url.as_deref()).await {
+            Ok((snapshot, profile_raw, usage_raw)) => (None, profile_raw, usage_raw, snapshot),
+            Err(err) => return probe_oauth_upstream_failure(&handle, db, account_id, err).await,
+        }
+    };
+
+    bundle.insert("profile".into(), profile_raw);
+    bundle.insert("usage".into(), usage_raw);
+
+    if let Some(new_token) = refreshed_token {
+        if let Err(err) = upsert_account_oauth(db, account_id, Some(&new_token), None).await {
+            let msg = format!("failed to persist refreshed token: {err}");
+            warn!("[probe][oauth] account {account_id}: {msg}");
+            handle
+                .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
+                .await;
+            let _ = handle.clear_probing(account_id).await;
+            return Err(ProbeFailure {
+                stage: "persist_token",
+                message: msg,
+                http_status: None,
+                is_auth: false,
+            });
+        }
+        // Mirror the freshly-rotated token into the pool so subsequent
+        // dispatches and flushes don't fall back to the now-invalid RT.
+        handle.update_credential(account_id, Some(new_token)).await;
+    }
+
+    if let Err(err) = update_account_metadata_unchecked(
+        db,
+        account_id,
+        snapshot.email.as_deref(),
+        snapshot.account_type.as_deref(),
+        Some(snapshot.organization_uuid.as_str()),
+    )
+    .await
+    {
+        let msg = format!("failed to persist metadata: {err}");
+        warn!("[probe][oauth] account {account_id}: {msg}");
+        handle
+            .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
+            .await;
+        let _ = handle.clear_probing(account_id).await;
+        return Err(ProbeFailure {
+            stage: "persist_metadata",
+            message: msg,
+            http_status: None,
+            is_auth: false,
+        });
+    }
+    if let Err(err) =
+        batch_upsert_runtime_states(db, &[(account_id, snapshot.runtime.clone())]).await
+    {
+        let msg = format!("failed to persist runtime: {err}");
+        warn!("[probe][oauth] account {account_id}: {msg}");
+        handle
+            .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
+            .await;
+        let _ = handle.clear_probing(account_id).await;
+        return Err(ProbeFailure {
+            stage: "persist_runtime",
+            message: msg,
+            http_status: None,
+            is_auth: false,
+        });
+    }
+    let did_reactivate = if account.status == "auth_error" {
+        match set_account_active(db, account_id).await {
+            Ok(()) => true,
+            Err(err) => {
                 let msg = format!("failed to reactivate account: {err}");
                 warn!("[probe][oauth] account {account_id}: {msg}");
                 handle
@@ -700,39 +748,72 @@ async fn run_oauth_probe(
                     is_auth: false,
                 });
             }
-            handle.clear_probe_error(account_id).await;
-            let _ = handle.clear_probing(account_id).await;
-            info!("[probe][oauth] completed for account {account_id}");
-            Ok(())
         }
-        Err(err) => {
-            let msg = err.to_string();
-            warn!("[probe][oauth] account {account_id}: {msg}");
-            if is_oauth_auth_failure(&err) {
-                if let Err(db_err) = set_account_auth_error(db, account_id, &msg).await {
-                    warn!(
-                        "[probe][oauth] failed to set auth_error for account {account_id}: {db_err}"
-                    );
-                }
+    } else {
+        false
+    };
+    handle.clear_probe_error(account_id).await;
+    let _ = handle.clear_probing(account_id).await;
+    if did_reactivate {
+        // DB just flipped from auth_error back to active; the in-memory pool
+        // still has this account in `state.invalid` (put there by an earlier
+        // `converge_invalidate`). Trigger a reload so the account re-enters
+        // the dispatchable set without waiting for the next manual reload —
+        // without this step, DB says "active" while the pool refuses to
+        // dispatch, which is exactly the "two sources of truth" divergence
+        // the normalization doc warns against.
+        let _ = handle.reload_from_db().await;
+    }
+    info!("[probe][oauth] completed for account {account_id}");
+    Ok(())
+}
+
+/// Common tail for any upstream OAuth call failure inside `run_oauth_probe`
+/// (either `refresh_oauth_token_with_raw` or `fetch_oauth_snapshot_raw`).
+/// Handles auth-error DB flip, probe-error bookkeeping, probing flag clear,
+/// and constructs the `ProbeFailure` with the right auth / http fields.
+async fn probe_oauth_upstream_failure(
+    handle: &AccountPoolHandle,
+    db: &SqlitePool,
+    account_id: i64,
+    err: ClewdrError,
+) -> Result<(), ProbeFailure> {
+    let msg = err.to_string();
+    warn!("[probe][oauth] account {account_id}: {msg}");
+    let auth = is_oauth_auth_failure(&err);
+    if auth {
+        match set_account_auth_error(db, account_id, &msg).await {
+            Ok(()) => {
+                // DB is authoritative; only after the status write succeeds
+                // do we converge the pool's in-memory view. Mirrors chat.rs's
+                // mark_oauth_account_auth_error pattern so a transient DB
+                // error can't leave the pool with a stale "invalidated" view
+                // while the DB still reports the account as active.
+                handle.invalidate(account_id, Reason::Null).await;
                 handle.clear_probe_error(account_id).await;
-            } else {
+            }
+            Err(db_err) => {
+                warn!("[probe][oauth] failed to set auth_error for account {account_id}: {db_err}");
                 handle
                     .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
                     .await;
             }
-            let _ = handle.clear_probing(account_id).await;
-            let auth = is_oauth_auth_failure(&err);
-            let http_status = if let ClewdrError::ClaudeHttpError { code, .. } = &err {
-                Some(code.as_u16())
-            } else {
-                None
-            };
-            Err(ProbeFailure {
-                stage: "refresh",
-                message: msg,
-                http_status,
-                is_auth: auth,
-            })
         }
+    } else {
+        handle
+            .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
+            .await;
     }
+    let _ = handle.clear_probing(account_id).await;
+    let http_status = if let ClewdrError::ClaudeHttpError { code, .. } = &err {
+        Some(code.as_u16())
+    } else {
+        None
+    };
+    Err(ProbeFailure {
+        stage: "refresh",
+        message: msg,
+        http_status,
+        is_auth: auth,
+    })
 }

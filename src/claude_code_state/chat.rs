@@ -84,6 +84,12 @@ impl ClaudeCodeState {
             warn!("Failed to set OAuth auth_error for account {account_id}: {db_err}");
             return;
         }
+        // DB is authoritative; converge the pool's in-memory view so the
+        // account stops being dispatched and any affinity pointing at it is
+        // cleared.
+        self.account_pool_handle
+            .invalidate(account_id, Reason::Null)
+            .await;
     }
 
     async fn mark_oauth_account_disabled(&mut self, account_id: i64) {
@@ -92,7 +98,11 @@ impl ClaudeCodeState {
         };
         if let Err(db_err) = set_account_disabled(&db, account_id, "disabled").await {
             warn!("Failed to set OAuth account {account_id} disabled: {db_err}");
+            return;
         }
+        self.account_pool_handle
+            .invalidate(account_id, Reason::Disabled)
+            .await;
     }
 
     async fn mark_oauth_account_cooldown(&mut self, account_id: i64, reset_time: i64) {
@@ -111,15 +121,49 @@ impl ClaudeCodeState {
     }
 
     async fn persist_oauth_refresh(&mut self, account_id: i64) -> Result<(), ClewdrError> {
-        let Some(token) = self.oauth_token.as_ref() else {
+        let Some(fallback) = self.oauth_token.clone() else {
             return Ok(());
         };
-        let refreshed = refresh_oauth_token(token, self.proxy_url.as_deref()).await?;
+
+        // Serialize concurrent refreshes for the same account — Anthropic's
+        // refresh tokens are single-use, so two concurrent refreshes with the
+        // same stored RT would both fail after the first one rotates it.
+        let _guard = crate::services::oauth_refresh_guard::guard()
+            .lock(account_id)
+            .await;
+
+        // After acquiring the guard, re-read the latest token: a peer may have
+        // already refreshed while we were waiting. This is the singleflight
+        // fast-path — avoids re-calling upstream and avoids burning another
+        // refresh-token rotation. If the pool has no in-memory entry (e.g. the
+        // account was moved to `state.invalid` by a concurrent auth_error),
+        // fall back to a fresh DB read under the guard so we don't drive
+        // refresh with the `fallback` clone captured before the guard.
         let db = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()).ok_or(
             ClewdrError::UnexpectedNone {
                 msg: "Missing billing context database",
             },
         )?;
+        let current = if let Some(t) = self
+            .account_pool_handle
+            .get_token(account_id)
+            .await
+            .unwrap_or(None)
+        {
+            t
+        } else {
+            match crate::db::accounts::get_account_by_id(&db, account_id).await {
+                Ok(Some(acc)) => acc.oauth_token.unwrap_or(fallback),
+                _ => fallback,
+            }
+        };
+        if !current.is_expired() {
+            self.oauth_token = Some(current.clone());
+            self.organization_uuid = Some(current.organization.uuid.clone());
+            return Ok(());
+        }
+
+        let refreshed = refresh_oauth_token(&current, self.proxy_url.as_deref()).await?;
         upsert_account_oauth(&db, account_id, Some(&refreshed.token), None).await?;
         update_account_metadata_unchecked(
             &db,
@@ -131,6 +175,11 @@ impl ClaudeCodeState {
         .await?;
         batch_upsert_runtime_states(&db, &[(account_id, refreshed.snapshot.runtime.clone())])
             .await?;
+        // Mirror the new token into the pool's in-memory slot so concurrent
+        // dispatches see the fresh credential without waiting for reload.
+        self.account_pool_handle
+            .update_credential(account_id, Some(refreshed.token.clone()))
+            .await;
         self.oauth_token = Some(refreshed.token);
         self.organization_uuid = Some(refreshed.snapshot.organization_uuid);
         Ok(())
