@@ -306,7 +306,8 @@ async fn v1_messages_requires_auth() {
 #[tokio::test]
 async fn v1_messages_rejects_invalid_api_key() {
     let app = setup_app(PolicyConfig::default()).await;
-    let invalid_key = format!("{}x", &app.api_key[..app.api_key.len() - 1]);
+    let replacement = if app.api_key.ends_with('x') { 'y' } else { 'x' };
+    let invalid_key = format!("{}{replacement}", &app.api_key[..app.api_key.len() - 1]);
 
     let response = app
         .request(
