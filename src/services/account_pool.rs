@@ -1867,4 +1867,49 @@ mod tests {
             "do_flush must not race the authoritative auth_error write"
         );
     }
+
+    /// PR-review regression: after a probe rotates the refresh token on an
+    /// `auth_error` account, the refresh is persisted to DB while the pool
+    /// still has the account in `state.invalid`. A subsequent queued probe
+    /// / test on the same account must read the rotated RT from DB via the
+    /// guard's fallback path, not the pre-guard clone. Today `get_token`
+    /// only scans `valid + exhausted`, so on a pool miss callers MUST
+    /// re-read DB — this test pins the in-pool side of that contract
+    /// (`get_token` returns None for invalid accounts) so the callsite
+    /// fallback remains load-bearing.
+    #[tokio::test]
+    async fn get_token_returns_none_for_invalidated_account() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        insert_oauth_row(&pool, 1, "at0", "rt0").await;
+        let mut state = empty_state(pool);
+        let mut slot = AccountSlot::new(&oauth_placeholder_cookie(1), None).unwrap();
+        slot.account_id = Some(1);
+        slot.token = Some(token_with_refresh("rt0"));
+        state.valid.push_back(slot);
+
+        // Seed sentinel: get_token sees the slot while it's in `valid`.
+        let seen = state
+            .valid
+            .iter()
+            .find(|c| c.account_id == Some(1))
+            .and_then(|c| c.token.as_ref())
+            .map(|t| t.refresh_token.clone());
+        assert_eq!(seen.as_deref(), Some("rt0"));
+
+        // Moving the account to `state.invalid` (via Invalidate) drops the
+        // token from the pool's searchable sets. Callers must fall back to
+        // DB under their guard instead of using a pre-guard clone.
+        AccountPoolActor::converge_invalidate(&mut state, 1, Reason::Null);
+        let after = state
+            .valid
+            .iter()
+            .chain(state.exhausted.iter())
+            .find(|c| c.account_id == Some(1))
+            .and_then(|c| c.token.as_ref())
+            .map(|t| t.refresh_token.clone());
+        assert_eq!(
+            after, None,
+            "get_token's data source must miss for invalidated accounts — callers rely on DB fallback"
+        );
+    }
 }

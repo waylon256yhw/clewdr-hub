@@ -738,15 +738,20 @@ pub async fn test_account(
         // Serialize concurrent refreshes for this account.
         let _guard = crate::services::oauth_refresh_guard::guard().lock(id).await;
 
-        // After acquiring the guard, prefer whatever token the pool currently
-        // holds — it may have been rotated by a concurrent chat-path refresh or
-        // probe while we were queued.
-        let token = state
-            .account_pool
-            .get_token(id)
-            .await
-            .unwrap_or(None)
-            .unwrap_or(token);
+        // After acquiring the guard, pick the authoritative current token.
+        // Prefer the pool's cached copy; fall back to a fresh DB read if the
+        // pool has no entry for this account (e.g. it was moved to
+        // `state.invalid` by a prior auth_error). DB is authoritative per
+        // docs §"容易漏掉 #5" — the `token` variable loaded before the guard
+        // may be stale if a peer rotated it while we were queued.
+        let token = if let Some(t) = state.account_pool.get_token(id).await.unwrap_or(None) {
+            t
+        } else {
+            match get_account_by_id(&state.db, id).await {
+                Ok(Some(acc)) => acc.oauth_token.unwrap_or(token),
+                _ => token,
+            }
+        };
 
         // Fast path: a peer already refreshed; reuse the fresh access token.
         if !token.is_expired() {
@@ -754,7 +759,40 @@ pub async fn test_account(
         } else {
             match refresh_oauth_token(&token, account.proxy_url.as_deref()).await {
                 Ok(refreshed) => {
-                    let _ = upsert_account_oauth(&state.db, id, Some(&refreshed.token), None).await;
+                    // DB-authoritative: persist rotated token first. Only
+                    // mirror into the in-memory pool after the DB write
+                    // succeeds — leaving memory ahead of DB is the exact
+                    // inversion of the "credentials follow DB" rule.
+                    if let Err(db_err) =
+                        upsert_account_oauth(&state.db, id, Some(&refreshed.token), None).await
+                    {
+                        let error_msg = format!("failed to persist refreshed token: {db_err}");
+                        let ctx = BillingContext {
+                            db: state.db.clone(),
+                            user_id: None,
+                            api_key_id: None,
+                            account_id: Some(id),
+                            model_raw: String::new(),
+                            request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
+                            started_at,
+                            event_tx: state.event_tx.clone(),
+                        };
+                        persist_probe_log(
+                            &ctx,
+                            RequestType::Test,
+                            "internal_error",
+                            None,
+                            "",
+                            Some(&error_msg),
+                        )
+                        .await;
+                        return Ok(Json(TestAccountResponse {
+                            success: false,
+                            latency_ms: (chrono::Utc::now() - started_at).num_milliseconds(),
+                            error: Some(error_msg),
+                            http_status: None,
+                        }));
+                    }
                     state
                         .account_pool
                         .update_credential(id, Some(refreshed.token.clone()))

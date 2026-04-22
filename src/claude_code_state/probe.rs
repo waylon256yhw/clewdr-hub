@@ -9,7 +9,7 @@ use crate::{
     billing::{BillingContext, RequestType, persist_probe_log},
     config::{AccountSlot, CLEWDR_CONFIG, Reason},
     db::accounts::{
-        AccountWithRuntime, batch_upsert_runtime_states, set_account_active,
+        AccountWithRuntime, batch_upsert_runtime_states, get_account_by_id, set_account_active,
         set_account_auth_error, update_account_metadata, update_account_metadata_unchecked,
         upsert_account_oauth,
     },
@@ -630,14 +630,22 @@ async fn run_oauth_probe(
         .lock(account_id)
         .await;
 
-    // After acquiring the guard, prefer the pool's cached token over the
-    // snapshot we loaded before spawning — a peer may have rotated the token
+    // After acquiring the guard, pick the authoritative current token. Prefer
+    // the pool's in-memory copy (fast, matches dispatch-time state). If the
+    // pool has no entry — typically because the account sits in
+    // `state.invalid` after a prior auth_error, which is exactly where admin-
+    // triggered probes retry from — fall back to a fresh DB read. DB is
+    // authoritative for credentials (docs §"容易漏掉 #5"); the `fallback_token`
+    // clone loaded before the guard may be stale if a peer rotated the token
     // while we were queued.
-    let token = handle
-        .get_token(account_id)
-        .await
-        .unwrap_or(None)
-        .unwrap_or(fallback_token);
+    let token = if let Some(t) = handle.get_token(account_id).await.unwrap_or(None) {
+        t
+    } else {
+        match get_account_by_id(db, account_id).await {
+            Ok(Some(acc)) => acc.oauth_token.unwrap_or(fallback_token),
+            _ => fallback_token,
+        }
+    };
 
     // A probe's job is to refresh the account's health signal (profile + usage
     // + metadata), not to force a refresh-token rotation. If the current access
@@ -723,24 +731,39 @@ async fn run_oauth_probe(
             is_auth: false,
         });
     }
-    if account.status == "auth_error"
-        && let Err(err) = set_account_active(db, account_id).await
-    {
-        let msg = format!("failed to reactivate account: {err}");
-        warn!("[probe][oauth] account {account_id}: {msg}");
-        handle
-            .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
-            .await;
-        let _ = handle.clear_probing(account_id).await;
-        return Err(ProbeFailure {
-            stage: "reactivate",
-            message: msg,
-            http_status: None,
-            is_auth: false,
-        });
-    }
+    let did_reactivate = if account.status == "auth_error" {
+        match set_account_active(db, account_id).await {
+            Ok(()) => true,
+            Err(err) => {
+                let msg = format!("failed to reactivate account: {err}");
+                warn!("[probe][oauth] account {account_id}: {msg}");
+                handle
+                    .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
+                    .await;
+                let _ = handle.clear_probing(account_id).await;
+                return Err(ProbeFailure {
+                    stage: "reactivate",
+                    message: msg,
+                    http_status: None,
+                    is_auth: false,
+                });
+            }
+        }
+    } else {
+        false
+    };
     handle.clear_probe_error(account_id).await;
     let _ = handle.clear_probing(account_id).await;
+    if did_reactivate {
+        // DB just flipped from auth_error back to active; the in-memory pool
+        // still has this account in `state.invalid` (put there by an earlier
+        // `converge_invalidate`). Trigger a reload so the account re-enters
+        // the dispatchable set without waiting for the next manual reload —
+        // without this step, DB says "active" while the pool refuses to
+        // dispatch, which is exactly the "two sources of truth" divergence
+        // the normalization doc warns against.
+        let _ = handle.reload_from_db().await;
+    }
     info!("[probe][oauth] completed for account {account_id}");
     Ok(())
 }

@@ -135,13 +135,28 @@ impl ClaudeCodeState {
         // After acquiring the guard, re-read the latest token: a peer may have
         // already refreshed while we were waiting. This is the singleflight
         // fast-path — avoids re-calling upstream and avoids burning another
-        // refresh-token rotation.
-        let current = self
+        // refresh-token rotation. If the pool has no in-memory entry (e.g. the
+        // account was moved to `state.invalid` by a concurrent auth_error),
+        // fall back to a fresh DB read under the guard so we don't drive
+        // refresh with the `fallback` clone captured before the guard.
+        let db = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()).ok_or(
+            ClewdrError::UnexpectedNone {
+                msg: "Missing billing context database",
+            },
+        )?;
+        let current = if let Some(t) = self
             .account_pool_handle
             .get_token(account_id)
             .await
             .unwrap_or(None)
-            .unwrap_or(fallback);
+        {
+            t
+        } else {
+            match crate::db::accounts::get_account_by_id(&db, account_id).await {
+                Ok(Some(acc)) => acc.oauth_token.unwrap_or(fallback),
+                _ => fallback,
+            }
+        };
         if !current.is_expired() {
             self.oauth_token = Some(current.clone());
             self.organization_uuid = Some(current.organization.uuid.clone());
@@ -149,11 +164,6 @@ impl ClaudeCodeState {
         }
 
         let refreshed = refresh_oauth_token(&current, self.proxy_url.as_deref()).await?;
-        let db = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()).ok_or(
-            ClewdrError::UnexpectedNone {
-                msg: "Missing billing context database",
-            },
-        )?;
         upsert_account_oauth(&db, account_id, Some(&refreshed.token), None).await?;
         update_account_metadata_unchecked(
             &db,
