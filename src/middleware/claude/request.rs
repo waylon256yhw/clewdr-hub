@@ -261,6 +261,55 @@ fn inject_metadata_user_id(
     metadata.fields.insert("user_id".to_string(), user_id);
 }
 
+fn cache_control_system_hash(body: &CreateMessageParams) -> Option<u64> {
+    let cache_systems = body
+        .system
+        .as_ref()
+        .and_then(Value::as_array)
+        .map(|systems| {
+            systems
+                .iter()
+                .filter(|s| s["cache_control"].as_object().is_some())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    (!cache_systems.is_empty()).then(|| {
+        let mut hasher = DefaultHasher::new();
+        cache_systems.hash(&mut hasher);
+        hasher.finish()
+    })
+}
+
+fn claude_code_session_affinity_hash(
+    body: &CreateMessageParams,
+    auth_user: Option<&crate::db::models::AuthenticatedUser>,
+) -> Option<u64> {
+    let metadata_user_id = body.metadata.as_ref()?.fields.get("user_id")?.trim();
+    if metadata_user_id.is_empty() || !metadata_user_id.contains("_session_") {
+        return None;
+    }
+
+    let mut hasher = DefaultHasher::new();
+    "claude-code-session-affinity-v1".hash(&mut hasher);
+    metadata_user_id.hash(&mut hasher);
+    if let Some(auth) = auth_user {
+        auth.user_id.hash(&mut hasher);
+        auth.api_key_id.hash(&mut hasher);
+    }
+    Some(hasher.finish())
+}
+
+fn request_affinity_hash(
+    body: &CreateMessageParams,
+    auth_user: Option<&crate::db::models::AuthenticatedUser>,
+) -> Option<u64> {
+    // Claude Code emits a stable session id in metadata.user_id. Prefer it over
+    // system-cache blocks so helper-model requests (for example Haiku) stay on
+    // the same account even when their system prompt differs from the main turn.
+    claude_code_session_affinity_hash(body, auth_user).or_else(|| cache_control_system_hash(body))
+}
+
 /// Normalize sampling parameters to keep Anthropic-compatible behavior across clients.
 ///
 /// We intentionally discard `top_p` and `top_k` for all requests. In practice they
@@ -436,22 +485,7 @@ where
             strip_ephemeral_scope_from_system(system);
         }
 
-        let cache_systems = body
-            .system
-            .as_ref()
-            .and_then(Value::as_array)
-            .map(|systems| {
-                systems
-                    .iter()
-                    .filter(|s| s["cache_control"].as_object().is_some())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let system_prompt_hash = (!cache_systems.is_empty()).then(|| {
-            let mut hasher = DefaultHasher::new();
-            cache_systems.hash(&mut hasher);
-            hasher.finish()
-        });
+        let system_prompt_hash = request_affinity_hash(&body, auth_user.as_ref());
 
         let input_tokens = body.count_tokens();
 
@@ -618,6 +652,50 @@ mod tests {
         assert_eq!(
             systems[0]["cache_control"]["type"].as_str(),
             Some("ephemeral")
+        );
+    }
+
+    fn body_with_session_and_system(session: &str, system_text: &str) -> CreateMessageParams {
+        CreateMessageParams {
+            model: "claude-sonnet-4-5".to_string(),
+            messages: vec![Message::new_text(Role::User, "hey")],
+            system: Some(json!([
+                {
+                    "type": "text",
+                    "text": system_text,
+                    "cache_control": { "type": "ephemeral" }
+                }
+            ])),
+            metadata: Some(crate::types::claude::Metadata {
+                fields: std::collections::HashMap::from([(
+                    "user_id".to_string(),
+                    session.to_string(),
+                )]),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn session_affinity_ignores_system_prompt_differences() {
+        let session = "user_abc_account__session_9c37db4e-f0c3-44fd-9054-f182c7103381";
+        let haiku = body_with_session_and_system(session, "haiku helper prompt");
+        let opus = body_with_session_and_system(session, "main opus prompt");
+
+        assert_eq!(
+            request_affinity_hash(&haiku, None),
+            request_affinity_hash(&opus, None)
+        );
+    }
+
+    #[test]
+    fn non_session_metadata_falls_back_to_system_hash() {
+        let first = body_with_session_and_system("user-without-session", "first prompt");
+        let second = body_with_session_and_system("user-without-session", "second prompt");
+
+        assert_ne!(
+            request_affinity_hash(&first, None),
+            request_affinity_hash(&second, None)
         );
     }
 
