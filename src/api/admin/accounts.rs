@@ -735,38 +735,60 @@ pub async fn test_account(
     // 3. Refresh token if expired
     let started_at = chrono::Utc::now();
     let access_token = if token.is_expired() {
-        match refresh_oauth_token(&token, account.proxy_url.as_deref()).await {
-            Ok(refreshed) => {
-                let _ = upsert_account_oauth(&state.db, id, Some(&refreshed.token), None).await;
-                refreshed.token.access_token
-            }
-            Err(e) => {
-                let error_msg = e.to_string();
-                let ctx = BillingContext {
-                    db: state.db.clone(),
-                    user_id: None,
-                    api_key_id: None,
-                    account_id: Some(id),
-                    model_raw: String::new(),
-                    request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
-                    started_at,
-                    event_tx: state.event_tx.clone(),
-                };
-                persist_probe_log(
-                    &ctx,
-                    RequestType::Test,
-                    "auth_rejected",
-                    None,
-                    "",
-                    Some(&error_msg),
-                )
-                .await;
-                return Ok(Json(TestAccountResponse {
-                    success: false,
-                    latency_ms: (chrono::Utc::now() - started_at).num_milliseconds(),
-                    error: Some(error_msg),
-                    http_status: None,
-                }));
+        // Serialize concurrent refreshes for this account.
+        let _guard = crate::services::oauth_refresh_guard::guard().lock(id).await;
+
+        // After acquiring the guard, prefer whatever token the pool currently
+        // holds — it may have been rotated by a concurrent chat-path refresh or
+        // probe while we were queued.
+        let token = state
+            .account_pool
+            .get_token(id)
+            .await
+            .unwrap_or(None)
+            .unwrap_or(token);
+
+        // Fast path: a peer already refreshed; reuse the fresh access token.
+        if !token.is_expired() {
+            token.access_token
+        } else {
+            match refresh_oauth_token(&token, account.proxy_url.as_deref()).await {
+                Ok(refreshed) => {
+                    let _ = upsert_account_oauth(&state.db, id, Some(&refreshed.token), None).await;
+                    state
+                        .account_pool
+                        .update_credential(id, Some(refreshed.token.clone()))
+                        .await;
+                    refreshed.token.access_token
+                }
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    let ctx = BillingContext {
+                        db: state.db.clone(),
+                        user_id: None,
+                        api_key_id: None,
+                        account_id: Some(id),
+                        model_raw: String::new(),
+                        request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
+                        started_at,
+                        event_tx: state.event_tx.clone(),
+                    };
+                    persist_probe_log(
+                        &ctx,
+                        RequestType::Test,
+                        "auth_rejected",
+                        None,
+                        "",
+                        Some(&error_msg),
+                    )
+                    .await;
+                    return Ok(Json(TestAccountResponse {
+                        success: false,
+                        latency_ms: (chrono::Utc::now() - started_at).num_milliseconds(),
+                        error: Some(error_msg),
+                        http_status: None,
+                    }));
+                }
             }
         }
     } else {

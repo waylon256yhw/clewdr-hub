@@ -12,10 +12,10 @@ use tracing::{error, info, warn};
 
 use crate::{
     claude_code_state::probe::probe_cookie,
-    config::{AccountSlot, ClewdrCookie, InvalidAccountSlot, Reason, UsageBreakdown},
+    config::{AccountSlot, ClewdrCookie, InvalidAccountSlot, Reason, TokenInfo, UsageBreakdown},
     db::accounts::{
         AccountSummary, active_reset_time, batch_upsert_runtime_states, load_all_accounts,
-        set_account_disabled, set_accounts_active, summarize_accounts, upsert_account_oauth,
+        set_account_disabled, set_accounts_active, summarize_accounts,
     },
     error::ClewdrError,
     state::AdminEvent,
@@ -81,6 +81,15 @@ enum AccountPoolMessage {
     SetProbeError(i64, String),
     ClearProbeError(i64),
     GetProbeErrors(RpcReplyPort<HashMap<i64, String>>),
+    /// Update the cached OAuth credential for an account without marking it
+    /// dirty. Used by refresh/probe paths that already wrote the authoritative
+    /// token to DB — this only keeps the in-memory slot in sync so subsequent
+    /// dispatches don't hand out a stale token.
+    UpdateCredential(i64, Option<TokenInfo>),
+    /// Read the currently cached OAuth token for an account from the pool's
+    /// in-memory slot. Used by refresh callers to re-check (after acquiring the
+    /// per-account refresh guard) whether a peer already refreshed the token.
+    GetToken(i64, RpcReplyPort<Option<TokenInfo>>),
 }
 
 #[derive(Debug)]
@@ -114,6 +123,38 @@ impl AccountPoolActor {
     fn mark_dirty(state: &mut AccountPoolState, account_id: Option<i64>) {
         if let Some(id) = account_id {
             state.dirty.insert(id);
+        }
+    }
+
+    /// Update the cached OAuth token for an account in both `valid` and
+    /// `exhausted`. The authoritative DB write is expected to have already
+    /// happened on the caller's side — this only keeps the in-memory slot in
+    /// sync so subsequent dispatches don't hand out a stale credential.
+    ///
+    /// Does not mark the account dirty: the runtime flush must never write
+    /// credential columns, per `docs/account-normalization-2026-04-21.md`
+    /// ("凭证类字段以 DB 为准").
+    fn update_slot_credential(
+        state: &mut AccountPoolState,
+        account_id: i64,
+        token: Option<TokenInfo>,
+    ) {
+        for slot in state.valid.iter_mut() {
+            if slot.account_id == Some(account_id) {
+                slot.token = token.clone();
+            }
+        }
+
+        let target = state
+            .exhausted
+            .iter()
+            .find(|c| c.account_id == Some(account_id))
+            .cloned();
+        if let Some(template) = target
+            && let Some(mut slot) = state.exhausted.take(&template)
+        {
+            slot.token = token;
+            state.exhausted.insert(slot);
         }
     }
 
@@ -611,23 +652,29 @@ impl AccountPoolActor {
         }
         let dirty_ids: HashSet<i64> = std::mem::take(&mut state.dirty);
 
+        // Build runtime-state updates only. Credential fields
+        // (`oauth_access_token / oauth_refresh_token / oauth_expires_at`) must
+        // not be written from the in-memory slot — doing so can overwrite a
+        // freshly-rotated refresh token with the stale copy that the pool has
+        // not seen yet. Credentials follow the rule "DB is authoritative" per
+        // `docs/account-normalization-2026-04-21.md`; the dedicated refresh
+        // paths (probe, chat's `persist_oauth_refresh`, admin test) write DB
+        // themselves and call `update_credential` to sync the in-memory slot.
         let mut params = Vec::new();
-        let mut oauth_updates = Vec::new();
         for cs in state.valid.iter().chain(state.exhausted.iter()) {
-            if let Some(id) = cs.account_id {
-                if dirty_ids.contains(&id) {
-                    params.push((id, cs.to_runtime_params()));
-                    oauth_updates.push((id, cs.token.clone()));
-                }
+            if let Some(id) = cs.account_id
+                && dirty_ids.contains(&id)
+            {
+                params.push((id, cs.to_runtime_params()));
             }
         }
 
         let mut disabled = Vec::new();
         for uc in &state.invalid {
-            if let Some(id) = uc.account_id {
-                if dirty_ids.contains(&id) {
-                    disabled.push((id, uc.reason.to_db_string()));
-                }
+            if let Some(id) = uc.account_id
+                && dirty_ids.contains(&id)
+            {
+                disabled.push((id, uc.reason.to_db_string()));
             }
         }
 
@@ -635,12 +682,6 @@ impl AccountPoolActor {
         if let Err(e) = batch_upsert_runtime_states(&state.db, &params).await {
             warn!("Failed to flush runtime states: {e}");
             for (id, _) in &params {
-                state.dirty.insert(*id);
-            }
-        }
-        for (id, token) in &oauth_updates {
-            if let Err(e) = upsert_account_oauth(&state.db, *id, token.as_ref(), None).await {
-                warn!("Failed to flush OAuth token for account {id}: {e}");
                 state.dirty.insert(*id);
             }
         }
@@ -935,6 +976,18 @@ impl Actor for AccountPoolActor {
             AccountPoolMessage::GetProbeErrors(reply_port) => {
                 reply_port.send(state.probe_errors.clone())?;
             }
+            AccountPoolMessage::UpdateCredential(account_id, token) => {
+                Self::update_slot_credential(state, account_id, token);
+            }
+            AccountPoolMessage::GetToken(account_id, reply_port) => {
+                let token = state
+                    .valid
+                    .iter()
+                    .chain(state.exhausted.iter())
+                    .find(|c| c.account_id == Some(account_id))
+                    .and_then(|c| c.token.clone());
+                reply_port.send(token)?;
+            }
         }
         Ok(())
     }
@@ -1183,15 +1236,45 @@ impl AccountPoolHandle {
             }
         })
     }
+
+    /// Push a freshly-refreshed OAuth token into the in-memory pool slot so
+    /// subsequent dispatches hand out the new credential. The authoritative DB
+    /// write must have happened on the caller's side first.
+    pub async fn update_credential(&self, account_id: i64, token: Option<TokenInfo>) {
+        let _ = ractor::cast!(
+            self.actor_ref,
+            AccountPoolMessage::UpdateCredential(account_id, token)
+        );
+    }
+
+    /// Read the currently cached OAuth token for an account from the pool's
+    /// in-memory slot. Used by refresh call sites (after acquiring the
+    /// per-account refresh guard) to decide whether a peer already refreshed
+    /// the token and the current caller can skip the upstream call.
+    pub async fn get_token(&self, account_id: i64) -> Result<Option<TokenInfo>, ClewdrError> {
+        ractor::call!(self.actor_ref, AccountPoolMessage::GetToken, account_id).map_err(|e| {
+            ClewdrError::RactorError {
+                loc: Location::generate(),
+                msg: format!("Failed to communicate with AccountPoolActor for get token: {e}"),
+            }
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AccountPoolActor, is_oauth_placeholder_slot, oauth_placeholder_cookie};
+    use super::{
+        AccountPoolActor, AccountPoolState, is_oauth_placeholder_slot, oauth_placeholder_cookie,
+    };
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::str::FromStr;
     use std::time::Duration;
 
+    use moka::sync::Cache;
+    use tokio::sync::broadcast;
+
     use crate::config::{AccountSlot, ClewdrCookie, TokenInfo};
+    use crate::db::init_pool;
 
     #[test]
     fn oauth_placeholder_cookie_is_unique_per_account_and_accepted_by_parser() {
@@ -1255,5 +1338,128 @@ mod tests {
             Some("db-access")
         );
         assert_eq!(reloaded.email.as_deref(), Some("mem@example.com"));
+    }
+
+    fn empty_state(db: sqlx::SqlitePool) -> AccountPoolState {
+        let (event_tx, _rx) = broadcast::channel(16);
+        let moka = Cache::builder()
+            .max_capacity(1000)
+            .time_to_idle(std::time::Duration::from_secs(60 * 60))
+            .build();
+        AccountPoolState {
+            valid: VecDeque::new(),
+            exhausted: HashSet::new(),
+            invalid: HashSet::new(),
+            moka,
+            db,
+            event_tx,
+            dirty: HashSet::new(),
+            handle: None,
+            inflight: HashMap::new(),
+            probing: HashSet::new(),
+            reactivated: HashSet::new(),
+            probe_errors: HashMap::new(),
+            drain_first_ids: HashSet::new(),
+        }
+    }
+
+    fn token_with_refresh(refresh: &str) -> TokenInfo {
+        TokenInfo::from_parts(
+            "stale-at".to_string(),
+            refresh.to_string(),
+            Duration::from_secs(3600),
+            "org".to_string(),
+        )
+    }
+
+    async fn insert_oauth_row(pool: &sqlx::SqlitePool, id: i64, access: &str, refresh: &str) {
+        sqlx::query(
+            "INSERT INTO accounts (
+                id, name, rr_order, max_slots, status, auth_source,
+                oauth_access_token, oauth_refresh_token, oauth_expires_at, drain_first
+            ) VALUES (?1, ?2, 1, 5, 'active', 'oauth', ?3, ?4, '2030-01-01T00:00:00Z', 0)",
+        )
+        .bind(id)
+        .bind(format!("acc-{id}"))
+        .bind(access)
+        .bind(refresh)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn read_refresh_token(pool: &sqlx::SqlitePool, id: i64) -> String {
+        let row: (Option<String>,) =
+            sqlx::query_as("SELECT oauth_refresh_token FROM accounts WHERE id = ?1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        row.0.unwrap_or_default()
+    }
+
+    /// Regression for the 2026-04-22 production incident: after a probe rotated
+    /// the refresh token (via `upsert_account_oauth` directly), the pool's
+    /// periodic `do_flush` was writing the *stale* in-memory slot's token back
+    /// into the DB, invalidating the rotation. `do_flush` must no longer touch
+    /// credential columns.
+    #[tokio::test]
+    async fn probe_success_does_not_overwrite_rt_on_flush() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        insert_oauth_row(&pool, 1, "at0", "rt0").await;
+
+        let mut state = empty_state(pool.clone());
+        let mut slot = AccountSlot::new(&oauth_placeholder_cookie(1), None).unwrap();
+        slot.account_id = Some(1);
+        slot.token = Some(token_with_refresh("rt0"));
+        state.valid.push_back(slot);
+
+        // A concurrent refresh (probe or chat) rotated the token in DB to rt1
+        // without telling the pool's in-memory slot.
+        let rotated = TokenInfo::from_parts(
+            "at1".to_string(),
+            "rt1".to_string(),
+            Duration::from_secs(3600),
+            "org".to_string(),
+        );
+        crate::db::accounts::upsert_account_oauth(&pool, 1, Some(&rotated), None)
+            .await
+            .unwrap();
+        assert_eq!(read_refresh_token(&pool, 1).await, "rt1");
+
+        // Simulate any runtime-state change that would mark the account dirty.
+        AccountPoolActor::mark_dirty(&mut state, Some(1));
+        AccountPoolActor::do_flush(&mut state).await;
+
+        // do_flush must not have clobbered the freshly-rotated refresh token.
+        assert_eq!(
+            read_refresh_token(&pool, 1).await,
+            "rt1",
+            "do_flush must not overwrite oauth_refresh_token from stale in-memory slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_slot_credential_replaces_in_memory_token() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        insert_oauth_row(&pool, 1, "at0", "rt0").await;
+
+        let mut state = empty_state(pool);
+        let mut slot = AccountSlot::new(&oauth_placeholder_cookie(1), None).unwrap();
+        slot.account_id = Some(1);
+        slot.token = Some(token_with_refresh("rt0"));
+        state.valid.push_back(slot);
+
+        AccountPoolActor::update_slot_credential(&mut state, 1, Some(token_with_refresh("rt1")));
+
+        let updated = state
+            .valid
+            .iter()
+            .find(|c| c.account_id == Some(1))
+            .and_then(|c| c.token.as_ref())
+            .map(|t| t.refresh_token.clone());
+        assert_eq!(updated.as_deref(), Some("rt1"));
+        // No dirty marking — flush should not write token via this path.
+        assert!(state.dirty.is_empty());
     }
 }
