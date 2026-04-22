@@ -103,6 +103,7 @@ function LogDetail({ log, onClose }: { log: RequestLog | null; onClose: () => vo
     ? [
         ["请求 ID", <Code key="rid">{log.request_id}</Code>],
         ["类型", <Badge key="ty" color={requestTypeColor(log.request_type)} variant="light">{log.request_type}</Badge>],
+        ["账号", log.account_name ?? "—"],
         ["代理名", log.request_type === "probe_proxy" ? (proxyName ?? (bodyLoading ? "加载中..." : "—")) : "—"],
         ["开始时间", formatDate(log.started_at)],
         ["完成时间", formatDate(log.completed_at)],

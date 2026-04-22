@@ -14,8 +14,8 @@ use sqlx::SqlitePool;
 use super::common::PaginationParams;
 use crate::{
     billing::{BillingContext, RequestType, persist_probe_log},
-    claude_code_state::{build_api_client, probe::probe_oauth_account},
-    config::{CLAUDE_ENDPOINT, ClewdrCookie},
+    claude_code_state::{ClaudeCodeState, build_api_client, probe::probe_oauth_account},
+    config::{AccountSlot, CLAUDE_ENDPOINT, ClewdrCookie},
     db::accounts::{
         AccountWithRuntime, batch_upsert_runtime_states, get_account_by_id, load_all_accounts,
         update_account_metadata_unchecked, upsert_account_oauth,
@@ -722,118 +722,143 @@ pub async fn test_account(
             msg: "account not found",
         })?;
 
-    // 2. Validate: must have OAuth token
-    let token = account.oauth_token.ok_or(ClewdrError::BadRequest {
-        msg: "account has no OAuth token",
-    })?;
     if account.status == "disabled" {
         return Err(ClewdrError::BadRequest {
             msg: "account is disabled",
         });
     }
 
-    // 3. Refresh token if expired
     let started_at = chrono::Utc::now();
-    let access_token = if token.is_expired() {
-        // Serialize concurrent refreshes for this account.
-        let _guard = crate::services::oauth_refresh_guard::guard().lock(id).await;
-
-        // After acquiring the guard, pick the authoritative current token.
-        // Prefer the pool's cached copy; fall back to a fresh DB read if the
-        // pool has no entry for this account (e.g. it was moved to
-        // `state.invalid` by a prior auth_error). DB is authoritative per
-        // docs §"容易漏掉 #5" — the `token` variable loaded before the guard
-        // may be stale if a peer rotated it while we were queued.
-        let token = if let Some(t) = state.account_pool.get_token(id).await.unwrap_or(None) {
-            t
-        } else {
-            match get_account_by_id(&state.db, id).await {
-                Ok(Some(acc)) => acc.oauth_token.unwrap_or(token),
-                _ => token,
-            }
-        };
-
-        // Fast path: a peer already refreshed; reuse the fresh access token.
-        if !token.is_expired() {
-            token.access_token
-        } else {
-            match refresh_oauth_token(&token, account.proxy_url.as_deref()).await {
-                Ok(refreshed) => {
-                    // DB-authoritative: persist rotated token first. Only
-                    // mirror into the in-memory pool after the DB write
-                    // succeeds — leaving memory ahead of DB is the exact
-                    // inversion of the "credentials follow DB" rule.
-                    if let Err(db_err) =
-                        upsert_account_oauth(&state.db, id, Some(&refreshed.token), None).await
-                    {
-                        let error_msg = format!("failed to persist refreshed token: {db_err}");
-                        let ctx = BillingContext {
-                            db: state.db.clone(),
-                            user_id: None,
-                            api_key_id: None,
-                            account_id: Some(id),
-                            model_raw: String::new(),
-                            request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
-                            started_at,
-                            event_tx: state.event_tx.clone(),
-                        };
-                        persist_probe_log(
-                            &ctx,
-                            RequestType::Test,
-                            "internal_error",
-                            None,
-                            "",
-                            Some(&error_msg),
-                        )
-                        .await;
-                        return Ok(Json(TestAccountResponse {
-                            success: false,
-                            latency_ms: (chrono::Utc::now() - started_at).num_milliseconds(),
-                            error: Some(error_msg),
-                            http_status: None,
-                        }));
+    let access_token = match account.oauth_token.clone() {
+        Some(token) => {
+            if token.is_expired() {
+                let _guard = crate::services::oauth_refresh_guard::guard().lock(id).await;
+                let token = if let Some(t) = state.account_pool.get_token(id).await.unwrap_or(None)
+                {
+                    t
+                } else {
+                    match get_account_by_id(&state.db, id).await {
+                        Ok(Some(acc)) => acc.oauth_token.unwrap_or(token),
+                        _ => token,
                     }
-                    state
-                        .account_pool
-                        .update_credential(id, Some(refreshed.token.clone()))
-                        .await;
-                    refreshed.token.access_token
+                };
+                if !token.is_expired() {
+                    token.access_token
+                } else {
+                    match refresh_oauth_token(&token, account.proxy_url.as_deref()).await {
+                        Ok(refreshed) => {
+                            if let Err(db_err) =
+                                upsert_account_oauth(&state.db, id, Some(&refreshed.token), None)
+                                    .await
+                            {
+                                let error_msg =
+                                    format!("failed to persist refreshed token: {db_err}");
+                                let ctx = BillingContext {
+                                    db: state.db.clone(),
+                                    user_id: None,
+                                    api_key_id: None,
+                                    account_id: Some(id),
+                                    model_raw: String::new(),
+                                    request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
+                                    started_at,
+                                    event_tx: state.event_tx.clone(),
+                                };
+                                persist_probe_log(
+                                    &ctx,
+                                    RequestType::Test,
+                                    "internal_error",
+                                    None,
+                                    "",
+                                    Some(&error_msg),
+                                )
+                                .await;
+                                return Ok(Json(TestAccountResponse {
+                                    success: false,
+                                    latency_ms: (chrono::Utc::now() - started_at)
+                                        .num_milliseconds(),
+                                    error: Some(error_msg),
+                                    http_status: None,
+                                }));
+                            }
+                            state
+                                .account_pool
+                                .update_credential(id, Some(refreshed.token.clone()))
+                                .await;
+                            refreshed.token.access_token
+                        }
+                        Err(e) => {
+                            let error_msg = e.to_string();
+                            let ctx = BillingContext {
+                                db: state.db.clone(),
+                                user_id: None,
+                                api_key_id: None,
+                                account_id: Some(id),
+                                model_raw: String::new(),
+                                request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
+                                started_at,
+                                event_tx: state.event_tx.clone(),
+                            };
+                            persist_probe_log(
+                                &ctx,
+                                RequestType::Test,
+                                "auth_rejected",
+                                None,
+                                "",
+                                Some(&error_msg),
+                            )
+                            .await;
+                            return Ok(Json(TestAccountResponse {
+                                success: false,
+                                latency_ms: (chrono::Utc::now() - started_at).num_milliseconds(),
+                                error: Some(error_msg),
+                                http_status: None,
+                            }));
+                        }
+                    }
                 }
-                Err(e) => {
-                    let error_msg = e.to_string();
-                    let ctx = BillingContext {
-                        db: state.db.clone(),
-                        user_id: None,
-                        api_key_id: None,
-                        account_id: Some(id),
-                        model_raw: String::new(),
-                        request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
-                        started_at,
-                        event_tx: state.event_tx.clone(),
-                    };
-                    persist_probe_log(
-                        &ctx,
-                        RequestType::Test,
-                        "auth_rejected",
-                        None,
-                        "",
-                        Some(&error_msg),
-                    )
-                    .await;
-                    return Ok(Json(TestAccountResponse {
-                        success: false,
-                        latency_ms: (chrono::Utc::now() - started_at).num_milliseconds(),
-                        error: Some(error_msg),
-                        http_status: None,
-                    }));
-                }
+            } else {
+                token.access_token
             }
         }
-    } else {
-        token.access_token.clone()
+        None => {
+            let cookie_blob = account
+                .cookie_blob
+                .as_deref()
+                .ok_or(ClewdrError::BadRequest {
+                    msg: "account has no usable credential",
+                })?;
+            let mut slot = AccountSlot::new(cookie_blob, None)?;
+            slot.account_id = Some(id);
+            slot.proxy_url = account.proxy_url.clone();
+            let mut cc_state =
+                ClaudeCodeState::from_cookie(state.account_pool.clone(), slot, profile.clone())?;
+            match cc_state.check_token() {
+                crate::claude_code_state::TokenStatus::None => {
+                    let org = cc_state.get_organization().await?;
+                    let code = cc_state.exchange_code(&org).await?;
+                    cc_state.exchange_token(code).await?;
+                }
+                crate::claude_code_state::TokenStatus::Expired => {
+                    cc_state.refresh_token().await?;
+                }
+                crate::claude_code_state::TokenStatus::Valid => {}
+            }
+            let token = cc_state
+                .cookie
+                .as_ref()
+                .and_then(|slot| slot.token.as_ref())
+                .cloned()
+                .ok_or(ClewdrError::UnexpectedNone {
+                    msg: "No access token found after cookie credential exchange",
+                })?;
+            state
+                .account_pool
+                .update_credential(id, Some(token.clone()))
+                .await;
+            token.access_token
+        }
     };
 
-    // 4. Build minimal request
     let body = serde_json::json!({
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 10,
