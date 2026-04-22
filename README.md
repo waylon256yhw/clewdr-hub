@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" width="140" alt="clewdr-hub" />
+</p>
+
 # clewdr-hub
 
 基于 [clewdr](https://github.com/Xerxes-2/clewdr) 的多用户 Claude 共享网关。

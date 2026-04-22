@@ -41,6 +41,9 @@ export default function Login() {
       <Paper shadow="md" p="xl" maw={360} w="100%" radius="md" withBorder>
         <form onSubmit={handleSubmit}>
           <Stack>
+            <Center>
+              <img src="/logo.svg" alt="clewdr-hub" width={72} height={72} />
+            </Center>
             <Title order={3} ta="center">
               clewdr-hub 管理面板
             </Title>

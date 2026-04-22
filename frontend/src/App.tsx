@@ -228,8 +228,9 @@ function AdminShell() {
     >
       <AppShell.Header>
         <Group h="100%" px="md" justify="space-between">
-          <Group>
+          <Group gap="xs">
             <Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
+            <img src="/logo.svg" alt="" width={28} height={28} />
             <Title order={4}>clewdr-hub</Title>
           </Group>
           <Group gap="xs">
