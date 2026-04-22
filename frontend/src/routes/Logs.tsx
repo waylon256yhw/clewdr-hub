@@ -41,6 +41,10 @@ function hasProbeJsonDetail(t: string): boolean {
   return t === "probe_cookie" || t === "probe_oauth" || t === "probe_proxy" || t === "test";
 }
 
+function shouldShowModel(log: RequestLog): boolean {
+  return log.request_type === "test" || !isProbeType(log.request_type);
+}
+
 function prettyJson(raw: string): string {
   try {
     return JSON.stringify(JSON.parse(raw), null, 2);
@@ -86,6 +90,7 @@ function LogDetail({ log, onClose }: { log: RequestLog | null; onClose: () => vo
     log.request_type === "probe_proxy"
       ? extractProbeProxyName(bodyData?.response_body)
       : null;
+  const showModel = shouldShowModel(log);
 
   const handleCopy = async () => {
     if (!formattedProbeJson) return;
@@ -104,6 +109,7 @@ function LogDetail({ log, onClose }: { log: RequestLog | null; onClose: () => vo
         ["请求 ID", <Code key="rid">{log.request_id}</Code>],
         ["类型", <Badge key="ty" color={requestTypeColor(log.request_type)} variant="light">{log.request_type}</Badge>],
         ["账号", log.account_name ?? "—"],
+        ["模型", showModel ? (log.model_raw ?? "—") : "—"],
         ["代理名", log.request_type === "probe_proxy" ? (proxyName ?? (bodyLoading ? "加载中..." : "—")) : "—"],
         ["开始时间", formatDate(log.started_at)],
         ["完成时间", formatDate(log.completed_at)],
@@ -120,7 +126,7 @@ function LogDetail({ log, onClose }: { log: RequestLog | null; onClose: () => vo
         ["Key", log.key_label ?? "—"],
         ["账号", log.account_name ?? "—"],
         ["代理名", "—"],
-        ["模型", probe ? "—" : (log.model_raw ?? "—")],
+        ["模型", showModel ? (log.model_raw ?? "—") : "—"],
         ["模型 (标准化)", log.model_normalized ?? "—"],
         ["流式", log.stream ? "是" : "否"],
         ["开始时间", formatDate(log.started_at)],
@@ -385,6 +391,7 @@ export default function Logs() {
               <Table.Tbody>
                 {logs.map((log) => {
                   const probe = isProbeType(log.request_type);
+                  const showModel = shouldShowModel(log);
                   return (
                   <Table.Tr
                     key={log.id}
@@ -399,7 +406,9 @@ export default function Logs() {
                     </Table.Td>
                     <Table.Td>{log.username ?? "—"}</Table.Td>
                     <Table.Td>
-                      <Text size="xs" lineClamp={1}>{probe ? "—" : (log.model_raw ?? "—")}</Text>
+                      <Text size="xs" lineClamp={1}>
+                        {showModel ? (log.model_raw ?? "—") : "—"}
+                      </Text>
                     </Table.Td>
                     <Table.Td>
                       <Badge color={statusColor(log.status)} variant="light" size="sm">

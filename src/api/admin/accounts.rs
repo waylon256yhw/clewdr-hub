@@ -700,6 +700,8 @@ pub async fn probe_all(
 // Credential test — minimal /v1/messages probe
 // ---------------------------------------------------------------------------
 
+const TEST_ACCOUNT_MODEL: &str = "claude-haiku-4-5-20251001";
+
 #[derive(Serialize)]
 pub struct TestAccountResponse {
     pub success: bool,
@@ -758,7 +760,7 @@ pub async fn test_account(
                                     user_id: None,
                                     api_key_id: None,
                                     account_id: Some(id),
-                                    model_raw: String::new(),
+                                    model_raw: TEST_ACCOUNT_MODEL.to_string(),
                                     request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
                                     started_at,
                                     event_tx: state.event_tx.clone(),
@@ -793,7 +795,7 @@ pub async fn test_account(
                                 user_id: None,
                                 api_key_id: None,
                                 account_id: Some(id),
-                                model_raw: String::new(),
+                                model_raw: TEST_ACCOUNT_MODEL.to_string(),
                                 request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
                                 started_at,
                                 event_tx: state.event_tx.clone(),
@@ -860,7 +862,7 @@ pub async fn test_account(
     };
 
     let body = serde_json::json!({
-        "model": "claude-haiku-4-5-20251001",
+        "model": TEST_ACCOUNT_MODEL,
         "max_tokens": 10,
         "messages": [{"role": "user", "content": "reply with ok only"}],
         "stream": false,
@@ -912,7 +914,7 @@ pub async fn test_account(
         user_id: None,
         api_key_id: None,
         account_id: Some(id),
-        model_raw: "claude-haiku-4-5-20251001".to_string(),
+        model_raw: TEST_ACCOUNT_MODEL.to_string(),
         request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
         started_at,
         event_tx: state.event_tx.clone(),
