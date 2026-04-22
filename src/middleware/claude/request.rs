@@ -24,7 +24,6 @@ use crate::{
 };
 
 const CLAUDE_CODE_ENTRYPOINT_ENV: &str = "CLAUDE_CODE_ENTRYPOINT";
-
 fn prepend_system_blocks(body: &mut CreateMessageParams, blocks: Vec<ContentBlock>) {
     if blocks.is_empty() {
         return;
@@ -95,6 +94,62 @@ fn claude_code_billing_header(messages: &[Message], profile: &StealthProfile) ->
         profile.cli_version,
         &version_hash[..3]
     )
+}
+
+fn is_billing_header_text(text: &str) -> bool {
+    text.trim_start()
+        .to_ascii_lowercase()
+        .starts_with("x-anthropic-billing-header:")
+}
+
+fn strip_leading_billing_header(text: &str) -> Option<String> {
+    if !is_billing_header_text(text) {
+        return Some(text.to_string());
+    }
+
+    let stripped = text
+        .lines()
+        .skip_while(|line| line.trim().is_empty())
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stripped = stripped.trim_start_matches('\n').trim().to_string();
+
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped)
+    }
+}
+
+fn strip_billing_headers_from_system(body: &mut CreateMessageParams) {
+    let Some(system) = body.system.take() else {
+        return;
+    };
+
+    let stripped = match system {
+        Value::String(text) => strip_leading_billing_header(&text).map(Value::String),
+        Value::Array(systems) => {
+            let filtered = systems
+                .into_iter()
+                .filter(|entry| match entry {
+                    Value::String(text) => !is_billing_header_text(text),
+                    Value::Object(obj)
+                        if matches!(obj.get("type"), Some(Value::String(t)) if t == "text") =>
+                    {
+                        obj.get("text")
+                            .and_then(Value::as_str)
+                            .is_none_or(|text| !is_billing_header_text(text))
+                    }
+                    _ => true,
+                })
+                .collect::<Vec<_>>();
+            Some(Value::Array(filtered))
+        }
+        other => Some(other),
+    };
+
+    body.system = stripped;
 }
 
 fn drop_empty_system(body: &mut CreateMessageParams) {
@@ -369,6 +424,8 @@ where
 
         let stream = body.stream.unwrap_or_default();
 
+        strip_billing_headers_from_system(&mut body);
+
         let system_prefixes = vec![ContentBlock::text(claude_code_billing_header(
             &body.messages,
             &profile,
@@ -497,6 +554,71 @@ mod tests {
             .map(|value| value["text"].as_str().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(texts, vec!["billing", "original system"]);
+    }
+
+    #[test]
+    fn strip_billing_headers_from_string_system() {
+        let mut body = CreateMessageParams {
+            messages: vec![Message::new_text(Role::User, "hey")],
+            model: "claude-sonnet-4-5".to_string(),
+            system: Some(json!(
+                "x-anthropic-billing-header: cc_version=2.1.117.320; cch=abcde;"
+            )),
+            ..Default::default()
+        };
+
+        strip_billing_headers_from_system(&mut body);
+
+        assert!(body.system.is_none());
+    }
+
+    #[test]
+    fn strip_billing_header_preserves_following_string_system_text() {
+        let mut body = CreateMessageParams {
+            messages: vec![Message::new_text(Role::User, "hey")],
+            model: "claude-sonnet-4-5".to_string(),
+            system: Some(json!(
+                "x-anthropic-billing-header: cc_version=2.1.117.320; cch=abcde;\nYou are Claude.\nKeep this instruction."
+            )),
+            ..Default::default()
+        };
+
+        strip_billing_headers_from_system(&mut body);
+
+        assert_eq!(
+            body.system,
+            Some(json!("You are Claude.\nKeep this instruction."))
+        );
+    }
+
+    #[test]
+    fn strip_billing_headers_from_array_system() {
+        let mut body = CreateMessageParams {
+            messages: vec![Message::new_text(Role::User, "hey")],
+            model: "claude-sonnet-4-5".to_string(),
+            system: Some(json!([
+                {
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.117.320; cch=abcde;"
+                },
+                {
+                    "type": "text",
+                    "text": "keep me",
+                    "cache_control": { "type": "ephemeral" }
+                }
+            ])),
+            ..Default::default()
+        };
+
+        strip_billing_headers_from_system(&mut body);
+
+        let systems = body.system.unwrap().as_array().cloned().unwrap();
+        assert_eq!(systems.len(), 1);
+        assert_eq!(systems[0]["text"].as_str(), Some("keep me"));
+        assert_eq!(
+            systems[0]["cache_control"]["type"].as_str(),
+            Some("ephemeral")
+        );
     }
 
     fn make_body(
