@@ -136,6 +136,10 @@ impl RouterBuilder {
                         "text/html; charset=utf-8"
                     } else if path.ends_with(".svg") {
                         "image/svg+xml"
+                    } else if path.ends_with(".png") {
+                        "image/png"
+                    } else if path.ends_with(".ico") {
+                        "image/x-icon"
                     } else if path.ends_with(".json") {
                         "application/json"
                     } else {
@@ -193,6 +197,10 @@ impl RouterBuilder {
                             "text/html; charset=utf-8"
                         } else if path.ends_with(".svg") {
                             "image/svg+xml"
+                        } else if path.ends_with(".png") {
+                            "image/png"
+                        } else if path.ends_with(".ico") {
+                            "image/x-icon"
                         } else if path.ends_with(".json") {
                             "application/json"
                         } else {
