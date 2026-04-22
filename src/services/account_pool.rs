@@ -90,6 +90,13 @@ enum AccountPoolMessage {
     /// in-memory slot. Used by refresh callers to re-check (after acquiring the
     /// per-account refresh guard) whether a peer already refreshed the token.
     GetToken(i64, RpcReplyPort<Option<TokenInfo>>),
+    /// Converge the in-memory pool for an account whose status has already
+    /// been persisted to DB by an explicit write path (e.g.
+    /// `set_account_auth_error`, `set_account_disabled`). This message does
+    /// **not** mark the account dirty — persisting status is the caller's
+    /// responsibility, `do_flush` must not touch the authoritative status by
+    /// way of `state.invalid`.
+    Invalidate(i64, Reason),
 }
 
 #[derive(Debug)]
@@ -97,7 +104,7 @@ struct AccountPoolState {
     valid: VecDeque<AccountSlot>,
     exhausted: HashSet<AccountSlot>,
     invalid: HashSet<InvalidAccountSlot>,
-    moka: Cache<u64, AccountSlot>,
+    moka: Cache<u64, i64>,
     db: SqlitePool,
     event_tx: broadcast::Sender<AdminEvent>,
     dirty: HashSet<i64>,
@@ -156,6 +163,87 @@ impl AccountPoolActor {
             slot.token = token;
             state.exhausted.insert(slot);
         }
+    }
+
+    /// In-memory convergence for an account whose authoritative status was
+    /// just written to DB by an explicit path (`set_account_auth_error`,
+    /// `set_account_disabled`, or similar). Removes the account from dispatch
+    /// surfaces, wipes affinity entries pointing at it, and records it in
+    /// `state.invalid` so pool-view summaries reflect DB reality.
+    ///
+    /// Deliberately does **not** call `mark_dirty`: the status was already
+    /// persisted by the caller, and letting `do_flush` also touch status would
+    /// let the pool's Reason race with the DB's (`auth_error` vs `disabled`).
+    /// See `docs/account-normalization-2026-04-21.md` §"容易漏掉 #5" for the
+    /// broader principle.
+    fn converge_invalidate(state: &mut AccountPoolState, account_id: i64, reason: Reason) {
+        // Remove from valid.
+        let mut removed_cookie: Option<ClewdrCookie> = None;
+        state.valid.retain(|c| {
+            if c.account_id == Some(account_id) {
+                if removed_cookie.is_none() {
+                    removed_cookie = Some(c.cookie.clone());
+                }
+                false
+            } else {
+                true
+            }
+        });
+
+        // Remove from exhausted (pulls by account_id lookup-then-take).
+        if let Some(template) = state
+            .exhausted
+            .iter()
+            .find(|c| c.account_id == Some(account_id))
+            .cloned()
+            && let Some(slot) = state.exhausted.take(&template)
+        {
+            removed_cookie.get_or_insert(slot.cookie);
+        }
+
+        // Record in invalid so pool-view summaries and collect's sticky-reason
+        // guard see the authoritative reason. Existing entry (if any) is
+        // replaced so the reason reflects the latest cause.
+        if let Some(cookie) = removed_cookie {
+            let marker = InvalidAccountSlot::new(cookie.clone(), Reason::Null);
+            let existing = state.invalid.take(&marker);
+            state.invalid.insert(InvalidAccountSlot::with_account_id(
+                cookie,
+                reason,
+                Some(account_id),
+            ));
+            drop(existing);
+        }
+
+        // Stop advertising the account for preferred-drain dispatch.
+        state.drain_first_ids.remove(&account_id);
+
+        // Detach the account from every flush-driven DB status write so the
+        // authoritative status just written by the caller cannot be raced:
+        //   - `reactivated` would cause `set_accounts_active` to flip it back
+        //     to "active".
+        //   - `dirty` combined with an entry in `state.invalid` would cause
+        //     `set_account_disabled(id, reason.to_db_string())` to overwrite
+        //     an `auth_error` row with `disabled`. Runtime-state flushing
+        //     only scans `valid` + `exhausted` (neither contains this account
+        //     anymore), so dropping the account from `dirty` loses nothing
+        //     meaningful.
+        state.reactivated.remove(&account_id);
+        state.dirty.remove(&account_id);
+
+        // Wipe affinity entries pointing at this account_id so coding sessions
+        // rebind on the next request.
+        state
+            .moka
+            .invalidate_entries_if(move |_, v| *v == account_id)
+            .ok();
+
+        // Inflight is intentionally left alone: in-flight Return / ReleaseSlot
+        // messages still arrive for this account and must decrement the
+        // counter. The collect sticky-reason guard prevents those Returns from
+        // flipping the account back into `valid`.
+
+        Self::emit_accounts_refresh(state);
     }
 
     fn mark_all_dirty(state: &mut AccountPoolState) {
@@ -321,96 +409,170 @@ impl AccountPoolActor {
             }
         });
 
-        let is_allowed = |c: &AccountSlot, inflight: &HashMap<i64, (u32, u32)>| -> bool {
-            let bound_ok = bound.is_empty() || c.account_id.is_some_and(|id| bound.contains(&id));
-            let slot_ok = c.account_id.map_or(true, |id| {
-                inflight.get(&id).map_or(true, |(cur, max)| cur < max)
-            });
-            bound_ok && slot_ok
+        // --- predicates ---
+        let bound_ok = |id: i64| -> bool { bound.is_empty() || bound.contains(&id) };
+        let slot_ok = |id: i64, inflight: &HashMap<i64, (u32, u32)>| -> bool {
+            inflight.get(&id).is_none_or(|(cur, max)| cur < max)
+        };
+        let is_usable = |c: &AccountSlot, inflight: &HashMap<i64, (u32, u32)>| -> bool {
+            c.account_id
+                .is_some_and(|id| bound_ok(id) && slot_ok(id, inflight))
         };
 
-        // Phase 1: prefer accounts flagged `drain_first` that are still allowed
-        // and have available inflight slots. This overrides moka cache affinity
-        // on purpose — the intent of `drain_first` is to concentrate usage on
-        // these accounts until they are saturated or cooling down, after which
-        // we fall through to the normal round-robin / cached selection.
+        // ---------- Phase A: affinity ----------
+        // Check the prompt-hash → account_id binding first. If the cached
+        // account is usable right now, return it without touching the cache
+        // (no insert). If it's unusable only because its inflight slots are
+        // saturated, we overflow-borrow another drain_first (or regular)
+        // account — but we do NOT rewrite the cache, so affinity stays with
+        // the original once it frees up. The cache is only invalidated when
+        // the cached account has been removed from `valid` (Invalidate, delete,
+        // or bound mismatch) — in that case we fall through to B/C which
+        // rewrites it.
+        let cached_id = cache_key.and_then(|k| state.moka.get(&k));
+        if let Some(cached_id) = cached_id {
+            let cached_pos = state
+                .valid
+                .iter()
+                .position(|c| c.account_id == Some(cached_id));
+            match cached_pos {
+                None => {
+                    // cached in moka but no longer in valid (Invalidate'd /
+                    // account removed / filtered by bound). Let B/C pick a
+                    // fresh account and rewrite the cache.
+                    if let Some(k) = cache_key {
+                        state.moka.invalidate(&k);
+                    }
+                }
+                Some(pos) => {
+                    if is_usable(&state.valid[pos], &state.inflight) {
+                        return Self::commit_dispatch(state, pos, cache_key, false);
+                    }
+                    if !bound_ok(cached_id) {
+                        // Cached doesn't match this request's bound set — treat
+                        // as stale. Drop cache, fall through to B/C to bind to
+                        // an in-bound account.
+                        if let Some(k) = cache_key {
+                            state.moka.invalidate(&k);
+                        }
+                    } else {
+                        // Only inflight saturation — overflow-borrow a sibling
+                        // (drain_first preferred) without touching the cache.
+                        let borrow_pos = state
+                            .valid
+                            .iter()
+                            .position(|c| {
+                                c.account_id != Some(cached_id)
+                                    && is_usable(c, &state.inflight)
+                                    && c.account_id
+                                        .is_some_and(|id| state.drain_first_ids.contains(&id))
+                            })
+                            .or_else(|| {
+                                state.valid.iter().position(|c| {
+                                    c.account_id != Some(cached_id) && is_usable(c, &state.inflight)
+                                })
+                            });
+                        return match borrow_pos {
+                            Some(pos) => Self::commit_dispatch(state, pos, cache_key, false),
+                            None => Err(Self::dispatch_empty_error(state, bound)),
+                        };
+                    }
+                }
+            }
+        }
+
+        // ---------- Phase B: prefer drain_first accounts ----------
         if !state.drain_first_ids.is_empty()
-            && let Some(idx) = state.valid.iter().position(|c| {
-                is_allowed(c, &state.inflight)
+            && let Some(pos) = state.valid.iter().position(|c| {
+                is_usable(c, &state.inflight)
                     && c.account_id
                         .is_some_and(|id| state.drain_first_ids.contains(&id))
             })
         {
-            let cookie = state.valid.remove(idx).unwrap();
-            if let Some(aid) = cookie.account_id {
-                if let Some((cur, _)) = state.inflight.get_mut(&aid) {
-                    *cur += 1;
-                }
-            }
-            state.valid.push_back(cookie.clone());
-            if let Some(key) = cache_key {
-                state.moka.insert(key, cookie.clone());
-            }
-            return Ok(cookie);
+            return Self::commit_dispatch(state, pos, cache_key, true);
         }
 
-        if let Some(key) = cache_key
-            && let Some(cached) = state.moka.get(&key)
-            && let Some(cookie) = state
-                .valid
-                .iter()
-                .find(|c| *c == &cached && is_allowed(c, &state.inflight))
-        {
-            let cookie = cookie.clone();
-            if let Some(aid) = cookie.account_id {
-                if let Some((cur, _)) = state.inflight.get_mut(&aid) {
-                    *cur += 1;
-                }
-            }
-            state.moka.insert(key, cookie.clone());
-            return Ok(cookie);
-        }
-
-        let idx = match state
+        // ---------- Phase C: round-robin ----------
+        if let Some(pos) = state
             .valid
             .iter()
-            .position(|c| is_allowed(c, &state.inflight))
+            .position(|c| is_usable(c, &state.inflight))
         {
-            Some(idx) => idx,
-            None => {
-                // Determine whether this is a temporary (cooling) or permanent (invalid/empty) failure.
-                let has_relevant_valid = state.valid.iter().any(|c| {
-                    bound.is_empty() || c.account_id.is_some_and(|id| bound.contains(&id))
-                });
-                let has_relevant_exhausted = state.exhausted.iter().any(|c| {
-                    bound.is_empty() || c.account_id.is_some_and(|id| bound.contains(&id))
-                });
-                // Valid accounts exist but all slots are full, or some are in cooldown → temporary
-                return Err(if has_relevant_valid || has_relevant_exhausted {
-                    ClewdrError::UpstreamCoolingDown
-                } else {
-                    ClewdrError::NoValidUpstreamAccounts
-                });
-            }
-        };
+            return Self::commit_dispatch(state, pos, cache_key, true);
+        }
 
-        let cookie = state.valid.remove(idx).unwrap();
-        if let Some(aid) = cookie.account_id {
-            if let Some((cur, _)) = state.inflight.get_mut(&aid) {
-                *cur += 1;
-            }
+        Err(Self::dispatch_empty_error(state, bound))
+    }
+
+    /// Remove the slot at `pos` from `valid`, increment inflight, re-queue at
+    /// the back (round-robin), and optionally rewrite the affinity cache.
+    fn commit_dispatch(
+        state: &mut AccountPoolState,
+        pos: usize,
+        cache_key: Option<u64>,
+        rewrite_cache: bool,
+    ) -> Result<AccountSlot, ClewdrError> {
+        let cookie = state.valid.remove(pos).unwrap();
+        if let Some(aid) = cookie.account_id
+            && let Some((cur, _)) = state.inflight.get_mut(&aid)
+        {
+            *cur += 1;
         }
         state.valid.push_back(cookie.clone());
-        if let Some(key) = cache_key {
-            state.moka.insert(key, cookie.clone());
+        if rewrite_cache
+            && let Some(key) = cache_key
+            && let Some(aid) = cookie.account_id
+        {
+            state.moka.insert(key, aid);
         }
         Ok(cookie)
+    }
+
+    /// Classify dispatch failure: if any in-bound account is still in `valid`
+    /// or `exhausted` we return `UpstreamCoolingDown` (transient); otherwise
+    /// there is no account to serve at all → `NoValidUpstreamAccounts`.
+    fn dispatch_empty_error(state: &AccountPoolState, bound: &[i64]) -> ClewdrError {
+        let has_relevant_valid = state
+            .valid
+            .iter()
+            .any(|c| bound.is_empty() || c.account_id.is_some_and(|id| bound.contains(&id)));
+        let has_relevant_exhausted = state
+            .exhausted
+            .iter()
+            .any(|c| bound.is_empty() || c.account_id.is_some_and(|id| bound.contains(&id)));
+        if has_relevant_valid || has_relevant_exhausted {
+            ClewdrError::UpstreamCoolingDown
+        } else {
+            ClewdrError::NoValidUpstreamAccounts
+        }
     }
 
     fn collect(state: &mut AccountPoolState, cookie: AccountSlot, reason: Option<Reason>) -> bool {
         let aid = cookie.account_id;
 
         let removed_probe = aid.is_some_and(|id| state.probing.remove(&id));
+
+        let tmp = InvalidAccountSlot::new(cookie.cookie.clone(), Reason::Null);
+
+        // Sticky-reason guard: accounts explicitly invalidated (via the
+        // `Invalidate` message from an auth_error / disabled path, or via a
+        // DB reload that surfaced one of those states) must not be
+        // auto-reactivated by a Return from an in-flight request that predates
+        // the invalidation. TMR / Restricted remain transient — the cooldown
+        // reactivation path below stays intact for those reasons.
+        if let Some(existing) = state.invalid.get(&tmp)
+            && matches!(
+                existing.reason,
+                Reason::Free | Reason::Disabled | Reason::Banned | Reason::Null
+            )
+        {
+            // Silent drop: the DB already reflects the authoritative reason,
+            // the inflight counter is decremented independently by
+            // `ReleaseSlot`, and no SSE event is owed — callers that care
+            // have already seen the status change via the explicit DB write
+            // path's own notification.
+            return removed_probe;
+        }
 
         // Remove from whichever set the cookie currently lives in
         let was_valid = state
@@ -419,7 +581,6 @@ impl AccountPoolActor {
             .position(|c| *c == cookie)
             .map(|i| state.valid.remove(i).unwrap());
         let was_exhausted = state.exhausted.take(&cookie);
-        let tmp = InvalidAccountSlot::new(cookie.cookie.clone(), Reason::Null);
         let was_invalid = state.invalid.take(&tmp);
 
         if was_valid.is_none() && was_exhausted.is_none() && was_invalid.is_none() {
@@ -865,6 +1026,7 @@ impl Actor for AccountPoolActor {
         let moka = Cache::builder()
             .max_capacity(1000)
             .time_to_idle(std::time::Duration::from_secs(60 * 60))
+            .support_invalidation_closures()
             .build();
 
         let mut state = AccountPoolState {
@@ -987,6 +1149,9 @@ impl Actor for AccountPoolActor {
                     .find(|c| c.account_id == Some(account_id))
                     .and_then(|c| c.token.clone());
                 reply_port.send(token)?;
+            }
+            AccountPoolMessage::Invalidate(account_id, reason) => {
+                Self::converge_invalidate(state, account_id, reason);
             }
         }
         Ok(())
@@ -1259,6 +1424,17 @@ impl AccountPoolHandle {
             }
         })
     }
+
+    /// Converge the in-memory pool after an explicit DB status write
+    /// (auth_error, disabled, banned, etc.). Does not persist status — the
+    /// caller is expected to have already written it via the appropriate
+    /// `set_account_*` helper. See `AccountPoolActor::converge_invalidate`.
+    pub async fn invalidate(&self, account_id: i64, reason: Reason) {
+        let _ = ractor::cast!(
+            self.actor_ref,
+            AccountPoolMessage::Invalidate(account_id, reason)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1273,7 +1449,7 @@ mod tests {
     use moka::sync::Cache;
     use tokio::sync::broadcast;
 
-    use crate::config::{AccountSlot, ClewdrCookie, TokenInfo};
+    use crate::config::{AccountSlot, ClewdrCookie, Reason, TokenInfo};
     use crate::db::init_pool;
 
     #[test]
@@ -1345,6 +1521,7 @@ mod tests {
         let moka = Cache::builder()
             .max_capacity(1000)
             .time_to_idle(std::time::Duration::from_secs(60 * 60))
+            .support_invalidation_closures()
             .build();
         AccountPoolState {
             valid: VecDeque::new(),
@@ -1461,5 +1638,233 @@ mod tests {
         assert_eq!(updated.as_deref(), Some("rt1"));
         // No dirty marking — flush should not write token via this path.
         assert!(state.dirty.is_empty());
+    }
+
+    // Compile-time assertion that the affinity cache stores account_id, not a
+    // full AccountSlot. Guards against regressing Bug 1's fix.
+    #[allow(dead_code)]
+    fn _assert_moka_cache_type_is_account_id(s: &AccountPoolState) {
+        let _: &Cache<u64, i64> = &s.moka;
+    }
+
+    fn push_slot(state: &mut AccountPoolState, id: i64, max_slots: u32) {
+        let mut slot = AccountSlot::new(&oauth_placeholder_cookie(id), None).unwrap();
+        slot.account_id = Some(id);
+        slot.token = Some(token_with_refresh(&format!("rt-{id}")));
+        state.inflight.insert(id, (0, max_slots));
+        state.valid.push_back(slot);
+    }
+
+    /// Bug 1 regression: an inflight-saturated `drain_first` account that is
+    /// currently bound in the affinity cache must not cause the cache to
+    /// rebind when the dispatcher overflows to another drain_first sibling.
+    /// "Slot full is overflow, not rebinding."
+    #[tokio::test]
+    async fn cached_drain_first_inflight_full_borrows_without_rebind() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        let mut state = empty_state(pool);
+        push_slot(&mut state, 1, 1); // A (drain_first)
+        push_slot(&mut state, 2, 1); // B (drain_first)
+        state.drain_first_ids.insert(1);
+        state.drain_first_ids.insert(2);
+        // Cached binding: key=77 → account 1.
+        state.moka.insert(77, 1);
+        // Saturate account 1's inflight.
+        state.inflight.insert(1, (1, 1));
+
+        let actor = AccountPoolActor;
+        let dispatched = actor.dispatch(&mut state, Some(77), &[]).unwrap();
+
+        assert_eq!(dispatched.account_id, Some(2), "should overflow to B");
+        state.moka.run_pending_tasks();
+        assert_eq!(
+            state.moka.get(&77),
+            Some(1),
+            "cache must remain bound to A — slot-full is overflow, not rebinding"
+        );
+    }
+
+    /// A cached binding to an account that has been invalidated (removed from
+    /// `state.valid` by Invalidate or account deletion) must rebind on the
+    /// next dispatch. The cache entry is cleared and the new winner is
+    /// written back.
+    #[tokio::test]
+    async fn cached_auth_error_triggers_rebind() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        let mut state = empty_state(pool);
+        push_slot(&mut state, 1, 5);
+        push_slot(&mut state, 2, 5);
+        state.moka.insert(77, 1);
+        // Simulate auth_error: account 1 explicitly invalidated.
+        AccountPoolActor::converge_invalidate(&mut state, 1, Reason::Null);
+
+        let actor = AccountPoolActor;
+        let dispatched = actor.dispatch(&mut state, Some(77), &[]).unwrap();
+
+        assert_eq!(dispatched.account_id, Some(2), "must rebind to B");
+        state.moka.run_pending_tasks();
+        assert_eq!(state.moka.get(&77), Some(2), "cache must point at B now");
+    }
+
+    /// `Invalidate` must wipe every affinity entry pointing at the removed
+    /// account, not just the key the current request used.
+    #[tokio::test]
+    async fn invalidate_clears_moka_entries_for_account() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        let mut state = empty_state(pool);
+        push_slot(&mut state, 1, 5);
+        push_slot(&mut state, 2, 5);
+        state.moka.insert(10, 1);
+        state.moka.insert(11, 1);
+        state.moka.insert(12, 2);
+        state.moka.run_pending_tasks();
+
+        AccountPoolActor::converge_invalidate(&mut state, 1, Reason::Null);
+        // `invalidate_entries_if` in moka 0.12 is processed asynchronously;
+        // force the scheduled deletions through before asserting.
+        state.moka.run_pending_tasks();
+
+        assert_eq!(state.moka.get(&10), None, "key 10 → A must be cleared");
+        assert_eq!(state.moka.get(&11), None, "key 11 → A must be cleared");
+        assert_eq!(
+            state.moka.get(&12),
+            Some(2),
+            "key 12 → B must not be touched"
+        );
+    }
+
+    /// A Return from an in-flight request whose account was explicitly
+    /// invalidated with a sticky reason (auth_error / disabled / banned /
+    /// free / null) must not auto-reactivate the account. The DB is
+    /// authoritative; pool must not silently flip status back to active via
+    /// `state.reactivated` → `set_accounts_active`.
+    #[tokio::test]
+    async fn collect_skips_reactivation_for_sticky_invalid_reason() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        let mut state = empty_state(pool);
+
+        let mut slot = AccountSlot::new(&oauth_placeholder_cookie(1), None).unwrap();
+        slot.account_id = Some(1);
+        // Account is sitting in `invalid` with a sticky reason (auth_error
+        // reloaded → Reason::Null).
+        state
+            .invalid
+            .insert(crate::config::InvalidAccountSlot::with_account_id(
+                slot.cookie.clone(),
+                Reason::Null,
+                Some(1),
+            ));
+
+        // In-flight request returns successfully (reason=None) — the pre-fix
+        // behaviour would take from invalid and push back into valid, then
+        // mark `state.reactivated` which drives `set_accounts_active` in
+        // do_flush, clobbering the DB auth_error.
+        AccountPoolActor::collect(&mut state, slot.clone(), None);
+
+        assert!(
+            state.invalid.iter().any(|u| u.account_id == Some(1)),
+            "sticky-invalidated account must remain in state.invalid"
+        );
+        assert!(
+            !state.valid.iter().any(|c| c.account_id == Some(1)),
+            "must not be reinserted into valid"
+        );
+        assert!(
+            !state.reactivated.contains(&1),
+            "must not queue DB reactivation"
+        );
+    }
+
+    /// Counter-test for the sticky-reason guard: cooldown reasons
+    /// (TooManyRequest / Restricted) must still be allowed to auto-reactivate
+    /// when a later Return arrives with reason=None. This is the existing
+    /// "account cooled down, back in service" flow.
+    #[tokio::test]
+    async fn collect_still_reactivates_for_cooldown_reason() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        let mut state = empty_state(pool);
+
+        let mut slot = AccountSlot::new(&oauth_placeholder_cookie(2), None).unwrap();
+        slot.account_id = Some(2);
+        state
+            .invalid
+            .insert(crate::config::InvalidAccountSlot::with_account_id(
+                slot.cookie.clone(),
+                Reason::TooManyRequest(1_700_000_000),
+                Some(2),
+            ));
+
+        AccountPoolActor::collect(&mut state, slot.clone(), None);
+
+        assert!(
+            state.valid.iter().any(|c| c.account_id == Some(2)),
+            "TMR-invalidated account must still reactivate on normal return"
+        );
+        assert!(
+            state.reactivated.contains(&2),
+            "TMR reactivation must queue set_accounts_active"
+        );
+    }
+
+    /// Regression for the ordering hazard called out in code review: a prior
+    /// TMR/Restricted return queued the account into `state.reactivated` (and
+    /// via `collect`'s `mark_dirty`, also into `state.dirty`). An
+    /// auth_error / disabled path then writes the authoritative DB status and
+    /// invalidates the pool. Both the pending reactivation AND the dirty
+    /// marking must be dropped so `do_flush` does not race the freshly-
+    /// written auth_error with either `set_accounts_active` (via
+    /// `state.reactivated`) or `set_account_disabled` (via
+    /// `state.invalid + state.dirty`).
+    #[tokio::test]
+    async fn invalidate_discards_pending_flush_side_effects() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        insert_oauth_row(&pool, 1, "at0", "rt0").await;
+        // Seed the authoritative auth_error that a probe would have written.
+        crate::db::accounts::set_account_auth_error(&pool, 1, "probe failure")
+            .await
+            .unwrap();
+
+        let mut state = empty_state(pool.clone());
+
+        // Simulate a prior TMR return that cool-down-reactivated the account:
+        // slot is back in `valid`, `reactivated` queues DB set-active, and
+        // `collect` marked the account dirty.
+        let mut slot = AccountSlot::new(&oauth_placeholder_cookie(1), None).unwrap();
+        slot.account_id = Some(1);
+        state
+            .invalid
+            .insert(crate::config::InvalidAccountSlot::with_account_id(
+                slot.cookie.clone(),
+                Reason::TooManyRequest(1_700_000_000),
+                Some(1),
+            ));
+        AccountPoolActor::collect(&mut state, slot.clone(), None);
+        assert!(state.reactivated.contains(&1));
+        assert!(state.dirty.contains(&1));
+        assert!(state.valid.iter().any(|c| c.account_id == Some(1)));
+
+        // Explicit failure path: probe writes auth_error to DB, then converges
+        // the pool. Both queued flush side-effects must be cleared.
+        AccountPoolActor::converge_invalidate(&mut state, 1, Reason::Null);
+        assert!(
+            !state.reactivated.contains(&1),
+            "reactivated must be cleared"
+        );
+        assert!(!state.dirty.contains(&1), "dirty must be cleared");
+        assert!(!state.valid.iter().any(|c| c.account_id == Some(1)));
+        assert!(state.invalid.iter().any(|u| u.account_id == Some(1)));
+
+        // Flushing must not touch the account at all — DB status stays at the
+        // value the explicit write path just set.
+        AccountPoolActor::do_flush(&mut state).await;
+
+        let (status,): (String,) = sqlx::query_as("SELECT status FROM accounts WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "auth_error",
+            "do_flush must not race the authoritative auth_error write"
+        );
     }
 }

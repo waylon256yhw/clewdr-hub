@@ -84,6 +84,12 @@ impl ClaudeCodeState {
             warn!("Failed to set OAuth auth_error for account {account_id}: {db_err}");
             return;
         }
+        // DB is authoritative; converge the pool's in-memory view so the
+        // account stops being dispatched and any affinity pointing at it is
+        // cleared.
+        self.account_pool_handle
+            .invalidate(account_id, Reason::Null)
+            .await;
     }
 
     async fn mark_oauth_account_disabled(&mut self, account_id: i64) {
@@ -92,7 +98,11 @@ impl ClaudeCodeState {
         };
         if let Err(db_err) = set_account_disabled(&db, account_id, "disabled").await {
             warn!("Failed to set OAuth account {account_id} disabled: {db_err}");
+            return;
         }
+        self.account_pool_handle
+            .invalidate(account_id, Reason::Disabled)
+            .await;
     }
 
     async fn mark_oauth_account_cooldown(&mut self, account_id: i64, reset_time: i64) {

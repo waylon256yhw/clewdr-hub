@@ -759,10 +759,23 @@ async fn probe_oauth_upstream_failure(
     warn!("[probe][oauth] account {account_id}: {msg}");
     let auth = is_oauth_auth_failure(&err);
     if auth {
-        if let Err(db_err) = set_account_auth_error(db, account_id, &msg).await {
-            warn!("[probe][oauth] failed to set auth_error for account {account_id}: {db_err}");
+        match set_account_auth_error(db, account_id, &msg).await {
+            Ok(()) => {
+                // DB is authoritative; only after the status write succeeds
+                // do we converge the pool's in-memory view. Mirrors chat.rs's
+                // mark_oauth_account_auth_error pattern so a transient DB
+                // error can't leave the pool with a stale "invalidated" view
+                // while the DB still reports the account as active.
+                handle.invalidate(account_id, Reason::Null).await;
+                handle.clear_probe_error(account_id).await;
+            }
+            Err(db_err) => {
+                warn!("[probe][oauth] failed to set auth_error for account {account_id}: {db_err}");
+                handle
+                    .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
+                    .await;
+            }
         }
-        handle.clear_probe_error(account_id).await;
     } else {
         handle
             .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
