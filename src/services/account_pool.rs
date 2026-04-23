@@ -102,7 +102,7 @@ enum AccountPoolMessage {
 #[derive(Debug)]
 struct AccountPoolState {
     valid: VecDeque<AccountSlot>,
-    exhausted: HashSet<AccountSlot>,
+    exhausted: HashMap<i64, AccountSlot>,
     invalid: HashSet<InvalidAccountSlot>,
     moka: Cache<u64, i64>,
     db: SqlitePool,
@@ -152,16 +152,8 @@ impl AccountPoolActor {
             }
         }
 
-        let target = state
-            .exhausted
-            .iter()
-            .find(|c| c.account_id == Some(account_id))
-            .cloned();
-        if let Some(template) = target
-            && let Some(mut slot) = state.exhausted.take(&template)
-        {
+        if let Some(slot) = state.exhausted.get_mut(&account_id) {
             slot.token = token;
-            state.exhausted.insert(slot);
         }
     }
 
@@ -190,14 +182,8 @@ impl AccountPoolActor {
             }
         });
 
-        // Remove from exhausted (pulls by account_id lookup-then-take).
-        if let Some(template) = state
-            .exhausted
-            .iter()
-            .find(|c| c.account_id == Some(account_id))
-            .cloned()
-            && let Some(slot) = state.exhausted.take(&template)
-        {
+        // Remove from exhausted (direct id lookup — exhausted is keyed by account_id).
+        if let Some(slot) = state.exhausted.remove(&account_id) {
             removed_cookie.get_or_insert(slot.cookie);
         }
 
@@ -247,7 +233,7 @@ impl AccountPoolActor {
     }
 
     fn mark_all_dirty(state: &mut AccountPoolState) {
-        for cs in state.valid.iter().chain(state.exhausted.iter()) {
+        for cs in state.valid.iter().chain(state.exhausted.values()) {
             if let Some(id) = cs.account_id {
                 state.dirty.insert(id);
             }
@@ -279,7 +265,7 @@ impl AccountPoolActor {
 
     fn reset(state: &mut AccountPoolState) {
         let mut reset_cookies = Vec::new();
-        state.exhausted.retain(|cookie| {
+        state.exhausted.retain(|_, cookie| {
             let reset_cookie = cookie.clone().reset();
             if reset_cookie.reset_time.is_none() {
                 reset_cookies.push(reset_cookie);
@@ -370,17 +356,14 @@ impl AccountPoolActor {
 
         if !state.exhausted.is_empty() {
             let mut dirty_from_exhausted = Vec::new();
-            let mut new_exhausted = HashSet::with_capacity(state.exhausted.len());
-            for mut cookie in state.exhausted.drain() {
-                if apply_resets(&mut cookie) {
+            for cookie in state.exhausted.values_mut() {
+                if apply_resets(cookie) {
                     changed = true;
                     if let Some(id) = cookie.account_id {
                         dirty_from_exhausted.push(id);
                     }
                 }
-                new_exhausted.insert(cookie);
             }
-            state.exhausted = new_exhausted;
             for id in dirty_from_exhausted {
                 state.dirty.insert(id);
             }
@@ -538,7 +521,7 @@ impl AccountPoolActor {
             .any(|c| bound.is_empty() || c.account_id.is_some_and(|id| bound.contains(&id)));
         let has_relevant_exhausted = state
             .exhausted
-            .iter()
+            .values()
             .any(|c| bound.is_empty() || c.account_id.is_some_and(|id| bound.contains(&id)));
         if has_relevant_valid || has_relevant_exhausted {
             ClewdrError::UpstreamCoolingDown
@@ -580,7 +563,7 @@ impl AccountPoolActor {
             .iter()
             .position(|c| *c == cookie)
             .map(|i| state.valid.remove(i).unwrap());
-        let was_exhausted = state.exhausted.take(&cookie);
+        let was_exhausted = aid.and_then(|id| state.exhausted.remove(&id));
         let was_invalid = state.invalid.take(&tmp);
 
         if was_valid.is_none() && was_exhausted.is_none() && was_invalid.is_none() {
@@ -591,7 +574,9 @@ impl AccountPoolActor {
             None => {
                 if cookie.reset_time.is_some() {
                     let was_ex = was_exhausted.is_some();
-                    state.exhausted.insert(cookie);
+                    if let Some(id) = aid {
+                        state.exhausted.insert(id, cookie);
+                    }
                     !was_ex
                 } else {
                     let was_val = was_valid.is_some();
@@ -604,7 +589,9 @@ impl AccountPoolActor {
                 cookie.reset_time = Some(*i);
                 cookie.reset_window_usage();
                 let was_ex = was_exhausted.is_some();
-                state.exhausted.insert(cookie);
+                if let Some(id) = aid {
+                    state.exhausted.insert(id, cookie);
+                }
                 !was_ex
             }
             Some(reason) => {
@@ -641,7 +628,7 @@ impl AccountPoolActor {
 
     fn accept(state: &mut AccountPoolState, cookie: AccountSlot) {
         if state.valid.contains(&cookie)
-            || state.exhausted.contains(&cookie)
+            || state.exhausted.values().any(|c| c == &cookie)
             || state.invalid.iter().any(|c| *c == cookie)
         {
             warn!("Cookie already exists");
@@ -702,7 +689,7 @@ impl AccountPoolActor {
             .valid
             .iter()
             .cloned()
-            .chain(state.exhausted.iter().cloned())
+            .chain(state.exhausted.values().cloned())
             .filter(|c| !is_oauth_placeholder_slot(c))
             .collect();
         for cookie in &cookies {
@@ -739,7 +726,7 @@ impl AccountPoolActor {
             .valid
             .iter()
             .cloned()
-            .chain(state.exhausted.iter().cloned())
+            .chain(state.exhausted.values().cloned())
             .filter(|cookie| cookie.account_id.is_some_and(|id| wanted.contains(&id)))
             .filter(|cookie| !is_oauth_placeholder_slot(cookie))
             .collect();
@@ -767,7 +754,7 @@ impl AccountPoolActor {
     fn report(state: &AccountPoolState) -> AccountPoolStatus {
         AccountPoolStatus {
             valid: state.valid.clone().into(),
-            exhausted: state.exhausted.iter().cloned().collect(),
+            exhausted: state.exhausted.values().cloned().collect(),
             invalid: state.invalid.iter().cloned().collect(),
         }
     }
@@ -822,7 +809,7 @@ impl AccountPoolActor {
         // paths (probe, chat's `persist_oauth_refresh`, admin test) write DB
         // themselves and call `update_credential` to sync the in-memory slot.
         let mut params = Vec::new();
-        for cs in state.valid.iter().chain(state.exhausted.iter()) {
+        for cs in state.valid.iter().chain(state.exhausted.values()) {
             if let Some(id) = cs.account_id
                 && dirty_ids.contains(&id)
             {
@@ -880,10 +867,8 @@ impl AccountPoolActor {
                 mem_cookies.insert(id, cs);
             }
         }
-        for cs in state.exhausted.drain() {
-            if let Some(id) = cs.account_id {
-                mem_cookies.insert(id, cs);
-            }
+        for (id, cs) in state.exhausted.drain() {
+            mem_cookies.insert(id, cs);
         }
         // Drain invalid set — will be rebuilt from DB
         state.invalid.clear();
@@ -967,7 +952,7 @@ impl AccountPoolActor {
             }
 
             if cs.reset_time.is_some() {
-                state.exhausted.insert(cs);
+                state.exhausted.insert(row.id, cs);
             } else {
                 state.valid.push_back(cs);
             }
@@ -1031,7 +1016,7 @@ impl Actor for AccountPoolActor {
 
         let mut state = AccountPoolState {
             valid: VecDeque::new(),
-            exhausted: HashSet::new(),
+            exhausted: HashMap::new(),
             invalid: HashSet::new(),
             moka,
             db,
@@ -1145,7 +1130,7 @@ impl Actor for AccountPoolActor {
                 let token = state
                     .valid
                     .iter()
-                    .chain(state.exhausted.iter())
+                    .chain(state.exhausted.values())
                     .find(|c| c.account_id == Some(account_id))
                     .and_then(|c| c.token.clone());
                 reply_port.send(token)?;
@@ -1167,7 +1152,7 @@ impl Actor for AccountPoolActor {
         // Do synchronous flush (await directly in post_stop)
         let dirty_ids: HashSet<i64> = std::mem::take(&mut state.dirty);
         let mut params = Vec::new();
-        for cs in state.valid.iter().chain(state.exhausted.iter()) {
+        for cs in state.valid.iter().chain(state.exhausted.values()) {
             if let Some(id) = cs.account_id {
                 if dirty_ids.contains(&id) {
                     params.push((id, cs.to_runtime_params()));
@@ -1525,7 +1510,7 @@ mod tests {
             .build();
         AccountPoolState {
             valid: VecDeque::new(),
-            exhausted: HashSet::new(),
+            exhausted: HashMap::new(),
             invalid: HashSet::new(),
             moka,
             db,
@@ -1903,7 +1888,7 @@ mod tests {
         let after = state
             .valid
             .iter()
-            .chain(state.exhausted.iter())
+            .chain(state.exhausted.values())
             .find(|c| c.account_id == Some(1))
             .and_then(|c| c.token.as_ref())
             .map(|t| t.refresh_token.clone());
