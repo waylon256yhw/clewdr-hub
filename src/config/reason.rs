@@ -1,7 +1,4 @@
-use std::{
-    fmt::{Debug, Display},
-    hash::Hash,
-};
+use std::fmt::{Debug, Display};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -54,20 +51,6 @@ pub struct InvalidAccountSlot {
 impl PartialEq<AccountSlot> for InvalidAccountSlot {
     fn eq(&self, other: &AccountSlot) -> bool {
         self.cookie == other.cookie
-    }
-}
-
-impl PartialEq for InvalidAccountSlot {
-    fn eq(&self, other: &Self) -> bool {
-        self.cookie == other.cookie
-    }
-}
-
-impl Eq for InvalidAccountSlot {}
-
-impl Hash for InvalidAccountSlot {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.cookie.hash(state);
     }
 }
 
