@@ -103,7 +103,7 @@ enum AccountPoolMessage {
 struct AccountPoolState {
     valid: VecDeque<AccountSlot>,
     exhausted: HashMap<i64, AccountSlot>,
-    invalid: HashSet<InvalidAccountSlot>,
+    invalid: HashMap<i64, InvalidAccountSlot>,
     moka: Cache<u64, i64>,
     db: SqlitePool,
     event_tx: broadcast::Sender<AdminEvent>,
@@ -191,14 +191,10 @@ impl AccountPoolActor {
         // guard see the authoritative reason. Existing entry (if any) is
         // replaced so the reason reflects the latest cause.
         if let Some(cookie) = removed_cookie {
-            let marker = InvalidAccountSlot::new(cookie.clone(), Reason::Null);
-            let existing = state.invalid.take(&marker);
-            state.invalid.insert(InvalidAccountSlot::with_account_id(
-                cookie,
-                reason,
-                Some(account_id),
-            ));
-            drop(existing);
+            state.invalid.insert(
+                account_id,
+                InvalidAccountSlot::new(cookie, reason, account_id),
+            );
         }
 
         // Stop advertising the account for preferred-drain dispatch.
@@ -238,10 +234,8 @@ impl AccountPoolActor {
                 state.dirty.insert(id);
             }
         }
-        for uc in &state.invalid {
-            if let Some(id) = uc.account_id {
-                state.dirty.insert(id);
-            }
+        for uc in state.invalid.values() {
+            state.dirty.insert(uc.account_id);
         }
     }
 
@@ -535,15 +529,14 @@ impl AccountPoolActor {
 
         let removed_probe = aid.is_some_and(|id| state.probing.remove(&id));
 
-        let tmp = InvalidAccountSlot::new(cookie.cookie.clone(), Reason::Null);
-
         // Sticky-reason guard: accounts explicitly invalidated (via the
         // `Invalidate` message from an auth_error / disabled path, or via a
         // DB reload that surfaced one of those states) must not be
         // auto-reactivated by a Return from an in-flight request that predates
         // the invalidation. TMR / Restricted remain transient — the cooldown
         // reactivation path below stays intact for those reasons.
-        if let Some(existing) = state.invalid.get(&tmp)
+        if let Some(id) = aid
+            && let Some(existing) = state.invalid.get(&id)
             && matches!(
                 existing.reason,
                 Reason::Free | Reason::Disabled | Reason::Banned | Reason::Null
@@ -564,7 +557,7 @@ impl AccountPoolActor {
             .position(|c| *c == cookie)
             .map(|i| state.valid.remove(i).unwrap());
         let was_exhausted = aid.and_then(|id| state.exhausted.remove(&id));
-        let was_invalid = state.invalid.take(&tmp);
+        let was_invalid = aid.and_then(|id| state.invalid.remove(&id));
 
         if was_valid.is_none() && was_exhausted.is_none() && was_invalid.is_none() {
             return removed_probe;
@@ -598,11 +591,12 @@ impl AccountPoolActor {
                 let mut cookie = cookie;
                 cookie.reset_window_usage();
                 let was_inv = was_invalid.is_some();
-                state.invalid.insert(InvalidAccountSlot::with_account_id(
-                    cookie.cookie.clone(),
-                    reason.clone(),
-                    aid,
-                ));
+                if let Some(id) = aid {
+                    state.invalid.insert(
+                        id,
+                        InvalidAccountSlot::new(cookie.cookie.clone(), reason.clone(), id),
+                    );
+                }
                 !was_inv
             }
         };
@@ -629,7 +623,7 @@ impl AccountPoolActor {
     fn accept(state: &mut AccountPoolState, cookie: AccountSlot) {
         if state.valid.contains(&cookie)
             || state.exhausted.values().any(|c| c == &cookie)
-            || state.invalid.iter().any(|c| *c == cookie)
+            || state.invalid.values().any(|c| *c == cookie)
         {
             warn!("Cookie already exists");
             return;
@@ -696,14 +690,14 @@ impl AccountPoolActor {
             Self::spawn_probe_guarded(state, cookie, None);
         }
 
-        let invalid_cookies: Vec<(ClewdrCookie, Option<i64>)> = state
+        let invalid_cookies: Vec<(ClewdrCookie, i64)> = state
             .invalid
-            .iter()
+            .values()
             .map(|uc| (uc.cookie.clone(), uc.account_id))
             .collect();
         for (cookie_blob, account_id) in invalid_cookies {
             if let Ok(mut cs) = AccountSlot::new(&cookie_blob.to_string(), None) {
-                cs.account_id = account_id;
+                cs.account_id = Some(account_id);
                 if is_oauth_placeholder_slot(&cs) {
                     continue;
                 }
@@ -734,15 +728,15 @@ impl AccountPoolActor {
             Self::spawn_probe_guarded(state, cookie, log_sink.clone());
         }
 
-        let invalid_cookies: Vec<(ClewdrCookie, Option<i64>)> = state
+        let invalid_cookies: Vec<(ClewdrCookie, i64)> = state
             .invalid
-            .iter()
-            .filter(|uc| uc.account_id.is_some_and(|id| wanted.contains(&id)))
+            .values()
+            .filter(|uc| wanted.contains(&uc.account_id))
             .map(|uc| (uc.cookie.clone(), uc.account_id))
             .collect();
         for (cookie_blob, account_id) in invalid_cookies {
             if let Ok(mut cs) = AccountSlot::new(&cookie_blob.to_string(), None) {
-                cs.account_id = account_id;
+                cs.account_id = Some(account_id);
                 if is_oauth_placeholder_slot(&cs) {
                     continue;
                 }
@@ -755,7 +749,7 @@ impl AccountPoolActor {
         AccountPoolStatus {
             valid: state.valid.clone().into(),
             exhausted: state.exhausted.values().cloned().collect(),
-            invalid: state.invalid.iter().cloned().collect(),
+            invalid: state.invalid.values().cloned().collect(),
         }
     }
 
@@ -818,11 +812,9 @@ impl AccountPoolActor {
         }
 
         let mut disabled = Vec::new();
-        for uc in &state.invalid {
-            if let Some(id) = uc.account_id
-                && dirty_ids.contains(&id)
-            {
-                disabled.push((id, uc.reason.to_db_string()));
+        for uc in state.invalid.values() {
+            if dirty_ids.contains(&uc.account_id) {
+                disabled.push((uc.account_id, uc.reason.to_db_string()));
             }
         }
 
@@ -893,11 +885,9 @@ impl AccountPoolActor {
                         .as_deref()
                         .map(Reason::from_db_string)
                         .unwrap_or(Reason::Null);
-                    state.invalid.insert(InvalidAccountSlot::with_account_id(
-                        cookie,
-                        reason,
-                        Some(row.id),
-                    ));
+                    state
+                        .invalid
+                        .insert(row.id, InvalidAccountSlot::new(cookie, reason, row.id));
                 }
                 continue;
             }
@@ -1017,7 +1007,7 @@ impl Actor for AccountPoolActor {
         let mut state = AccountPoolState {
             valid: VecDeque::new(),
             exhausted: HashMap::new(),
-            invalid: HashSet::new(),
+            invalid: HashMap::new(),
             moka,
             db,
             event_tx,
@@ -1162,14 +1152,15 @@ impl Actor for AccountPoolActor {
         if let Err(e) = batch_upsert_runtime_states(&state.db, &params).await {
             error!("Failed to flush runtime states on shutdown: {e}");
         }
-        for uc in &state.invalid {
-            if let Some(id) = uc.account_id {
-                if dirty_ids.contains(&id) {
-                    if let Err(e) =
-                        set_account_disabled(&state.db, id, &uc.reason.to_db_string()).await
-                    {
-                        error!("Failed to set account {id} disabled on shutdown: {e}");
-                    }
+        for uc in state.invalid.values() {
+            if dirty_ids.contains(&uc.account_id) {
+                if let Err(e) =
+                    set_account_disabled(&state.db, uc.account_id, &uc.reason.to_db_string()).await
+                {
+                    error!(
+                        "Failed to set account {} disabled on shutdown: {e}",
+                        uc.account_id
+                    );
                 }
             }
         }
@@ -1511,7 +1502,7 @@ mod tests {
         AccountPoolState {
             valid: VecDeque::new(),
             exhausted: HashMap::new(),
-            invalid: HashSet::new(),
+            invalid: HashMap::new(),
             moka,
             db,
             event_tx,
@@ -1732,13 +1723,10 @@ mod tests {
         slot.account_id = Some(1);
         // Account is sitting in `invalid` with a sticky reason (auth_error
         // reloaded → Reason::Null).
-        state
-            .invalid
-            .insert(crate::config::InvalidAccountSlot::with_account_id(
-                slot.cookie.clone(),
-                Reason::Null,
-                Some(1),
-            ));
+        state.invalid.insert(
+            1,
+            crate::config::InvalidAccountSlot::new(slot.cookie.clone(), Reason::Null, 1),
+        );
 
         // In-flight request returns successfully (reason=None) — the pre-fix
         // behaviour would take from invalid and push back into valid, then
@@ -1747,7 +1735,7 @@ mod tests {
         AccountPoolActor::collect(&mut state, slot.clone(), None);
 
         assert!(
-            state.invalid.iter().any(|u| u.account_id == Some(1)),
+            state.invalid.contains_key(&1),
             "sticky-invalidated account must remain in state.invalid"
         );
         assert!(
@@ -1771,13 +1759,14 @@ mod tests {
 
         let mut slot = AccountSlot::new(&oauth_placeholder_cookie(2), None).unwrap();
         slot.account_id = Some(2);
-        state
-            .invalid
-            .insert(crate::config::InvalidAccountSlot::with_account_id(
+        state.invalid.insert(
+            2,
+            crate::config::InvalidAccountSlot::new(
                 slot.cookie.clone(),
                 Reason::TooManyRequest(1_700_000_000),
-                Some(2),
-            ));
+                2,
+            ),
+        );
 
         AccountPoolActor::collect(&mut state, slot.clone(), None);
 
@@ -1816,13 +1805,14 @@ mod tests {
         // `collect` marked the account dirty.
         let mut slot = AccountSlot::new(&oauth_placeholder_cookie(1), None).unwrap();
         slot.account_id = Some(1);
-        state
-            .invalid
-            .insert(crate::config::InvalidAccountSlot::with_account_id(
+        state.invalid.insert(
+            1,
+            crate::config::InvalidAccountSlot::new(
                 slot.cookie.clone(),
                 Reason::TooManyRequest(1_700_000_000),
-                Some(1),
-            ));
+                1,
+            ),
+        );
         AccountPoolActor::collect(&mut state, slot.clone(), None);
         assert!(state.reactivated.contains(&1));
         assert!(state.dirty.contains(&1));
@@ -1837,7 +1827,7 @@ mod tests {
         );
         assert!(!state.dirty.contains(&1), "dirty must be cleared");
         assert!(!state.valid.iter().any(|c| c.account_id == Some(1)));
-        assert!(state.invalid.iter().any(|u| u.account_id == Some(1)));
+        assert!(state.invalid.contains_key(&1));
 
         // Flushing must not touch the account at all — DB status stays at the
         // value the explicit write path just set.

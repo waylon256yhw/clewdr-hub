@@ -48,8 +48,7 @@ impl Display for Reason {
 pub struct InvalidAccountSlot {
     pub cookie: ClewdrCookie,
     pub reason: Reason,
-    #[serde(default)]
-    pub account_id: Option<i64>,
+    pub account_id: i64,
 }
 
 impl PartialEq<AccountSlot> for InvalidAccountSlot {
@@ -73,15 +72,7 @@ impl Hash for InvalidAccountSlot {
 }
 
 impl InvalidAccountSlot {
-    pub fn new(cookie: ClewdrCookie, reason: Reason) -> Self {
-        Self {
-            cookie,
-            reason,
-            account_id: None,
-        }
-    }
-
-    pub fn with_account_id(cookie: ClewdrCookie, reason: Reason, account_id: Option<i64>) -> Self {
+    pub fn new(cookie: ClewdrCookie, reason: Reason, account_id: i64) -> Self {
         Self {
             cookie,
             reason,
