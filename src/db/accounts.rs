@@ -1259,14 +1259,22 @@ mod tests {
                 .unwrap_or_else(|e| panic!("migration statement failed: {e}\n---\n{trimmed}\n"));
         }
 
-        let survivors: Vec<(i64, String, String, Option<String>, Option<String>, Option<String>, Option<String>)> =
-            sqlx::query_as(
-                "SELECT id, name, auth_source, cookie_blob, oauth_access_token, oauth_refresh_token, oauth_expires_at
+        type SurvivorRow = (
+            i64,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let survivors: Vec<SurvivorRow> = sqlx::query_as(
+            "SELECT id, name, auth_source, cookie_blob, oauth_access_token, oauth_refresh_token, oauth_expires_at
                  FROM accounts ORDER BY id",
-            )
-            .fetch_all(&pool)
-            .await
-            .unwrap();
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
 
         // case 2 is the only unrecoverable row — it should be gone.
         let names: Vec<&str> = survivors.iter().map(|row| row.1.as_str()).collect();

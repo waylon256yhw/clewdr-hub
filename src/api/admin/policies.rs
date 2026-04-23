@@ -94,11 +94,10 @@ pub async fn create(
     .execute(&db)
     .await
     .map_err(|e| {
-        if let sqlx::Error::Database(ref de) = e {
-            if de.message().contains("UNIQUE") {
+        if let sqlx::Error::Database(ref de) = e
+            && de.message().contains("UNIQUE") {
                 return ClewdrError::Conflict { msg: "policy name already exists" };
             }
-        }
         ClewdrError::from(e)
     })?
     .last_insert_rowid();
@@ -115,19 +114,19 @@ pub async fn update(
     Json(req): Json<UpdatePolicyRequest>,
 ) -> Result<Json<PolicyResponse>, ClewdrError> {
     // Validate all fields first before any writes
-    if let Some(v) = req.max_concurrent {
-        if v <= 0 {
-            return Err(ClewdrError::BadRequest {
-                msg: "max_concurrent must be positive",
-            });
-        }
+    if let Some(v) = req.max_concurrent
+        && v <= 0
+    {
+        return Err(ClewdrError::BadRequest {
+            msg: "max_concurrent must be positive",
+        });
     }
-    if let Some(v) = req.rpm_limit {
-        if v <= 0 {
-            return Err(ClewdrError::BadRequest {
-                msg: "rpm_limit must be positive",
-            });
-        }
+    if let Some(v) = req.rpm_limit
+        && v <= 0
+    {
+        return Err(ClewdrError::BadRequest {
+            msg: "rpm_limit must be positive",
+        });
     }
 
     let mut tx = db.begin().await?;
@@ -149,12 +148,12 @@ pub async fn update(
             .execute(&mut *tx)
             .await
             .map_err(|e| {
-                if let sqlx::Error::Database(ref de) = e {
-                    if de.message().contains("UNIQUE") {
-                        return ClewdrError::Conflict {
-                            msg: "policy name already exists",
-                        };
-                    }
+                if let sqlx::Error::Database(ref de) = e
+                    && de.message().contains("UNIQUE")
+                {
+                    return ClewdrError::Conflict {
+                        msg: "policy name already exists",
+                    };
                 }
                 ClewdrError::from(e)
             })?;

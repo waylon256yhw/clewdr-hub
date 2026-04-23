@@ -17,10 +17,9 @@ fn extract_key_from_headers(parts: &Parts) -> Option<String> {
         .headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
+        && let Some(token) = auth.strip_prefix("Bearer ")
     {
-        if let Some(token) = auth.strip_prefix("Bearer ") {
-            return Some(token.to_string());
-        }
+        return Some(token.to_string());
     }
     None
 }

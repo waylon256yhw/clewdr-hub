@@ -591,7 +591,7 @@ impl ClaudeCodeState {
     ) -> Result<axum::response::Response, ClewdrError> {
         if !self.stream {
             let (resp, billing_usage) = Self::materialize_non_stream_response(response).await?;
-            let bu = billing_usage.unwrap_or_else(|| crate::billing::BillingUsage {
+            let bu = billing_usage.unwrap_or(crate::billing::BillingUsage {
                 input_tokens: self.usage.input_tokens as u64,
                 output_tokens: 0,
                 cache_creation_tokens: 0,
@@ -755,10 +755,10 @@ impl ClaudeCodeState {
                                     .await;
                                     c.add_and_bucket_usage(total_input, total_out, family);
                                     let _ = handle.release(c, None).await;
-                                    if let Some(aid) = aid {
-                                        if !released.swap(true, Ordering::Relaxed) {
-                                            handle.release_slot(aid).await;
-                                        }
+                                    if let Some(aid) = aid
+                                        && !released.swap(true, Ordering::Relaxed)
+                                    {
+                                        handle.release_slot(aid).await;
                                     }
                                 });
                             }

@@ -72,28 +72,27 @@ pub async fn api_claude_code(
 ) -> Result<(Extension<ClaudeContext>, Response), ClewdrError> {
     let db = &state.db;
 
-    if let Some(user_id) = context.user_id {
-        if let Err(e) = check_quota(
+    if let Some(user_id) = context.user_id
+        && let Err(e) = check_quota(
             db,
             user_id,
             context.weekly_budget_nanousd,
             context.monthly_budget_nanousd,
         )
         .await
-        {
-            let (status, http_status) = error_to_log_status(&e);
-            let err_msg = e.to_string();
-            log_error_request(
-                &state,
-                &context,
-                RequestType::Messages,
-                status,
-                http_status,
-                &err_msg,
-            )
-            .await;
-            return Err(e);
-        }
+    {
+        let (status, http_status) = error_to_log_status(&e);
+        let err_msg = e.to_string();
+        log_error_request(
+            &state,
+            &context,
+            RequestType::Messages,
+            status,
+            http_status,
+            &err_msg,
+        )
+        .await;
+        return Err(e);
     }
 
     let permit = if let (Some(user_id), Some(max_c), Some(rpm)) =

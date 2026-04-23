@@ -247,6 +247,12 @@ pub(crate) fn is_oauth_auth_failure(err: &ClewdrError) -> bool {
     }
 }
 
+pub enum TokenStatus {
+    None,
+    Expired,
+    Valid,
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_oauth_auth_failure;
@@ -264,10 +270,4 @@ mod tests {
             reason: Reason::Disabled,
         }));
     }
-}
-
-pub enum TokenStatus {
-    None,
-    Expired,
-    Valid,
 }

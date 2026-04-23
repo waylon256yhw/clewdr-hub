@@ -232,14 +232,13 @@ fn inject_metadata_user_id(
     auth_user: Option<&crate::db::models::AuthenticatedUser>,
 ) {
     // Check if metadata.user_id already exists
-    if let Some(ref metadata) = body.metadata {
-        if metadata
+    if let Some(ref metadata) = body.metadata
+        && metadata
             .fields
             .get("user_id")
             .is_some_and(|v| !v.is_empty())
-        {
-            return;
-        }
+    {
+        return;
     }
 
     let Some(auth) = auth_user else {
@@ -340,10 +339,8 @@ fn normalize_sampling_params(body: &mut CreateMessageParams, profile: &StealthPr
     body.top_p = None;
     body.top_k = None;
 
-    if thinking_active {
-        if body.temperature != Some(1.0) {
-            body.temperature = None;
-        }
+    if thinking_active && body.temperature != Some(1.0) {
+        body.temperature = None;
     }
 
     let mut rewrote_opus_4_7_legacy_thinking = false;

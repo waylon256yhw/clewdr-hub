@@ -3,13 +3,18 @@ use sqlx::SqlitePool;
 use super::api_key::generate_api_key;
 use super::models::AuthenticatedUser;
 
+/// Row shape returned by `authenticate_api_key`'s `sqlx::query_as`:
+/// (ak.id, u.id, u.username, u.role, ak.key_hash, u.policy_id,
+///  p.max_concurrent, p.rpm_limit, p.weekly_budget_nanousd, p.monthly_budget_nanousd).
+type ApiKeyAuthRow = (i64, i64, String, String, Vec<u8>, i64, i32, i32, i64, i64);
+
 /// Look up an API key by its lookup_key prefix, then verify the full blake3 hash.
 pub async fn authenticate_api_key(
     pool: &SqlitePool,
     lookup_key: &str,
     full_key_hash: &[u8; 32],
 ) -> Result<Option<AuthenticatedUser>, sqlx::Error> {
-    let row: Option<(i64, i64, String, String, Vec<u8>, i64, i32, i32, i64, i64)> = sqlx::query_as(
+    let row: Option<ApiKeyAuthRow> = sqlx::query_as(
         r#"
         SELECT ak.id, u.id, u.username, u.role, ak.key_hash, u.policy_id,
                p.max_concurrent, p.rpm_limit,

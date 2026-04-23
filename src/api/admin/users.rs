@@ -152,11 +152,10 @@ pub async fn create(
     .execute(&db)
     .await
     .map_err(|e| {
-        if let sqlx::Error::Database(ref de) = e {
-            if de.message().contains("UNIQUE") {
+        if let sqlx::Error::Database(ref de) = e
+            && de.message().contains("UNIQUE") {
                 return ClewdrError::Conflict { msg: "username already exists" };
             }
-        }
         ClewdrError::from(e)
     })?
     .last_insert_rowid();
@@ -208,12 +207,12 @@ pub async fn update(
             .execute(&mut *tx)
             .await
             .map_err(|e| {
-                if let sqlx::Error::Database(ref de) = e {
-                    if de.message().contains("UNIQUE") {
-                        return ClewdrError::Conflict {
-                            msg: "username already exists",
-                        };
-                    }
+                if let sqlx::Error::Database(ref de) = e
+                    && de.message().contains("UNIQUE")
+                {
+                    return ClewdrError::Conflict {
+                        msg: "username already exists",
+                    };
                 }
                 ClewdrError::from(e)
             })?;

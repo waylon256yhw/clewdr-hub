@@ -373,12 +373,12 @@ pub async fn create(
     .execute(&db)
     .await
     .map_err(|e| {
-        if let sqlx::Error::Database(ref de) = e {
-            if de.message().contains("UNIQUE") {
-                return ClewdrError::Conflict {
-                    msg: "account name or rr_order already exists",
-                };
-            }
+        if let sqlx::Error::Database(ref de) = e
+            && de.message().contains("UNIQUE")
+        {
+            return ClewdrError::Conflict {
+                msg: "account name or rr_order already exists",
+            };
         }
         ClewdrError::from(e)
     })?

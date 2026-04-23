@@ -105,18 +105,18 @@ const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 pub async fn cli_versions(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<CliVersionsResponse>, ClewdrError> {
-    let force = params.get("force").is_some();
+    let force = params.contains_key("force");
 
     if !force {
         let cache = VERSION_CACHE.lock().await;
-        if let Some(ref c) = *cache {
-            if c.fetched_at.elapsed() < CACHE_TTL {
-                return Ok(Json(CliVersionsResponse {
-                    versions: c.versions.clone(),
-                    cached: true,
-                    fetched_at: Some(c.fetched_at_utc.to_rfc3339()),
-                }));
-            }
+        if let Some(ref c) = *cache
+            && c.fetched_at.elapsed() < CACHE_TTL
+        {
+            return Ok(Json(CliVersionsResponse {
+                versions: c.versions.clone(),
+                cached: true,
+                fetched_at: Some(c.fetched_at_utc.to_rfc3339()),
+            }));
         }
     }
 
@@ -174,7 +174,7 @@ async fn fetch_npm_versions() -> Result<Vec<String>, Box<dyn std::error::Error +
         .unwrap_or_default();
 
     // Sort by semver descending, take latest 10
-    versions.sort_by(|a, b| version_tuple(b).cmp(&version_tuple(a)));
+    versions.sort_by_key(|v| std::cmp::Reverse(version_tuple(v)));
     versions.truncate(5);
 
     Ok(versions)

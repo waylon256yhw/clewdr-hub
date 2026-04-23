@@ -187,38 +187,38 @@ impl RouterBuilder {
                 let path = uri.path().trim_start_matches('/');
                 // Try serving static file
                 let file_path = std::path::Path::new(STATIC_DIR).join(path);
-                if file_path.is_file() {
-                    if let Ok(bytes) = tokio::fs::read(&file_path).await {
-                        let ct = if path.ends_with(".js") {
-                            "application/javascript"
-                        } else if path.ends_with(".css") {
-                            "text/css"
-                        } else if path.ends_with(".html") {
-                            "text/html; charset=utf-8"
-                        } else if path.ends_with(".svg") {
-                            "image/svg+xml"
-                        } else if path.ends_with(".png") {
-                            "image/png"
-                        } else if path.ends_with(".ico") {
-                            "image/x-icon"
-                        } else if path.ends_with(".json") {
-                            "application/json"
-                        } else {
-                            "application/octet-stream"
-                        };
-                        let cc = if path.starts_with("assets/") {
-                            "public, max-age=31536000, immutable"
-                        } else if path.ends_with(".html") {
-                            "no-cache"
-                        } else {
-                            "public, max-age=3600"
-                        };
-                        return Response::builder()
-                            .header(header::CONTENT_TYPE, ct)
-                            .header(header::CACHE_CONTROL, cc)
-                            .body(axum::body::Body::from(bytes))
-                            .unwrap();
-                    }
+                if file_path.is_file()
+                    && let Ok(bytes) = tokio::fs::read(&file_path).await
+                {
+                    let ct = if path.ends_with(".js") {
+                        "application/javascript"
+                    } else if path.ends_with(".css") {
+                        "text/css"
+                    } else if path.ends_with(".html") {
+                        "text/html; charset=utf-8"
+                    } else if path.ends_with(".svg") {
+                        "image/svg+xml"
+                    } else if path.ends_with(".png") {
+                        "image/png"
+                    } else if path.ends_with(".ico") {
+                        "image/x-icon"
+                    } else if path.ends_with(".json") {
+                        "application/json"
+                    } else {
+                        "application/octet-stream"
+                    };
+                    let cc = if path.starts_with("assets/") {
+                        "public, max-age=31536000, immutable"
+                    } else if path.ends_with(".html") {
+                        "no-cache"
+                    } else {
+                        "public, max-age=3600"
+                    };
+                    return Response::builder()
+                        .header(header::CONTENT_TYPE, ct)
+                        .header(header::CACHE_CONTROL, cc)
+                        .body(axum::body::Body::from(bytes))
+                        .unwrap();
                 }
                 // API paths → 404
                 if path.starts_with("api/") || path.starts_with("auth/") || path.starts_with("v1/")

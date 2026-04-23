@@ -26,6 +26,12 @@ pub struct UserLimiterMap {
     inner: Arc<RwLock<HashMap<i64, Arc<UserLimiter>>>>,
 }
 
+impl Default for UserLimiterMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UserLimiterMap {
     pub fn new() -> Self {
         Self {
@@ -100,10 +106,11 @@ impl UserLimiterMap {
         // Slow path: write lock, create or replace
         let mut map = self.inner.write().await;
         // Double-check after acquiring write lock
-        if let Some(limiter) = map.get(&user_id) {
-            if limiter.max_concurrent == max_concurrent && limiter.rpm_limit == rpm_limit {
-                return limiter.clone();
-            }
+        if let Some(limiter) = map.get(&user_id)
+            && limiter.max_concurrent == max_concurrent
+            && limiter.rpm_limit == rpm_limit
+        {
+            return limiter.clone();
         }
 
         let limiter = Arc::new(UserLimiter {

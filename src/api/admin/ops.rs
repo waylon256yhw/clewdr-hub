@@ -293,8 +293,7 @@ async fn load_model_distribution(
     window: &WindowSpec,
     selected_user_id: Option<i64>,
 ) -> Result<Vec<ModelDistributionItem>, ClewdrError> {
-    let query = format!(
-        r#"SELECT
+    let query = r#"SELECT
                COALESCE(NULLIF(r.model_normalized, ''), NULLIF(r.model_raw, ''), 'unknown') AS model,
                COUNT(*) AS request_count,
                COALESCE(SUM(
@@ -312,8 +311,7 @@ async fn load_model_distribution(
              AND (?3 IS NULL OR r.user_id = ?3)
            GROUP BY model
            ORDER BY cost_nanousd DESC, request_count DESC
-           LIMIT 8"#,
-    );
+           LIMIT 8"#.to_string();
 
     let rows: Vec<ModelDistributionRow> = sqlx::query_as(&query)
         .bind(window.start_utc.to_rfc3339())

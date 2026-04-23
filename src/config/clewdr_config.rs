@@ -108,10 +108,10 @@ impl ClewdrConfig {
                 error!("Failed to load config: {}", e);
             })
             .unwrap_or_default();
-        if let Some(ref f) = Args::try_parse().ok().and_then(|a| a.file) {
-            if f.exists() {
-                tracing::warn!("--file flag is deprecated; manage cookies via admin API instead");
-            }
+        if let Some(ref f) = Args::try_parse().ok().and_then(|a| a.file)
+            && f.exists()
+        {
+            tracing::warn!("--file flag is deprecated; manage cookies via admin API instead");
         }
         let config = config.validate();
         if !config.no_fs {

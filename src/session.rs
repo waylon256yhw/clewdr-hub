@@ -64,10 +64,10 @@ pub fn clear_cookie_header() -> String {
 
 pub fn extract_session_cookie(cookie_header: &str) -> Option<&str> {
     for part in cookie_header.split("; ") {
-        if let Some(val) = part.strip_prefix("clewdr_session=") {
-            if !val.is_empty() {
-                return Some(val);
-            }
+        if let Some(val) = part.strip_prefix("clewdr_session=")
+            && !val.is_empty()
+        {
+            return Some(val);
         }
     }
     None

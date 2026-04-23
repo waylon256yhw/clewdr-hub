@@ -121,12 +121,12 @@ pub fn normalize_model(raw: &str) -> Option<String> {
     }
     // Alias + date suffix (e.g. claude-opus-4-6-20260301)
     for &(alias, key) in KNOWN_ALIASES {
-        if let Some(rest) = m.strip_prefix(alias) {
-            if let Some(date_part) = rest.strip_prefix('-') {
-                if date_part.len() == 8 && date_part.bytes().all(|b| b.is_ascii_digit()) {
-                    return Some(key.to_string());
-                }
-            }
+        if let Some(rest) = m.strip_prefix(alias)
+            && let Some(date_part) = rest.strip_prefix('-')
+            && date_part.len() == 8
+            && date_part.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Some(key.to_string());
         }
     }
     None
