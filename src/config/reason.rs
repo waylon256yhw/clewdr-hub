@@ -3,7 +3,6 @@ use std::fmt::{Debug, Display};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::AccountSlot;
 use crate::config::ClewdrCookie;
 
 /// Reason why an account is considered unusable for dispatch
@@ -46,12 +45,6 @@ pub struct InvalidAccountSlot {
     pub cookie: ClewdrCookie,
     pub reason: Reason,
     pub account_id: i64,
-}
-
-impl PartialEq<AccountSlot> for InvalidAccountSlot {
-    fn eq(&self, other: &AccountSlot) -> bool {
-        self.cookie == other.cookie
-    }
 }
 
 impl InvalidAccountSlot {

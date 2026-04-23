@@ -550,12 +550,17 @@ impl AccountPoolActor {
             return removed_probe;
         }
 
-        // Remove from whichever set the cookie currently lives in
-        let was_valid = state
-            .valid
-            .iter()
-            .position(|c| *c == cookie)
-            .map(|i| state.valid.remove(i).unwrap());
+        // Remove from whichever set the account currently lives in, keyed by
+        // account_id. Slots without an account_id cannot be in any pool
+        // container (the loader always assigns one) — skip removal for such
+        // degenerate inputs.
+        let was_valid = aid.and_then(|id| {
+            state
+                .valid
+                .iter()
+                .position(|c| c.account_id == Some(id))
+                .and_then(|i| state.valid.remove(i))
+        });
         let was_exhausted = aid.and_then(|id| state.exhausted.remove(&id));
         let was_invalid = aid.and_then(|id| state.invalid.remove(&id));
 
@@ -621,17 +626,24 @@ impl AccountPoolActor {
     }
 
     fn accept(state: &mut AccountPoolState, cookie: AccountSlot) {
-        if state.valid.contains(&cookie)
-            || state.exhausted.values().any(|c| c == &cookie)
-            || state.invalid.values().any(|c| *c == cookie)
+        debug_assert!(
+            cookie.account_id.is_some(),
+            "submit() requires a slot with account_id; the pool no longer identifies slots by cookie"
+        );
+        let Some(aid) = cookie.account_id else {
+            warn!("submit rejected: slot has no account_id");
+            return;
+        };
+        if state.valid.iter().any(|c| c.account_id == Some(aid))
+            || state.exhausted.contains_key(&aid)
+            || state.invalid.contains_key(&aid)
         {
-            warn!("Cookie already exists");
+            warn!("Account {aid} already exists in pool");
             return;
         }
         let needs_probe = cookie.email.is_none() || cookie.account_type.is_none();
-        let aid = cookie.account_id;
         state.valid.push_back(cookie.clone());
-        Self::mark_dirty(state, aid);
+        Self::mark_dirty(state, Some(aid));
         Self::log(state);
 
         if needs_probe {
