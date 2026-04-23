@@ -27,8 +27,8 @@ const FLUSH_INTERVAL: u64 = 15;
 const SESSION_WINDOW_SECS: i64 = 5 * 60 * 60; // 5h
 const WEEKLY_WINDOW_SECS: i64 = 7 * 24 * 60 * 60; // 7d
 
-/// Build a unique placeholder cookie string for an oauth-only account so its
-/// `AccountSlot` stays distinguishable in HashSet/moka keyed on the cookie value.
+/// Build a placeholder cookie string for an oauth-only account so the loader
+/// can construct an `AccountSlot` from a DB row that has no real `cookie_blob`.
 /// The format satisfies `ClewdrCookie`'s regex (`sk-ant-sid\d{2}-[A-Za-z0-9_-]{86,120}-[A-Za-z0-9_-]{6}AA`).
 fn oauth_placeholder_cookie(account_id: i64) -> String {
     format!("sk-ant-sid99-o{:0>85}-pool00AA", account_id)
@@ -102,8 +102,8 @@ enum AccountPoolMessage {
 #[derive(Debug)]
 struct AccountPoolState {
     valid: VecDeque<AccountSlot>,
-    exhausted: HashSet<AccountSlot>,
-    invalid: HashSet<InvalidAccountSlot>,
+    exhausted: HashMap<i64, AccountSlot>,
+    invalid: HashMap<i64, InvalidAccountSlot>,
     moka: Cache<u64, i64>,
     db: SqlitePool,
     event_tx: broadcast::Sender<AdminEvent>,
@@ -152,16 +152,8 @@ impl AccountPoolActor {
             }
         }
 
-        let target = state
-            .exhausted
-            .iter()
-            .find(|c| c.account_id == Some(account_id))
-            .cloned();
-        if let Some(template) = target
-            && let Some(mut slot) = state.exhausted.take(&template)
-        {
+        if let Some(slot) = state.exhausted.get_mut(&account_id) {
             slot.token = token;
-            state.exhausted.insert(slot);
         }
     }
 
@@ -190,14 +182,8 @@ impl AccountPoolActor {
             }
         });
 
-        // Remove from exhausted (pulls by account_id lookup-then-take).
-        if let Some(template) = state
-            .exhausted
-            .iter()
-            .find(|c| c.account_id == Some(account_id))
-            .cloned()
-            && let Some(slot) = state.exhausted.take(&template)
-        {
+        // Remove from exhausted (direct id lookup — exhausted is keyed by account_id).
+        if let Some(slot) = state.exhausted.remove(&account_id) {
             removed_cookie.get_or_insert(slot.cookie);
         }
 
@@ -205,14 +191,10 @@ impl AccountPoolActor {
         // guard see the authoritative reason. Existing entry (if any) is
         // replaced so the reason reflects the latest cause.
         if let Some(cookie) = removed_cookie {
-            let marker = InvalidAccountSlot::new(cookie.clone(), Reason::Null);
-            let existing = state.invalid.take(&marker);
-            state.invalid.insert(InvalidAccountSlot::with_account_id(
-                cookie,
-                reason,
-                Some(account_id),
-            ));
-            drop(existing);
+            state.invalid.insert(
+                account_id,
+                InvalidAccountSlot::new(cookie, reason, account_id),
+            );
         }
 
         // Stop advertising the account for preferred-drain dispatch.
@@ -247,15 +229,13 @@ impl AccountPoolActor {
     }
 
     fn mark_all_dirty(state: &mut AccountPoolState) {
-        for cs in state.valid.iter().chain(state.exhausted.iter()) {
+        for cs in state.valid.iter().chain(state.exhausted.values()) {
             if let Some(id) = cs.account_id {
                 state.dirty.insert(id);
             }
         }
-        for uc in &state.invalid {
-            if let Some(id) = uc.account_id {
-                state.dirty.insert(id);
-            }
+        for uc in state.invalid.values() {
+            state.dirty.insert(uc.account_id);
         }
     }
 
@@ -279,7 +259,7 @@ impl AccountPoolActor {
 
     fn reset(state: &mut AccountPoolState) {
         let mut reset_cookies = Vec::new();
-        state.exhausted.retain(|cookie| {
+        state.exhausted.retain(|_, cookie| {
             let reset_cookie = cookie.clone().reset();
             if reset_cookie.reset_time.is_none() {
                 reset_cookies.push(reset_cookie);
@@ -370,17 +350,14 @@ impl AccountPoolActor {
 
         if !state.exhausted.is_empty() {
             let mut dirty_from_exhausted = Vec::new();
-            let mut new_exhausted = HashSet::with_capacity(state.exhausted.len());
-            for mut cookie in state.exhausted.drain() {
-                if apply_resets(&mut cookie) {
+            for cookie in state.exhausted.values_mut() {
+                if apply_resets(cookie) {
                     changed = true;
                     if let Some(id) = cookie.account_id {
                         dirty_from_exhausted.push(id);
                     }
                 }
-                new_exhausted.insert(cookie);
             }
-            state.exhausted = new_exhausted;
             for id in dirty_from_exhausted {
                 state.dirty.insert(id);
             }
@@ -538,7 +515,7 @@ impl AccountPoolActor {
             .any(|c| bound.is_empty() || c.account_id.is_some_and(|id| bound.contains(&id)));
         let has_relevant_exhausted = state
             .exhausted
-            .iter()
+            .values()
             .any(|c| bound.is_empty() || c.account_id.is_some_and(|id| bound.contains(&id)));
         if has_relevant_valid || has_relevant_exhausted {
             ClewdrError::UpstreamCoolingDown
@@ -552,15 +529,14 @@ impl AccountPoolActor {
 
         let removed_probe = aid.is_some_and(|id| state.probing.remove(&id));
 
-        let tmp = InvalidAccountSlot::new(cookie.cookie.clone(), Reason::Null);
-
         // Sticky-reason guard: accounts explicitly invalidated (via the
         // `Invalidate` message from an auth_error / disabled path, or via a
         // DB reload that surfaced one of those states) must not be
         // auto-reactivated by a Return from an in-flight request that predates
         // the invalidation. TMR / Restricted remain transient — the cooldown
         // reactivation path below stays intact for those reasons.
-        if let Some(existing) = state.invalid.get(&tmp)
+        if let Some(id) = aid
+            && let Some(existing) = state.invalid.get(&id)
             && matches!(
                 existing.reason,
                 Reason::Free | Reason::Disabled | Reason::Banned | Reason::Null
@@ -574,14 +550,19 @@ impl AccountPoolActor {
             return removed_probe;
         }
 
-        // Remove from whichever set the cookie currently lives in
-        let was_valid = state
-            .valid
-            .iter()
-            .position(|c| *c == cookie)
-            .map(|i| state.valid.remove(i).unwrap());
-        let was_exhausted = state.exhausted.take(&cookie);
-        let was_invalid = state.invalid.take(&tmp);
+        // Remove from whichever set the account currently lives in, keyed by
+        // account_id. Slots without an account_id cannot be in any pool
+        // container (the loader always assigns one) — skip removal for such
+        // degenerate inputs.
+        let was_valid = aid.and_then(|id| {
+            state
+                .valid
+                .iter()
+                .position(|c| c.account_id == Some(id))
+                .and_then(|i| state.valid.remove(i))
+        });
+        let was_exhausted = aid.and_then(|id| state.exhausted.remove(&id));
+        let was_invalid = aid.and_then(|id| state.invalid.remove(&id));
 
         if was_valid.is_none() && was_exhausted.is_none() && was_invalid.is_none() {
             return removed_probe;
@@ -591,7 +572,9 @@ impl AccountPoolActor {
             None => {
                 if cookie.reset_time.is_some() {
                     let was_ex = was_exhausted.is_some();
-                    state.exhausted.insert(cookie);
+                    if let Some(id) = aid {
+                        state.exhausted.insert(id, cookie);
+                    }
                     !was_ex
                 } else {
                     let was_val = was_valid.is_some();
@@ -604,18 +587,21 @@ impl AccountPoolActor {
                 cookie.reset_time = Some(*i);
                 cookie.reset_window_usage();
                 let was_ex = was_exhausted.is_some();
-                state.exhausted.insert(cookie);
+                if let Some(id) = aid {
+                    state.exhausted.insert(id, cookie);
+                }
                 !was_ex
             }
             Some(reason) => {
                 let mut cookie = cookie;
                 cookie.reset_window_usage();
                 let was_inv = was_invalid.is_some();
-                state.invalid.insert(InvalidAccountSlot::with_account_id(
-                    cookie.cookie.clone(),
-                    reason.clone(),
-                    aid,
-                ));
+                if let Some(id) = aid {
+                    state.invalid.insert(
+                        id,
+                        InvalidAccountSlot::new(cookie.cookie.clone(), reason.clone(), id),
+                    );
+                }
                 !was_inv
             }
         };
@@ -626,10 +612,8 @@ impl AccountPoolActor {
                 &reason,
                 None | Some(Reason::TooManyRequest(_) | Reason::Restricted(_))
             );
-        if moved_out_of_invalid {
-            if let Some(id) = aid {
-                state.reactivated.insert(id);
-            }
+        if moved_out_of_invalid && let Some(id) = aid {
+            state.reactivated.insert(id);
         }
 
         Self::mark_dirty(state, aid);
@@ -640,17 +624,24 @@ impl AccountPoolActor {
     }
 
     fn accept(state: &mut AccountPoolState, cookie: AccountSlot) {
-        if state.valid.contains(&cookie)
-            || state.exhausted.contains(&cookie)
-            || state.invalid.iter().any(|c| *c == cookie)
+        debug_assert!(
+            cookie.account_id.is_some(),
+            "submit() requires a slot with account_id; the pool no longer identifies slots by cookie"
+        );
+        let Some(aid) = cookie.account_id else {
+            warn!("submit rejected: slot has no account_id");
+            return;
+        };
+        if state.valid.iter().any(|c| c.account_id == Some(aid))
+            || state.exhausted.contains_key(&aid)
+            || state.invalid.contains_key(&aid)
         {
-            warn!("Cookie already exists");
+            warn!("Account {aid} already exists in pool");
             return;
         }
         let needs_probe = cookie.email.is_none() || cookie.account_type.is_none();
-        let aid = cookie.account_id;
         state.valid.push_back(cookie.clone());
-        Self::mark_dirty(state, aid);
+        Self::mark_dirty(state, Some(aid));
         Self::log(state);
 
         if needs_probe {
@@ -702,21 +693,21 @@ impl AccountPoolActor {
             .valid
             .iter()
             .cloned()
-            .chain(state.exhausted.iter().cloned())
+            .chain(state.exhausted.values().cloned())
             .filter(|c| !is_oauth_placeholder_slot(c))
             .collect();
         for cookie in &cookies {
             Self::spawn_probe_guarded(state, cookie, None);
         }
 
-        let invalid_cookies: Vec<(ClewdrCookie, Option<i64>)> = state
+        let invalid_cookies: Vec<(ClewdrCookie, i64)> = state
             .invalid
-            .iter()
+            .values()
             .map(|uc| (uc.cookie.clone(), uc.account_id))
             .collect();
         for (cookie_blob, account_id) in invalid_cookies {
             if let Ok(mut cs) = AccountSlot::new(&cookie_blob.to_string(), None) {
-                cs.account_id = account_id;
+                cs.account_id = Some(account_id);
                 if is_oauth_placeholder_slot(&cs) {
                     continue;
                 }
@@ -739,7 +730,7 @@ impl AccountPoolActor {
             .valid
             .iter()
             .cloned()
-            .chain(state.exhausted.iter().cloned())
+            .chain(state.exhausted.values().cloned())
             .filter(|cookie| cookie.account_id.is_some_and(|id| wanted.contains(&id)))
             .filter(|cookie| !is_oauth_placeholder_slot(cookie))
             .collect();
@@ -747,15 +738,15 @@ impl AccountPoolActor {
             Self::spawn_probe_guarded(state, cookie, log_sink.clone());
         }
 
-        let invalid_cookies: Vec<(ClewdrCookie, Option<i64>)> = state
+        let invalid_cookies: Vec<(ClewdrCookie, i64)> = state
             .invalid
-            .iter()
-            .filter(|uc| uc.account_id.is_some_and(|id| wanted.contains(&id)))
+            .values()
+            .filter(|uc| wanted.contains(&uc.account_id))
             .map(|uc| (uc.cookie.clone(), uc.account_id))
             .collect();
         for (cookie_blob, account_id) in invalid_cookies {
             if let Ok(mut cs) = AccountSlot::new(&cookie_blob.to_string(), None) {
-                cs.account_id = account_id;
+                cs.account_id = Some(account_id);
                 if is_oauth_placeholder_slot(&cs) {
                     continue;
                 }
@@ -767,8 +758,8 @@ impl AccountPoolActor {
     fn report(state: &AccountPoolState) -> AccountPoolStatus {
         AccountPoolStatus {
             valid: state.valid.clone().into(),
-            exhausted: state.exhausted.iter().cloned().collect(),
-            invalid: state.invalid.iter().cloned().collect(),
+            exhausted: state.exhausted.values().cloned().collect(),
+            invalid: state.invalid.values().cloned().collect(),
         }
     }
 
@@ -822,7 +813,7 @@ impl AccountPoolActor {
         // paths (probe, chat's `persist_oauth_refresh`, admin test) write DB
         // themselves and call `update_credential` to sync the in-memory slot.
         let mut params = Vec::new();
-        for cs in state.valid.iter().chain(state.exhausted.iter()) {
+        for cs in state.valid.iter().chain(state.exhausted.values()) {
             if let Some(id) = cs.account_id
                 && dirty_ids.contains(&id)
             {
@@ -831,11 +822,9 @@ impl AccountPoolActor {
         }
 
         let mut disabled = Vec::new();
-        for uc in &state.invalid {
-            if let Some(id) = uc.account_id
-                && dirty_ids.contains(&id)
-            {
-                disabled.push((id, uc.reason.to_db_string()));
+        for uc in state.invalid.values() {
+            if dirty_ids.contains(&uc.account_id) {
+                disabled.push((uc.account_id, uc.reason.to_db_string()));
             }
         }
 
@@ -880,10 +869,8 @@ impl AccountPoolActor {
                 mem_cookies.insert(id, cs);
             }
         }
-        for cs in state.exhausted.drain() {
-            if let Some(id) = cs.account_id {
-                mem_cookies.insert(id, cs);
-            }
+        for (id, cs) in state.exhausted.drain() {
+            mem_cookies.insert(id, cs);
         }
         // Drain invalid set — will be rebuilt from DB
         state.invalid.clear();
@@ -908,11 +895,9 @@ impl AccountPoolActor {
                         .as_deref()
                         .map(Reason::from_db_string)
                         .unwrap_or(Reason::Null);
-                    state.invalid.insert(InvalidAccountSlot::with_account_id(
-                        cookie,
-                        reason,
-                        Some(row.id),
-                    ));
+                    state
+                        .invalid
+                        .insert(row.id, InvalidAccountSlot::new(cookie, reason, row.id));
                 }
                 continue;
             }
@@ -920,8 +905,8 @@ impl AccountPoolActor {
             let cs_result = match row.cookie_blob.as_deref() {
                 Some(cookie_str) => AccountSlot::new(cookie_str, None),
                 None if row.oauth_token.is_some() => {
-                    // OAuth-only account: synthesize a per-account placeholder cookie so the
-                    // slot is still hashable/equal-distinct in the pool's HashSet and moka cache.
+                    // OAuth-only account: synthesize a placeholder cookie so the loader can
+                    // construct an AccountSlot from a DB row without a real cookie_blob.
                     // The real credential is in `row.oauth_token` and is attached below.
                     AccountSlot::new(&oauth_placeholder_cookie(row.id), None)
                 }
@@ -967,7 +952,7 @@ impl AccountPoolActor {
             }
 
             if cs.reset_time.is_some() {
-                state.exhausted.insert(cs);
+                state.exhausted.insert(row.id, cs);
             } else {
                 state.valid.push_back(cs);
             }
@@ -1031,8 +1016,8 @@ impl Actor for AccountPoolActor {
 
         let mut state = AccountPoolState {
             valid: VecDeque::new(),
-            exhausted: HashSet::new(),
-            invalid: HashSet::new(),
+            exhausted: HashMap::new(),
+            invalid: HashMap::new(),
             moka,
             db,
             event_tx,
@@ -1145,7 +1130,7 @@ impl Actor for AccountPoolActor {
                 let token = state
                     .valid
                     .iter()
-                    .chain(state.exhausted.iter())
+                    .chain(state.exhausted.values())
                     .find(|c| c.account_id == Some(account_id))
                     .and_then(|c| c.token.clone());
                 reply_port.send(token)?;
@@ -1167,25 +1152,25 @@ impl Actor for AccountPoolActor {
         // Do synchronous flush (await directly in post_stop)
         let dirty_ids: HashSet<i64> = std::mem::take(&mut state.dirty);
         let mut params = Vec::new();
-        for cs in state.valid.iter().chain(state.exhausted.iter()) {
-            if let Some(id) = cs.account_id {
-                if dirty_ids.contains(&id) {
-                    params.push((id, cs.to_runtime_params()));
-                }
+        for cs in state.valid.iter().chain(state.exhausted.values()) {
+            if let Some(id) = cs.account_id
+                && dirty_ids.contains(&id)
+            {
+                params.push((id, cs.to_runtime_params()));
             }
         }
         if let Err(e) = batch_upsert_runtime_states(&state.db, &params).await {
             error!("Failed to flush runtime states on shutdown: {e}");
         }
-        for uc in &state.invalid {
-            if let Some(id) = uc.account_id {
-                if dirty_ids.contains(&id) {
-                    if let Err(e) =
-                        set_account_disabled(&state.db, id, &uc.reason.to_db_string()).await
-                    {
-                        error!("Failed to set account {id} disabled on shutdown: {e}");
-                    }
-                }
+        for uc in state.invalid.values() {
+            if dirty_ids.contains(&uc.account_id)
+                && let Err(e) =
+                    set_account_disabled(&state.db, uc.account_id, &uc.reason.to_db_string()).await
+            {
+                error!(
+                    "Failed to set account {} disabled on shutdown: {e}",
+                    uc.account_id
+                );
             }
         }
         Ok(())
@@ -1456,8 +1441,8 @@ mod tests {
     fn oauth_placeholder_cookie_is_unique_per_account_and_accepted_by_parser() {
         // The synthesized placeholder must (a) satisfy `ClewdrCookie::from_str`'s
         // regex so the loader can construct an `AccountSlot`, and (b) be distinct
-        // per account_id so slots remain hashable/equal-distinct in the pool's
-        // HashSet<AccountSlot> (exhausted) and moka affinity cache.
+        // per account_id so debug logs and AccountSlot's cookie-keyed PartialEq
+        // (still in place until Step 3 retires AccountSlot) stay unambiguous.
         let c1 = oauth_placeholder_cookie(1);
         let c2 = oauth_placeholder_cookie(2);
         let c_big = oauth_placeholder_cookie(i64::MAX);
@@ -1525,8 +1510,8 @@ mod tests {
             .build();
         AccountPoolState {
             valid: VecDeque::new(),
-            exhausted: HashSet::new(),
-            invalid: HashSet::new(),
+            exhausted: HashMap::new(),
+            invalid: HashMap::new(),
             moka,
             db,
             event_tx,
@@ -1747,13 +1732,10 @@ mod tests {
         slot.account_id = Some(1);
         // Account is sitting in `invalid` with a sticky reason (auth_error
         // reloaded → Reason::Null).
-        state
-            .invalid
-            .insert(crate::config::InvalidAccountSlot::with_account_id(
-                slot.cookie.clone(),
-                Reason::Null,
-                Some(1),
-            ));
+        state.invalid.insert(
+            1,
+            crate::config::InvalidAccountSlot::new(slot.cookie.clone(), Reason::Null, 1),
+        );
 
         // In-flight request returns successfully (reason=None) — the pre-fix
         // behaviour would take from invalid and push back into valid, then
@@ -1762,7 +1744,7 @@ mod tests {
         AccountPoolActor::collect(&mut state, slot.clone(), None);
 
         assert!(
-            state.invalid.iter().any(|u| u.account_id == Some(1)),
+            state.invalid.contains_key(&1),
             "sticky-invalidated account must remain in state.invalid"
         );
         assert!(
@@ -1786,13 +1768,14 @@ mod tests {
 
         let mut slot = AccountSlot::new(&oauth_placeholder_cookie(2), None).unwrap();
         slot.account_id = Some(2);
-        state
-            .invalid
-            .insert(crate::config::InvalidAccountSlot::with_account_id(
+        state.invalid.insert(
+            2,
+            crate::config::InvalidAccountSlot::new(
                 slot.cookie.clone(),
                 Reason::TooManyRequest(1_700_000_000),
-                Some(2),
-            ));
+                2,
+            ),
+        );
 
         AccountPoolActor::collect(&mut state, slot.clone(), None);
 
@@ -1831,13 +1814,14 @@ mod tests {
         // `collect` marked the account dirty.
         let mut slot = AccountSlot::new(&oauth_placeholder_cookie(1), None).unwrap();
         slot.account_id = Some(1);
-        state
-            .invalid
-            .insert(crate::config::InvalidAccountSlot::with_account_id(
+        state.invalid.insert(
+            1,
+            crate::config::InvalidAccountSlot::new(
                 slot.cookie.clone(),
                 Reason::TooManyRequest(1_700_000_000),
-                Some(1),
-            ));
+                1,
+            ),
+        );
         AccountPoolActor::collect(&mut state, slot.clone(), None);
         assert!(state.reactivated.contains(&1));
         assert!(state.dirty.contains(&1));
@@ -1852,7 +1836,7 @@ mod tests {
         );
         assert!(!state.dirty.contains(&1), "dirty must be cleared");
         assert!(!state.valid.iter().any(|c| c.account_id == Some(1)));
-        assert!(state.invalid.iter().any(|u| u.account_id == Some(1)));
+        assert!(state.invalid.contains_key(&1));
 
         // Flushing must not touch the account at all — DB status stays at the
         // value the explicit write path just set.
@@ -1903,7 +1887,7 @@ mod tests {
         let after = state
             .valid
             .iter()
-            .chain(state.exhausted.iter())
+            .chain(state.exhausted.values())
             .find(|c| c.account_id == Some(1))
             .and_then(|c| c.token.as_ref())
             .map(|t| t.refresh_token.clone());

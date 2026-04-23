@@ -1,12 +1,8 @@
-use std::{
-    fmt::{Debug, Display},
-    hash::Hash,
-};
+use std::fmt::{Debug, Display};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::AccountSlot;
 use crate::config::ClewdrCookie;
 
 /// Reason why an account is considered unusable for dispatch
@@ -48,40 +44,11 @@ impl Display for Reason {
 pub struct InvalidAccountSlot {
     pub cookie: ClewdrCookie,
     pub reason: Reason,
-    #[serde(default)]
-    pub account_id: Option<i64>,
-}
-
-impl PartialEq<AccountSlot> for InvalidAccountSlot {
-    fn eq(&self, other: &AccountSlot) -> bool {
-        self.cookie == other.cookie
-    }
-}
-
-impl PartialEq for InvalidAccountSlot {
-    fn eq(&self, other: &Self) -> bool {
-        self.cookie == other.cookie
-    }
-}
-
-impl Eq for InvalidAccountSlot {}
-
-impl Hash for InvalidAccountSlot {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.cookie.hash(state);
-    }
+    pub account_id: i64,
 }
 
 impl InvalidAccountSlot {
-    pub fn new(cookie: ClewdrCookie, reason: Reason) -> Self {
-        Self {
-            cookie,
-            reason,
-            account_id: None,
-        }
-    }
-
-    pub fn with_account_id(cookie: ClewdrCookie, reason: Reason, account_id: Option<i64>) -> Self {
+    pub fn new(cookie: ClewdrCookie, reason: Reason, account_id: i64) -> Self {
         Self {
             cookie,
             reason,
@@ -100,10 +67,10 @@ impl Reason {
             other => {
                 if let Some(ts) = other.strip_prefix("restricted:") {
                     Some(Reason::Restricted(ts.parse().unwrap_or(0)))
-                } else if let Some(ts) = other.strip_prefix("too_many_request:") {
-                    Some(Reason::TooManyRequest(ts.parse().unwrap_or(0)))
                 } else {
-                    None
+                    other
+                        .strip_prefix("too_many_request:")
+                        .map(|ts| Reason::TooManyRequest(ts.parse().unwrap_or(0)))
                 }
             }
         }
