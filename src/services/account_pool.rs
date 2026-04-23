@@ -27,8 +27,8 @@ const FLUSH_INTERVAL: u64 = 15;
 const SESSION_WINDOW_SECS: i64 = 5 * 60 * 60; // 5h
 const WEEKLY_WINDOW_SECS: i64 = 7 * 24 * 60 * 60; // 7d
 
-/// Build a unique placeholder cookie string for an oauth-only account so its
-/// `AccountSlot` stays distinguishable in HashSet/moka keyed on the cookie value.
+/// Build a placeholder cookie string for an oauth-only account so the loader
+/// can construct an `AccountSlot` from a DB row that has no real `cookie_blob`.
 /// The format satisfies `ClewdrCookie`'s regex (`sk-ant-sid\d{2}-[A-Za-z0-9_-]{86,120}-[A-Za-z0-9_-]{6}AA`).
 fn oauth_placeholder_cookie(account_id: i64) -> String {
     format!("sk-ant-sid99-o{:0>85}-pool00AA", account_id)
@@ -907,8 +907,8 @@ impl AccountPoolActor {
             let cs_result = match row.cookie_blob.as_deref() {
                 Some(cookie_str) => AccountSlot::new(cookie_str, None),
                 None if row.oauth_token.is_some() => {
-                    // OAuth-only account: synthesize a per-account placeholder cookie so the
-                    // slot is still hashable/equal-distinct in the pool's HashSet and moka cache.
+                    // OAuth-only account: synthesize a placeholder cookie so the loader can
+                    // construct an AccountSlot from a DB row without a real cookie_blob.
                     // The real credential is in `row.oauth_token` and is attached below.
                     AccountSlot::new(&oauth_placeholder_cookie(row.id), None)
                 }
@@ -1444,8 +1444,8 @@ mod tests {
     fn oauth_placeholder_cookie_is_unique_per_account_and_accepted_by_parser() {
         // The synthesized placeholder must (a) satisfy `ClewdrCookie::from_str`'s
         // regex so the loader can construct an `AccountSlot`, and (b) be distinct
-        // per account_id so slots remain hashable/equal-distinct in the pool's
-        // HashSet<AccountSlot> (exhausted) and moka affinity cache.
+        // per account_id so debug logs and AccountSlot's cookie-keyed PartialEq
+        // (still in place until Step 3 retires AccountSlot) stay unambiguous.
         let c1 = oauth_placeholder_cookie(1);
         let c2 = oauth_placeholder_cookie(2);
         let c_big = oauth_placeholder_cookie(i64::MAX);
