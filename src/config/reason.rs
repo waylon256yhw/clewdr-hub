@@ -67,10 +67,10 @@ impl Reason {
             other => {
                 if let Some(ts) = other.strip_prefix("restricted:") {
                     Some(Reason::Restricted(ts.parse().unwrap_or(0)))
-                } else if let Some(ts) = other.strip_prefix("too_many_request:") {
-                    Some(Reason::TooManyRequest(ts.parse().unwrap_or(0)))
                 } else {
-                    None
+                    other
+                        .strip_prefix("too_many_request:")
+                        .map(|ts| Reason::TooManyRequest(ts.parse().unwrap_or(0)))
                 }
             }
         }

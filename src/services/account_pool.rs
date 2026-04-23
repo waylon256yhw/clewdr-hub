@@ -612,10 +612,8 @@ impl AccountPoolActor {
                 &reason,
                 None | Some(Reason::TooManyRequest(_) | Reason::Restricted(_))
             );
-        if moved_out_of_invalid {
-            if let Some(id) = aid {
-                state.reactivated.insert(id);
-            }
+        if moved_out_of_invalid && let Some(id) = aid {
+            state.reactivated.insert(id);
         }
 
         Self::mark_dirty(state, aid);
@@ -1155,25 +1153,24 @@ impl Actor for AccountPoolActor {
         let dirty_ids: HashSet<i64> = std::mem::take(&mut state.dirty);
         let mut params = Vec::new();
         for cs in state.valid.iter().chain(state.exhausted.values()) {
-            if let Some(id) = cs.account_id {
-                if dirty_ids.contains(&id) {
-                    params.push((id, cs.to_runtime_params()));
-                }
+            if let Some(id) = cs.account_id
+                && dirty_ids.contains(&id)
+            {
+                params.push((id, cs.to_runtime_params()));
             }
         }
         if let Err(e) = batch_upsert_runtime_states(&state.db, &params).await {
             error!("Failed to flush runtime states on shutdown: {e}");
         }
         for uc in state.invalid.values() {
-            if dirty_ids.contains(&uc.account_id) {
-                if let Err(e) =
+            if dirty_ids.contains(&uc.account_id)
+                && let Err(e) =
                     set_account_disabled(&state.db, uc.account_id, &uc.reason.to_db_string()).await
-                {
-                    error!(
-                        "Failed to set account {} disabled on shutdown: {e}",
-                        uc.account_id
-                    );
-                }
+            {
+                error!(
+                    "Failed to set account {} disabled on shutdown: {e}",
+                    uc.account_id
+                );
             }
         }
         Ok(())
