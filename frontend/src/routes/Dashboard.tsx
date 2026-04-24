@@ -60,6 +60,26 @@ export default function Dashboard() {
       ),
     },
     {
+      label: "调度细节",
+      link: "/accounts",
+      value: (
+        <Group gap="xs">
+          <Badge color="green" variant="light">
+            {data.pool.detail.dispatchable_now} dispatchable
+          </Badge>
+          <Badge color="yellow" variant="light">
+            {data.pool.detail.saturated} saturated
+          </Badge>
+          <Badge color="blue" variant="light">
+            {data.pool.detail.probing} probing
+          </Badge>
+          <Badge color="gray" variant="light">
+            {data.pool.detail.unconfigured} unconfigured
+          </Badge>
+        </Group>
+      ),
+    },
+    {
       label: "认证结构",
       link: "/accounts",
       value: (

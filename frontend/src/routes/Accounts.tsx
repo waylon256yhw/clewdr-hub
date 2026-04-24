@@ -76,16 +76,35 @@ function authSourceLabel(source: Account["auth_source"]): string {
   }
 }
 
-function accountStatusColor(status: "active" | "cooling" | "error" | "disabled"): string {
+function accountStatusColor(
+  status: "active" | "cooling" | "error" | "disabled" | "unconfigured",
+): string {
   switch (status) {
     case "active": return "green";
     case "cooling": return "yellow";
     case "error": return "red";
     case "disabled": return "gray";
+    case "unconfigured": return "gray";
   }
 }
 
-function displayAccountStatus(account: Account): "active" | "cooling" | "error" | "disabled" {
+type DisplayState = "active" | "cooling" | "error" | "disabled" | "unconfigured";
+
+/**
+ * Derive the badge state from the backend `health` field when present.
+ * Falls back to the legacy DB-status + runtime.reset_time heuristic when
+ * the account has not been indexed by the pool yet (snapshot/list race).
+ */
+function resolveDisplayStatus(account: Account): DisplayState {
+  if (account.health) {
+    switch (account.health.state) {
+      case "active": return "active";
+      case "cooling_down": return "cooling";
+      case "unconfigured": return "unconfigured";
+      case "invalid":
+        return account.health.kind === "disabled" ? "disabled" : "error";
+    }
+  }
   if (account.status === "disabled") return "disabled";
   if (account.status === "auth_error") return "error";
   if (account.status === "cooldown") return "cooling";
@@ -160,7 +179,9 @@ function AccountCard({
   onDelete: () => void;
 }) {
   const rt = account.runtime;
-  const displayStatus = displayAccountStatus(account);
+  const displayStatus = resolveDisplayStatus(account);
+  const isProbing = account.health?.probing ?? probing;
+  const effectiveProbeError = account.health?.last_probe_error ?? probeError;
   const probeCheckedAt = formatProbeCheckedAt(rt?.resets_last_checked_at);
   const testMut = useMutation({
     mutationFn: () => testAccount(account.id),
@@ -218,7 +239,7 @@ function AccountCard({
         <Badge color={accountStatusColor(displayStatus)} variant="light" size="sm">
           {displayStatus}
         </Badge>
-        {probing && <Badge color="blue" variant="light" size="sm">probing</Badge>}
+        {isProbing && <Badge color="blue" variant="light" size="sm">probing</Badge>}
         <Badge color="dark" variant="outline" size="sm">{authSourceLabel(account.auth_source)}</Badge>
         {account.account_type && (
           <Badge color={accountTypeColor(account.account_type)} variant="light" size="sm">
@@ -244,8 +265,8 @@ function AccountCard({
         <Text size="xs" c="red" mb="xs">{account.invalid_reason}</Text>
       )}
 
-      {probeError && (
-        <Text size="xs" c="orange" mb="xs">探测错误: {probeError}</Text>
+      {effectiveProbeError && (
+        <Text size="xs" c="orange" mb="xs">探测错误: {effectiveProbeError}</Text>
       )}
 
       {account.last_error && (

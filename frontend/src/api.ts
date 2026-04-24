@@ -59,10 +59,35 @@ export interface Paginated<T> {
   limit: number;
 }
 
+export interface HealthDetail {
+  dispatchable_now: number;
+  saturated: number;
+  cooling_down: number;
+  probing: number;
+  invalid_auth: number;
+  invalid_disabled: number;
+  unconfigured: number;
+}
+
+export interface InvalidBreakdown {
+  free: number;
+  disabled: number;
+  banned: number;
+  null: number;
+  restricted: number;
+  too_many_request: number;
+}
+
 export interface OverviewResponse {
   version: string;
   server_time: string;
-  pool: { valid: number; exhausted: number; invalid: number };
+  pool: {
+    valid: number;
+    exhausted: number;
+    invalid: number;
+    detail: HealthDetail;
+    invalid_breakdown: InvalidBreakdown;
+  };
   users: { total: number; admins: number; members: number; disabled: number };
   api_keys: { total: number; active: number; disabled: number };
   accounts: {
@@ -92,6 +117,29 @@ export interface AccountRuntime {
   weekly_opus: UsageWindow | null;
 }
 
+/**
+ * Unified account-health view produced by the Step 2.5 snapshot. The `state`
+ * tag is the mutually-exclusive base status (pool bucket authoritative);
+ * `probing` and `last_probe_error` are orthogonal overlays — a probing
+ * disabled/cooling account keeps its base state.
+ */
+export type AccountHealth =
+  | { state: "active"; probing: boolean; last_probe_error?: string | null }
+  | {
+      state: "cooling_down";
+      reset_time: number;
+      probing: boolean;
+      last_probe_error?: string | null;
+    }
+  | {
+      state: "invalid";
+      kind: "auth_error" | "disabled";
+      reason?: string | null;
+      probing: boolean;
+      last_probe_error?: string | null;
+    }
+  | { state: "unconfigured"; probing: boolean; last_probe_error?: string | null };
+
 export interface Account {
   id: number;
   name: string;
@@ -112,6 +160,7 @@ export interface Account {
   created_at: string | null;
   updated_at: string | null;
   runtime: AccountRuntime | null;
+  health?: AccountHealth;
 }
 
 export interface Proxy {
