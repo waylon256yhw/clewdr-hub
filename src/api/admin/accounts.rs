@@ -28,6 +28,7 @@ use crate::{
         AdminOAuthStartResponse, exchange_admin_oauth_callback, refresh_oauth_token,
         start_admin_oauth_flow,
     },
+    services::account_health::AccountHealth,
     services::account_pool::AccountPoolHandle,
     state::AppState,
     stealth::SharedStealthProfile,
@@ -81,9 +82,14 @@ pub struct AccountResponse {
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub runtime: Option<AccountRuntimeResponse>,
+    /// Unified account-health view merging the DB row with the current
+    /// pool state. `None` when the account has not been indexed by the
+    /// pool yet (e.g., just created between snapshot and list load).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<AccountHealth>,
 }
 
-fn map_account(row: &AccountWithRuntime) -> AccountResponse {
+fn map_account(row: &AccountWithRuntime, health: Option<AccountHealth>) -> AccountResponse {
     let runtime = row.runtime.as_ref().map(|rt| AccountRuntimeResponse {
         reset_time: rt.reset_time,
         resets_last_checked_at: rt.resets_last_checked_at,
@@ -135,6 +141,7 @@ fn map_account(row: &AccountWithRuntime) -> AccountResponse {
         created_at: row.created_at.clone(),
         updated_at: row.updated_at.clone(),
         runtime,
+        health,
     }
 }
 
@@ -254,10 +261,18 @@ pub async fn list(
     Query(_params): Query<PaginationParams>,
 ) -> Result<Json<AccountsListResponse>, ClewdrError> {
     let all = load_all_accounts(&db).await?;
-    let probing_ids = actor.get_probing_ids().await.unwrap_or_default();
-    let probe_errors = actor.get_probe_errors().await.unwrap_or_default();
+    // Single snapshot drives both per-item `health` and the top-level
+    // `probing_ids` / `probe_errors`, so the list view cannot disagree
+    // with itself about which accounts are probing or what the last
+    // probe error was.
+    let snapshot = actor.get_health_snapshot().await?;
     let total = all.len() as i64;
-    let items: Vec<AccountResponse> = all.iter().map(map_account).collect();
+    let items: Vec<AccountResponse> = all
+        .iter()
+        .map(|row| map_account(row, snapshot.per_account.get(&row.id).cloned()))
+        .collect();
+    let probing_ids = snapshot.summary.probe.probing_ids.clone();
+    let probe_errors = snapshot.summary.probe.last_errors.clone();
     Ok(Json(AccountsListResponse {
         items,
         total,
