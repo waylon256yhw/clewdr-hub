@@ -13,7 +13,7 @@ use sqlx::SqlitePool;
 use super::common::PaginationParams;
 use crate::{
     billing::{BillingContext, RequestType, persist_probe_log},
-    claude_code_state::{ClaudeCodeState, build_api_client, probe::probe_oauth_account},
+    claude_code_state::{ClaudeCodeState, build_api_client},
     config::{AccountSlot, CLAUDE_ENDPOINT, ClewdrCookie},
     db::accounts::{
         AccountWithRuntime, batch_upsert_runtime_states, get_account_by_id, load_all_accounts,
@@ -646,58 +646,34 @@ pub async fn remove(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// HTTP `POST /accounts/probe`. Per Step 4 / C4, this delegates the
+/// cookie-vs-oauth split to the pool's unified probe entry point. The
+/// admin still computes eligibility (OAuth: must be non-disabled with a
+/// stored token; cookie: must have a `cookie_blob`) so disabled OAuth
+/// accounts are not auto-reactivated by an admin probe — that asymmetry
+/// matches pre-C4 behavior. Pool's `spawn_probe_guarded` then DB-loads
+/// each row and dispatches to `probe_cookie` or `probe_oauth_account`.
 pub async fn probe_all(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ClewdrError> {
     let accounts = load_all_accounts(&state.db).await?;
-    let mut probing_ids = Vec::new();
-    let mut cookie_backed_ids = Vec::new();
+    let eligible_ids: Vec<i64> = accounts
+        .into_iter()
+        .filter(|a| match a.auth_source.as_str() {
+            "oauth" => a.status != "disabled" && a.oauth_token.is_some(),
+            _ => a.cookie_blob.is_some(),
+        })
+        .map(|a| a.id)
+        .collect();
 
-    for account in accounts {
-        let auth_source = account.auth_source.as_str();
-
-        if auth_source == "oauth" && account.status != "disabled" && account.oauth_token.is_some() {
-            if !state.account_pool.begin_probe(account.id).await? {
-                continue;
-            }
-            probing_ids.push(account.id);
-            let handle = state.account_pool.clone();
-            let db = state.db.clone();
-            let event_tx = state.event_tx.clone();
-            tokio::spawn(async move {
-                probe_oauth_account(account, handle, db, Some(event_tx)).await;
-            });
-            continue;
-        }
-
-        if account.cookie_blob.is_some() {
-            cookie_backed_ids.push(account.id);
-            continue;
-        }
-
-        if account.status != "disabled" && account.oauth_token.is_some() {
-            if !state.account_pool.begin_probe(account.id).await? {
-                continue;
-            }
-            probing_ids.push(account.id);
-            let handle = state.account_pool.clone();
-            let db = state.db.clone();
-            let event_tx = state.event_tx.clone();
-            tokio::spawn(async move {
-                probe_oauth_account(account, handle, db, Some(event_tx)).await;
-            });
-            continue;
-        }
-    }
-
-    if !cookie_backed_ids.is_empty() {
-        probing_ids.extend(
-            state
-                .account_pool
-                .probe_accounts(cookie_backed_ids, state.event_tx.clone())
-                .await?,
-        );
-    }
+    let probing_ids = if eligible_ids.is_empty() {
+        Vec::new()
+    } else {
+        state
+            .account_pool
+            .probe_accounts(eligible_ids, state.event_tx.clone())
+            .await?
+    };
 
     Ok(Json(serde_json::json!({ "probing_ids": probing_ids })))
 }
