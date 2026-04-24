@@ -13,8 +13,8 @@ use tracing::{error, info, warn};
 use crate::{
     claude_code_state::probe::{probe_cookie, probe_oauth_account},
     config::{
-        AccountSlot, AuthMethod, ClewdrCookie, InvalidAccountSlot, Reason, RuntimeStateParams,
-        TokenInfo, UsageBreakdown,
+        AccountSlot, AuthMethod, InvalidAccountSlot, Reason, RuntimeStateParams, TokenInfo,
+        UsageBreakdown,
     },
     db::accounts::{
         AccountWithRuntime, active_reset_time, batch_upsert_runtime_states, get_account_by_id,
@@ -265,12 +265,17 @@ impl AccountPoolActor {
     /// See `docs/account-normalization-2026-04-21.md` §"容易漏掉 #5" for the
     /// broader principle.
     fn converge_invalidate(state: &mut AccountPoolState, account_id: i64, reason: Reason) {
-        // Remove from valid.
-        let mut removed_cookie: Option<ClewdrCookie> = None;
+        // Pull the account out of valid / exhausted, capturing its auth_method
+        // along the way so the InvalidAccountSlot record can preserve the
+        // kind for admin overview's invalid-grouping display. If the
+        // account isn't in either bucket (already invalid, or never loaded)
+        // we leave `state.invalid` untouched — over-writing it would erase
+        // the existing reason without us being sure of the kind.
+        let mut removed_kind: Option<AuthMethod> = None;
         state.valid.retain(|c| {
             if c.account_id == Some(account_id) {
-                if removed_cookie.is_none() {
-                    removed_cookie = Some(c.cookie.clone());
+                if removed_kind.is_none() {
+                    removed_kind = Some(c.auth_method);
                 }
                 false
             } else {
@@ -278,18 +283,17 @@ impl AccountPoolActor {
             }
         });
 
-        // Remove from exhausted (direct id lookup — exhausted is keyed by account_id).
         if let Some(slot) = state.exhausted.remove(&account_id) {
-            removed_cookie.get_or_insert(slot.cookie);
+            removed_kind.get_or_insert(slot.auth_method);
         }
 
         // Record in invalid so pool-view summaries and collect's sticky-reason
         // guard see the authoritative reason. Existing entry (if any) is
         // replaced so the reason reflects the latest cause.
-        if let Some(cookie) = removed_cookie {
+        if let Some(auth_method) = removed_kind {
             state.invalid.insert(
                 account_id,
-                InvalidAccountSlot::new(cookie, reason, account_id),
+                InvalidAccountSlot::new(account_id, auth_method, reason),
             );
         }
 
@@ -639,14 +643,13 @@ impl AccountPoolActor {
     /// `account_id`, by peeking each bucket without consuming. C5's guard
     /// compares this against the caller's request-time fingerprint.
     ///
-    /// Lookup order: `valid` → `exhausted` → `invalid`. `invalid` only has
-    /// the cookie blob preserved on `InvalidAccountSlot.cookie`, so OAuth
-    /// accounts in invalid currently fingerprint as Cookie(prefix). That
-    /// asymmetry is harmless for now: an OAuth account in invalid is
-    /// already in a sticky-reason state (Disabled / AuthError) and will
-    /// be caught by the sticky-reason guard above before the fingerprint
-    /// check runs. C6 retires `InvalidAccountSlot.cookie` and replaces
-    /// this branch with an `auth_method`-aware lookup.
+    /// Lookup order: `valid` → `exhausted`. The `invalid` bucket no
+    /// longer carries credential bytes (Step 4 / C6 retired
+    /// `InvalidAccountSlot.cookie`) — we return None for invalid-only
+    /// accounts. That's correct because every reason that can land an
+    /// account in `invalid` (Free / Disabled / Banned / Null) is already
+    /// caught by the sticky-reason guard above before this fingerprint
+    /// check runs, so a None return here cannot mask a stale-write race.
     fn pool_credential_fingerprint(
         state: &AccountPoolState,
         account_id: i64,
@@ -660,9 +663,6 @@ impl AccountPoolActor {
         }
         if let Some(slot) = state.exhausted.get(&account_id) {
             return CredentialFingerprint::from_slot(slot);
-        }
-        if let Some(inv) = state.invalid.get(&account_id) {
-            return Some(CredentialFingerprint::cookie_prefix(inv.cookie.as_ref()));
         }
         None
     }
@@ -718,29 +718,34 @@ impl AccountPoolActor {
             .position(|c| c.account_id == Some(account_id))
             .and_then(|i| state.valid.remove(i));
         let had_exhausted = state.exhausted.remove(&account_id);
-        let had_invalid = state.invalid.remove(&account_id);
+        // Don't pop the invalid entry yet — if the account is *only* in
+        // invalid we can't rebucket it (post-C6 invalid no longer carries
+        // credential bytes for slot rebuild), so we'd otherwise leak it
+        // out of every bucket. Only consume the entry if we actually have
+        // a slot to migrate.
+        let had_invalid_flag = state.invalid.contains_key(&account_id);
 
         let had_valid_flag = had_valid.is_some();
         let had_exhausted_flag = had_exhausted.is_some();
-        let had_invalid_flag = had_invalid.is_some();
 
-        // Prefer a full slot (valid / exhausted) because it carries the live
-        // credential. Fall back to rematerialising from `InvalidAccountSlot`
-        // when the account was only present in `invalid`; that path keeps
-        // only the cookie string, which is enough for bucket placement.
-        let mut slot = match (had_valid, had_exhausted, had_invalid.as_ref()) {
-            (Some(s), _, _) => s,
-            (None, Some(s), _) => s,
-            (None, None, Some(inv)) => {
-                let raw = inv.cookie.to_string();
-                let Ok(mut s) = AccountSlot::new(&raw, None) else {
-                    return removed_probe;
-                };
-                s.account_id = Some(inv.account_id);
-                s
-            }
+        // Prefer a full slot from valid / exhausted because it carries the
+        // live credential. After Step 4 / C6 the `invalid` bucket no longer
+        // stores credential bytes, so an account that's *only* in invalid
+        // cannot be re-bucketed here — it stays put until `do_reload`
+        // rebuilds it from DB. In practice every reason that lands an
+        // account in `invalid` (Free / Disabled / Banned / Null) is
+        // sticky and would have been caught by the sticky-reason guard
+        // above, so this `_` arm is unreachable on the hot path; we
+        // return defensively rather than panicking.
+        let mut slot = match (had_valid, had_exhausted) {
+            (Some(s), _) => s,
+            (None, Some(s)) => s,
             _ => return removed_probe,
         };
+
+        // We have a slot to rebucket — pop the invalid entry now (if any)
+        // so the rebucket below is the sole writer for this account_id.
+        let _ = state.invalid.remove(&account_id);
 
         slot.apply_runtime_state(&update);
 
@@ -764,7 +769,7 @@ impl AccountPoolActor {
                 slot.reset_window_usage();
                 state.invalid.insert(
                     account_id,
-                    InvalidAccountSlot::new(slot.cookie.clone(), reason.clone(), account_id),
+                    InvalidAccountSlot::new(account_id, slot.auth_method, reason.clone()),
                 );
                 !had_invalid_flag
             }
@@ -1121,25 +1126,22 @@ impl AccountPoolActor {
         // Rebuild from DB
         for row in &accounts {
             if matches!(row.status.as_str(), "disabled" | "auth_error") {
-                let cookie_for_invalid = match row.cookie_blob.as_deref() {
-                    Some(cookie_str) => AccountSlot::new(cookie_str, None).ok().map(|cs| cs.cookie),
-                    None if row.oauth_token.is_some() => {
-                        AccountSlot::new(&oauth_placeholder_cookie(row.id), None)
-                            .ok()
-                            .map(|cs| cs.cookie)
-                    }
-                    None => None,
-                };
-                if let Some(cookie) = cookie_for_invalid {
-                    let reason = row
-                        .invalid_reason
-                        .as_deref()
-                        .map(Reason::from_db_string)
-                        .unwrap_or(Reason::Null);
-                    state
-                        .invalid
-                        .insert(row.id, InvalidAccountSlot::new(cookie, reason, row.id));
+                // Post Step 4 / C6 the invalid bucket only stores
+                // (account_id, auth_method, reason) — no credential bytes.
+                // Skip rows with no credential at all so we don't surface
+                // a phantom invalid entry for a half-deleted account.
+                if row.cookie_blob.is_none() && row.oauth_token.is_none() {
+                    continue;
                 }
+                let reason = row
+                    .invalid_reason
+                    .as_deref()
+                    .map(Reason::from_db_string)
+                    .unwrap_or(Reason::Null);
+                let auth_method = AuthMethod::from_auth_source(&row.auth_source);
+                state
+                    .invalid
+                    .insert(row.id, InvalidAccountSlot::new(row.id, auth_method, reason));
                 continue;
             }
 
@@ -2033,7 +2035,7 @@ mod tests {
         // reloaded → Reason::Null).
         state.invalid.insert(
             1,
-            crate::config::InvalidAccountSlot::new(slot.cookie.clone(), Reason::Null, 1),
+            crate::config::InvalidAccountSlot::new(1, AuthMethod::Cookie, Reason::Null),
         );
 
         // In-flight request returns successfully (reason=None) — the pre-fix
@@ -2057,34 +2059,82 @@ mod tests {
     }
 
     /// Counter-test for the sticky-reason guard: cooldown reasons
-    /// (TooManyRequest / Restricted) must still be allowed to auto-reactivate
-    /// when a later Return arrives with reason=None. This is the existing
+    /// (TooManyRequest / Restricted) flowing through `collect_by_id` from
+    /// the EXHAUSTED bucket auto-reactivate when a later Return arrives
+    /// with reason=None and a cleared reset_time. This is the existing
     /// "account cooled down, back in service" flow.
+    ///
+    /// Pre-C6 this also covered the rare TMR-in-INVALID case (auto
+    /// re-bucket from invalid via the `(None, None, Some(inv))` arm of
+    /// the slot-lookup match). Post-C6 the invalid bucket no longer
+    /// carries credential bytes, so a TMR account that somehow ends up
+    /// only in invalid waits for `do_reload` to rebuild it from DB
+    /// instead — the in-production path here is exhausted-bucket
+    /// reactivation, which is what this test now exercises.
     #[tokio::test]
     async fn collect_still_reactivates_for_cooldown_reason() {
         let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
         let mut state = empty_state(pool);
 
-        let mut slot = AccountSlot::new(&oauth_placeholder_cookie(2), None).unwrap();
-        slot.account_id = Some(2);
+        // Account is sitting in EXHAUSTED with a TMR reset_time (the
+        // production representation of "cooled down").
+        let mut slot = oauth_slot_with_refresh(2, "rt0");
+        slot.reset_time = Some(1_700_000_000);
+        state.exhausted.insert(2, slot.clone());
+
+        // The release captures the caller's view: reset_time has elapsed,
+        // dispatch's `reset()` cleared it, and the request finished
+        // normally (reason=None).
+        let mut update = slot.to_runtime_params();
+        update.reset_time = None;
+        AccountPoolActor::collect_by_id(&mut state, 2, update, None, None);
+
+        assert!(
+            state.valid.iter().any(|c| c.account_id == Some(2)),
+            "exhausted account released with reset_time=None must reactivate to valid"
+        );
+        assert!(
+            !state.exhausted.contains_key(&2),
+            "slot must move out of exhausted"
+        );
+    }
+
+    /// Post-C6 invariant: a TMR account that somehow ends up *only* in
+    /// the invalid bucket no longer auto-reactivates via release_runtime
+    /// (the previous `(None, None, Some(inv))` slot-rebuild branch is
+    /// gone, since `InvalidAccountSlot` no longer carries credential
+    /// bytes). It stays in invalid until `do_reload` rebuilds it from
+    /// DB. The dispatcher never picks invalid accounts, so no chat
+    /// release would arrive for one in production — but if a stale
+    /// release does arrive, we must NOT silently lose the account.
+    #[tokio::test]
+    async fn collect_leaves_invalid_only_account_in_invalid_after_c6() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        let mut state = empty_state(pool);
+
+        let slot = oauth_slot_with_refresh(2, "rt0");
         state.invalid.insert(
             2,
             crate::config::InvalidAccountSlot::new(
-                slot.cookie.clone(),
-                Reason::TooManyRequest(1_700_000_000),
                 2,
+                AuthMethod::OAuth,
+                Reason::TooManyRequest(1_700_000_000),
             ),
         );
 
         AccountPoolActor::collect_by_id(&mut state, 2, slot.to_runtime_params(), None, None);
 
         assert!(
-            state.valid.iter().any(|c| c.account_id == Some(2)),
-            "TMR-invalidated account must still reactivate on normal return"
+            !state.valid.iter().any(|c| c.account_id == Some(2)),
+            "invalid-only account must not be silently re-bucketed without DB context"
         );
         assert!(
-            state.reactivated.contains(&2),
-            "TMR reactivation must queue set_accounts_active"
+            state.invalid.contains_key(&2),
+            "invalid-only account must remain in invalid until do_reload rebuilds from DB"
+        );
+        assert!(
+            !state.reactivated.contains(&2),
+            "no reactivation queued without an actual rebucket"
         );
     }
 
@@ -2108,23 +2158,20 @@ mod tests {
 
         let mut state = empty_state(pool.clone());
 
-        // Simulate a prior TMR return that cool-down-reactivated the account:
-        // slot is back in `valid`, `reactivated` queues DB set-active, and
-        // `collect` marked the account dirty.
+        // Simulate the post-cooldown reactivation flow: slot is back in
+        // `valid`, `reactivated` queues `set_accounts_active`, `dirty`
+        // queues a runtime flush. Pre-C6 this state was reachable via
+        // `collect_by_id`'s now-retired (None, None, Some(inv)) arm; the
+        // setup is now manual since the only invariant under test is
+        // `converge_invalidate`'s ability to drop *whatever* pending
+        // flush side-effects are queued for an account it just decided
+        // to invalidate.
         let mut slot = AccountSlot::new(&oauth_placeholder_cookie(1), None).unwrap();
         slot.account_id = Some(1);
-        state.invalid.insert(
-            1,
-            crate::config::InvalidAccountSlot::new(
-                slot.cookie.clone(),
-                Reason::TooManyRequest(1_700_000_000),
-                1,
-            ),
-        );
-        AccountPoolActor::collect_by_id(&mut state, 1, slot.to_runtime_params(), None, None);
-        assert!(state.reactivated.contains(&1));
-        assert!(state.dirty.contains(&1));
-        assert!(state.valid.iter().any(|c| c.account_id == Some(1)));
+        slot.auth_method = AuthMethod::OAuth;
+        state.valid.push_back(slot);
+        state.reactivated.insert(1);
+        state.dirty.insert(1);
 
         // Explicit failure path: probe writes auth_error to DB, then converges
         // the pool. Both queued flush side-effects must be cleared.
@@ -2292,12 +2339,9 @@ mod tests {
         state.exhausted.insert(3, slot3);
 
         // Invalid slot for 4 with Reason::Banned, overlaid with probing.
-        let slot4_cookie = AccountSlot::new(&oauth_placeholder_cookie(4), None)
-            .unwrap()
-            .cookie;
         state.invalid.insert(
             4,
-            crate::config::InvalidAccountSlot::new(slot4_cookie, Reason::Banned, 4),
+            crate::config::InvalidAccountSlot::new(4, AuthMethod::OAuth, Reason::Banned),
         );
         state.probing.insert(4);
         state.probe_errors.insert(4, "transient".to_string());
@@ -2407,12 +2451,9 @@ mod tests {
         state.valid.push_back(slot5);
         state.inflight.insert(5, (0, 5));
 
-        let slot6_cookie = AccountSlot::new(&oauth_placeholder_cookie(6), None)
-            .unwrap()
-            .cookie;
         state.invalid.insert(
             6,
-            crate::config::InvalidAccountSlot::new(slot6_cookie, Reason::Banned, 6),
+            crate::config::InvalidAccountSlot::new(6, AuthMethod::OAuth, Reason::Banned),
         );
 
         let accounts = load_all_accounts(&state.db).await.unwrap();
@@ -2827,10 +2868,10 @@ mod tests {
         state.exhausted.insert(3, s3);
 
         // invalid: id 4 (cookie disabled)
-        let inv_cookie = ClewdrCookie::from_str(&cookie_blob_for(b'd')).unwrap();
-        state
-            .invalid
-            .insert(4, InvalidAccountSlot::new(inv_cookie, Reason::Disabled, 4));
+        state.invalid.insert(
+            4,
+            InvalidAccountSlot::new(4, AuthMethod::Cookie, Reason::Disabled),
+        );
 
         // wanted = all four IDs + a non-existent 99
         let wanted = vec![1, 2, 3, 4, 99];
@@ -3218,5 +3259,91 @@ mod tests {
             .find(|c| c.account_id == Some(4))
             .unwrap();
         assert_eq!(after.count_tokens_allowed, Some(true));
+    }
+
+    /// Step 4 / C6: `do_reload` no longer mints a placeholder cookie
+    /// just to land an oauth-only `disabled`/`auth_error` row in the
+    /// invalid bucket. The bucket entry is built directly from
+    /// `(row.id, AuthMethod::from_auth_source, Reason::from_db_string)`.
+    /// This test runs both kinds through one reload so the auth_method
+    /// stamping is per-row, not stuck on a constant.
+    #[tokio::test]
+    async fn reload_inserts_invalid_bucket_entries_without_credential_bytes() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        // Cookie account that just got auth_error'd by a probe.
+        let cookie_blob = cookie_blob_for(b'e');
+        sqlx::query(
+            "INSERT INTO accounts (
+                id, name, rr_order, max_slots, status, auth_source, cookie_blob,
+                organization_uuid, drain_first, invalid_reason
+            ) VALUES (?1, ?2, ?1, 5, 'auth_error', 'cookie', ?3, 'org', 0, 'null')",
+        )
+        .bind(70_i64)
+        .bind("acc-70")
+        .bind(&cookie_blob)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // OAuth account that's been admin-disabled.
+        insert_account_row(
+            &pool,
+            71,
+            "disabled",
+            "oauth",
+            Some("at_x"),
+            Some("rt_x"),
+            Some("disabled"),
+        )
+        .await;
+
+        let mut state = empty_state(pool);
+        AccountPoolActor::do_reload(&mut state).await;
+
+        let cookie_inv = state
+            .invalid
+            .get(&70)
+            .expect("cookie auth_error row must land in invalid");
+        assert_eq!(cookie_inv.account_id, 70);
+        assert_eq!(cookie_inv.auth_method, AuthMethod::Cookie);
+        assert_eq!(cookie_inv.reason, Reason::Null);
+
+        let oauth_inv = state
+            .invalid
+            .get(&71)
+            .expect("oauth disabled row must land in invalid");
+        assert_eq!(oauth_inv.account_id, 71);
+        assert_eq!(oauth_inv.auth_method, AuthMethod::OAuth);
+        assert_eq!(oauth_inv.reason, Reason::Disabled);
+    }
+
+    /// Pool-side fingerprint lookup must NOT fall back to invalid-bucket
+    /// cookie bytes after C6 — those bytes are gone. Returning `None` for
+    /// invalid-only accounts is the correct behavior; the sticky-reason
+    /// guard above `pool_credential_fingerprint` already covers every
+    /// reason that can place an account in invalid (Free / Disabled /
+    /// Banned / Null), so a None here cannot mask a stale-write race.
+    #[tokio::test]
+    async fn pool_credential_fingerprint_returns_none_for_invalid_only_accounts() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        let mut state = empty_state(pool);
+        state.invalid.insert(
+            99,
+            crate::config::InvalidAccountSlot::new(99, AuthMethod::Cookie, Reason::Disabled),
+        );
+
+        let fp = AccountPoolActor::pool_credential_fingerprint(&state, 99);
+        assert!(
+            fp.is_none(),
+            "invalid-only accounts must not synthesize a fingerprint from retired cookie bytes"
+        );
+
+        // Likewise for OAuth invalid (no token in invalid post-C6).
+        state.invalid.insert(
+            100,
+            crate::config::InvalidAccountSlot::new(100, AuthMethod::OAuth, Reason::Banned),
+        );
+        let fp_oauth = AccountPoolActor::pool_credential_fingerprint(&state, 100);
+        assert!(fp_oauth.is_none());
     }
 }

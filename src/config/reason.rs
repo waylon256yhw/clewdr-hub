@@ -3,7 +3,7 @@ use std::fmt::{Debug, Display};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::config::ClewdrCookie;
+use crate::config::AuthMethod;
 
 /// Reason why an account is considered unusable for dispatch
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Error)]
@@ -38,21 +38,32 @@ impl Display for Reason {
     }
 }
 
-/// A struct representing a cookie that can't be used
-/// Contains the cookie and the reason why it's considered unusable
+/// Pool-side record for an account that is currently dispatch-ineligible.
+///
+/// Step 4 / C6 retired the embedded cookie blob — pre-C6 this struct
+/// stored the full `ClewdrCookie` so `spawn_probe_*` and `collect_by_id`
+/// could reconstruct an `AccountSlot` from in-memory residue. Post-C4
+/// probes load credentials from DB by `account_id`; post-C5 release
+/// guards drop stale runtime via `CredentialFingerprint`. Neither path
+/// needs the bytes here any more, and keeping them was forcing
+/// `pool_credential_fingerprint` to fall back to a half-typed
+/// (cookie-only) identity for OAuth accounts in invalid.
+///
+/// `auth_method` stays so admin overview / `AccountHealth` can group
+/// invalid accounts by kind without re-querying the DB.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct InvalidAccountSlot {
-    pub cookie: ClewdrCookie,
-    pub reason: Reason,
     pub account_id: i64,
+    pub auth_method: AuthMethod,
+    pub reason: Reason,
 }
 
 impl InvalidAccountSlot {
-    pub fn new(cookie: ClewdrCookie, reason: Reason, account_id: i64) -> Self {
+    pub fn new(account_id: i64, auth_method: AuthMethod, reason: Reason) -> Self {
         Self {
-            cookie,
-            reason,
             account_id,
+            auth_method,
+            reason,
         }
     }
 }
