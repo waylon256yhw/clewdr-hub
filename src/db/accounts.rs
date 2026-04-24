@@ -642,6 +642,54 @@ pub async fn update_account_metadata(
     Ok(())
 }
 
+/// Non-destructive sibling of [`update_account_metadata`]'s guard: returns
+/// true iff the account's stored credential still starts with
+/// `expected_credential_prefix` under `expected_auth_source`. Used by
+/// probe commit chains to decide whether to continue writing probe
+/// results after each step, so an admin credential rotation or a peer
+/// probe's rotation mid-probe aborts the rest of the stale probe's
+/// writes (runtime, set_active, auth_error, ...).
+///
+/// The comparison uses `substr(col, 1, ?len) = ?prefix` — the same exact-
+/// bytes form as the metadata guard — so SQLite wildcard characters in
+/// the prefix do not relax the check.
+pub async fn account_credential_matches_prefix(
+    pool: &SqlitePool,
+    account_id: i64,
+    expected_auth_source: &str,
+    expected_credential_prefix: &str,
+) -> Result<bool, sqlx::Error> {
+    let plen = expected_credential_prefix.len() as i64;
+    let matched: Option<(i64,)> = match expected_auth_source {
+        "cookie" => {
+            let legacy_prefix = format!("sessionKey={expected_credential_prefix}");
+            let legacy_plen = legacy_prefix.len() as i64;
+            sqlx::query_as(
+                "SELECT 1 FROM accounts WHERE id = ?1 AND auth_source = 'cookie' AND (substr(cookie_blob, 1, ?2) = ?3 OR substr(cookie_blob, 1, ?4) = ?5)",
+            )
+            .bind(account_id)
+            .bind(plen)
+            .bind(expected_credential_prefix)
+            .bind(legacy_plen)
+            .bind(legacy_prefix)
+            .fetch_optional(pool)
+            .await?
+        }
+        "oauth" => {
+            sqlx::query_as(
+                "SELECT 1 FROM accounts WHERE id = ?1 AND auth_source = 'oauth' AND substr(oauth_access_token, 1, ?2) = ?3",
+            )
+            .bind(account_id)
+            .bind(plen)
+            .bind(expected_credential_prefix)
+            .fetch_optional(pool)
+            .await?
+        }
+        _ => return Ok(false),
+    };
+    Ok(matched.is_some())
+}
+
 pub async fn update_account_metadata_unchecked(
     pool: &SqlitePool,
     account_id: i64,
@@ -744,7 +792,8 @@ mod tests {
 
     use super::{
         AccountAuthSourceSummary, AccountPoolSummary, AccountStatusSummary, AccountSummary,
-        AccountWithRuntime, RuntimeStateRow, summarize_accounts, update_account_metadata,
+        AccountWithRuntime, RuntimeStateRow, account_credential_matches_prefix, summarize_accounts,
+        update_account_metadata,
     };
     use crate::config::{Organization, TokenInfo, UsageBreakdown};
     use crate::db::init_pool;
@@ -1129,6 +1178,92 @@ mod tests {
             row.get::<Option<String>, _>("organization_uuid").as_deref(),
             Some("seed"),
             "underscore in prefix must not act as a wildcard"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_credential_matches_prefix_positive_cases() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        // Cookie + literal match.
+        sqlx::query(
+            "INSERT INTO accounts (
+                id, name, rr_order, max_slots, status, auth_source, cookie_blob, drain_first
+            ) VALUES (10, 'ck', 1, 5, 'active', 'cookie', ?1, 0)",
+        )
+        .bind("sk-ant-sid01-ABCDE-rest")
+        .execute(&pool)
+        .await
+        .unwrap();
+        // OAuth + literal match.
+        sqlx::query(
+            "INSERT INTO accounts (
+                id, name, rr_order, max_slots, status, auth_source,
+                oauth_access_token, oauth_refresh_token, oauth_expires_at,
+                organization_uuid, drain_first
+            ) VALUES (11, 'oa', 2, 5, 'active', 'oauth', ?1, ?2, '2030-01-01T00:00:00Z', 'org', 0)",
+        )
+        .bind("at-current-token")
+        .bind("rt")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            account_credential_matches_prefix(&pool, 10, "cookie", "sk-ant-sid01-ABCDE")
+                .await
+                .unwrap()
+        );
+        assert!(
+            account_credential_matches_prefix(&pool, 11, "oauth", "at-current")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn account_credential_matches_prefix_detects_rotation() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (
+                id, name, rr_order, max_slots, status, auth_source,
+                oauth_access_token, oauth_refresh_token, oauth_expires_at,
+                organization_uuid, drain_first
+            ) VALUES (12, 'oa', 1, 5, 'active', 'oauth', ?1, ?2, '2030-01-01T00:00:00Z', 'org', 0)",
+        )
+        .bind("at-NEW-rotated")
+        .bind("rt")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Probe started with the pre-rotation prefix; rotation must be visible.
+        assert!(
+            !account_credential_matches_prefix(&pool, 12, "oauth", "at-OLD")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn account_credential_matches_prefix_rejects_auth_source_mismatch() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (
+                id, name, rr_order, max_slots, status, auth_source, cookie_blob, drain_first
+            ) VALUES (13, 'ck', 1, 5, 'active', 'cookie', ?1, 0)",
+        )
+        .bind("sk-ant-sid01-whatever")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Even if the stored cookie happens to start with a string the caller
+        // would use as an OAuth access_token prefix, the auth_source gate
+        // keeps the cross-kind match from succeeding.
+        assert!(
+            !account_credential_matches_prefix(&pool, 13, "oauth", "sk-ant-sid01")
+                .await
+                .unwrap()
         );
     }
 

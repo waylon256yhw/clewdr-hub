@@ -9,8 +9,9 @@ use crate::{
     billing::{BillingContext, RequestType, persist_probe_log},
     config::{AccountSlot, CLEWDR_CONFIG, Reason},
     db::accounts::{
-        AccountWithRuntime, batch_upsert_runtime_states, get_account_by_id, set_account_active,
-        set_account_auth_error, update_account_metadata, upsert_account_oauth,
+        AccountWithRuntime, account_credential_matches_prefix, batch_upsert_runtime_states,
+        get_account_by_id, set_account_active, set_account_auth_error, update_account_metadata,
+        upsert_account_oauth,
     },
     error::ClewdrError,
     oauth::{fetch_oauth_snapshot_raw, refresh_oauth_token_with_raw},
@@ -647,6 +648,16 @@ async fn run_oauth_probe(
         }
     };
 
+    // Fingerprint the access token this probe started with. Used on the
+    // upstream-failure path to decide whether a stale probe's verdict
+    // should still be allowed to stamp auth_error on the account: if the
+    // credential has rotated (admin reconnect, peer refresh), the probe's
+    // failure reflects the old credential and must not taint the new one.
+    let starting_access_prefix = {
+        let cap = 20.min(token.access_token.len());
+        token.access_token[..cap].to_string()
+    };
+
     // A probe's job is to refresh the account's health signal (profile + usage
     // + metadata), not to force a refresh-token rotation. If the current access
     // token is still fresh, we fetch the snapshot directly without rotating —
@@ -661,12 +672,30 @@ async fn run_oauth_probe(
                 usage_raw,
                 refreshed.snapshot,
             ),
-            Err(err) => return probe_oauth_upstream_failure(&handle, db, account_id, err).await,
+            Err(err) => {
+                return probe_oauth_upstream_failure(
+                    &handle,
+                    db,
+                    account_id,
+                    &starting_access_prefix,
+                    err,
+                )
+                .await;
+            }
         }
     } else {
         match fetch_oauth_snapshot_raw(&token.access_token, account.proxy_url.as_deref()).await {
             Ok((snapshot, profile_raw, usage_raw)) => (None, profile_raw, usage_raw, snapshot),
-            Err(err) => return probe_oauth_upstream_failure(&handle, db, account_id, err).await,
+            Err(err) => {
+                return probe_oauth_upstream_failure(
+                    &handle,
+                    db,
+                    account_id,
+                    &starting_access_prefix,
+                    err,
+                )
+                .await;
+            }
         }
     };
 
@@ -727,6 +756,42 @@ async fn run_oauth_probe(
             is_auth: false,
         });
     }
+
+    // Final fingerprint check before the remaining unguarded writes
+    // (runtime upsert, optional set_account_active, probe-error bookkeeping).
+    // `update_account_metadata` has its own guard, but once past that the
+    // chain has multiple DB writes and a pool reload — a credential
+    // rotation in the middle would otherwise let this stale probe reactivate
+    // the account under the new credential or clobber its runtime. Aborting
+    // here is intentionally coarse: we accept last-writer-wins between this
+    // check and the three writes immediately following, since those all
+    // happen in rapid succession on the same task.
+    match account_credential_matches_prefix(db, account_id, "oauth", access_prefix).await {
+        Ok(true) => {}
+        Ok(false) => {
+            info!(
+                "[probe][oauth] account {account_id}: credential rotated during probe; abandoning remaining commits"
+            );
+            handle.clear_probe_error(account_id).await;
+            let _ = handle.clear_probing(account_id).await;
+            return Ok(());
+        }
+        Err(err) => {
+            let msg = format!("credential fingerprint check failed: {err}");
+            warn!("[probe][oauth] account {account_id}: {msg}");
+            handle
+                .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
+                .await;
+            let _ = handle.clear_probing(account_id).await;
+            return Err(ProbeFailure {
+                stage: "fingerprint_check",
+                message: msg,
+                http_status: None,
+                is_auth: false,
+            });
+        }
+    }
+
     if let Err(err) =
         batch_upsert_runtime_states(db, &[(account_id, snapshot.runtime.clone())]).await
     {
@@ -784,16 +849,34 @@ async fn run_oauth_probe(
 /// (either `refresh_oauth_token_with_raw` or `fetch_oauth_snapshot_raw`).
 /// Handles auth-error DB flip, probe-error bookkeeping, probing flag clear,
 /// and constructs the `ProbeFailure` with the right auth / http fields.
+///
+/// `expected_prefix` is the OAuth access-token fingerprint this probe
+/// started with. If a concurrent admin reconnect or peer refresh has
+/// rotated the credential while this probe was in flight, we skip the
+/// DB auth-error flip entirely — the stale probe's failure reflects the
+/// old credential, not the new one now on the account.
 async fn probe_oauth_upstream_failure(
     handle: &AccountPoolHandle,
     db: &SqlitePool,
     account_id: i64,
+    expected_prefix: &str,
     err: ClewdrError,
 ) -> Result<(), ProbeFailure> {
     let msg = err.to_string();
     warn!("[probe][oauth] account {account_id}: {msg}");
     let auth = is_oauth_auth_failure(&err);
-    if auth {
+    let still_current =
+        match account_credential_matches_prefix(db, account_id, "oauth", expected_prefix).await {
+            Ok(v) => v,
+            Err(db_err) => {
+                warn!("[probe][oauth] account {account_id}: fingerprint check failed: {db_err}");
+                // Be conservative: treat as "not current" so a DB hiccup doesn't
+                // let a stale probe stamp auth_error onto a rotated credential.
+                false
+            }
+        };
+
+    if auth && still_current {
         match set_account_auth_error(db, account_id, &msg).await {
             Ok(()) => {
                 // DB is authoritative; only after the status write succeeds
@@ -811,6 +894,14 @@ async fn probe_oauth_upstream_failure(
                     .await;
             }
         }
+    } else if auth {
+        // Credential rotated while probe was in flight — stale failure
+        // must not taint the new credential's state. Clear any probe
+        // error bookkeeping so the rotated credential gets a clean slate.
+        info!(
+            "[probe][oauth] account {account_id}: credential rotated during probe; skipping auth_error on stale result"
+        );
+        handle.clear_probe_error(account_id).await;
     } else {
         handle
             .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
