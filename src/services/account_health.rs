@@ -104,6 +104,20 @@ pub struct AccountHealthSummary {
     pub generated_at: i64,
 }
 
+/// Legacy three-bucket counts, derived from the per-account health
+/// states so they cannot disagree with [`HealthDetail`] or the
+/// dispatcher's real view:
+///
+/// - `valid` — accounts currently [`AccountHealthState::Active`],
+///   including those in `state.exhausted` whose `reset_time` has
+///   already passed (the pool's reset tick has not fired yet but
+///   dispatch will reclaim them on its next attempt).
+/// - `exhausted` — accounts currently [`AccountHealthState::CoolingDown`].
+/// - `invalid` — accounts currently [`AccountHealthState::Invalid`].
+///
+/// Accounts with [`AccountHealthState::Unconfigured`] do not count toward
+/// any of these — matching the pre-Step-2.5 meaning of
+/// `state.{valid,exhausted,invalid}.len()`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct PoolCounts {
     pub valid: usize,
@@ -391,11 +405,23 @@ pub fn compose_health_snapshot(
         per_account.insert(id, compose_health(account, account_view, now));
     }
 
-    let pool_counts = PoolCounts {
-        valid: view.valid_ids.len(),
-        exhausted: view.exhausted.len(),
-        invalid: view.invalid.len(),
-    };
+    // Derive pool counts from the per-account health so /health.ready,
+    // admin overview's pool.{valid,exhausted,invalid} and detail.*
+    // stay consistent: an expired cooldown moves out of `exhausted` into
+    // `valid` here the same moment compose_health flipped its state to
+    // Active, instead of lingering in `exhausted` until the next reset
+    // tick (up to 300s). Accounts that are in DB but not in any pool
+    // bucket (Unconfigured) do not count toward the legacy three-bucket
+    // view — same as pre-Step-2.5.
+    let mut pool_counts = PoolCounts::default();
+    for health in per_account.values() {
+        match &health.state {
+            AccountHealthState::Active => pool_counts.valid += 1,
+            AccountHealthState::CoolingDown { .. } => pool_counts.exhausted += 1,
+            AccountHealthState::Invalid { .. } => pool_counts.invalid += 1,
+            AccountHealthState::Unconfigured => {}
+        }
+    }
 
     let mut probing_ids: Vec<i64> = view.probing.iter().copied().collect();
     probing_ids.sort_unstable();
@@ -604,6 +630,31 @@ mod tests {
         assert_eq!(
             snap.per_account.get(&1).map(|h| h.state.clone()),
             Some(AccountHealthState::Active)
+        );
+        // Legacy pool counts also reflect the reclassification, so
+        // /health.ready (valid > 0) and admin overview.pool.valid do not
+        // disagree with detail.dispatchable_now.
+        assert_eq!(snap.summary.pool.valid, 1);
+        assert_eq!(snap.summary.pool.exhausted, 0);
+    }
+
+    #[test]
+    fn expired_cooldown_makes_health_ready_without_waiting_for_reset_tick() {
+        // A single-account deployment whose only account has just cleared
+        // its cooldown must not continue reporting /health.ready=false
+        // until the 300s reset tick fires.
+        let past = Utc::now().timestamp() - 1;
+        let a = account(1, "oauth", "active", None, true, None);
+        let mut exhausted = HashMap::new();
+        exhausted.insert(1, Some(past));
+        let view = PoolSnapshotView {
+            exhausted,
+            ..Default::default()
+        };
+        let snap = compose_health_snapshot(&view, &[a], Utc::now().timestamp());
+        assert!(
+            snap.summary.pool.valid > 0,
+            "pool.valid drives /health.ready"
         );
     }
 
