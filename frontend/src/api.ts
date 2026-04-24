@@ -82,9 +82,6 @@ export interface OverviewResponse {
   version: string;
   server_time: string;
   pool: {
-    valid: number;
-    exhausted: number;
-    invalid: number;
     detail: HealthDetail;
     invalid_breakdown: InvalidBreakdown;
   };

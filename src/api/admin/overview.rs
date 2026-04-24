@@ -25,19 +25,12 @@ pub struct OverviewResponse {
     pub must_change_password: bool,
 }
 
-/// Pool-level counts.
-///
-/// `valid` / `exhausted` / `invalid` are the legacy three-bucket view kept
-/// for wire compatibility with older dashboards. `detail` exposes the
-/// orthogonal diagnostic slices introduced in Step 2.5 (see
-/// `AccountHealthSummary`). `invalid_breakdown` splits `invalid` by
-/// `Reason` so admins can tell free / banned / disabled / … apart at a
-/// glance.
+/// Pool-level counts. `detail` exposes the orthogonal diagnostic slices
+/// introduced in Step 2.5 (see `AccountHealthSummary`); `invalid_breakdown`
+/// splits the invalid bucket by `Reason` so admins can tell free / banned /
+/// disabled / … apart at a glance.
 #[derive(Serialize)]
 pub struct PoolOverview {
-    pub valid: usize,
-    pub exhausted: usize,
-    pub invalid: usize,
     pub detail: HealthDetail,
     pub invalid_breakdown: InvalidBreakdown,
 }
@@ -92,9 +85,6 @@ pub async fn overview(
     let summary = &snapshot.summary;
 
     let pool = PoolOverview {
-        valid: summary.pool.valid,
-        exhausted: summary.pool.exhausted,
-        invalid: summary.pool.invalid,
         detail: summary.detail,
         invalid_breakdown: summary.invalid_breakdown,
     };
