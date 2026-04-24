@@ -902,10 +902,20 @@ async fn probe_oauth_upstream_failure(
             "[probe][oauth] account {account_id}: credential rotated during probe; skipping auth_error on stale result"
         );
         handle.clear_probe_error(account_id).await;
-    } else {
+    } else if still_current {
         handle
             .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
             .await;
+    } else {
+        // Transient failure (5xx / network hiccup) on a probe whose
+        // credential has since been rotated. The error belongs to the
+        // old credential; showing it as the new credential's
+        // `last_probe_error` would be misleading. Drop it and clear any
+        // lingering entry.
+        info!(
+            "[probe][oauth] account {account_id}: credential rotated during probe; dropping transient probe error on stale result"
+        );
+        handle.clear_probe_error(account_id).await;
     }
     let _ = handle.clear_probing(account_id).await;
     let http_status = if let ClewdrError::ClaudeHttpError { code, .. } = &err {
