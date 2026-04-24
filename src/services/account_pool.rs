@@ -971,21 +971,30 @@ impl AccountPoolActor {
                 cs.token = Some(token);
             }
 
-            // Merge by credential-kind tuple, not cookie byte equality. Kind flip
-            // (cookie↔oauth) = real credential replacement → fresh defaults +
-            // probing cleanup. Same kind preserves runtime; DB credential is
-            // authoritative and was already applied above when `row.oauth_token`
-            // was attached to `cs`.
+            // Merge by credential-kind tuple, not cookie byte equality. Kind
+            // flip (cookie↔oauth) = real credential replacement → fresh
+            // defaults + probing cleanup. Same kind preserves runtime; DB
+            // credential is authoritative and was already applied above when
+            // `row.oauth_token` was attached to `cs`.
             //
-            // Rationale: OAuth refresh writes a new access_token to DB and syncs
-            // the in-memory slot via `update_credential`. If a byte-level token
-            // change (normal refresh) were treated as replacement, runtime and
-            // probing state would reset on every refresh — the opposite of
-            // Step 3 Goal 3. See docs/account-normalization-2026-04-21.md.
+            // `mem_is_oauth` MUST come from the placeholder-cookie marker,
+            // not from `mem.token.is_some()`: cookie accounts exchange their
+            // cookie for a short-lived bearer token (stored on
+            // `AccountSlot.token`) during `ClaudeCodeState::exchange_token`,
+            // so `mem.token` being present does not mean this slot is
+            // OAuth-backed. Only `oauth_placeholder_cookie(...)` identifies
+            // an OAuth-only slot reliably.
+            //
+            // Within the cookie kind, a byte-level `cookie_blob` change is
+            // treated as admin-initiated replacement (DB never changes
+            // cookie bytes implicitly). OAuth access_token rotation from a
+            // normal refresh is preserved — runtime/probing must survive.
             if let Some(mem) = mem_cookies.remove(&row.id) {
-                let mem_is_oauth = mem.token.is_some();
+                let mem_is_oauth = is_oauth_placeholder_slot(&mem);
                 let row_is_oauth = row.oauth_token.is_some();
-                if mem_is_oauth == row_is_oauth {
+                let same_kind = mem_is_oauth == row_is_oauth;
+                let cookie_content_swap = same_kind && !row_is_oauth && mem.cookie != cs.cookie;
+                if same_kind && !cookie_content_swap {
                     Self::apply_in_memory_runtime(&mut cs, mem, !row_is_oauth);
                     cs.proxy_url = row.proxy_url.clone();
                 } else {
@@ -2251,6 +2260,80 @@ mod tests {
             after.token.as_ref().map(|t| t.refresh_token.as_str()),
             Some("rt_authoritative"),
             "pool credential must not be overwritten by release payload"
+        );
+    }
+
+    /// Regression for codex finding 2026-04-24: cookie accounts exchange
+    /// their cookie for a short-lived bearer token during
+    /// `ClaudeCodeState::exchange_token`, so `mem.token.is_some()` is NOT
+    /// a reliable OAuth-kind discriminator. If it were, a cookie account
+    /// that had served any request would be misclassified on the next
+    /// reload and its runtime / probing state reset.
+    #[tokio::test]
+    async fn reload_preserves_cookie_account_with_exchanged_bearer_token() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        let cookie_blob = cookie_blob_for(b'c');
+        insert_cookie_account_row(&pool, 50, &cookie_blob).await;
+
+        let mut state = empty_state(pool);
+        let mut mem_slot = AccountSlot::new(&cookie_blob, None).unwrap();
+        mem_slot.account_id = Some(50);
+        // Cookie account has exchanged its cookie for a bearer token —
+        // this is normal after the first request.
+        mem_slot.token = Some(token_with_refresh("cookie_exchanged_bearer"));
+        mem_slot.count_tokens_allowed = Some(true);
+        state.valid.push_back(mem_slot);
+        state.probing.insert(50);
+
+        AccountPoolActor::do_reload(&mut state).await;
+
+        let slot = state
+            .valid
+            .iter()
+            .find(|c| c.account_id == Some(50))
+            .expect("cookie account must survive reload");
+        assert_eq!(
+            slot.count_tokens_allowed,
+            Some(true),
+            "same-kind cookie reload must preserve runtime"
+        );
+        assert!(
+            state.probing.contains(&50),
+            "same-kind cookie reload must not clear probing"
+        );
+    }
+
+    /// Within the cookie kind, a cookie_blob byte swap represents admin-
+    /// initiated credential replacement (DB never changes cookie_blob
+    /// implicitly). Runtime and probing state must reset.
+    #[tokio::test]
+    async fn reload_resets_on_cookie_content_swap() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        let new_cookie = cookie_blob_for(b'd');
+        insert_cookie_account_row(&pool, 51, &new_cookie).await;
+
+        let mut state = empty_state(pool);
+        let old_cookie = cookie_blob_for(b'e');
+        let mut mem_slot = AccountSlot::new(&old_cookie, None).unwrap();
+        mem_slot.account_id = Some(51);
+        mem_slot.count_tokens_allowed = Some(true);
+        state.valid.push_back(mem_slot);
+        state.probing.insert(51);
+
+        AccountPoolActor::do_reload(&mut state).await;
+
+        let slot = state
+            .valid
+            .iter()
+            .find(|c| c.account_id == Some(51))
+            .expect("reloaded slot must appear in valid");
+        assert!(
+            slot.count_tokens_allowed.is_none(),
+            "cookie content swap must reset runtime"
+        );
+        assert!(
+            !state.probing.contains(&51),
+            "cookie content swap must clear probing"
         );
     }
 
