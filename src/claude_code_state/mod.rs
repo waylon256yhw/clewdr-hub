@@ -136,11 +136,15 @@ impl ClaudeCodeState {
     pub async fn release_account(&self, reason: Option<Reason>) {
         // return the account to the account pool
         if let Some(ref cookie) = self.cookie {
+            let Some(account_id) = cookie.account_id else {
+                return;
+            };
+            let update = cookie.to_runtime_params();
             self.account_pool_handle
-                .release(cookie.to_owned(), reason)
+                .release_runtime(account_id, update, reason)
                 .await
                 .unwrap_or_else(|e| {
-                    error!("Failed to send cookie: {}", e);
+                    error!("Failed to release account: {}", e);
                 });
         }
     }

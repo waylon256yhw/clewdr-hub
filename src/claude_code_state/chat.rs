@@ -377,8 +377,15 @@ impl ClaudeCodeState {
                 return;
             }
             cookie.set_count_tokens_allowed(Some(value));
-            let cloned = cookie.clone();
-            if let Err(err) = self.account_pool_handle.release(cloned, None).await {
+            let Some(account_id) = cookie.account_id else {
+                return;
+            };
+            let update = cookie.to_runtime_params();
+            if let Err(err) = self
+                .account_pool_handle
+                .release_runtime(account_id, update, None)
+                .await
+            {
                 warn!("Failed to persist count_tokens permission: {}", err);
             }
         }
@@ -618,8 +625,15 @@ impl ClaudeCodeState {
             // Lazy boundary refresh if due, then reset period counters and start fresh
             Self::update_cookie_boundaries_if_due(cookie, &self.account_pool_handle).await;
             cookie.add_and_bucket_usage(input, output, family);
-            let cloned = cookie.clone();
-            if let Err(err) = self.account_pool_handle.release(cloned, None).await {
+            let Some(account_id) = cookie.account_id else {
+                return;
+            };
+            let update = cookie.to_runtime_params();
+            if let Err(err) = self
+                .account_pool_handle
+                .release_runtime(account_id, update, None)
+                .await
+            {
                 warn!("Failed to persist usage statistics: {}", err);
             }
         }
@@ -754,7 +768,11 @@ impl ClaudeCodeState {
                                     )
                                     .await;
                                     c.add_and_bucket_usage(total_input, total_out, family);
-                                    let _ = handle.release(c, None).await;
+                                    if let Some(account_id) = c.account_id {
+                                        let update = c.to_runtime_params();
+                                        let _ =
+                                            handle.release_runtime(account_id, update, None).await;
+                                    }
                                     if let Some(aid) = aid
                                         && !released.swap(true, Ordering::Relaxed)
                                     {
@@ -873,7 +891,10 @@ impl ClaudeCodeState {
                                             family,
                                         );
                                     }
-                                    let _ = h.release(cookie, None).await;
+                                    if let Some(account_id) = cookie.account_id {
+                                        let update = cookie.to_runtime_params();
+                                        let _ = h.release_runtime(account_id, update, None).await;
+                                    }
                                 }
                                 if let Some(ctx) = billing_ctx {
                                     let usage = should_persist_usage.then_some(

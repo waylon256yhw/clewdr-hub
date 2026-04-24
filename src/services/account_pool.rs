@@ -12,7 +12,10 @@ use tracing::{error, info, warn};
 
 use crate::{
     claude_code_state::probe::probe_cookie,
-    config::{AccountSlot, ClewdrCookie, InvalidAccountSlot, Reason, TokenInfo, UsageBreakdown},
+    config::{
+        AccountSlot, ClewdrCookie, InvalidAccountSlot, Reason, RuntimeStateParams, TokenInfo,
+        UsageBreakdown,
+    },
     db::accounts::{
         active_reset_time, batch_upsert_runtime_states, load_all_accounts, set_account_disabled,
         set_accounts_active,
@@ -57,9 +60,27 @@ pub struct AccountPoolStatus {
     pub invalid: Vec<InvalidAccountSlot>,
 }
 
+/// Runtime state fields an in-flight request can write back to the pool.
+/// Identical to [`RuntimeStateParams`] (the DB upsert payload) by design:
+/// `release(account_id, update, reason)` funnels through the same fields
+/// `apply_runtime_state` already consumes on the DB-load path. Carries no
+/// credential bytes — credentials follow the "DB is authoritative" rule
+/// and flow through `UpdateCredential` / reload merge, not release.
+pub type RuntimeUpdate = RuntimeStateParams;
+
 #[derive(Debug)]
 enum AccountPoolMessage {
     Return(AccountSlot, Option<Reason>),
+    /// Account-id-keyed return. Carries only runtime-state fields, not a
+    /// full `AccountSlot` — the pool's own in-memory slot (with its
+    /// authoritative credential) is the one that gets updated and moved
+    /// between buckets. The legacy [`Return`] variant remains during the
+    /// migration and funnels through the same handler.
+    ReturnById {
+        account_id: i64,
+        update: RuntimeUpdate,
+        reason: Option<Reason>,
+    },
     Submit(AccountSlot),
     CheckReset,
     Request(
@@ -544,98 +565,111 @@ impl AccountPoolActor {
     }
 
     fn collect(state: &mut AccountPoolState, cookie: AccountSlot, reason: Option<Reason>) -> bool {
-        let aid = cookie.account_id;
+        let Some(account_id) = cookie.account_id else {
+            // Degenerate input: slot without account_id. Pool no longer
+            // tracks slots by cookie, so there is nothing to collect.
+            return false;
+        };
+        let update = cookie.to_runtime_params();
+        Self::collect_by_id(state, account_id, update, reason)
+    }
 
-        let removed_probe = aid.is_some_and(|id| state.probing.remove(&id));
+    /// Account-id-keyed collect. Finds the pool's own slot for this
+    /// `account_id`, merges `update` onto it, then moves it between
+    /// `valid` / `exhausted` / `invalid` according to `reason`. Credential
+    /// bytes on the pool's slot are never touched — only the runtime
+    /// fields in `update`. See
+    /// `docs/account-normalization-2026-04-21.md` §Step 3 Goal 1.
+    fn collect_by_id(
+        state: &mut AccountPoolState,
+        account_id: i64,
+        update: RuntimeUpdate,
+        reason: Option<Reason>,
+    ) -> bool {
+        let removed_probe = state.probing.remove(&account_id);
 
-        // Sticky-reason guard: accounts explicitly invalidated (via the
-        // `Invalidate` message from an auth_error / disabled path, or via a
-        // DB reload that surfaced one of those states) must not be
-        // auto-reactivated by a Return from an in-flight request that predates
-        // the invalidation. TMR / Restricted remain transient — the cooldown
-        // reactivation path below stays intact for those reasons.
-        if let Some(id) = aid
-            && let Some(existing) = state.invalid.get(&id)
+        // Sticky-reason guard: must peek `invalid` BEFORE we remove, so a
+        // Return from an in-flight request whose account was explicitly
+        // invalidated (auth_error / disabled / banned / free / null)
+        // doesn't auto-reactivate. TMR / Restricted stay transient — they
+        // intentionally flow through the cooldown reactivation path below.
+        if let Some(existing) = state.invalid.get(&account_id)
             && matches!(
                 existing.reason,
                 Reason::Free | Reason::Disabled | Reason::Banned | Reason::Null
             )
         {
-            // Silent drop: the DB already reflects the authoritative reason,
-            // the inflight counter is decremented independently by
-            // `ReleaseSlot`, and no SSE event is owed — callers that care
-            // have already seen the status change via the explicit DB write
-            // path's own notification.
             return removed_probe;
         }
 
-        // Remove from whichever set the account currently lives in, keyed by
-        // account_id. Slots without an account_id cannot be in any pool
-        // container (the loader always assigns one) — skip removal for such
-        // degenerate inputs.
-        let was_valid = aid.and_then(|id| {
-            state
-                .valid
-                .iter()
-                .position(|c| c.account_id == Some(id))
-                .and_then(|i| state.valid.remove(i))
-        });
-        let was_exhausted = aid.and_then(|id| state.exhausted.remove(&id));
-        let was_invalid = aid.and_then(|id| state.invalid.remove(&id));
+        let had_valid = state
+            .valid
+            .iter()
+            .position(|c| c.account_id == Some(account_id))
+            .and_then(|i| state.valid.remove(i));
+        let had_exhausted = state.exhausted.remove(&account_id);
+        let had_invalid = state.invalid.remove(&account_id);
 
-        if was_valid.is_none() && was_exhausted.is_none() && was_invalid.is_none() {
-            return removed_probe;
-        }
+        let had_valid_flag = had_valid.is_some();
+        let had_exhausted_flag = had_exhausted.is_some();
+        let had_invalid_flag = had_invalid.is_some();
+
+        // Prefer a full slot (valid / exhausted) because it carries the live
+        // credential. Fall back to rematerialising from `InvalidAccountSlot`
+        // when the account was only present in `invalid`; that path keeps
+        // only the cookie string, which is enough for bucket placement.
+        let mut slot = match (had_valid, had_exhausted, had_invalid.as_ref()) {
+            (Some(s), _, _) => s,
+            (None, Some(s), _) => s,
+            (None, None, Some(inv)) => {
+                let raw = inv.cookie.to_string();
+                let Ok(mut s) = AccountSlot::new(&raw, None) else {
+                    return removed_probe;
+                };
+                s.account_id = Some(inv.account_id);
+                s
+            }
+            _ => return removed_probe,
+        };
+
+        slot.apply_runtime_state(&update);
 
         let changed_set = match &reason {
             None => {
-                if cookie.reset_time.is_some() {
-                    let was_ex = was_exhausted.is_some();
-                    if let Some(id) = aid {
-                        state.exhausted.insert(id, cookie);
-                    }
-                    !was_ex
+                if slot.reset_time.is_some() {
+                    state.exhausted.insert(account_id, slot);
+                    !had_exhausted_flag
                 } else {
-                    let was_val = was_valid.is_some();
-                    state.valid.push_back(cookie);
-                    !was_val
+                    state.valid.push_back(slot);
+                    !had_valid_flag
                 }
             }
             Some(Reason::TooManyRequest(i) | Reason::Restricted(i)) => {
-                let mut cookie = cookie;
-                cookie.reset_time = Some(*i);
-                cookie.reset_window_usage();
-                let was_ex = was_exhausted.is_some();
-                if let Some(id) = aid {
-                    state.exhausted.insert(id, cookie);
-                }
-                !was_ex
+                slot.reset_time = Some(*i);
+                slot.reset_window_usage();
+                state.exhausted.insert(account_id, slot);
+                !had_exhausted_flag
             }
             Some(reason) => {
-                let mut cookie = cookie;
-                cookie.reset_window_usage();
-                let was_inv = was_invalid.is_some();
-                if let Some(id) = aid {
-                    state.invalid.insert(
-                        id,
-                        InvalidAccountSlot::new(cookie.cookie.clone(), reason.clone(), id),
-                    );
-                }
-                !was_inv
+                slot.reset_window_usage();
+                state.invalid.insert(
+                    account_id,
+                    InvalidAccountSlot::new(slot.cookie.clone(), reason.clone(), account_id),
+                );
+                !had_invalid_flag
             }
         };
 
-        // Track invalid → valid/exhausted for DB status reactivation
-        let moved_out_of_invalid = was_invalid.is_some()
+        let moved_out_of_invalid = had_invalid_flag
             && matches!(
                 &reason,
                 None | Some(Reason::TooManyRequest(_) | Reason::Restricted(_))
             );
-        if moved_out_of_invalid && let Some(id) = aid {
-            state.reactivated.insert(id);
+        if moved_out_of_invalid {
+            state.reactivated.insert(account_id);
         }
 
-        Self::mark_dirty(state, aid);
+        Self::mark_dirty(state, Some(account_id));
         if changed_set {
             Self::log(state);
         }
@@ -1106,6 +1140,17 @@ impl Actor for AccountPoolActor {
                     Self::emit_accounts_refresh(state);
                 }
             }
+            AccountPoolMessage::ReturnById {
+                account_id,
+                update,
+                reason,
+            } => {
+                let completed_probe = Self::collect_by_id(state, account_id, update, reason);
+                if completed_probe {
+                    Self::do_flush(state).await;
+                    Self::emit_accounts_refresh(state);
+                }
+            }
             AccountPoolMessage::Submit(cookie) => {
                 Self::accept(state, cookie);
             }
@@ -1324,6 +1369,32 @@ impl AccountPoolHandle {
                     "Failed to communicate with AccountPoolActor for return operation: {e}"
                 ),
             }
+        })
+    }
+
+    /// Return an account to the pool with an id-keyed runtime update.
+    /// The pool's own in-memory slot stays the source of truth for the
+    /// account's credential — `update` only carries runtime-state fields
+    /// (usage, utilization, reset_time, count_tokens_allowed, etc.).
+    pub async fn release_runtime(
+        &self,
+        account_id: i64,
+        update: RuntimeUpdate,
+        reason: Option<Reason>,
+    ) -> Result<(), ClewdrError> {
+        ractor::cast!(
+            self.actor_ref,
+            AccountPoolMessage::ReturnById {
+                account_id,
+                update,
+                reason,
+            }
+        )
+        .map_err(|e| ClewdrError::RactorError {
+            loc: Location::generate(),
+            msg: format!(
+                "Failed to communicate with AccountPoolActor for release_runtime operation: {e}"
+            ),
         })
     }
 
@@ -2221,6 +2292,40 @@ mod tests {
         assert_eq!(snapshot.summary.detail.dispatchable_now, 1);
         assert_eq!(snapshot.summary.detail.cooling_down, 0);
         assert_eq!(snapshot.summary.detail.invalid_auth, 1);
+    }
+
+    /// Step 3 Goal 1 invariant: `collect_by_id` merges the runtime update
+    /// onto the pool's own slot — the caller cannot overwrite credentials
+    /// through release. OAuth refresh paths keep the DB authoritative and
+    /// the pool's slot stays in sync via `update_credential`.
+    #[tokio::test]
+    async fn collect_by_id_preserves_pool_credential_over_caller_state() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        let mut state = empty_state(pool);
+
+        let mut slot = AccountSlot::new(&oauth_placeholder_cookie(77), None).unwrap();
+        slot.account_id = Some(77);
+        slot.token = Some(token_with_refresh("rt_authoritative"));
+        state.valid.push_back(slot.clone());
+        state.inflight.insert(77, (0, 5));
+
+        // Runtime update carries only runtime-state fields (flip a flag).
+        let mut update = slot.to_runtime_params();
+        update.count_tokens_allowed = Some(true);
+
+        AccountPoolActor::collect_by_id(&mut state, 77, update, None);
+
+        let after = state
+            .valid
+            .iter()
+            .find(|c| c.account_id == Some(77))
+            .expect("slot must remain in valid");
+        assert_eq!(after.count_tokens_allowed, Some(true));
+        assert_eq!(
+            after.token.as_ref().map(|t| t.refresh_token.as_str()),
+            Some("rt_authoritative"),
+            "pool credential must not be overwritten by release payload"
+        );
     }
 
     async fn insert_cookie_account_row(pool: &sqlx::SqlitePool, id: i64, cookie_blob: &str) {
