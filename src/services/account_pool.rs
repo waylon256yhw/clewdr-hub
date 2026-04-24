@@ -13,8 +13,8 @@ use tracing::{error, info, warn};
 use crate::{
     claude_code_state::probe::probe_cookie,
     config::{
-        AccountSlot, ClewdrCookie, InvalidAccountSlot, Reason, RuntimeStateParams, TokenInfo,
-        UsageBreakdown,
+        AccountSlot, AuthMethod, ClewdrCookie, InvalidAccountSlot, Reason, RuntimeStateParams,
+        TokenInfo, UsageBreakdown,
     },
     db::accounts::{
         active_reset_time, batch_upsert_runtime_states, load_all_accounts, set_account_disabled,
@@ -964,6 +964,7 @@ impl AccountPoolActor {
                 }
             };
             cs.account_id = Some(row.id);
+            cs.auth_method = AuthMethod::from_auth_source(&row.auth_source);
             cs.proxy_url = row.proxy_url.clone();
             cs.email = row.email.clone();
             cs.account_type = row.account_type.clone();
@@ -1518,7 +1519,7 @@ mod tests {
     use crate::db::accounts::load_all_accounts;
     use crate::services::account_health::compose_health_snapshot;
 
-    use crate::config::{AccountSlot, ClewdrCookie, Reason, TokenInfo};
+    use crate::config::{AccountSlot, AuthMethod, ClewdrCookie, Reason, TokenInfo};
     use crate::db::init_pool;
 
     #[test]
@@ -2495,6 +2496,53 @@ mod tests {
         assert!(
             !state.probing.contains(&44),
             "probing must be cleared on credential replacement"
+        );
+    }
+
+    /// Loader must stamp `auth_method` from `accounts.auth_source` so the
+    /// rest of Step 4 can dispatch send-path / probe-path / reload-merge
+    /// without reading cookie shape. Two rows of opposite kinds in the
+    /// same reload prove the column is read per-row, not stuck on a
+    /// process-wide constant.
+    #[tokio::test]
+    async fn reload_stamps_auth_method_from_row_auth_source() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        let cookie_blob = cookie_blob_for(b'c');
+        insert_cookie_account_row(&pool, 60, &cookie_blob).await;
+        insert_account_row(
+            &pool,
+            61,
+            "active",
+            "oauth",
+            Some("at_a"),
+            Some("rt_a"),
+            None,
+        )
+        .await;
+
+        let mut state = empty_state(pool);
+        AccountPoolActor::do_reload(&mut state).await;
+
+        let cookie_slot = state
+            .valid
+            .iter()
+            .find(|c| c.account_id == Some(60))
+            .expect("cookie account 60 must load");
+        assert_eq!(
+            cookie_slot.auth_method,
+            AuthMethod::Cookie,
+            "row auth_source='cookie' must stamp AuthMethod::Cookie"
+        );
+
+        let oauth_slot = state
+            .valid
+            .iter()
+            .find(|c| c.account_id == Some(61))
+            .expect("oauth account 61 must load");
+        assert_eq!(
+            oauth_slot.auth_method,
+            AuthMethod::OAuth,
+            "row auth_source='oauth' must stamp AuthMethod::OAuth"
         );
     }
 }

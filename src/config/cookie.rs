@@ -25,6 +25,33 @@ pub enum ModelFamily {
     Other,
 }
 
+/// Authentication method for an account.
+///
+/// Step 4 introduces this as the canonical kind discriminator for an
+/// `AccountSlot`. Pre-Step-4 code derived "is this OAuth?" from the
+/// presence of a placeholder cookie (`is_oauth_placeholder_slot`); that
+/// implicit shape is being retired across PR #6/#7/#8. Loader fills this
+/// from the DB column `accounts.auth_source`.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMethod {
+    #[default]
+    Cookie,
+    OAuth,
+}
+
+impl AuthMethod {
+    /// Map the persisted `accounts.auth_source` string to a typed kind.
+    /// Unknown values fall back to `Cookie` (defensive — Step 1 already
+    /// constrained the column to `cookie | oauth`).
+    pub fn from_auth_source(s: &str) -> Self {
+        match s {
+            "oauth" => AuthMethod::OAuth,
+            _ => AuthMethod::Cookie,
+        }
+    }
+}
+
 /// Per-period usage breakdown by family
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct UsageBreakdown {
@@ -73,6 +100,11 @@ impl<'de> Deserialize<'de> for ClewdrCookie {
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct AccountSlot {
     pub cookie: ClewdrCookie,
+    /// Authentication kind (Cookie or OAuth). Loader populates this from
+    /// `accounts.auth_source`. `#[serde(default)]` keeps deserialization
+    /// of pre-Step-4 snapshots compatible (defaults to Cookie).
+    #[serde(default)]
+    pub auth_method: AuthMethod,
     #[serde(default)]
     pub account_id: Option<i64>,
     #[serde(default)]
@@ -180,6 +212,7 @@ impl AccountSlot {
         let cookie = ClewdrCookie::from_str(cookie)?;
         Ok(Self {
             cookie,
+            auth_method: AuthMethod::Cookie,
             account_id: None,
             proxy_url: None,
             token: None,
@@ -580,5 +613,52 @@ mod tests {
     fn test_invalid_cookie() {
         let result = ClewdrCookie::from_str("invalid-cookie");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn auth_method_default_is_cookie() {
+        // Pre-Step-4 snapshots and any code path that constructs an
+        // AccountSlot without explicitly setting auth_method must land on
+        // Cookie — flipping this default would silently re-classify
+        // existing data as OAuth on first reload.
+        assert_eq!(AuthMethod::default(), AuthMethod::Cookie);
+        let slot = AccountSlot::default();
+        assert_eq!(slot.auth_method, AuthMethod::Cookie);
+    }
+
+    #[test]
+    fn auth_method_from_auth_source_strings() {
+        assert_eq!(AuthMethod::from_auth_source("cookie"), AuthMethod::Cookie);
+        assert_eq!(AuthMethod::from_auth_source("oauth"), AuthMethod::OAuth);
+        // Unknown / legacy "hybrid" / empty all fall back to Cookie so a
+        // mis-typed DB value can't accidentally route a slot through the
+        // OAuth send-path.
+        assert_eq!(AuthMethod::from_auth_source(""), AuthMethod::Cookie);
+        assert_eq!(AuthMethod::from_auth_source("hybrid"), AuthMethod::Cookie);
+        assert_eq!(AuthMethod::from_auth_source("OAuth"), AuthMethod::Cookie);
+    }
+
+    #[test]
+    fn auth_method_serde_lowercase() {
+        // Wire format must match the persisted auth_source column to keep
+        // any future cross-process snapshot exchange clean.
+        let cookie_json = serde_json::to_string(&AuthMethod::Cookie).unwrap();
+        let oauth_json = serde_json::to_string(&AuthMethod::OAuth).unwrap();
+        assert_eq!(cookie_json, "\"cookie\"");
+        assert_eq!(oauth_json, "\"oauth\"");
+        let parsed: AuthMethod = serde_json::from_str("\"oauth\"").unwrap();
+        assert_eq!(parsed, AuthMethod::OAuth);
+    }
+
+    #[test]
+    fn account_slot_new_defaults_auth_method_to_cookie() {
+        // Cookie accounts that go through `exchange_token` later hold a
+        // bearer token (slot.token = Some(_)). auth_method must NOT be
+        // derived from token presence — once Cookie, always Cookie until
+        // a reload from a row with auth_source="oauth" overwrites it.
+        let base = make_base_cookie_with_len(86);
+        let full = format!("sk-ant-sid01-{base}");
+        let slot = AccountSlot::new(&full, None).unwrap();
+        assert_eq!(slot.auth_method, AuthMethod::Cookie);
     }
 }
