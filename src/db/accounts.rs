@@ -561,32 +561,66 @@ pub async fn set_account_active(pool: &SqlitePool, account_id: i64) -> Result<()
     Ok(())
 }
 
-/// Update account telemetry metadata (email, account_type, org_uuid).
-/// Only updates if the account's cookie_blob still matches the expected value,
-/// preventing stale probes from overwriting metadata after cookie replacement.
+/// Update account telemetry metadata (email, account_type, org_uuid) only
+/// if the account's current credential still matches the fingerprint the
+/// caller started with. Prevents stale probes from overwriting metadata
+/// after a credential rotation (cookie replacement or OAuth re-auth).
+///
+/// For `auth_source = "cookie"`, the guard matches against `cookie_blob`
+/// (with a legacy `sessionKey=` variant for pre-normalization rows). For
+/// `auth_source = "oauth"`, it matches against `oauth_access_token`.
+///
+/// Returns Ok(()) with a warn log if the guard misses — callers treat a
+/// missed update as a no-op, not an error.
 pub async fn update_account_metadata(
     pool: &SqlitePool,
     account_id: i64,
     email: &str,
     account_type: &str,
     org_uuid: &str,
-    expected_cookie_prefix: &str,
+    expected_auth_source: &str,
+    expected_credential_prefix: &str,
 ) -> Result<(), sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE accounts SET email = ?1, account_type = ?2, organization_uuid = ?3, updated_at = CURRENT_TIMESTAMP WHERE id = ?4 AND (cookie_blob LIKE ?5 OR cookie_blob LIKE ?6)",
-    )
-    .bind(email)
-    .bind(account_type)
-    .bind(org_uuid)
-    .bind(account_id)
-    .bind(format!("{}%", expected_cookie_prefix))
-    .bind(format!("sessionKey={}%", expected_cookie_prefix))
-    .execute(pool)
-    .await?;
+    let result = match expected_auth_source {
+        "cookie" => {
+            sqlx::query(
+                "UPDATE accounts SET email = ?1, account_type = ?2, organization_uuid = ?3, updated_at = CURRENT_TIMESTAMP WHERE id = ?4 AND (cookie_blob LIKE ?5 OR cookie_blob LIKE ?6)",
+            )
+            .bind(email)
+            .bind(account_type)
+            .bind(org_uuid)
+            .bind(account_id)
+            .bind(format!("{}%", expected_credential_prefix))
+            .bind(format!("sessionKey={}%", expected_credential_prefix))
+            .execute(pool)
+            .await?
+        }
+        "oauth" => {
+            sqlx::query(
+                "UPDATE accounts SET email = ?1, account_type = ?2, organization_uuid = ?3, updated_at = CURRENT_TIMESTAMP WHERE id = ?4 AND oauth_access_token LIKE ?5",
+            )
+            .bind(email)
+            .bind(account_type)
+            .bind(org_uuid)
+            .bind(account_id)
+            .bind(format!("{}%", expected_credential_prefix))
+            .execute(pool)
+            .await?
+        }
+        other => {
+            tracing::warn!(
+                account_id,
+                auth_source = %other,
+                "update_account_metadata: unknown auth_source, skipping metadata persist"
+            );
+            return Ok(());
+        }
+    };
     if result.rows_affected() == 0 {
         tracing::warn!(
             account_id,
-            "update_account_metadata guard missed: cookie_blob does not start with the expected prefix, metadata not persisted"
+            auth_source = %expected_auth_source,
+            "update_account_metadata guard missed: credential fingerprint changed, metadata not persisted"
         );
     }
     Ok(())
@@ -824,15 +858,39 @@ mod tests {
         .unwrap();
 
         let prefix = "sk-ant-sid02-ABCDEFG";
-        update_account_metadata(&pool, 1, "n@example.com", "pro", "org-normal", prefix)
-            .await
-            .unwrap();
-        update_account_metadata(&pool, 2, "l@example.com", "pro", "org-legacy", prefix)
-            .await
-            .unwrap();
-        update_account_metadata(&pool, 3, "e@example.com", "pro", "org-embedded", prefix)
-            .await
-            .unwrap();
+        update_account_metadata(
+            &pool,
+            1,
+            "n@example.com",
+            "pro",
+            "org-normal",
+            "cookie",
+            prefix,
+        )
+        .await
+        .unwrap();
+        update_account_metadata(
+            &pool,
+            2,
+            "l@example.com",
+            "pro",
+            "org-legacy",
+            "cookie",
+            prefix,
+        )
+        .await
+        .unwrap();
+        update_account_metadata(
+            &pool,
+            3,
+            "e@example.com",
+            "pro",
+            "org-embedded",
+            "cookie",
+            prefix,
+        )
+        .await
+        .unwrap();
 
         let normal =
             sqlx::query("SELECT email, account_type, organization_uuid FROM accounts WHERE id = 1")
@@ -882,6 +940,130 @@ mod tests {
         assert_eq!(embedded.get::<Option<String>, _>("email"), None);
         assert_eq!(embedded.get::<Option<String>, _>("account_type"), None);
         assert_eq!(embedded.get::<Option<String>, _>("organization_uuid"), None);
+    }
+
+    #[tokio::test]
+    async fn update_account_metadata_oauth_branch_matches_access_token_prefix() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (
+                id, name, rr_order, max_slots, status, auth_source,
+                oauth_access_token, oauth_refresh_token, oauth_expires_at,
+                organization_uuid, drain_first
+            ) VALUES (1, 'oa', 1, 5, 'active', 'oauth', ?1, ?2, '2030-01-01T00:00:00Z', 'seed', 0)",
+        )
+        .bind("at-abc123xyz-secret")
+        .bind("rt-refresh")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Matching access_token prefix → UPDATE lands.
+        update_account_metadata(
+            &pool,
+            1,
+            "o@example.com",
+            "max",
+            "org-fresh",
+            "oauth",
+            "at-abc123",
+        )
+        .await
+        .unwrap();
+
+        let row =
+            sqlx::query("SELECT email, account_type, organization_uuid FROM accounts WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            row.get::<Option<String>, _>("email").as_deref(),
+            Some("o@example.com")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("organization_uuid").as_deref(),
+            Some("org-fresh")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_account_metadata_oauth_guard_misses_after_access_token_rotation() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (
+                id, name, rr_order, max_slots, status, auth_source,
+                oauth_access_token, oauth_refresh_token, oauth_expires_at,
+                organization_uuid, drain_first
+            ) VALUES (2, 'oa', 1, 5, 'active', 'oauth', ?1, ?2, '2030-01-01T00:00:00Z', 'seed', 0)",
+        )
+        .bind("at-new-rotated-token")
+        .bind("rt-refresh")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Probe started with old prefix, access_token was rotated mid-flight.
+        update_account_metadata(
+            &pool,
+            2,
+            "stale@example.com",
+            "max",
+            "stale-org",
+            "oauth",
+            "at-old-prefix",
+        )
+        .await
+        .unwrap();
+
+        let row = sqlx::query("SELECT email, organization_uuid FROM accounts WHERE id = 2")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<Option<String>, _>("email"), None);
+        assert_eq!(
+            row.get::<Option<String>, _>("organization_uuid").as_deref(),
+            Some("seed"),
+            "rotated access_token must block stale probe's metadata write"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_account_metadata_skips_on_auth_source_mismatch() {
+        // Cookie account probed as "oauth" (or vice versa) must no-op,
+        // not silently write against a different credential column.
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (
+                id, name, rr_order, max_slots, status, auth_source, cookie_blob, drain_first
+            ) VALUES (3, 'ck', 1, 5, 'active', 'cookie', ?1, 0)",
+        )
+        .bind("sk-ant-sid02-ABCDEFG-rest")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        update_account_metadata(
+            &pool,
+            3,
+            "should@not.write",
+            "pro",
+            "should-not-write",
+            "oauth",
+            "sk-ant-sid02",
+        )
+        .await
+        .unwrap();
+
+        let row = sqlx::query("SELECT email, organization_uuid FROM accounts WHERE id = 3")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<Option<String>, _>("email"), None);
+        assert_eq!(
+            row.get::<Option<String>, _>("organization_uuid"),
+            None,
+            "oauth guard on cookie account must miss — schema has no oauth_access_token"
+        );
     }
 
     #[tokio::test]

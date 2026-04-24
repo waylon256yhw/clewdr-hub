@@ -426,13 +426,14 @@ async fn run_cookie_probe(
         info.email, info.account_type, info.org_uuid
     );
 
-    // 2. Persist metadata to DB (with cookie prefix check to prevent stale writes)
+    // 2. Persist metadata to DB (guarded by credential fingerprint to prevent stale writes)
     if let Err(e) = update_account_metadata(
         db,
         account_id,
         &info.email,
         &info.account_type,
         &info.org_uuid,
+        "cookie",
         &cookie_prefix,
     )
     .await
