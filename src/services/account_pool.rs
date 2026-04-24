@@ -18,6 +18,10 @@ use crate::{
         set_account_disabled, set_accounts_active, summarize_accounts,
     },
     error::ClewdrError,
+    services::account_health::{
+        AccountHealth, AccountHealthSnapshot, PoolAccountView, PoolBucket, PoolCounts,
+        ProbeSummary, compose_health, summarize,
+    },
     state::AdminEvent,
     stealth,
 };
@@ -97,6 +101,11 @@ enum AccountPoolMessage {
     /// responsibility, `do_flush` must not touch the authoritative status by
     /// way of `state.invalid`.
     Invalidate(i64, Reason),
+    /// Build a unified `AccountHealthSnapshot` combining the DB rows with
+    /// the in-memory pool state. Shared by `/health`, admin overview, admin
+    /// accounts list, and (internally) the reload log. See
+    /// `docs/account-normalization-2026-04-21.md` §Step 2.5.
+    GetHealthSnapshot(RpcReplyPort<Result<AccountHealthSnapshot, ClewdrError>>),
 }
 
 #[derive(Debug)]
@@ -763,6 +772,83 @@ impl AccountPoolActor {
         }
     }
 
+    /// Build a unified account-health snapshot by joining DB rows with the
+    /// in-memory pool state. Runs inside the actor, so `state` is consistent
+    /// for the entire build. Shared by the `GetHealthSnapshot` handler and
+    /// (in a later commit) the reload log — callers must invoke this
+    /// directly on the actor, **never** via `AccountPoolHandle` RPC, to
+    /// avoid the actor awaiting a call back into itself.
+    ///
+    /// The pool's bucket membership wins over DB `status` / `reset_time`.
+    /// This matters between `collect` / `reset` and the next `do_flush`,
+    /// where the pool has already moved an account but the DB row has not
+    /// been written yet. See `PoolAccountView` docs for the precedence
+    /// rules.
+    async fn build_health_snapshot(
+        state: &AccountPoolState,
+    ) -> Result<AccountHealthSnapshot, ClewdrError> {
+        let accounts = load_all_accounts(&state.db).await?;
+        let now = Utc::now().timestamp();
+
+        // Index valid bucket by account_id for O(1) lookup.
+        let valid_ids: HashSet<i64> = state
+            .valid
+            .iter()
+            .filter_map(|slot| slot.account_id)
+            .collect();
+
+        let mut per_account: HashMap<i64, AccountHealth> = HashMap::with_capacity(accounts.len());
+        for account in &accounts {
+            let id = account.id;
+            let bucket = if valid_ids.contains(&id) {
+                Some(PoolBucket::Valid)
+            } else if let Some(slot) = state.exhausted.get(&id) {
+                Some(PoolBucket::Exhausted {
+                    reset_time: slot.reset_time,
+                })
+            } else {
+                state.invalid.get(&id).map(|inv| PoolBucket::Invalid {
+                    reason: &inv.reason,
+                })
+            };
+            let view = PoolAccountView {
+                bucket,
+                inflight: state.inflight.get(&id).copied(),
+                probing: state.probing.contains(&id),
+                last_probe_error: state.probe_errors.get(&id).map(String::as_str),
+            };
+            per_account.insert(id, compose_health(account, view));
+        }
+
+        let pool_counts = PoolCounts {
+            valid: state.valid.len(),
+            exhausted: state.exhausted.len(),
+            invalid: state.invalid.len(),
+        };
+
+        let mut probing_ids: Vec<i64> = state.probing.iter().copied().collect();
+        probing_ids.sort_unstable();
+        let probe = ProbeSummary {
+            probing_count: state.probing.len(),
+            probing_ids,
+            last_errors: state.probe_errors.clone(),
+        };
+
+        let summary = summarize(
+            &accounts,
+            &per_account,
+            &state.inflight,
+            pool_counts,
+            probe,
+            now,
+        );
+
+        Ok(AccountHealthSnapshot {
+            summary,
+            per_account,
+        })
+    }
+
     fn apply_in_memory_runtime(dst: &mut AccountSlot, mem: AccountSlot, preserve_token: bool) {
         if preserve_token {
             dst.token = mem.token;
@@ -1138,6 +1224,10 @@ impl Actor for AccountPoolActor {
             AccountPoolMessage::Invalidate(account_id, reason) => {
                 Self::converge_invalidate(state, account_id, reason);
             }
+            AccountPoolMessage::GetHealthSnapshot(reply_port) => {
+                let result = Self::build_health_snapshot(state).await;
+                reply_port.send(result)?;
+            }
         }
         Ok(())
     }
@@ -1385,6 +1475,20 @@ impl AccountPoolHandle {
                 ),
             }
         })
+    }
+
+    /// Fetch the unified account-health snapshot. Joins DB rows with the
+    /// in-memory pool state inside the actor, so counts and per-account
+    /// views are internally consistent.
+    pub async fn get_health_snapshot(&self) -> Result<AccountHealthSnapshot, ClewdrError> {
+        ractor::call!(self.actor_ref, AccountPoolMessage::GetHealthSnapshot).map_err(|e| {
+            ClewdrError::RactorError {
+                loc: Location::generate(),
+                msg: format!(
+                    "Failed to communicate with AccountPoolActor for get_health_snapshot: {e}"
+                ),
+            }
+        })?
     }
 
     /// Push a freshly-refreshed OAuth token into the in-memory pool slot so
@@ -1895,5 +1999,253 @@ mod tests {
             after, None,
             "get_token's data source must miss for invalidated accounts — callers rely on DB fallback"
         );
+    }
+
+    async fn insert_account_row(
+        pool: &sqlx::SqlitePool,
+        id: i64,
+        status: &str,
+        auth_source: &str,
+        access: Option<&str>,
+        refresh: Option<&str>,
+        invalid_reason: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO accounts (
+                id, name, rr_order, max_slots, status, auth_source,
+                oauth_access_token, oauth_refresh_token, oauth_expires_at,
+                organization_uuid, invalid_reason, drain_first
+            ) VALUES (?1, ?2, ?1, 5, ?3, ?4, ?5, ?6, '2030-01-01T00:00:00Z', 'org', ?7, 0)",
+        )
+        .bind(id)
+        .bind(format!("acc-{id}"))
+        .bind(status)
+        .bind(auth_source)
+        .bind(access)
+        .bind(refresh)
+        .bind(invalid_reason)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn set_runtime_reset(pool: &sqlx::SqlitePool, id: i64, reset_time: i64) {
+        sqlx::query(
+            "INSERT INTO account_runtime_state (account_id, reset_time) VALUES (?1, ?2)
+             ON CONFLICT(account_id) DO UPDATE SET reset_time = excluded.reset_time",
+        )
+        .bind(id)
+        .bind(reset_time)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Bug-1-style regression: the unified snapshot must classify every
+    /// account coherently — the same health.state the admin list shows,
+    /// the same detail counts `/health` and overview read, and the same
+    /// `probing_ids`/`last_errors` the frontend consumes. A disabled
+    /// account currently under probe must keep its `Invalid { Disabled }`
+    /// base state while still appearing in `detail.probing` and
+    /// `probe.probing_ids`.
+    #[tokio::test]
+    async fn build_health_snapshot_unifies_pool_and_db_views() {
+        use crate::services::account_health::{AccountHealthState, InvalidKind, PoolCounts};
+
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+
+        // id=1: active, will be valid + inflight 0/5 (dispatchable_now).
+        // id=2: active, will be valid + inflight 5/5 (saturated).
+        // id=3: active, will be exhausted with pool_reset_time in the future
+        //       (cooling_down).
+        // id=4: disabled + banned + in state.invalid + overlaid with probing
+        //       (invalid_disabled ∩ probing).
+        insert_account_row(&pool, 1, "active", "oauth", Some("at1"), Some("rt1"), None).await;
+        insert_account_row(&pool, 2, "active", "oauth", Some("at2"), Some("rt2"), None).await;
+        insert_account_row(&pool, 3, "active", "oauth", Some("at3"), Some("rt3"), None).await;
+        insert_account_row(
+            &pool,
+            4,
+            "disabled",
+            "oauth",
+            Some("at4"),
+            Some("rt4"),
+            Some("banned"),
+        )
+        .await;
+
+        let future = chrono::Utc::now().timestamp() + 600;
+        set_runtime_reset(&pool, 3, future).await;
+
+        let mut state = empty_state(pool);
+
+        // Valid slots for 1 and 2.
+        let mut slot1 = AccountSlot::new(&oauth_placeholder_cookie(1), None).unwrap();
+        slot1.account_id = Some(1);
+        state.valid.push_back(slot1);
+        state.inflight.insert(1, (0, 5));
+
+        let mut slot2 = AccountSlot::new(&oauth_placeholder_cookie(2), None).unwrap();
+        slot2.account_id = Some(2);
+        state.valid.push_back(slot2);
+        state.inflight.insert(2, (5, 5));
+
+        // Cooling slot in exhausted carries the future reset_time in memory.
+        let mut slot3 = AccountSlot::new(&oauth_placeholder_cookie(3), None).unwrap();
+        slot3.account_id = Some(3);
+        slot3.reset_time = Some(future);
+        state.exhausted.insert(3, slot3);
+
+        // Invalid slot for 4 with Reason::Banned, overlaid with probing.
+        let slot4_cookie = AccountSlot::new(&oauth_placeholder_cookie(4), None)
+            .unwrap()
+            .cookie;
+        state.invalid.insert(
+            4,
+            crate::config::InvalidAccountSlot::new(slot4_cookie, Reason::Banned, 4),
+        );
+        state.probing.insert(4);
+        state.probe_errors.insert(4, "transient".to_string());
+
+        let snapshot = AccountPoolActor::build_health_snapshot(&state)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.summary.total, 4);
+        assert_eq!(
+            snapshot.summary.pool,
+            PoolCounts {
+                valid: 2,
+                exhausted: 1,
+                invalid: 1,
+            }
+        );
+
+        let detail = snapshot.summary.detail;
+        assert_eq!(detail.dispatchable_now, 1, "id=1 is ready to dispatch");
+        assert_eq!(detail.saturated, 1, "id=2 has inflight cur >= max");
+        assert_eq!(detail.cooling_down, 1, "id=3 is cooling");
+        assert_eq!(detail.probing, 1, "id=4 overlays probing on disabled");
+        assert_eq!(detail.invalid_disabled, 1);
+        assert_eq!(detail.invalid_auth, 0);
+        assert_eq!(detail.unconfigured, 0);
+
+        assert_eq!(snapshot.summary.invalid_breakdown.banned, 1);
+        assert_eq!(snapshot.summary.invalid_breakdown.disabled, 0);
+
+        assert_eq!(snapshot.summary.probe.probing_count, 1);
+        assert_eq!(snapshot.summary.probe.probing_ids, vec![4]);
+        assert_eq!(
+            snapshot
+                .summary
+                .probe
+                .last_errors
+                .get(&4)
+                .map(String::as_str),
+            Some("transient")
+        );
+
+        // auth_sources counts the DB auth_source column for all rows.
+        assert_eq!(snapshot.summary.auth_sources.oauth, 4);
+        assert_eq!(snapshot.summary.auth_sources.cookie, 0);
+
+        // Per-account: the probing overlay must not change the base state.
+        let h4 = snapshot
+            .per_account
+            .get(&4)
+            .expect("id=4 must be in per_account");
+        assert!(h4.probing, "id=4 is actively probing");
+        assert_eq!(h4.last_probe_error.as_deref(), Some("transient"));
+        assert!(
+            matches!(
+                h4.state,
+                AccountHealthState::Invalid {
+                    kind: InvalidKind::Disabled,
+                    reason: Some(Reason::Banned),
+                }
+            ),
+            "base state must survive the probing overlay: {:?}",
+            h4.state
+        );
+
+        // Cooling account carries the pool reset_time.
+        let h3 = snapshot.per_account.get(&3).expect("id=3");
+        assert_eq!(
+            h3.state,
+            AccountHealthState::CoolingDown { reset_time: future }
+        );
+        assert!(!h3.probing);
+
+        // Active account with saturated inflight still reports Active as its
+        // base state — saturation is a detail slice, not a state change.
+        let h2 = snapshot.per_account.get(&2).expect("id=2");
+        assert_eq!(h2.state, AccountHealthState::Active);
+    }
+
+    /// Regression: between `collect` / `reset` and the next `do_flush`, the
+    /// pool's bucket and the DB row disagree. `build_health_snapshot` must
+    /// trust the pool, otherwise the admin list and overview show stale
+    /// CoolingDown/Active entries even though dispatch has already moved on.
+    #[tokio::test]
+    async fn build_health_snapshot_pool_bucket_overrides_stale_db() {
+        use crate::services::account_health::{AccountHealthState, InvalidKind};
+
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+
+        // id=5: DB says active + runtime.reset_time still in the future,
+        //       but the pool has already moved the slot back to `valid`
+        //       (stale cooldown row). Expected: Active.
+        // id=6: DB still says active, but the pool has just moved the
+        //       account into `state.invalid` with Reason::Banned. Expected:
+        //       Invalid { AuthError, Banned }.
+        insert_account_row(&pool, 5, "active", "oauth", Some("at5"), Some("rt5"), None).await;
+        insert_account_row(&pool, 6, "active", "oauth", Some("at6"), Some("rt6"), None).await;
+
+        let future = chrono::Utc::now().timestamp() + 600;
+        set_runtime_reset(&pool, 5, future).await;
+
+        let mut state = empty_state(pool);
+
+        let mut slot5 = AccountSlot::new(&oauth_placeholder_cookie(5), None).unwrap();
+        slot5.account_id = Some(5);
+        // Pool slot has no reset_time — the account just got reset()-ed.
+        state.valid.push_back(slot5);
+        state.inflight.insert(5, (0, 5));
+
+        let slot6_cookie = AccountSlot::new(&oauth_placeholder_cookie(6), None)
+            .unwrap()
+            .cookie;
+        state.invalid.insert(
+            6,
+            crate::config::InvalidAccountSlot::new(slot6_cookie, Reason::Banned, 6),
+        );
+
+        let snapshot = AccountPoolActor::build_health_snapshot(&state)
+            .await
+            .unwrap();
+
+        let h5 = snapshot.per_account.get(&5).expect("id=5");
+        assert_eq!(
+            h5.state,
+            AccountHealthState::Active,
+            "pool bucket Valid must beat stale DB reset_time"
+        );
+
+        let h6 = snapshot.per_account.get(&6).expect("id=6");
+        assert!(
+            matches!(
+                h6.state,
+                AccountHealthState::Invalid {
+                    kind: InvalidKind::AuthError,
+                    reason: Some(Reason::Banned),
+                }
+            ),
+            "pool bucket Invalid must beat stale DB status=active: {:?}",
+            h6.state
+        );
+
+        assert_eq!(snapshot.summary.detail.dispatchable_now, 1);
+        assert_eq!(snapshot.summary.detail.cooling_down, 0);
+        assert_eq!(snapshot.summary.detail.invalid_auth, 1);
     }
 }
