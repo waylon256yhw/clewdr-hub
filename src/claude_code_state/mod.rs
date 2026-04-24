@@ -17,7 +17,7 @@ use crate::{
     billing::BillingContext,
     config::{AccountSlot, CLAUDE_ENDPOINT, Reason, TokenInfo},
     error::{ClewdrError, WreqSnafu},
-    services::account_pool::AccountPoolHandle,
+    services::account_pool::{AccountPoolHandle, CredentialFingerprint},
     stealth::SharedStealthProfile,
     types::claude::Usage,
 };
@@ -140,8 +140,12 @@ impl ClaudeCodeState {
                 return;
             };
             let update = cookie.to_runtime_params();
+            // Capture the request-time credential identity so the pool can
+            // discard this release if the credential has been admin-rotated
+            // since acquire (Step 4 / C5).
+            let fingerprint = CredentialFingerprint::from_slot(cookie);
             self.account_pool_handle
-                .release_runtime(account_id, update, reason)
+                .release_runtime(account_id, update, reason, fingerprint)
                 .await
                 .unwrap_or_else(|e| {
                     error!("Failed to release account: {}", e);

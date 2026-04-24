@@ -55,6 +55,62 @@ pub(crate) fn is_oauth_placeholder_slot(cookie: &AccountSlot) -> bool {
     raw.contains("sk-ant-sid99-o") && raw.ends_with("-pool00AA")
 }
 
+/// Length of the credential prefix used for fingerprinting in C5's
+/// release_runtime guard. 20 bytes is enough to distinguish admin
+/// replacements (cookie blobs and refresh tokens are both 80+ chars with
+/// high-entropy first bytes) without bloating the message payload that
+/// flows through every chat / probe completion.
+const CREDENTIAL_FINGERPRINT_LEN: usize = 20;
+
+/// Stable identity for a credential at request-acquire time. Captured by
+/// every caller of `release_runtime` so `collect_by_id` can detect that
+/// the pool's slot has been credential-rotated (admin replacement) since
+/// the request started, and discard the stale runtime / Reason instead of
+/// applying it to a slot that no longer represents the same logical
+/// credential.
+///
+/// OAuth uses the **refresh_token** prefix, not access_token: a normal
+/// OAuth refresh rotates `access_token` but keeps `refresh_token`, so the
+/// fingerprint must survive `refresh_token`-stable rotations or every
+/// request that overlaps a refresh would falsely trip the guard. Admin
+/// reconnect rotates both, so the fingerprint correctly flips.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialFingerprint {
+    Cookie(String),
+    OAuth(String),
+}
+
+impl CredentialFingerprint {
+    fn cookie_prefix(s: &str) -> Self {
+        let cap = CREDENTIAL_FINGERPRINT_LEN.min(s.len());
+        CredentialFingerprint::Cookie(s[..cap].to_string())
+    }
+
+    fn oauth_prefix(s: &str) -> Self {
+        let cap = CREDENTIAL_FINGERPRINT_LEN.min(s.len());
+        CredentialFingerprint::OAuth(s[..cap].to_string())
+    }
+
+    /// Build a fingerprint from a request-time `AccountSlot`. Returns None
+    /// when the slot has no usable credential identifier (an OAuth slot
+    /// with `token = None` — should not happen in practice, but treated
+    /// as "no fingerprint" so the caller's guard becomes a pass-through
+    /// rather than a false rejection).
+    pub fn from_slot(slot: &AccountSlot) -> Option<Self> {
+        match slot.auth_method {
+            // Use the inner cookie blob (`Deref<Target = str>`), not
+            // `to_string()` — the latter prepends `sessionKey=` which is
+            // identical across every cookie account and would collapse
+            // every fingerprint into the same 20-byte prefix.
+            AuthMethod::Cookie => Some(Self::cookie_prefix(slot.cookie.as_ref())),
+            AuthMethod::OAuth => slot
+                .token
+                .as_ref()
+                .map(|t| Self::oauth_prefix(&t.refresh_token)),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct AccountPoolStatus {
     pub valid: Vec<AccountSlot>,
@@ -77,10 +133,19 @@ enum AccountPoolMessage {
     /// authoritative credential — callers never ship a full `AccountSlot`.
     /// `update` is boxed because `RuntimeUpdate` carries 5 usage buckets
     /// and would otherwise dominate the enum layout.
+    ///
+    /// `expected_fingerprint` (Step 4 / C5) is the credential identity the
+    /// caller saw at request-acquire time. `collect_by_id` compares it
+    /// against the pool's current credential and discards stale releases
+    /// — i.e., requests whose credential was admin-rotated mid-flight no
+    /// longer poison the new credential's runtime / Reason. None means
+    /// "no fingerprint available, skip the guard" (legacy / probe paths
+    /// that still need wiring through C6).
     Return {
         account_id: i64,
         update: Box<RuntimeUpdate>,
         reason: Option<Reason>,
+        expected_fingerprint: Option<CredentialFingerprint>,
     },
     CheckReset,
     Request(
@@ -570,11 +635,44 @@ impl AccountPoolActor {
     /// bytes on the pool's slot are never touched — only the runtime
     /// fields in `update`. See
     /// `docs/account-normalization-2026-04-21.md` §Step 3 Goal 1.
+    /// Compute the credential fingerprint of the pool's *current* slot for
+    /// `account_id`, by peeking each bucket without consuming. C5's guard
+    /// compares this against the caller's request-time fingerprint.
+    ///
+    /// Lookup order: `valid` → `exhausted` → `invalid`. `invalid` only has
+    /// the cookie blob preserved on `InvalidAccountSlot.cookie`, so OAuth
+    /// accounts in invalid currently fingerprint as Cookie(prefix). That
+    /// asymmetry is harmless for now: an OAuth account in invalid is
+    /// already in a sticky-reason state (Disabled / AuthError) and will
+    /// be caught by the sticky-reason guard above before the fingerprint
+    /// check runs. C6 retires `InvalidAccountSlot.cookie` and replaces
+    /// this branch with an `auth_method`-aware lookup.
+    fn pool_credential_fingerprint(
+        state: &AccountPoolState,
+        account_id: i64,
+    ) -> Option<CredentialFingerprint> {
+        if let Some(slot) = state
+            .valid
+            .iter()
+            .find(|c| c.account_id == Some(account_id))
+        {
+            return CredentialFingerprint::from_slot(slot);
+        }
+        if let Some(slot) = state.exhausted.get(&account_id) {
+            return CredentialFingerprint::from_slot(slot);
+        }
+        if let Some(inv) = state.invalid.get(&account_id) {
+            return Some(CredentialFingerprint::cookie_prefix(inv.cookie.as_ref()));
+        }
+        None
+    }
+
     fn collect_by_id(
         state: &mut AccountPoolState,
         account_id: i64,
         update: RuntimeUpdate,
         reason: Option<Reason>,
+        expected_fingerprint: Option<CredentialFingerprint>,
     ) -> bool {
         let removed_probe = state.probing.remove(&account_id);
 
@@ -590,6 +688,28 @@ impl AccountPoolActor {
             )
         {
             return removed_probe;
+        }
+
+        // Fingerprint guard (Step 4 / C5): the caller captured the
+        // credential identity at request-acquire time. If the pool's
+        // current credential differs (admin reconnect or kind flip while
+        // the request was in flight), the runtime + Reason in this update
+        // belong to a credential that no longer represents this account
+        // — applying either would either erase the new credential's
+        // usage state or push a stale auth_error onto a healthy slot.
+        //
+        // OAuth refresh is *not* a mismatch: the fingerprint is the
+        // refresh_token prefix, which survives a normal refresh.
+        if let Some(expected) = expected_fingerprint.as_ref() {
+            let actual = Self::pool_credential_fingerprint(state, account_id);
+            if actual.as_ref() != Some(expected) {
+                warn!(
+                    "[release_runtime] credential fingerprint mismatch for account {account_id} \
+                     (expected {:?}, actual {:?}); dropping stale runtime + reason",
+                    expected, actual
+                );
+                return removed_probe;
+            }
         }
 
         let had_valid = state
@@ -1187,8 +1307,10 @@ impl Actor for AccountPoolActor {
                 account_id,
                 update,
                 reason,
+                expected_fingerprint,
             } => {
-                let completed_probe = Self::collect_by_id(state, account_id, *update, reason);
+                let completed_probe =
+                    Self::collect_by_id(state, account_id, *update, reason, expected_fingerprint);
                 if completed_probe {
                     Self::do_flush(state).await;
                     Self::emit_accounts_refresh(state);
@@ -1401,11 +1523,21 @@ impl AccountPoolHandle {
     /// The pool's own in-memory slot stays the source of truth for the
     /// account's credential — `update` only carries runtime-state fields
     /// (usage, utilization, reset_time, count_tokens_allowed, etc.).
+    ///
+    /// `expected_fingerprint` (Step 4 / C5): the credential identity the
+    /// caller saw at request-acquire time. If the pool's slot has rotated
+    /// since (admin replacement), the runtime update and Reason are both
+    /// discarded — applying them would either reset the new credential's
+    /// usage state or poison a healthy credential with a stale auth_error
+    /// from the prior one. Pass `None` only when no slot context is
+    /// available (e.g. probe paths that still rebuild from DB rows; those
+    /// land via C6).
     pub async fn release_runtime(
         &self,
         account_id: i64,
         update: RuntimeUpdate,
         reason: Option<Reason>,
+        expected_fingerprint: Option<CredentialFingerprint>,
     ) -> Result<(), ClewdrError> {
         ractor::cast!(
             self.actor_ref,
@@ -1413,6 +1545,7 @@ impl AccountPoolHandle {
                 account_id,
                 update: Box::new(update),
                 reason,
+                expected_fingerprint,
             }
         )
         .map_err(|e| ClewdrError::RactorError {
@@ -1585,7 +1718,8 @@ impl AccountPoolHandle {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccountPoolActor, AccountPoolState, is_oauth_placeholder_slot, oauth_placeholder_cookie,
+        AccountPoolActor, AccountPoolState, CredentialFingerprint, is_oauth_placeholder_slot,
+        oauth_placeholder_cookie,
     };
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::str::FromStr;
@@ -1906,7 +2040,7 @@ mod tests {
         // behaviour would take from invalid and push back into valid, then
         // mark `state.reactivated` which drives `set_accounts_active` in
         // do_flush, clobbering the DB auth_error.
-        AccountPoolActor::collect_by_id(&mut state, 1, slot.to_runtime_params(), None);
+        AccountPoolActor::collect_by_id(&mut state, 1, slot.to_runtime_params(), None, None);
 
         assert!(
             state.invalid.contains_key(&1),
@@ -1942,7 +2076,7 @@ mod tests {
             ),
         );
 
-        AccountPoolActor::collect_by_id(&mut state, 2, slot.to_runtime_params(), None);
+        AccountPoolActor::collect_by_id(&mut state, 2, slot.to_runtime_params(), None, None);
 
         assert!(
             state.valid.iter().any(|c| c.account_id == Some(2)),
@@ -1987,7 +2121,7 @@ mod tests {
                 1,
             ),
         );
-        AccountPoolActor::collect_by_id(&mut state, 1, slot.to_runtime_params(), None);
+        AccountPoolActor::collect_by_id(&mut state, 1, slot.to_runtime_params(), None, None);
         assert!(state.reactivated.contains(&1));
         assert!(state.dirty.contains(&1));
         assert!(state.valid.iter().any(|c| c.account_id == Some(1)));
@@ -2329,7 +2463,7 @@ mod tests {
         let mut update = slot.to_runtime_params();
         update.count_tokens_allowed = Some(true);
 
-        AccountPoolActor::collect_by_id(&mut state, 77, update, None);
+        AccountPoolActor::collect_by_id(&mut state, 77, update, None, None);
 
         let after = state
             .valid
@@ -2892,5 +3026,197 @@ mod tests {
             err.contains("cookie_blob"),
             "error message must mention the missing field, got: {err}"
         );
+    }
+
+    fn cookie_slot_with_blob(account_id: i64, blob: &str) -> AccountSlot {
+        let mut slot = AccountSlot::new(blob, None).unwrap();
+        slot.account_id = Some(account_id);
+        slot.auth_method = AuthMethod::Cookie;
+        slot
+    }
+
+    fn oauth_slot_with_refresh(account_id: i64, refresh: &str) -> AccountSlot {
+        let mut slot = AccountSlot::new(&oauth_placeholder_cookie(account_id), None).unwrap();
+        slot.account_id = Some(account_id);
+        slot.auth_method = AuthMethod::OAuth;
+        slot.token = Some(token_with_refresh(refresh));
+        slot
+    }
+
+    /// C5 race scenario 1: a chat request acquired a cookie account, then
+    /// admin reconnect rotated the credential to a brand-new cookie blob
+    /// before the request finished. The release carries the OLD cookie's
+    /// fingerprint and a `Reason::Null` (generic auth failure on the now-
+    /// stale cookie). Without the fingerprint guard, `collect_by_id`
+    /// would push the NEW slot into `invalid` with the stale auth error.
+    #[tokio::test]
+    async fn collect_by_id_drops_stale_release_after_admin_credential_swap() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        let mut state = empty_state(pool);
+
+        let original_blob = cookie_blob_for(b'a');
+        let new_blob = cookie_blob_for(b'b');
+        // Pool currently holds the NEW credential (post admin swap).
+        state.valid.push_back(cookie_slot_with_blob(1, &new_blob));
+        state.inflight.insert(1, (0, 5));
+
+        // Caller captured fingerprint at acquire time, before the swap.
+        let request_time_slot = cookie_slot_with_blob(1, &original_blob);
+        let stale_fp = CredentialFingerprint::from_slot(&request_time_slot);
+        assert!(stale_fp.is_some());
+
+        let update = request_time_slot.to_runtime_params();
+        AccountPoolActor::collect_by_id(&mut state, 1, update, Some(Reason::Null), stale_fp);
+
+        // Pool slot must remain in valid, untouched. The stale auth_error
+        // reason must NOT have demoted the new credential.
+        assert_eq!(
+            state.valid.len(),
+            1,
+            "new credential must stay in valid bucket"
+        );
+        assert!(
+            !state.invalid.contains_key(&1),
+            "stale Reason::Null must not push the rotated cookie into invalid"
+        );
+        let surviving_blob = state
+            .valid
+            .iter()
+            .find(|c| c.account_id == Some(1))
+            .map(|c| c.cookie.to_string())
+            .unwrap();
+        assert!(
+            surviving_blob.contains(&new_blob[..20]),
+            "new cookie blob must remain (got: {})",
+            surviving_blob
+        );
+    }
+
+    /// C5 race scenario 2: an OAuth refresh swapped the access_token but
+    /// kept the refresh_token (a normal refresh, not an admin reconnect).
+    /// The fingerprint is the refresh_token prefix, so the caller's
+    /// capture from before the refresh must still match the pool's
+    /// current slot. The runtime update MUST be applied — otherwise every
+    /// request that overlaps a refresh would lose its usage / boundary
+    /// updates.
+    #[tokio::test]
+    async fn collect_by_id_accepts_release_across_oauth_refresh_same_refresh_token() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        let mut state = empty_state(pool);
+
+        // Pool slot post-refresh: same refresh_token "rt_stable", new access_token "at_new".
+        let mut pool_slot = oauth_slot_with_refresh(2, "rt_stable");
+        pool_slot.token = Some(TokenInfo::from_parts(
+            "at_new".into(),
+            "rt_stable".into(),
+            Duration::from_secs(3600),
+            "org".into(),
+        ));
+        state.valid.push_back(pool_slot);
+        state.inflight.insert(2, (0, 5));
+
+        // Caller captured fingerprint before the refresh. access_token was
+        // "at_old" then; refresh_token was the same "rt_stable".
+        let mut request_time_slot = oauth_slot_with_refresh(2, "rt_stable");
+        request_time_slot.token = Some(TokenInfo::from_parts(
+            "at_old".into(),
+            "rt_stable".into(),
+            Duration::from_secs(3600),
+            "org".into(),
+        ));
+        let fp = CredentialFingerprint::from_slot(&request_time_slot);
+        assert!(matches!(fp, Some(CredentialFingerprint::OAuth(_))));
+
+        // Bring an interesting runtime mutation through the release.
+        let mut update = request_time_slot.to_runtime_params();
+        update.count_tokens_allowed = Some(true);
+        AccountPoolActor::collect_by_id(&mut state, 2, update, None, fp);
+
+        let after = state
+            .valid
+            .iter()
+            .find(|c| c.account_id == Some(2))
+            .expect("OAuth slot must remain in valid");
+        assert_eq!(
+            after.count_tokens_allowed,
+            Some(true),
+            "release across an OAuth refresh (refresh_token unchanged) must apply runtime"
+        );
+        assert_eq!(
+            after.token.as_ref().map(|t| t.access_token.as_str()),
+            Some("at_new"),
+            "credential bytes are pool-owned; release_runtime must not touch them"
+        );
+    }
+
+    /// C5 race scenario 3: admin reconnected an OAuth account, rotating
+    /// BOTH access_token and refresh_token. The caller's release carries
+    /// a fingerprint from the old refresh_token, so the guard fires and
+    /// the runtime + Reason are both dropped.
+    #[tokio::test]
+    async fn collect_by_id_drops_stale_release_after_oauth_admin_reconnect() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        let mut state = empty_state(pool);
+
+        // Pool slot post admin reconnect: new refresh_token.
+        let mut pool_slot = oauth_slot_with_refresh(3, "rt_new_after_admin_reconnect");
+        pool_slot.count_tokens_allowed = Some(false);
+        state.valid.push_back(pool_slot);
+
+        // Caller captured fingerprint before reconnect.
+        let request_time_slot = oauth_slot_with_refresh(3, "rt_old_pre_reconnect");
+        let stale_fp = CredentialFingerprint::from_slot(&request_time_slot);
+
+        // Runtime update from the stale request would flip count_tokens_allowed
+        // to true AND demote with a Reason::TooManyRequest cooldown.
+        let mut update = request_time_slot.to_runtime_params();
+        update.count_tokens_allowed = Some(true);
+        let cooldown_until = chrono::Utc::now().timestamp() + 7200;
+        AccountPoolActor::collect_by_id(
+            &mut state,
+            3,
+            update,
+            Some(Reason::TooManyRequest(cooldown_until)),
+            stale_fp,
+        );
+
+        let after = state
+            .valid
+            .iter()
+            .find(|c| c.account_id == Some(3))
+            .expect("OAuth slot must stay in valid (cooldown was on stale credential)");
+        assert_eq!(
+            after.count_tokens_allowed,
+            Some(false),
+            "stale runtime must NOT overwrite the post-reconnect runtime"
+        );
+        assert!(
+            !state.exhausted.contains_key(&3),
+            "stale TMR cooldown must not push the new credential to exhausted"
+        );
+    }
+
+    /// Backward compatibility: callers that pass `None` for fingerprint
+    /// (probe paths still being wired through C6, plus historical test
+    /// fixtures) keep the pre-C5 behavior — the guard becomes a
+    /// pass-through and the update + Reason are applied as before.
+    #[tokio::test]
+    async fn collect_by_id_with_no_fingerprint_skips_guard_and_applies_update() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        let mut state = empty_state(pool);
+        state
+            .valid
+            .push_back(cookie_slot_with_blob(4, &cookie_blob_for(b'a')));
+
+        let mut update = state.valid.front().unwrap().to_runtime_params();
+        update.count_tokens_allowed = Some(true);
+        AccountPoolActor::collect_by_id(&mut state, 4, update, None, None);
+
+        let after = state
+            .valid
+            .iter()
+            .find(|c| c.account_id == Some(4))
+            .unwrap();
+        assert_eq!(after.count_tokens_allowed, Some(true));
     }
 }

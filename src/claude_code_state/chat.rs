@@ -20,7 +20,7 @@ use crate::{
     },
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
     oauth::refresh_oauth_token,
-    services::account_pool::AccountPoolHandle,
+    services::account_pool::{AccountPoolHandle, CredentialFingerprint},
     types::claude::{CountMessageTokensResponse, CreateMessageParams},
 };
 
@@ -380,9 +380,10 @@ impl ClaudeCodeState {
                 return;
             };
             let update = cookie.to_runtime_params();
+            let fingerprint = CredentialFingerprint::from_slot(cookie);
             if let Err(err) = self
                 .account_pool_handle
-                .release_runtime(account_id, update, None)
+                .release_runtime(account_id, update, None, fingerprint)
                 .await
             {
                 warn!("Failed to persist count_tokens permission: {}", err);
@@ -627,9 +628,10 @@ impl ClaudeCodeState {
                 return;
             };
             let update = cookie.to_runtime_params();
+            let fingerprint = CredentialFingerprint::from_slot(cookie);
             if let Err(err) = self
                 .account_pool_handle
-                .release_runtime(account_id, update, None)
+                .release_runtime(account_id, update, None, fingerprint)
                 .await
             {
                 warn!("Failed to persist usage statistics: {}", err);
@@ -768,8 +770,10 @@ impl ClaudeCodeState {
                                     c.add_and_bucket_usage(total_input, total_out, family);
                                     if let Some(account_id) = c.account_id {
                                         let update = c.to_runtime_params();
-                                        let _ =
-                                            handle.release_runtime(account_id, update, None).await;
+                                        let fingerprint = CredentialFingerprint::from_slot(&c);
+                                        let _ = handle
+                                            .release_runtime(account_id, update, None, fingerprint)
+                                            .await;
                                     }
                                     if let Some(aid) = aid
                                         && !released.swap(true, Ordering::Relaxed)
@@ -891,7 +895,10 @@ impl ClaudeCodeState {
                                     }
                                     if let Some(account_id) = cookie.account_id {
                                         let update = cookie.to_runtime_params();
-                                        let _ = h.release_runtime(account_id, update, None).await;
+                                        let fingerprint = CredentialFingerprint::from_slot(&cookie);
+                                        let _ = h
+                                            .release_runtime(account_id, update, None, fingerprint)
+                                            .await;
                                     }
                                 }
                                 if let Some(ctx) = billing_ctx {
