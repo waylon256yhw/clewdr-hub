@@ -568,7 +568,10 @@ pub async fn set_account_active(pool: &SqlitePool, account_id: i64) -> Result<()
 ///
 /// For `auth_source = "cookie"`, the guard matches against `cookie_blob`
 /// (with a legacy `sessionKey=` variant for pre-normalization rows). For
-/// `auth_source = "oauth"`, it matches against `oauth_access_token`.
+/// `auth_source = "oauth"`, it matches against `oauth_access_token`. The
+/// prefix comparison uses `substr(col, 1, ?len) = ?prefix` rather than
+/// `LIKE prefix%` so SQLite wildcard characters (`_`, `%`) in the prefix
+/// bytes do not relax the guard.
 ///
 /// `email`, `account_type`, and `org_uuid` are `Option<&str>`: `None`
 /// preserves the existing DB value (COALESCE semantics), matching
@@ -589,27 +592,34 @@ pub async fn update_account_metadata(
 ) -> Result<(), sqlx::Error> {
     let result = match expected_auth_source {
         "cookie" => {
+            let plen = expected_credential_prefix.len() as i64;
+            let legacy_prefix = format!("sessionKey={expected_credential_prefix}");
+            let legacy_plen = legacy_prefix.len() as i64;
             sqlx::query(
-                "UPDATE accounts SET email = COALESCE(?1, email), account_type = COALESCE(?2, account_type), organization_uuid = COALESCE(?3, organization_uuid), updated_at = CURRENT_TIMESTAMP WHERE id = ?4 AND (cookie_blob LIKE ?5 OR cookie_blob LIKE ?6)",
+                "UPDATE accounts SET email = COALESCE(?1, email), account_type = COALESCE(?2, account_type), organization_uuid = COALESCE(?3, organization_uuid), updated_at = CURRENT_TIMESTAMP WHERE id = ?4 AND (substr(cookie_blob, 1, ?5) = ?6 OR substr(cookie_blob, 1, ?7) = ?8)",
             )
             .bind(email)
             .bind(account_type)
             .bind(org_uuid)
             .bind(account_id)
-            .bind(format!("{}%", expected_credential_prefix))
-            .bind(format!("sessionKey={}%", expected_credential_prefix))
+            .bind(plen)
+            .bind(expected_credential_prefix)
+            .bind(legacy_plen)
+            .bind(legacy_prefix)
             .execute(pool)
             .await?
         }
         "oauth" => {
+            let plen = expected_credential_prefix.len() as i64;
             sqlx::query(
-                "UPDATE accounts SET email = COALESCE(?1, email), account_type = COALESCE(?2, account_type), organization_uuid = COALESCE(?3, organization_uuid), updated_at = CURRENT_TIMESTAMP WHERE id = ?4 AND oauth_access_token LIKE ?5",
+                "UPDATE accounts SET email = COALESCE(?1, email), account_type = COALESCE(?2, account_type), organization_uuid = COALESCE(?3, organization_uuid), updated_at = CURRENT_TIMESTAMP WHERE id = ?4 AND substr(oauth_access_token, 1, ?5) = ?6",
             )
             .bind(email)
             .bind(account_type)
             .bind(org_uuid)
             .bind(account_id)
-            .bind(format!("{}%", expected_credential_prefix))
+            .bind(plen)
+            .bind(expected_credential_prefix)
             .execute(pool)
             .await?
         }
@@ -1069,6 +1079,56 @@ mod tests {
             row.get::<Option<String>, _>("organization_uuid"),
             None,
             "oauth guard on cookie account must miss — schema has no oauth_access_token"
+        );
+    }
+
+    /// Regression: prior `LIKE '{prefix}%'` guard treated `_` as
+    /// single-char wildcard, so two rotated credentials with matching
+    /// shape around underscore positions could both satisfy the guard.
+    /// The substr-equality form must only match on exact bytes.
+    #[tokio::test]
+    async fn update_account_metadata_prefix_underscore_is_not_wildcard() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (
+                id, name, rr_order, max_slots, status, auth_source,
+                oauth_access_token, oauth_refresh_token, oauth_expires_at,
+                organization_uuid, drain_first
+            ) VALUES (4, 'oa', 1, 5, 'active', 'oauth', ?1, ?2, '2030-01-01T00:00:00Z', 'seed', 0)",
+        )
+        // Real access token after rotation uses literal 'X' where the
+        // stale probe's snapshot used '_'. Under LIKE-semantics the
+        // single '_' in the stale prefix would match any character and
+        // silently pass the guard.
+        .bind("at-newXtoken-rest")
+        .bind("rt")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Stale probe started on the OLD access token "at-new_token..."
+        // and kept its first 14 bytes as the fingerprint.
+        update_account_metadata(
+            &pool,
+            4,
+            Some("stale@example.com"),
+            Some("max"),
+            Some("stale-org"),
+            "oauth",
+            "at-new_token-r",
+        )
+        .await
+        .unwrap();
+
+        let row = sqlx::query("SELECT email, organization_uuid FROM accounts WHERE id = 4")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<Option<String>, _>("email"), None);
+        assert_eq!(
+            row.get::<Option<String>, _>("organization_uuid").as_deref(),
+            Some("seed"),
+            "underscore in prefix must not act as a wildcard"
         );
     }
 
