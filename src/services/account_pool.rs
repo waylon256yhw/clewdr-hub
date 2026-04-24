@@ -978,25 +978,26 @@ impl AccountPoolActor {
             // credential is authoritative and was already applied above when
             // `row.oauth_token` was attached to `cs`.
             //
-            // `mem_is_oauth` MUST come from the placeholder-cookie marker,
-            // not from `mem.token.is_some()`: cookie accounts exchange their
-            // cookie for a short-lived bearer token (stored on
-            // `AccountSlot.token`) during `ClaudeCodeState::exchange_token`,
-            // so `mem.token` being present does not mean this slot is
-            // OAuth-backed. Only `oauth_placeholder_cookie(...)` identifies
-            // an OAuth-only slot reliably.
+            // `mem_kind` and `row_kind` both come from explicit AuthMethod
+            // (Step 4 PR #6 / C3): mem reads its own field (loader stamps
+            // it from row.auth_source on load); row reads `auth_source`
+            // directly. This replaces the pre-C3 placeholder-cookie marker
+            // and `row.oauth_token.is_some()` proxies — cookie accounts
+            // hold a bearer token in `slot.token` after `exchange_token`,
+            // so token presence is not a reliable kind discriminator.
             //
             // Within the cookie kind, a byte-level `cookie_blob` change is
             // treated as admin-initiated replacement (DB never changes
             // cookie bytes implicitly). OAuth access_token rotation from a
             // normal refresh is preserved — runtime/probing must survive.
             if let Some(mem) = mem_cookies.remove(&row.id) {
-                let mem_is_oauth = is_oauth_placeholder_slot(&mem);
-                let row_is_oauth = row.oauth_token.is_some();
-                let same_kind = mem_is_oauth == row_is_oauth;
-                let cookie_content_swap = same_kind && !row_is_oauth && mem.cookie != cs.cookie;
+                let mem_kind = mem.auth_method;
+                let row_kind = AuthMethod::from_auth_source(&row.auth_source);
+                let same_kind = mem_kind == row_kind;
+                let cookie_content_swap =
+                    same_kind && row_kind == AuthMethod::Cookie && mem.cookie != cs.cookie;
                 if same_kind && !cookie_content_swap {
-                    Self::apply_in_memory_runtime(&mut cs, mem, !row_is_oauth);
+                    Self::apply_in_memory_runtime(&mut cs, mem, row_kind == AuthMethod::Cookie);
                     cs.proxy_url = row.proxy_url.clone();
                 } else {
                     replaced_ids.push(row.id);
@@ -2380,6 +2381,7 @@ mod tests {
         let mut state = empty_state(pool);
         let mut mem_slot = AccountSlot::new(&oauth_placeholder_cookie(42), None).unwrap();
         mem_slot.account_id = Some(42);
+        mem_slot.auth_method = AuthMethod::OAuth;
         mem_slot.token = Some(token_with_refresh("rt_stale"));
         mem_slot.count_tokens_allowed = Some(true);
         mem_slot.supports_claude_1m_sonnet = Some(true);
@@ -2427,6 +2429,7 @@ mod tests {
         let mut state = empty_state(pool);
         let mut mem_slot = AccountSlot::new(&oauth_placeholder_cookie(43), None).unwrap();
         mem_slot.account_id = Some(43);
+        mem_slot.auth_method = AuthMethod::OAuth;
         mem_slot.token = Some(token_with_refresh("rt_old"));
         mem_slot.count_tokens_allowed = Some(true);
         state.valid.push_back(mem_slot);
