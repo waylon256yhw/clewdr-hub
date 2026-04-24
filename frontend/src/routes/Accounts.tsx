@@ -261,17 +261,29 @@ function AccountCard({
         <Text size="xs" c="dimmed" mb="xs">探测更新时间: {probeCheckedAt}</Text>
       )}
 
-      {account.invalid_reason && (
-        <Text size="xs" c="red" mb="xs">{account.invalid_reason}</Text>
-      )}
+      {/*
+        invalid_reason / last_error come straight from the DB row. The
+        list handler loads accounts and pool state in two separate calls,
+        so during the collect→do_flush window the DB row can still carry
+        a stale invalid_reason / last_error even though the pool has
+        already reclassified the account. Show these strings only when
+        the snapshot agrees ("invalid"), or when we never got a snapshot
+        (health missing) and have to trust the DB. This keeps the red
+        text from contradicting the green/yellow badge above.
+      */}
+      {account.invalid_reason &&
+        (!account.health || account.health.state === "invalid") && (
+          <Text size="xs" c="red" mb="xs">{account.invalid_reason}</Text>
+        )}
 
       {effectiveProbeError && (
         <Text size="xs" c="orange" mb="xs">探测错误: {effectiveProbeError}</Text>
       )}
 
-      {account.last_error && (
-        <Text size="xs" c="orange" mb="xs">OAuth: {account.last_error}</Text>
-      )}
+      {account.last_error &&
+        (!account.health || account.health.state === "invalid") && (
+          <Text size="xs" c="orange" mb="xs">OAuth: {account.last_error}</Text>
+        )}
 
       <Divider my="xs" />
 
