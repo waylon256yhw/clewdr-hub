@@ -10,8 +10,7 @@ use crate::{
     config::{AccountSlot, CLEWDR_CONFIG, Reason},
     db::accounts::{
         AccountWithRuntime, batch_upsert_runtime_states, get_account_by_id, set_account_active,
-        set_account_auth_error, update_account_metadata, update_account_metadata_unchecked,
-        upsert_account_oauth,
+        set_account_auth_error, update_account_metadata, upsert_account_oauth,
     },
     error::ClewdrError,
     oauth::{fetch_oauth_snapshot_raw, refresh_oauth_token_with_raw},
@@ -430,9 +429,9 @@ async fn run_cookie_probe(
     if let Err(e) = update_account_metadata(
         db,
         account_id,
-        &info.email,
-        &info.account_type,
-        &info.org_uuid,
+        Some(&info.email),
+        Some(&info.account_type),
+        Some(&info.org_uuid),
         "cookie",
         &cookie_prefix,
     )
@@ -674,6 +673,15 @@ async fn run_oauth_probe(
     bundle.insert("profile".into(), profile_raw);
     bundle.insert("usage".into(), usage_raw);
 
+    // The access_token the DB currently holds after any refresh this probe
+    // just performed. Used below as the credential fingerprint guarding the
+    // metadata write — blocks stale probes after an admin reconnect or a
+    // concurrent refresh rotates `oauth_access_token`.
+    let authoritative_access_token: String = refreshed_token
+        .as_ref()
+        .map(|t| t.access_token.clone())
+        .unwrap_or_else(|| token.access_token.clone());
+
     if let Some(new_token) = refreshed_token {
         if let Err(err) = upsert_account_oauth(db, account_id, Some(&new_token), None).await {
             let msg = format!("failed to persist refreshed token: {err}");
@@ -694,12 +702,15 @@ async fn run_oauth_probe(
         handle.update_credential(account_id, Some(new_token)).await;
     }
 
-    if let Err(err) = update_account_metadata_unchecked(
+    let access_prefix = &authoritative_access_token[..20.min(authoritative_access_token.len())];
+    if let Err(err) = update_account_metadata(
         db,
         account_id,
         snapshot.email.as_deref(),
         snapshot.account_type.as_deref(),
         Some(snapshot.organization_uuid.as_str()),
+        "oauth",
+        access_prefix,
     )
     .await
     {

@@ -570,21 +570,27 @@ pub async fn set_account_active(pool: &SqlitePool, account_id: i64) -> Result<()
 /// (with a legacy `sessionKey=` variant for pre-normalization rows). For
 /// `auth_source = "oauth"`, it matches against `oauth_access_token`.
 ///
+/// `email`, `account_type`, and `org_uuid` are `Option<&str>`: `None`
+/// preserves the existing DB value (COALESCE semantics), matching
+/// `update_account_metadata_unchecked`. This is the shape OAuth probe
+/// snapshots deliver — not every profile endpoint populates email /
+/// account_type.
+///
 /// Returns Ok(()) with a warn log if the guard misses — callers treat a
 /// missed update as a no-op, not an error.
 pub async fn update_account_metadata(
     pool: &SqlitePool,
     account_id: i64,
-    email: &str,
-    account_type: &str,
-    org_uuid: &str,
+    email: Option<&str>,
+    account_type: Option<&str>,
+    org_uuid: Option<&str>,
     expected_auth_source: &str,
     expected_credential_prefix: &str,
 ) -> Result<(), sqlx::Error> {
     let result = match expected_auth_source {
         "cookie" => {
             sqlx::query(
-                "UPDATE accounts SET email = ?1, account_type = ?2, organization_uuid = ?3, updated_at = CURRENT_TIMESTAMP WHERE id = ?4 AND (cookie_blob LIKE ?5 OR cookie_blob LIKE ?6)",
+                "UPDATE accounts SET email = COALESCE(?1, email), account_type = COALESCE(?2, account_type), organization_uuid = COALESCE(?3, organization_uuid), updated_at = CURRENT_TIMESTAMP WHERE id = ?4 AND (cookie_blob LIKE ?5 OR cookie_blob LIKE ?6)",
             )
             .bind(email)
             .bind(account_type)
@@ -597,7 +603,7 @@ pub async fn update_account_metadata(
         }
         "oauth" => {
             sqlx::query(
-                "UPDATE accounts SET email = ?1, account_type = ?2, organization_uuid = ?3, updated_at = CURRENT_TIMESTAMP WHERE id = ?4 AND oauth_access_token LIKE ?5",
+                "UPDATE accounts SET email = COALESCE(?1, email), account_type = COALESCE(?2, account_type), organization_uuid = COALESCE(?3, organization_uuid), updated_at = CURRENT_TIMESTAMP WHERE id = ?4 AND oauth_access_token LIKE ?5",
             )
             .bind(email)
             .bind(account_type)
@@ -861,9 +867,9 @@ mod tests {
         update_account_metadata(
             &pool,
             1,
-            "n@example.com",
-            "pro",
-            "org-normal",
+            Some("n@example.com"),
+            Some("pro"),
+            Some("org-normal"),
             "cookie",
             prefix,
         )
@@ -872,9 +878,9 @@ mod tests {
         update_account_metadata(
             &pool,
             2,
-            "l@example.com",
-            "pro",
-            "org-legacy",
+            Some("l@example.com"),
+            Some("pro"),
+            Some("org-legacy"),
             "cookie",
             prefix,
         )
@@ -883,9 +889,9 @@ mod tests {
         update_account_metadata(
             &pool,
             3,
-            "e@example.com",
-            "pro",
-            "org-embedded",
+            Some("e@example.com"),
+            Some("pro"),
+            Some("org-embedded"),
             "cookie",
             prefix,
         )
@@ -962,9 +968,9 @@ mod tests {
         update_account_metadata(
             &pool,
             1,
-            "o@example.com",
-            "max",
-            "org-fresh",
+            Some("o@example.com"),
+            Some("max"),
+            Some("org-fresh"),
             "oauth",
             "at-abc123",
         )
@@ -1006,9 +1012,9 @@ mod tests {
         update_account_metadata(
             &pool,
             2,
-            "stale@example.com",
-            "max",
-            "stale-org",
+            Some("stale@example.com"),
+            Some("max"),
+            Some("stale-org"),
             "oauth",
             "at-old-prefix",
         )
@@ -1045,9 +1051,9 @@ mod tests {
         update_account_metadata(
             &pool,
             3,
-            "should@not.write",
-            "pro",
-            "should-not-write",
+            Some("should@not.write"),
+            Some("pro"),
+            Some("should-not-write"),
             "oauth",
             "sk-ant-sid02",
         )
