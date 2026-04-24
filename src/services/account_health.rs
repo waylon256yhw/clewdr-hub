@@ -10,7 +10,7 @@
 //!
 //! See `docs/account-normalization-2026-04-21.md` §Step 2.5.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 
@@ -150,7 +150,7 @@ pub struct AuthSourceCounts {
     pub cookie: i64,
 }
 
-/// Wire type returned by `AccountPoolActor::build_health_snapshot`.
+/// Wire type returned by [`compose_health_snapshot`].
 ///
 /// Carries the aggregated summary plus the per-account view. Callers that
 /// only need the summary (`/health`, admin overview, reload log) can ignore
@@ -159,6 +159,25 @@ pub struct AuthSourceCounts {
 pub struct AccountHealthSnapshot {
     pub summary: AccountHealthSummary,
     pub per_account: HashMap<i64, AccountHealth>,
+}
+
+/// Cheap in-memory snapshot of the pool fields needed to compose an
+/// [`AccountHealthSnapshot`]. Produced in one actor turn by
+/// `AccountPoolState::snapshot_view` without touching the DB, so the
+/// health read path does not serialise with dispatch / return traffic
+/// on the actor. The DB rows are loaded off-actor by the caller.
+#[derive(Debug, Default, Clone)]
+pub struct PoolSnapshotView {
+    pub valid_ids: HashSet<i64>,
+    /// `account_id → AccountSlot.reset_time` for rows currently in the
+    /// exhausted bucket.
+    pub exhausted: HashMap<i64, Option<i64>>,
+    /// `account_id → InvalidAccountSlot.reason` for rows currently in
+    /// the invalid bucket.
+    pub invalid: HashMap<i64, Reason>,
+    pub inflight: HashMap<i64, (u32, u32)>,
+    pub probing: HashSet<i64>,
+    pub probe_errors: HashMap<i64, String>,
 }
 
 fn has_credential(account: &AccountWithRuntime) -> bool {
@@ -213,14 +232,31 @@ fn compose_from_db(account: &AccountWithRuntime) -> AccountHealthState {
 /// when the account is not in any bucket (e.g., newly inserted row not yet
 /// reloaded) or to refine `InvalidKind` when the pool's view alone is
 /// ambiguous.
-pub fn compose_health(account: &AccountWithRuntime, view: PoolAccountView<'_>) -> AccountHealth {
+///
+/// `now` is the UNIX timestamp used to filter expired cooldowns. An
+/// account in `exhausted` whose `reset_time <= now` is reported as
+/// `Active` — the pool's periodic `reset` tick will physically move it
+/// back to `valid` on its next turn, but the dispatcher and every read
+/// surface should already treat it as usable.
+pub fn compose_health(
+    account: &AccountWithRuntime,
+    view: PoolAccountView<'_>,
+    now: i64,
+) -> AccountHealth {
     let state = match view.bucket {
         Some(PoolBucket::Valid) => AccountHealthState::Active,
-        Some(PoolBucket::Exhausted { reset_time }) => AccountHealthState::CoolingDown {
-            reset_time: reset_time
-                .or_else(|| active_reset_time(account))
-                .unwrap_or(0),
-        },
+        Some(PoolBucket::Exhausted { reset_time }) => {
+            // Drop reset_time entries that have already expired — the
+            // pool's CheckReset tick has not run yet (every 300s), but
+            // the account is effectively ready.
+            let effective = reset_time
+                .filter(|t| *t > now)
+                .or_else(|| active_reset_time(account));
+            match effective {
+                Some(t) => AccountHealthState::CoolingDown { reset_time: t },
+                None => AccountHealthState::Active,
+            }
+        }
         Some(PoolBucket::Invalid { reason }) => AccountHealthState::Invalid {
             kind: infer_invalid_kind(account, reason),
             reason: Some(reason.clone()),
@@ -322,6 +358,68 @@ pub fn summarize(
     }
 }
 
+/// End-to-end snapshot builder: join the loaded DB rows with the actor's
+/// cheap in-memory snapshot to produce every read surface's view.
+///
+/// Pure — no IO, no locks — so it runs wherever the caller wants
+/// (typically off-actor, right after a parallel `load_all_accounts` +
+/// `SnapshotPoolState` RPC). `now` is the UNIX timestamp used both for
+/// `generated_at` and for filtering expired cooldowns.
+pub fn compose_health_snapshot(
+    view: &PoolSnapshotView,
+    accounts: &[AccountWithRuntime],
+    now: i64,
+) -> AccountHealthSnapshot {
+    let mut per_account: HashMap<i64, AccountHealth> = HashMap::with_capacity(accounts.len());
+    for account in accounts {
+        let id = account.id;
+        let bucket = if view.valid_ids.contains(&id) {
+            Some(PoolBucket::Valid)
+        } else if let Some(reset) = view.exhausted.get(&id) {
+            Some(PoolBucket::Exhausted { reset_time: *reset })
+        } else {
+            view.invalid
+                .get(&id)
+                .map(|reason| PoolBucket::Invalid { reason })
+        };
+        let account_view = PoolAccountView {
+            bucket,
+            inflight: view.inflight.get(&id).copied(),
+            probing: view.probing.contains(&id),
+            last_probe_error: view.probe_errors.get(&id).map(String::as_str),
+        };
+        per_account.insert(id, compose_health(account, account_view, now));
+    }
+
+    let pool_counts = PoolCounts {
+        valid: view.valid_ids.len(),
+        exhausted: view.exhausted.len(),
+        invalid: view.invalid.len(),
+    };
+
+    let mut probing_ids: Vec<i64> = view.probing.iter().copied().collect();
+    probing_ids.sort_unstable();
+    let probe = ProbeSummary {
+        probing_count: view.probing.len(),
+        probing_ids,
+        last_errors: view.probe_errors.clone(),
+    };
+
+    let summary = summarize(
+        accounts,
+        &per_account,
+        &view.inflight,
+        pool_counts,
+        probe,
+        now,
+    );
+
+    AccountHealthSnapshot {
+        summary,
+        per_account,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -330,6 +428,10 @@ mod tests {
 
     use super::*;
     use crate::config::{Organization, TokenInfo, UsageBreakdown};
+
+    fn now() -> i64 {
+        Utc::now().timestamp()
+    }
     use crate::db::accounts::RuntimeStateRow;
 
     fn runtime(reset_time: Option<i64>) -> RuntimeStateRow {
@@ -405,7 +507,7 @@ mod tests {
     #[test]
     fn active_account_with_credential_is_active() {
         let a = account(1, "cookie", "active", Some("c=yes"), false, None);
-        let h = compose_health(&a, PoolAccountView::default());
+        let h = compose_health(&a, PoolAccountView::default(), now());
         assert_eq!(h.state, AccountHealthState::Active);
         assert!(!h.probing);
         assert!(h.last_probe_error.is_none());
@@ -414,14 +516,14 @@ mod tests {
     #[test]
     fn active_without_credential_is_unconfigured() {
         let a = account(1, "cookie", "active", None, false, None);
-        let h = compose_health(&a, PoolAccountView::default());
+        let h = compose_health(&a, PoolAccountView::default(), now());
         assert_eq!(h.state, AccountHealthState::Unconfigured);
     }
 
     #[test]
     fn oauth_only_account_is_active_when_token_present() {
         let a = account(1, "oauth", "active", None, true, None);
-        let h = compose_health(&a, PoolAccountView::default());
+        let h = compose_health(&a, PoolAccountView::default(), now());
         assert_eq!(h.state, AccountHealthState::Active);
     }
 
@@ -429,7 +531,7 @@ mod tests {
     fn past_reset_time_does_not_cool() {
         let past = Utc::now().timestamp() - 60;
         let a = account(1, "cookie", "active", Some("c=yes"), false, Some(past));
-        let h = compose_health(&a, PoolAccountView::default());
+        let h = compose_health(&a, PoolAccountView::default(), now());
         assert_eq!(h.state, AccountHealthState::Active);
     }
 
@@ -437,7 +539,7 @@ mod tests {
     fn future_db_reset_time_cools_down() {
         let future = Utc::now().timestamp() + 300;
         let a = account(1, "cookie", "active", Some("c=yes"), false, Some(future));
-        let h = compose_health(&a, PoolAccountView::default());
+        let h = compose_health(&a, PoolAccountView::default(), now());
         assert_eq!(
             h.state,
             AccountHealthState::CoolingDown { reset_time: future }
@@ -455,12 +557,53 @@ mod tests {
             }),
             ..Default::default()
         };
-        let h = compose_health(&a, view);
+        let h = compose_health(&a, view, now());
         assert_eq!(
             h.state,
             AccountHealthState::CoolingDown {
                 reset_time: pool_reset
             }
+        );
+    }
+
+    #[test]
+    fn pool_exhausted_bucket_with_expired_reset_reports_active() {
+        // Regression: the pool's reset() tick runs every 300s. Between the
+        // moment a cooldown expires and the next tick, the account is
+        // still physically in state.exhausted with reset_time in the past.
+        // Without this guard /health, admin overview and admin accounts
+        // would keep reporting it as cooling_down for up to five minutes
+        // even though the dispatcher is free to use it.
+        let past = Utc::now().timestamp() - 60;
+        let a = account(1, "oauth", "active", None, true, None);
+        let view = PoolAccountView {
+            bucket: Some(PoolBucket::Exhausted {
+                reset_time: Some(past),
+            }),
+            ..Default::default()
+        };
+        let h = compose_health(&a, view, Utc::now().timestamp());
+        assert_eq!(h.state, AccountHealthState::Active);
+    }
+
+    #[test]
+    fn expired_exhausted_bucket_does_not_count_as_cooling_in_snapshot() {
+        // Roll the same regression through compose_health_snapshot so the
+        // overview / admin detail counts stay honest too.
+        let past = Utc::now().timestamp() - 60;
+        let a = account(1, "oauth", "active", None, true, None);
+        let mut exhausted = HashMap::new();
+        exhausted.insert(1, Some(past));
+        let view = PoolSnapshotView {
+            exhausted,
+            ..Default::default()
+        };
+        let snap = compose_health_snapshot(&view, &[a], Utc::now().timestamp());
+        assert_eq!(snap.summary.detail.cooling_down, 0);
+        assert_eq!(snap.summary.detail.dispatchable_now, 1);
+        assert_eq!(
+            snap.per_account.get(&1).map(|h| h.state.clone()),
+            Some(AccountHealthState::Active)
         );
     }
 
@@ -483,7 +626,7 @@ mod tests {
             bucket: Some(PoolBucket::Valid),
             ..Default::default()
         };
-        let h = compose_health(&a, view);
+        let h = compose_health(&a, view, now());
         assert_eq!(h.state, AccountHealthState::Active);
     }
 
@@ -500,7 +643,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let h = compose_health(&a, view);
+        let h = compose_health(&a, view, now());
         assert_eq!(
             h.state,
             AccountHealthState::Invalid {
@@ -521,7 +664,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let h = compose_health(&a, view);
+        let h = compose_health(&a, view, now());
         assert_eq!(
             h.state,
             AccountHealthState::Invalid {
@@ -537,7 +680,7 @@ mod tests {
             account(1, "cookie", "auth_error", Some("c=yes"), false, None),
             &Reason::Free,
         );
-        let h = compose_health(&a, PoolAccountView::default());
+        let h = compose_health(&a, PoolAccountView::default(), now());
         assert_eq!(
             h.state,
             AccountHealthState::Invalid {
@@ -553,7 +696,7 @@ mod tests {
             account(1, "oauth", "disabled", None, true, None),
             &Reason::Banned,
         );
-        let h = compose_health(&a, PoolAccountView::default());
+        let h = compose_health(&a, PoolAccountView::default(), now());
         assert_eq!(
             h.state,
             AccountHealthState::Invalid {
@@ -566,7 +709,7 @@ mod tests {
     #[test]
     fn invalid_without_reason_keeps_none() {
         let a = account(1, "oauth", "disabled", None, true, None);
-        let h = compose_health(&a, PoolAccountView::default());
+        let h = compose_health(&a, PoolAccountView::default(), now());
         assert_eq!(
             h.state,
             AccountHealthState::Invalid {
@@ -585,7 +728,7 @@ mod tests {
             last_probe_error: Some("boom"),
             ..Default::default()
         };
-        let h = compose_health(&a, view);
+        let h = compose_health(&a, view, now());
         assert_eq!(
             h.state,
             AccountHealthState::CoolingDown { reset_time: future }
@@ -601,7 +744,7 @@ mod tests {
             probing: true,
             ..Default::default()
         };
-        let h = compose_health(&a, view);
+        let h = compose_health(&a, view, now());
         assert!(h.probing);
         assert!(matches!(
             h.state,
@@ -620,7 +763,7 @@ mod tests {
             last_probe_error: Some("still no cookie"),
             ..Default::default()
         };
-        let h = compose_health(&a, view);
+        let h = compose_health(&a, view, now());
         assert_eq!(h.state, AccountHealthState::Unconfigured);
         assert!(h.probing);
         assert_eq!(h.last_probe_error.as_deref(), Some("still no cookie"));
@@ -644,6 +787,7 @@ mod tests {
                         bucket: Some(PoolBucket::Valid),
                         ..Default::default()
                     },
+                    now(),
                 ),
             ),
             (
@@ -654,6 +798,7 @@ mod tests {
                         bucket: Some(PoolBucket::Valid),
                         ..Default::default()
                     },
+                    now(),
                 ),
             ),
         ]);
@@ -693,7 +838,7 @@ mod tests {
             last_probe_error: Some("retry"),
             ..Default::default()
         };
-        let health = compose_health(&a, view);
+        let health = compose_health(&a, view, now());
         assert_eq!(health.state, AccountHealthState::Active);
         assert!(health.probing);
 
@@ -744,6 +889,7 @@ mod tests {
                         last_probe_error: Some("retry"),
                         ..Default::default()
                     },
+                    now(),
                 ),
             ),
             (
@@ -754,6 +900,7 @@ mod tests {
                         probing: true,
                         ..Default::default()
                     },
+                    now(),
                 ),
             ),
         ]);
@@ -797,9 +944,18 @@ mod tests {
         let active = account(3, "oauth", "active", None, true, None);
         let accounts = vec![auth_err.clone(), disabled.clone(), active.clone()];
         let per_account = per_account_map(vec![
-            (1, compose_health(&auth_err, PoolAccountView::default())),
-            (2, compose_health(&disabled, PoolAccountView::default())),
-            (3, compose_health(&active, PoolAccountView::default())),
+            (
+                1,
+                compose_health(&auth_err, PoolAccountView::default(), now()),
+            ),
+            (
+                2,
+                compose_health(&disabled, PoolAccountView::default(), now()),
+            ),
+            (
+                3,
+                compose_health(&active, PoolAccountView::default(), now()),
+            ),
         ]);
 
         let summary = summarize(

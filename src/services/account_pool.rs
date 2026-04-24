@@ -14,13 +14,12 @@ use crate::{
     claude_code_state::probe::probe_cookie,
     config::{AccountSlot, ClewdrCookie, InvalidAccountSlot, Reason, TokenInfo, UsageBreakdown},
     db::accounts::{
-        AccountWithRuntime, active_reset_time, batch_upsert_runtime_states, load_all_accounts,
-        set_account_disabled, set_accounts_active,
+        active_reset_time, batch_upsert_runtime_states, load_all_accounts, set_account_disabled,
+        set_accounts_active,
     },
     error::ClewdrError,
     services::account_health::{
-        AccountHealth, AccountHealthSnapshot, AccountHealthSummary, PoolAccountView, PoolBucket,
-        PoolCounts, ProbeSummary, compose_health, summarize,
+        AccountHealthSnapshot, AccountHealthSummary, PoolSnapshotView, compose_health_snapshot,
     },
     state::AdminEvent,
     stealth,
@@ -101,11 +100,13 @@ enum AccountPoolMessage {
     /// responsibility, `do_flush` must not touch the authoritative status by
     /// way of `state.invalid`.
     Invalidate(i64, Reason),
-    /// Build a unified `AccountHealthSnapshot` combining the DB rows with
-    /// the in-memory pool state. Shared by `/health`, admin overview, admin
-    /// accounts list, and (internally) the reload log. See
-    /// `docs/account-normalization-2026-04-21.md` §Step 2.5.
-    GetHealthSnapshot(RpcReplyPort<Result<AccountHealthSnapshot, ClewdrError>>),
+    /// Return a cheap in-memory pool snapshot for the health read path,
+    /// along with the actor's DB handle. The caller runs
+    /// `load_all_accounts` and `account_health::compose_health_snapshot`
+    /// off-actor, so the `/health` / overview / accounts list endpoints
+    /// do not serialise with dispatch / return traffic on this actor.
+    /// See `docs/account-normalization-2026-04-21.md` §Step 2.5.
+    SnapshotPoolState(RpcReplyPort<(PoolSnapshotView, SqlitePool)>),
 }
 
 #[derive(Debug)]
@@ -781,90 +782,32 @@ impl AccountPoolActor {
         }
     }
 
-    /// Build a unified account-health snapshot by joining DB rows with the
-    /// in-memory pool state. Runs inside the actor, so `state` is consistent
-    /// for the entire build. Shared by the `GetHealthSnapshot` handler and
-    /// the reload log — callers must invoke this directly on the actor,
-    /// **never** via `AccountPoolHandle` RPC, to avoid the actor awaiting a
-    /// call back into itself.
-    ///
-    /// The pool's bucket membership wins over DB `status` / `reset_time`.
-    /// This matters between `collect` / `reset` and the next `do_flush`,
-    /// where the pool has already moved an account but the DB row has not
-    /// been written yet. See `PoolAccountView` docs for the precedence
-    /// rules.
-    async fn build_health_snapshot(
-        state: &AccountPoolState,
-    ) -> Result<AccountHealthSnapshot, ClewdrError> {
-        let accounts = load_all_accounts(&state.db).await?;
-        Ok(Self::compose_health_snapshot(state, &accounts))
-    }
-
-    /// Pure compositor behind `build_health_snapshot` — reused by reload
-    /// paths that already hold a freshly-loaded `&[AccountWithRuntime]` so
-    /// they don't re-query the DB just to log a summary.
-    fn compose_health_snapshot(
-        state: &AccountPoolState,
-        accounts: &[AccountWithRuntime],
-    ) -> AccountHealthSnapshot {
-        let now = Utc::now().timestamp();
-
-        // Index valid bucket by account_id for O(1) lookup.
-        let valid_ids: HashSet<i64> = state
-            .valid
-            .iter()
-            .filter_map(|slot| slot.account_id)
-            .collect();
-
-        let mut per_account: HashMap<i64, AccountHealth> = HashMap::with_capacity(accounts.len());
-        for account in accounts {
-            let id = account.id;
-            let bucket = if valid_ids.contains(&id) {
-                Some(PoolBucket::Valid)
-            } else if let Some(slot) = state.exhausted.get(&id) {
-                Some(PoolBucket::Exhausted {
-                    reset_time: slot.reset_time,
-                })
-            } else {
-                state.invalid.get(&id).map(|inv| PoolBucket::Invalid {
-                    reason: &inv.reason,
-                })
-            };
-            let view = PoolAccountView {
-                bucket,
-                inflight: state.inflight.get(&id).copied(),
-                probing: state.probing.contains(&id),
-                last_probe_error: state.probe_errors.get(&id).map(String::as_str),
-            };
-            per_account.insert(id, compose_health(account, view));
-        }
-
-        let pool_counts = PoolCounts {
-            valid: state.valid.len(),
-            exhausted: state.exhausted.len(),
-            invalid: state.invalid.len(),
-        };
-
-        let mut probing_ids: Vec<i64> = state.probing.iter().copied().collect();
-        probing_ids.sort_unstable();
-        let probe = ProbeSummary {
-            probing_count: state.probing.len(),
-            probing_ids,
-            last_errors: state.probe_errors.clone(),
-        };
-
-        let summary = summarize(
-            accounts,
-            &per_account,
-            &state.inflight,
-            pool_counts,
-            probe,
-            now,
-        );
-
-        AccountHealthSnapshot {
-            summary,
-            per_account,
+    /// Cheap in-memory snapshot of the pool fields needed by the health
+    /// read path. Runs in a single actor turn with no DB I/O, so
+    /// `/health` / admin overview / admin accounts list / reload log
+    /// cannot head-of-line-block real dispatch traffic on the actor.
+    /// Callers assemble the final `AccountHealthSnapshot` off-actor via
+    /// `account_health::compose_health_snapshot`.
+    fn snapshot_view(state: &AccountPoolState) -> PoolSnapshotView {
+        PoolSnapshotView {
+            valid_ids: state
+                .valid
+                .iter()
+                .filter_map(|slot| slot.account_id)
+                .collect(),
+            exhausted: state
+                .exhausted
+                .iter()
+                .map(|(id, slot)| (*id, slot.reset_time))
+                .collect(),
+            invalid: state
+                .invalid
+                .iter()
+                .map(|(id, inv)| (*id, inv.reason.clone()))
+                .collect(),
+            inflight: state.inflight.clone(),
+            probing: state.probing.clone(),
+            probe_errors: state.probe_errors.clone(),
         }
     }
 
@@ -1094,7 +1037,9 @@ impl AccountPoolActor {
             state.probing.remove(id);
         }
 
-        Self::log_account_summary(&Self::compose_health_snapshot(state, &accounts).summary);
+        let view = Self::snapshot_view(state);
+        let snapshot = compose_health_snapshot(&view, &accounts, Utc::now().timestamp());
+        Self::log_account_summary(&snapshot.summary);
 
         // Spawn probes for unprobed cookies
         Self::spawn_probes_for_unprobed(state);
@@ -1243,9 +1188,8 @@ impl Actor for AccountPoolActor {
             AccountPoolMessage::Invalidate(account_id, reason) => {
                 Self::converge_invalidate(state, account_id, reason);
             }
-            AccountPoolMessage::GetHealthSnapshot(reply_port) => {
-                let result = Self::build_health_snapshot(state).await;
-                reply_port.send(result)?;
+            AccountPoolMessage::SnapshotPoolState(reply_port) => {
+                reply_port.send((Self::snapshot_view(state), state.db.clone()))?;
             }
         }
         Ok(())
@@ -1500,14 +1444,16 @@ impl AccountPoolHandle {
     /// in-memory pool state inside the actor, so counts and per-account
     /// views are internally consistent.
     pub async fn get_health_snapshot(&self) -> Result<AccountHealthSnapshot, ClewdrError> {
-        ractor::call!(self.actor_ref, AccountPoolMessage::GetHealthSnapshot).map_err(|e| {
-            ClewdrError::RactorError {
+        let (view, db) = ractor::call!(self.actor_ref, AccountPoolMessage::SnapshotPoolState)
+            .map_err(|e| ClewdrError::RactorError {
                 loc: Location::generate(),
                 msg: format!(
                     "Failed to communicate with AccountPoolActor for get_health_snapshot: {e}"
                 ),
-            }
-        })?
+            })?;
+        let accounts = load_all_accounts(&db).await?;
+        let now = Utc::now().timestamp();
+        Ok(compose_health_snapshot(&view, &accounts, now))
     }
 
     /// Push a freshly-refreshed OAuth token into the in-memory pool slot so
@@ -1556,6 +1502,9 @@ mod tests {
 
     use moka::sync::Cache;
     use tokio::sync::broadcast;
+
+    use crate::db::accounts::load_all_accounts;
+    use crate::services::account_health::compose_health_snapshot;
 
     use crate::config::{AccountSlot, ClewdrCookie, Reason, TokenInfo};
     use crate::db::init_pool;
@@ -2126,9 +2075,9 @@ mod tests {
         state.probing.insert(4);
         state.probe_errors.insert(4, "transient".to_string());
 
-        let snapshot = AccountPoolActor::build_health_snapshot(&state)
-            .await
-            .unwrap();
+        let accounts = load_all_accounts(&state.db).await.unwrap();
+        let view = AccountPoolActor::snapshot_view(&state);
+        let snapshot = compose_health_snapshot(&view, &accounts, chrono::Utc::now().timestamp());
 
         assert_eq!(snapshot.summary.total, 4);
         assert_eq!(
@@ -2239,9 +2188,9 @@ mod tests {
             crate::config::InvalidAccountSlot::new(slot6_cookie, Reason::Banned, 6),
         );
 
-        let snapshot = AccountPoolActor::build_health_snapshot(&state)
-            .await
-            .unwrap();
+        let accounts = load_all_accounts(&state.db).await.unwrap();
+        let view = AccountPoolActor::snapshot_view(&state);
+        let snapshot = compose_health_snapshot(&view, &accounts, chrono::Utc::now().timestamp());
 
         let h5 = snapshot.per_account.get(&5).expect("id=5");
         assert_eq!(
