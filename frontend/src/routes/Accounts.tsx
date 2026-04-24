@@ -561,8 +561,9 @@ export default function Accounts() {
     queryKey: qk.accounts,
     queryFn: listAccounts,
     refetchInterval: (query) => {
-      const ids = query.state.data?.probing_ids ?? [];
-      return ids.length > 0 ? 3000 : 30_000;
+      const items = query.state.data?.items ?? [];
+      const anyProbing = items.some((item) => item.health?.probing);
+      return anyProbing ? 3000 : 30_000;
     },
   });
   const { data: proxiesData } = useQuery({
@@ -577,9 +578,26 @@ export default function Accounts() {
     mutationFn: probeAllAccounts,
     onSuccess: (resp) => {
       notifications.show({ message: "已触发全量探测", color: "green" });
-      queryClient.setQueryData(qk.accounts, (old: AccountsListResponse | undefined) =>
-        old ? { ...old, probing_ids: resp.probing_ids } : old,
-      );
+      const probingSet = new Set(resp.probing_ids);
+      // Optimistic patch: items already in cache with populated `health` get
+      // an instant probing badge so the banner / 3s polling cadence kicks in
+      // before the next refetch.
+      queryClient.setQueryData(qk.accounts, (old: AccountsListResponse | undefined) => {
+        if (!old) return old;
+        return {
+          ...old,
+          items: old.items.map((item) =>
+            probingSet.has(item.id) && item.health
+              ? { ...item, health: { ...item.health, probing: true } }
+              : item,
+          ),
+        };
+      });
+      // Safety net for rows whose `health` isn't cached yet (just-created
+      // accounts the pool hasn't indexed into its snapshot). Server has
+      // already run begin_probe; an immediate refetch surfaces probing=true
+      // for those rows so the banner / polling cadence converge there too.
+      queryClient.invalidateQueries({ queryKey: qk.accounts });
     },
     onError: (e) =>
       notifications.show({ message: e instanceof ApiError ? e.message : "探测失败", color: "red" }),
@@ -596,8 +614,9 @@ export default function Accounts() {
 
   const accounts = data?.items ?? [];
   const proxies = proxiesData?.items ?? [];
-  const probingIds = new Set(data?.probing_ids ?? []);
-  const probeErrors = data?.probe_errors ?? {};
+  const probingIds = new Set(
+    accounts.filter((a) => a.health?.probing).map((a) => a.id),
+  );
 
   const openCreate = () => {
     setEditing(null);
@@ -639,7 +658,6 @@ export default function Accounts() {
               key={a.id}
               account={a}
               probing={probingIds.has(a.id)}
-              probeError={probingIds.has(a.id) ? undefined : probeErrors[a.id]}
               onEdit={() => openEdit(a)}
               onDelete={() => setDeleting(a)}
             />

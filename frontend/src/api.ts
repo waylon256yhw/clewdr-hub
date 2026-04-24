@@ -344,8 +344,6 @@ export interface AccountsListResponse {
   total: number;
   offset: number;
   limit: number;
-  probing_ids: number[];
-  probe_errors: Record<string, string>;
 }
 
 export const listProxies = () =>

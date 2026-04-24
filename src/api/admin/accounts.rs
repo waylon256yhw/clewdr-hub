@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::str::FromStr;
 
 use axum::{
@@ -40,8 +39,6 @@ pub struct AccountsListResponse {
     pub total: i64,
     pub offset: i64,
     pub limit: i64,
-    pub probing_ids: Vec<i64>,
-    pub probe_errors: HashMap<i64, String>,
 }
 
 #[derive(Serialize)]
@@ -261,25 +258,19 @@ pub async fn list(
     Query(_params): Query<PaginationParams>,
 ) -> Result<Json<AccountsListResponse>, ClewdrError> {
     let all = load_all_accounts(&db).await?;
-    // Single snapshot drives both per-item `health` and the top-level
-    // `probing_ids` / `probe_errors`, so the list view cannot disagree
-    // with itself about which accounts are probing or what the last
-    // probe error was.
+    // Single snapshot drives each item's `health`, so the list cannot
+    // disagree with itself about probing state or the last probe error.
     let snapshot = actor.get_health_snapshot().await?;
     let total = all.len() as i64;
     let items: Vec<AccountResponse> = all
         .iter()
         .map(|row| map_account(row, snapshot.per_account.get(&row.id).cloned()))
         .collect();
-    let probing_ids = snapshot.summary.probe.probing_ids.clone();
-    let probe_errors = snapshot.summary.probe.last_errors.clone();
     Ok(Json(AccountsListResponse {
         items,
         total,
         offset: 0,
         limit: total,
-        probing_ids,
-        probe_errors,
     }))
 }
 
