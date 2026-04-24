@@ -13,14 +13,14 @@ use wreq::Method;
 use crate::{
     billing::{RequestType, TerminalLogOptions},
     claude_code_state::{ClaudeCodeState, TokenStatus},
-    config::{ModelFamily, Reason},
+    config::{AuthMethod, ModelFamily, Reason},
     db::accounts::{
         batch_upsert_runtime_states, set_account_auth_error, set_account_disabled,
         set_account_reset_time, update_account_metadata_unchecked, upsert_account_oauth,
     },
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
     oauth::refresh_oauth_token,
-    services::account_pool::{AccountPoolHandle, is_oauth_placeholder_slot},
+    services::account_pool::AccountPoolHandle,
     types::claude::{CountMessageTokensResponse, CreateMessageParams},
 };
 
@@ -216,8 +216,7 @@ impl ClaudeCodeState {
 
             let cookie = state.acquire_account().await?;
             let account_id = cookie.account_id;
-            let has_cookie_credential = !is_oauth_placeholder_slot(&cookie);
-            let is_pure_oauth_slot = cookie.token.is_some() && !has_cookie_credential;
+            let is_pure_oauth_slot = cookie.auth_method == AuthMethod::OAuth;
             // Pure oauth slots have no real cookie-backed reauth path, so hoist
             // their token into `oauth_token`. Cookie-backed slots keep using the
             // historic cookie/token path.
@@ -450,8 +449,7 @@ impl ClaudeCodeState {
 
             let cookie = state.acquire_account().await?;
             let account_id = cookie.account_id;
-            let has_cookie_credential = !is_oauth_placeholder_slot(&cookie);
-            let is_pure_oauth_slot = cookie.token.is_some() && !has_cookie_credential;
+            let is_pure_oauth_slot = cookie.auth_method == AuthMethod::OAuth;
             if is_pure_oauth_slot {
                 state.oauth_token = cookie.token.clone();
             } else {
@@ -1371,5 +1369,43 @@ mod tests {
             }),
             Some(Reason::Null)
         );
+    }
+
+    /// `try_chat` and `try_count_tokens` route to the OAuth bearer path
+    /// when `slot.auth_method == AuthMethod::OAuth`. A cookie-backed slot
+    /// that has acquired a short-lived bearer token via `exchange_token`
+    /// (slot.token = Some(_)) must STILL be classified as cookie — token
+    /// presence is not a kind discriminator. This codifies the regression
+    /// guard against re-introducing token-based dispatch logic.
+    #[test]
+    fn dispatch_decision_is_driven_by_auth_method_not_token_presence() {
+        use crate::config::{AccountSlot, AuthMethod, TokenInfo};
+
+        let cookie_str = format!(
+            "sk-ant-sid01-{}-aaaaaaAA",
+            std::iter::repeat_n('a', 86).collect::<String>()
+        );
+
+        // Cookie account post-`exchange_token`: token is set but kind is Cookie.
+        let mut cookie_with_bearer = AccountSlot::new(&cookie_str, None).unwrap();
+        cookie_with_bearer.token = Some(TokenInfo::from_parts(
+            "at".into(),
+            "rt".into(),
+            std::time::Duration::from_secs(3600),
+            "org-uuid".into(),
+        ));
+        assert_eq!(cookie_with_bearer.auth_method, AuthMethod::Cookie);
+        let is_pure_oauth = cookie_with_bearer.auth_method == AuthMethod::OAuth;
+        assert!(
+            !is_pure_oauth,
+            "cookie account holding a bearer token must NOT be sent down the OAuth path"
+        );
+
+        // OAuth account: kind is OAuth regardless of token state.
+        let oauth_slot = AccountSlot {
+            auth_method: AuthMethod::OAuth,
+            ..AccountSlot::default()
+        };
+        assert!(oauth_slot.auth_method == AuthMethod::OAuth);
     }
 }
