@@ -2,9 +2,12 @@ use axum::{Extension, Json, extract::State};
 use serde::Serialize;
 use sqlx::SqlitePool;
 
-use crate::db::accounts::{load_all_accounts, summarize_accounts};
 use crate::db::models::AuthenticatedUser;
 use crate::error::ClewdrError;
+use crate::services::account_health::{
+    AccountHealthState, AuthSourceCounts, HealthDetail, InvalidBreakdown, InvalidKind,
+};
+use crate::services::account_pool::AccountPoolHandle;
 use crate::stealth;
 
 #[derive(Serialize)]
@@ -22,11 +25,21 @@ pub struct OverviewResponse {
     pub must_change_password: bool,
 }
 
+/// Pool-level counts.
+///
+/// `valid` / `exhausted` / `invalid` are the legacy three-bucket view kept
+/// for wire compatibility with older dashboards. `detail` exposes the
+/// orthogonal diagnostic slices introduced in Step 2.5 (see
+/// `AccountHealthSummary`). `invalid_breakdown` splits `invalid` by
+/// `Reason` so admins can tell free / banned / disabled / … apart at a
+/// glance.
 #[derive(Serialize)]
 pub struct PoolOverview {
     pub valid: usize,
     pub exhausted: usize,
     pub invalid: usize,
+    pub detail: HealthDetail,
+    pub invalid_breakdown: InvalidBreakdown,
 }
 
 #[derive(Serialize)]
@@ -51,7 +64,7 @@ pub struct AccountOverview {
     pub auth_sources: AccountAuthSourceOverview,
 }
 
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 pub struct AccountStatusOverview {
     pub active: i64,
     pub cooling: i64,
@@ -72,15 +85,39 @@ pub struct StealthOverview {
 
 pub async fn overview(
     State(db): State<SqlitePool>,
+    State(actor): State<AccountPoolHandle>,
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<Json<OverviewResponse>, ClewdrError> {
-    let accounts = load_all_accounts(&db).await?;
-    let account_summary = summarize_accounts(&accounts);
+    let snapshot = actor.get_health_snapshot().await?;
+    let summary = &snapshot.summary;
+
     let pool = PoolOverview {
-        valid: account_summary.pool.valid,
-        exhausted: account_summary.pool.exhausted,
-        invalid: account_summary.pool.invalid,
+        valid: summary.pool.valid,
+        exhausted: summary.pool.exhausted,
+        invalid: summary.pool.invalid,
+        detail: summary.detail,
+        invalid_breakdown: summary.invalid_breakdown,
     };
+
+    // Aggregate statuses by health state so admin overview shares its
+    // categorisation with /health and the accounts list. Unconfigured rows
+    // stay in `active` to preserve the pre-Step-2.5 meaning of this counter
+    // ("DB status=active, not cooling, not invalid").
+    let mut statuses = AccountStatusOverview::default();
+    for health in snapshot.per_account.values() {
+        match &health.state {
+            AccountHealthState::Active | AccountHealthState::Unconfigured => statuses.active += 1,
+            AccountHealthState::CoolingDown { .. } => statuses.cooling += 1,
+            AccountHealthState::Invalid {
+                kind: InvalidKind::AuthError,
+                ..
+            } => statuses.error += 1,
+            AccountHealthState::Invalid {
+                kind: InvalidKind::Disabled,
+                ..
+            } => statuses.disabled += 1,
+        }
+    }
 
     let user_stats: (i64, i64, i64, i64) = sqlx::query_as(
         r#"SELECT COUNT(*),
@@ -126,6 +163,7 @@ pub async fn overview(
             .fetch_one(&db)
             .await?;
 
+    let AuthSourceCounts { oauth, cookie } = summary.auth_sources;
     Ok(Json(OverviewResponse {
         version: crate::VERSION_INFO.clone(),
         server_time: now.to_rfc3339(),
@@ -142,17 +180,9 @@ pub async fn overview(
             disabled: key_stats.2,
         },
         accounts: AccountOverview {
-            total: account_summary.total,
-            statuses: AccountStatusOverview {
-                active: account_summary.statuses.active,
-                cooling: account_summary.statuses.cooling,
-                error: account_summary.statuses.error,
-                disabled: account_summary.statuses.disabled,
-            },
-            auth_sources: AccountAuthSourceOverview {
-                oauth: account_summary.auth_sources.oauth,
-                cookie: account_summary.auth_sources.cookie,
-            },
+            total: summary.total,
+            statuses,
+            auth_sources: AccountAuthSourceOverview { oauth, cookie },
         },
         policies: policy_count,
         requests_1h,
