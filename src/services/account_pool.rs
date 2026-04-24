@@ -14,13 +14,13 @@ use crate::{
     claude_code_state::probe::probe_cookie,
     config::{AccountSlot, ClewdrCookie, InvalidAccountSlot, Reason, TokenInfo, UsageBreakdown},
     db::accounts::{
-        AccountSummary, active_reset_time, batch_upsert_runtime_states, load_all_accounts,
-        set_account_disabled, set_accounts_active, summarize_accounts,
+        AccountWithRuntime, active_reset_time, batch_upsert_runtime_states, load_all_accounts,
+        set_account_disabled, set_accounts_active,
     },
     error::ClewdrError,
     services::account_health::{
-        AccountHealth, AccountHealthSnapshot, PoolAccountView, PoolBucket, PoolCounts,
-        ProbeSummary, compose_health, summarize,
+        AccountHealth, AccountHealthSnapshot, AccountHealthSummary, PoolAccountView, PoolBucket,
+        PoolCounts, ProbeSummary, compose_health, summarize,
     },
     state::AdminEvent,
     stealth,
@@ -257,12 +257,21 @@ impl AccountPoolActor {
         );
     }
 
-    fn log_account_summary(summary: AccountSummary) {
+    fn log_account_summary(summary: &AccountHealthSummary) {
+        let pool = &summary.pool;
+        let detail = &summary.detail;
         info!(
-            "Valid: {}, Exhausted: {}, Invalid: {}",
-            summary.pool.valid.to_string().green(),
-            summary.pool.exhausted.to_string().yellow(),
-            summary.pool.invalid.to_string().red(),
+            "Valid: {}, Exhausted: {}, Invalid: {} | Dispatchable: {}, Saturated: {}, Cooling: {}, Probing: {}, InvalidAuth: {}, InvalidDisabled: {}, Unconfigured: {}",
+            pool.valid.to_string().green(),
+            pool.exhausted.to_string().yellow(),
+            pool.invalid.to_string().red(),
+            detail.dispatchable_now.to_string().green(),
+            detail.saturated.to_string().yellow(),
+            detail.cooling_down.to_string().yellow(),
+            detail.probing.to_string().cyan(),
+            detail.invalid_auth.to_string().red(),
+            detail.invalid_disabled.to_string().red(),
+            detail.unconfigured.to_string().bright_black(),
         );
     }
 
@@ -775,9 +784,9 @@ impl AccountPoolActor {
     /// Build a unified account-health snapshot by joining DB rows with the
     /// in-memory pool state. Runs inside the actor, so `state` is consistent
     /// for the entire build. Shared by the `GetHealthSnapshot` handler and
-    /// (in a later commit) the reload log — callers must invoke this
-    /// directly on the actor, **never** via `AccountPoolHandle` RPC, to
-    /// avoid the actor awaiting a call back into itself.
+    /// the reload log — callers must invoke this directly on the actor,
+    /// **never** via `AccountPoolHandle` RPC, to avoid the actor awaiting a
+    /// call back into itself.
     ///
     /// The pool's bucket membership wins over DB `status` / `reset_time`.
     /// This matters between `collect` / `reset` and the next `do_flush`,
@@ -788,6 +797,16 @@ impl AccountPoolActor {
         state: &AccountPoolState,
     ) -> Result<AccountHealthSnapshot, ClewdrError> {
         let accounts = load_all_accounts(&state.db).await?;
+        Ok(Self::compose_health_snapshot(state, &accounts))
+    }
+
+    /// Pure compositor behind `build_health_snapshot` — reused by reload
+    /// paths that already hold a freshly-loaded `&[AccountWithRuntime]` so
+    /// they don't re-query the DB just to log a summary.
+    fn compose_health_snapshot(
+        state: &AccountPoolState,
+        accounts: &[AccountWithRuntime],
+    ) -> AccountHealthSnapshot {
         let now = Utc::now().timestamp();
 
         // Index valid bucket by account_id for O(1) lookup.
@@ -798,7 +817,7 @@ impl AccountPoolActor {
             .collect();
 
         let mut per_account: HashMap<i64, AccountHealth> = HashMap::with_capacity(accounts.len());
-        for account in &accounts {
+        for account in accounts {
             let id = account.id;
             let bucket = if valid_ids.contains(&id) {
                 Some(PoolBucket::Valid)
@@ -835,7 +854,7 @@ impl AccountPoolActor {
         };
 
         let summary = summarize(
-            &accounts,
+            accounts,
             &per_account,
             &state.inflight,
             pool_counts,
@@ -843,10 +862,10 @@ impl AccountPoolActor {
             now,
         );
 
-        Ok(AccountHealthSnapshot {
+        AccountHealthSnapshot {
             summary,
             per_account,
-        })
+        }
     }
 
     fn apply_in_memory_runtime(dst: &mut AccountSlot, mem: AccountSlot, preserve_token: bool) {
@@ -1075,7 +1094,7 @@ impl AccountPoolActor {
             state.probing.remove(id);
         }
 
-        Self::log_account_summary(summarize_accounts(&accounts));
+        Self::log_account_summary(&Self::compose_health_snapshot(state, &accounts).summary);
 
         // Spawn probes for unprobed cookies
         Self::spawn_probes_for_unprobed(state);
