@@ -70,18 +70,16 @@ pub type RuntimeUpdate = RuntimeStateParams;
 
 #[derive(Debug)]
 enum AccountPoolMessage {
-    Return(AccountSlot, Option<Reason>),
-    /// Account-id-keyed return. Carries only runtime-state fields, not a
-    /// full `AccountSlot` — the pool's own in-memory slot (with its
-    /// authoritative credential) is the one that gets updated and moved
-    /// between buckets. The legacy [`Return`] variant remains during the
-    /// migration and funnels through the same handler.
-    ReturnById {
+    /// Return an account with an id-keyed runtime update. The pool's own
+    /// in-memory slot is the one that moves between buckets and keeps the
+    /// authoritative credential — callers never ship a full `AccountSlot`.
+    /// `update` is boxed because `RuntimeUpdate` carries 5 usage buckets
+    /// and would otherwise dominate the enum layout.
+    Return {
         account_id: i64,
-        update: RuntimeUpdate,
+        update: Box<RuntimeUpdate>,
         reason: Option<Reason>,
     },
-    Submit(AccountSlot),
     CheckReset,
     Request(
         Option<u64>,
@@ -564,16 +562,6 @@ impl AccountPoolActor {
         }
     }
 
-    fn collect(state: &mut AccountPoolState, cookie: AccountSlot, reason: Option<Reason>) -> bool {
-        let Some(account_id) = cookie.account_id else {
-            // Degenerate input: slot without account_id. Pool no longer
-            // tracks slots by cookie, so there is nothing to collect.
-            return false;
-        };
-        let update = cookie.to_runtime_params();
-        Self::collect_by_id(state, account_id, update, reason)
-    }
-
     /// Account-id-keyed collect. Finds the pool's own slot for this
     /// `account_id`, merges `update` onto it, then moves it between
     /// `valid` / `exhausted` / `invalid` according to `reason`. Credential
@@ -674,32 +662,6 @@ impl AccountPoolActor {
             Self::log(state);
         }
         removed_probe
-    }
-
-    fn accept(state: &mut AccountPoolState, cookie: AccountSlot) {
-        debug_assert!(
-            cookie.account_id.is_some(),
-            "submit() requires a slot with account_id; the pool no longer identifies slots by cookie"
-        );
-        let Some(aid) = cookie.account_id else {
-            warn!("submit rejected: slot has no account_id");
-            return;
-        };
-        if state.valid.iter().any(|c| c.account_id == Some(aid))
-            || state.exhausted.contains_key(&aid)
-            || state.invalid.contains_key(&aid)
-        {
-            warn!("Account {aid} already exists in pool");
-            return;
-        }
-        let needs_probe = cookie.email.is_none() || cookie.account_type.is_none();
-        state.valid.push_back(cookie.clone());
-        Self::mark_dirty(state, Some(aid));
-        Self::log(state);
-
-        if needs_probe {
-            Self::spawn_probe_guarded(state, &cookie, None);
-        }
     }
 
     fn spawn_probe_guarded(
@@ -1133,26 +1095,16 @@ impl Actor for AccountPoolActor {
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match message {
-            AccountPoolMessage::Return(cookie, reason) => {
-                let completed_probe = Self::collect(state, cookie, reason);
-                if completed_probe {
-                    Self::do_flush(state).await;
-                    Self::emit_accounts_refresh(state);
-                }
-            }
-            AccountPoolMessage::ReturnById {
+            AccountPoolMessage::Return {
                 account_id,
                 update,
                 reason,
             } => {
-                let completed_probe = Self::collect_by_id(state, account_id, update, reason);
+                let completed_probe = Self::collect_by_id(state, account_id, *update, reason);
                 if completed_probe {
                     Self::do_flush(state).await;
                     Self::emit_accounts_refresh(state);
                 }
-            }
-            AccountPoolMessage::Submit(cookie) => {
-                Self::accept(state, cookie);
             }
             AccountPoolMessage::CheckReset => {
                 Self::refresh_usage_windows(state);
@@ -1357,21 +1309,6 @@ impl AccountPoolHandle {
         })?
     }
 
-    pub async fn release(
-        &self,
-        cookie: AccountSlot,
-        reason: Option<Reason>,
-    ) -> Result<(), ClewdrError> {
-        ractor::cast!(self.actor_ref, AccountPoolMessage::Return(cookie, reason)).map_err(|e| {
-            ClewdrError::RactorError {
-                loc: Location::generate(),
-                msg: format!(
-                    "Failed to communicate with AccountPoolActor for return operation: {e}"
-                ),
-            }
-        })
-    }
-
     /// Return an account to the pool with an id-keyed runtime update.
     /// The pool's own in-memory slot stays the source of truth for the
     /// account's credential — `update` only carries runtime-state fields
@@ -1384,9 +1321,9 @@ impl AccountPoolHandle {
     ) -> Result<(), ClewdrError> {
         ractor::cast!(
             self.actor_ref,
-            AccountPoolMessage::ReturnById {
+            AccountPoolMessage::Return {
                 account_id,
-                update,
+                update: Box::new(update),
                 reason,
             }
         )
@@ -1395,17 +1332,6 @@ impl AccountPoolHandle {
             msg: format!(
                 "Failed to communicate with AccountPoolActor for release_runtime operation: {e}"
             ),
-        })
-    }
-
-    pub async fn submit(&self, cookie: AccountSlot) -> Result<(), ClewdrError> {
-        ractor::cast!(self.actor_ref, AccountPoolMessage::Submit(cookie)).map_err(|e| {
-            ClewdrError::RactorError {
-                loc: Location::generate(),
-                msg: format!(
-                    "Failed to communicate with AccountPoolActor for submit operation: {e}"
-                ),
-            }
         })
     }
 
@@ -1890,7 +1816,7 @@ mod tests {
         // behaviour would take from invalid and push back into valid, then
         // mark `state.reactivated` which drives `set_accounts_active` in
         // do_flush, clobbering the DB auth_error.
-        AccountPoolActor::collect(&mut state, slot.clone(), None);
+        AccountPoolActor::collect_by_id(&mut state, 1, slot.to_runtime_params(), None);
 
         assert!(
             state.invalid.contains_key(&1),
@@ -1926,7 +1852,7 @@ mod tests {
             ),
         );
 
-        AccountPoolActor::collect(&mut state, slot.clone(), None);
+        AccountPoolActor::collect_by_id(&mut state, 2, slot.to_runtime_params(), None);
 
         assert!(
             state.valid.iter().any(|c| c.account_id == Some(2)),
@@ -1971,7 +1897,7 @@ mod tests {
                 1,
             ),
         );
-        AccountPoolActor::collect(&mut state, slot.clone(), None);
+        AccountPoolActor::collect_by_id(&mut state, 1, slot.to_runtime_params(), None);
         assert!(state.reactivated.contains(&1));
         assert!(state.dirty.contains(&1));
         assert!(state.valid.iter().any(|c| c.account_id == Some(1)));
