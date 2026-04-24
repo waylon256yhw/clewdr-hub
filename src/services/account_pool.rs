@@ -975,18 +975,24 @@ impl AccountPoolActor {
                 cs.token = Some(token);
             }
 
-            // Merge: if memory has same account_id with same cookie, preserve runtime
+            // Merge by credential-kind tuple, not cookie byte equality. Kind flip
+            // (cookie↔oauth) = real credential replacement → fresh defaults +
+            // probing cleanup. Same kind preserves runtime; DB credential is
+            // authoritative and was already applied above when `row.oauth_token`
+            // was attached to `cs`.
+            //
+            // Rationale: OAuth refresh writes a new access_token to DB and syncs
+            // the in-memory slot via `update_credential`. If a byte-level token
+            // change (normal refresh) were treated as replacement, runtime and
+            // probing state would reset on every refresh — the opposite of
+            // Step 3 Goal 3. See docs/account-normalization-2026-04-21.md.
             if let Some(mem) = mem_cookies.remove(&row.id) {
-                if mem.cookie == cs.cookie {
-                    // Same credential — preserve runtime state from memory.
-                    // OAuth credentials are replaced out-of-band by reconnect/edit flows; when
-                    // DB has a token, it is the source of truth even if the placeholder cookie is
-                    // deterministic and therefore matches the in-memory slot.
-                    Self::apply_in_memory_runtime(&mut cs, mem, row.oauth_token.is_none());
+                let mem_is_oauth = mem.token.is_some();
+                let row_is_oauth = row.oauth_token.is_some();
+                if mem_is_oauth == row_is_oauth {
+                    Self::apply_in_memory_runtime(&mut cs, mem, !row_is_oauth);
                     cs.proxy_url = row.proxy_url.clone();
-                }
-                // Cookie changed = credential replacement → use fresh defaults from new()
-                else {
+                } else {
                     replaced_ids.push(row.id);
                 }
             } else if let Some(ref runtime) = row.runtime {
@@ -2215,5 +2221,166 @@ mod tests {
         assert_eq!(snapshot.summary.detail.dispatchable_now, 1);
         assert_eq!(snapshot.summary.detail.cooling_down, 0);
         assert_eq!(snapshot.summary.detail.invalid_auth, 1);
+    }
+
+    async fn insert_cookie_account_row(pool: &sqlx::SqlitePool, id: i64, cookie_blob: &str) {
+        sqlx::query(
+            "INSERT INTO accounts (
+                id, name, rr_order, max_slots, status, auth_source, cookie_blob,
+                organization_uuid, drain_first
+            ) VALUES (?1, ?2, ?1, 5, 'active', 'cookie', ?3, 'org', 0)",
+        )
+        .bind(id)
+        .bind(format!("acc-{id}"))
+        .bind(cookie_blob)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn cookie_blob_for(seed: u8) -> String {
+        // Shape matches ClewdrCookie's regex (sid01 = real session cookie).
+        let body: String = std::iter::repeat_n(seed as char, 86).collect();
+        format!("sk-ant-sid01-{body}-aaaaaaAA")
+    }
+
+    /// Regression for Step 3 Goal 3: a byte-level OAuth `access_token`
+    /// change (the shape of a normal refresh) must NOT be treated as
+    /// credential replacement by the reload merge. Runtime and probing
+    /// state survive; DB credential bytes become authoritative.
+    #[tokio::test]
+    async fn reload_preserves_runtime_on_oauth_refresh() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        insert_account_row(
+            &pool,
+            42,
+            "active",
+            "oauth",
+            Some("at_new"),
+            Some("rt_new"),
+            None,
+        )
+        .await;
+
+        let mut state = empty_state(pool);
+        let mut mem_slot = AccountSlot::new(&oauth_placeholder_cookie(42), None).unwrap();
+        mem_slot.account_id = Some(42);
+        mem_slot.token = Some(token_with_refresh("rt_stale"));
+        mem_slot.count_tokens_allowed = Some(true);
+        mem_slot.supports_claude_1m_sonnet = Some(true);
+        state.valid.push_back(mem_slot);
+        state.inflight.insert(42, (0, 5));
+        state.probing.insert(42);
+
+        AccountPoolActor::do_reload(&mut state).await;
+
+        let slot = state
+            .valid
+            .iter()
+            .find(|c| c.account_id == Some(42))
+            .expect("same-kind reload must keep id=42 in valid");
+        assert_eq!(
+            slot.count_tokens_allowed,
+            Some(true),
+            "same-kind reload must preserve in-memory runtime"
+        );
+        assert_eq!(slot.supports_claude_1m_sonnet, Some(true));
+        assert_eq!(
+            slot.token.as_ref().map(|t| t.access_token.as_str()),
+            Some("at_new"),
+            "DB is authoritative for oauth credential bytes"
+        );
+        assert_eq!(
+            slot.token.as_ref().map(|t| t.refresh_token.as_str()),
+            Some("rt_new"),
+        );
+        assert!(
+            state.probing.contains(&42),
+            "same-kind reload must not clear probing state"
+        );
+    }
+
+    /// Credential kind flip (OAuth → Cookie): user pasted a cookie,
+    /// wiping the OAuth credential. Runtime defaults must be applied and
+    /// probing state cleared.
+    #[tokio::test]
+    async fn reload_resets_on_kind_flip_oauth_to_cookie() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        let cookie_blob = cookie_blob_for(b'a');
+        insert_cookie_account_row(&pool, 43, &cookie_blob).await;
+
+        let mut state = empty_state(pool);
+        let mut mem_slot = AccountSlot::new(&oauth_placeholder_cookie(43), None).unwrap();
+        mem_slot.account_id = Some(43);
+        mem_slot.token = Some(token_with_refresh("rt_old"));
+        mem_slot.count_tokens_allowed = Some(true);
+        state.valid.push_back(mem_slot);
+        state.probing.insert(43);
+
+        AccountPoolActor::do_reload(&mut state).await;
+
+        let slot = state
+            .valid
+            .iter()
+            .find(|c| c.account_id == Some(43))
+            .expect("id=43 must appear in reloaded valid");
+        assert!(
+            slot.count_tokens_allowed.is_none(),
+            "kind flip must reset runtime to defaults"
+        );
+        assert!(
+            slot.token.is_none(),
+            "cookie account must not retain stale OAuth token"
+        );
+        assert!(
+            !state.probing.contains(&43),
+            "probing must be cleared on credential replacement"
+        );
+    }
+
+    /// Credential kind flip (Cookie → OAuth): user switched auth method
+    /// via admin API. Same semantics as above but the opposite direction.
+    #[tokio::test]
+    async fn reload_resets_on_kind_flip_cookie_to_oauth() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        insert_account_row(
+            &pool,
+            44,
+            "active",
+            "oauth",
+            Some("at_fresh"),
+            Some("rt_fresh"),
+            None,
+        )
+        .await;
+
+        let mut state = empty_state(pool);
+        let cookie_blob = cookie_blob_for(b'b');
+        let mut mem_slot = AccountSlot::new(&cookie_blob, None).unwrap();
+        mem_slot.account_id = Some(44);
+        mem_slot.count_tokens_allowed = Some(true);
+        state.valid.push_back(mem_slot);
+        state.probing.insert(44);
+
+        AccountPoolActor::do_reload(&mut state).await;
+
+        let slot = state
+            .valid
+            .iter()
+            .find(|c| c.account_id == Some(44))
+            .expect("id=44 must appear in reloaded valid");
+        assert!(
+            slot.count_tokens_allowed.is_none(),
+            "kind flip must reset runtime to defaults"
+        );
+        assert_eq!(
+            slot.token.as_ref().map(|t| t.access_token.as_str()),
+            Some("at_fresh"),
+            "oauth token from DB must be attached on kind flip"
+        );
+        assert!(
+            !state.probing.contains(&44),
+            "probing must be cleared on credential replacement"
+        );
     }
 }
