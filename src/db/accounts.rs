@@ -1,6 +1,7 @@
 use sqlx::{Row, SqlitePool};
 
 use crate::config::{RuntimeStateParams, TokenInfo, UsageBreakdown};
+use crate::services::account_error::AccountFailureContextPersisted;
 
 /// Joined result of accounts + account_runtime_state.
 #[derive(Debug, Clone)]
@@ -22,6 +23,10 @@ pub struct AccountWithRuntime {
     pub last_error: Option<String>,
     pub organization_uuid: Option<String>,
     pub invalid_reason: Option<String>,
+    /// Step 3.5 C4a: structured failure context from the latest
+    /// classifier event. `None` for accounts that are active, or
+    /// invalid accounts persisted before this column existed.
+    pub last_failure: Option<AccountFailureContextPersisted>,
     pub email: Option<String>,
     pub account_type: Option<String>,
     pub created_at: Option<String>,
@@ -198,6 +203,7 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
             a.status, a.auth_source, a.cookie_blob,
             a.oauth_access_token, a.oauth_refresh_token, a.oauth_expires_at,
             a.organization_uuid, a.last_refresh_at, a.last_error, a.invalid_reason,
+            a.last_failure_json,
             a.email, a.account_type, a.created_at, a.updated_at,
             a.drain_first,
             rs.account_id AS rs_marker,
@@ -337,6 +343,10 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
             last_error: row.get("last_error"),
             organization_uuid,
             invalid_reason: row.get("invalid_reason"),
+            last_failure: row
+                .get::<Option<String>, _>("last_failure_json")
+                .as_deref()
+                .and_then(AccountFailureContextPersisted::from_json_lenient),
             email: row.get("email"),
             account_type: row.get("account_type"),
             created_at: row.get("created_at"),
@@ -583,6 +593,50 @@ pub async fn set_account_disabled(
     Ok(())
 }
 
+/// Step 3.5 C4a: persist a structured failure context for an account.
+///
+/// `Some(ctx)` writes the JSON blob to `accounts.last_failure_json`.
+/// `None` clears the column (used on probe/test success or explicit
+/// reactivation alongside `set_account_active`).
+///
+/// Distinct from [`set_account_disabled`] / [`set_account_auth_error`]
+/// — those carry the legacy `Reason` for in-pool identity. This
+/// helper writes the richer classifier context for AccountHealth
+/// display only and does not touch `status` / `invalid_reason`.
+/// Callers that want both must call both.
+///
+/// Serialization failure logs and falls back to clearing the column
+/// (we don't want a corrupt write to wedge the account's status
+/// transition).
+pub async fn set_account_last_failure(
+    pool: &SqlitePool,
+    account_id: i64,
+    failure: Option<&AccountFailureContextPersisted>,
+) -> Result<(), sqlx::Error> {
+    let payload = match failure {
+        Some(ctx) => match serde_json::to_string(ctx) {
+            Ok(json) => Some(json),
+            Err(err) => {
+                tracing::warn!(
+                    account_id,
+                    error = %err,
+                    "failed to serialize AccountFailureContextPersisted; clearing last_failure_json"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    sqlx::query(
+        "UPDATE accounts SET last_failure_json = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+    )
+    .bind(payload)
+    .bind(account_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn set_accounts_active(pool: &SqlitePool, ids: &[i64]) -> Result<(), sqlx::Error> {
     if ids.is_empty() {
         return Ok(());
@@ -593,6 +647,7 @@ pub async fn set_accounts_active(pool: &SqlitePool, ids: &[i64]) -> Result<(), s
          SET status = 'active',
              invalid_reason = NULL,
              last_error = NULL,
+             last_failure_json = NULL,
              updated_at = CURRENT_TIMESTAMP
          WHERE id IN ({placeholders}) AND status IN ('disabled', 'auth_error')"
     );
@@ -610,6 +665,7 @@ pub async fn set_account_active(pool: &SqlitePool, account_id: i64) -> Result<()
          SET status = 'active',
              invalid_reason = NULL,
              last_error = NULL,
+             last_failure_json = NULL,
              updated_at = CURRENT_TIMESTAMP
          WHERE id = ?1 AND status != 'disabled'",
     )
@@ -914,6 +970,7 @@ mod tests {
             last_error: None,
             organization_uuid: Some("org".to_string()),
             invalid_reason: None,
+            last_failure: None,
             email: None,
             account_type: None,
             created_at: None,
@@ -1827,6 +1884,114 @@ mod tests {
             by_name.get("case8_legacy_hybrid_cookie_only"),
             Some(&"cookie"),
             "hybrid with only cookie should normalize to cookie"
+        );
+    }
+
+    /// Step 3.5 C4a: end-to-end round-trip for `last_failure_json`.
+    /// Migration applies, helper writes JSON, load_all_accounts parses
+    /// it back, and active reset clears it.
+    #[tokio::test]
+    async fn last_failure_json_round_trips_via_helper() {
+        use crate::config::Reason;
+        use crate::services::account_error::{
+            AccountFailureContext, AccountFailureContextPersisted, FailureSource,
+            classify_account_failure,
+        };
+
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        insert_cookie_account(&pool, 1, "acct-c4a", 1).await;
+
+        // Fabricate a real classifier output rather than constructing
+        // AccountFailureContext by hand — exercises the full From<&_>
+        // conversion path the production caller will use.
+        let err = crate::error::ClewdrError::InvalidCookie {
+            reason: Reason::TooManyRequest(1_700_000_000),
+        };
+        let ctx: AccountFailureContext =
+            classify_account_failure(&err, FailureSource::Messages, None);
+        let persisted = AccountFailureContextPersisted::from(&ctx);
+
+        super::set_account_last_failure(&pool, 1, Some(&persisted))
+            .await
+            .unwrap();
+
+        let accounts = super::load_all_accounts(&pool).await.unwrap();
+        let acct = accounts.iter().find(|a| a.id == 1).unwrap();
+        let loaded = acct.last_failure.as_ref().expect("must round-trip");
+        assert_eq!(loaded.normalized_reason_type, "rate_limited");
+        assert_eq!(loaded.source, FailureSource::Messages);
+
+        // Clearing via None writes NULL.
+        super::set_account_last_failure(&pool, 1, None)
+            .await
+            .unwrap();
+        let accounts = super::load_all_accounts(&pool).await.unwrap();
+        assert!(
+            accounts
+                .iter()
+                .find(|a| a.id == 1)
+                .unwrap()
+                .last_failure
+                .is_none()
+        );
+    }
+
+    /// Step 3.5 C4a: corrupted JSON in the column does not break
+    /// `load_all_accounts` — the row is still returned with
+    /// `last_failure: None` (lenient parse swallows the error).
+    #[tokio::test]
+    async fn last_failure_json_corrupt_row_loads_with_none() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        insert_cookie_account(&pool, 1, "acct-c4a-bad", 1).await;
+
+        sqlx::query("UPDATE accounts SET last_failure_json = '{not valid json' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let accounts = super::load_all_accounts(&pool).await.unwrap();
+        let acct = accounts.iter().find(|a| a.id == 1).unwrap();
+        // Garbage JSON yields None — the rest of the row is still present.
+        assert!(acct.last_failure.is_none());
+        assert_eq!(acct.name, "acct-c4a-bad");
+    }
+
+    /// Step 3.5 C4a: `set_accounts_active` and `set_account_active`
+    /// both clear `last_failure_json` alongside `invalid_reason` /
+    /// `last_error` to keep the active state consistent.
+    #[tokio::test]
+    async fn reactivation_clears_last_failure_json() {
+        use crate::config::Reason;
+        use crate::services::account_error::{
+            AccountFailureContextPersisted, FailureSource, classify_account_failure,
+        };
+
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        insert_cookie_account(&pool, 1, "acct-c4a-r", 1).await;
+
+        // Mark auth_error so set_accounts_active will pick it up.
+        sqlx::query("UPDATE accounts SET status = 'auth_error' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let err = crate::error::ClewdrError::InvalidCookie {
+            reason: Reason::Disabled,
+        };
+        let ctx = classify_account_failure(&err, FailureSource::Messages, None);
+        let persisted = AccountFailureContextPersisted::from(&ctx);
+        super::set_account_last_failure(&pool, 1, Some(&persisted))
+            .await
+            .unwrap();
+
+        super::set_accounts_active(&pool, &[1]).await.unwrap();
+
+        let accounts = super::load_all_accounts(&pool).await.unwrap();
+        let acct = accounts.iter().find(|a| a.id == 1).unwrap();
+        assert_eq!(acct.status, "active");
+        assert!(
+            acct.last_failure.is_none(),
+            "reactivation must clear last_failure_json"
         );
     }
 }

@@ -530,6 +530,7 @@ pub async fn update(
              SET status = ?1,
                  invalid_reason = CASE WHEN ?1 = 'active' THEN NULL ELSE invalid_reason END,
                  last_error = CASE WHEN ?1 = 'active' THEN NULL ELSE last_error END,
+                 last_failure_json = NULL,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = ?2",
         )
@@ -566,6 +567,7 @@ pub async fn update(
                  status = 'active',
                  invalid_reason = NULL,
                  last_error = NULL,
+                 last_failure_json = NULL,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = ?2",
         )
@@ -589,6 +591,7 @@ pub async fn update(
                  status = 'active',
                  last_error = NULL,
                  invalid_reason = NULL,
+                 last_failure_json = NULL,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = ?6",
         )
@@ -919,11 +922,12 @@ pub async fn test_account(
             .unwrap_or(wreq::StatusCode::INTERNAL_SERVER_ERROR);
         let synthetic = ClewdrError::ClaudeHttpError {
             code,
-            inner: crate::error::ClaudeErrorBody {
+            inner: Box::new(crate::error::ClaudeErrorBody {
                 message: serde_json::json!(""),
                 r#type: "error".to_string(),
                 code: Some(status_u16),
-            },
+                ..Default::default()
+            }),
         };
         crate::services::account_error::classify_account_failure(
             &synthetic,
