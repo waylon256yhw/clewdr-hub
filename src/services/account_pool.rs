@@ -69,6 +69,10 @@ impl CredentialFingerprint {
         CredentialFingerprint::OAuth(s[..cap].to_string())
     }
 
+    pub fn from_oauth_refresh_token(refresh_token: &str) -> Self {
+        Self::oauth_prefix(refresh_token)
+    }
+
     /// Build a fingerprint from a request-time `AccountSlot`. Returns None
     /// when the slot has no usable credential identifier (an OAuth slot
     /// with `token = None` — should not happen in practice, but treated
@@ -3168,6 +3172,49 @@ mod tests {
             Some("at_new"),
             "credential bytes are pool-owned; release_runtime must not touch them"
         );
+    }
+
+    #[tokio::test]
+    async fn oauth_probe_runtime_release_updates_pool_before_next_flush() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        insert_oauth_row(&pool, 2, "at_probe", "rt_probe").await;
+        let mut state = empty_state(pool.clone());
+
+        let slot = oauth_slot_with_refresh(2, "rt_probe");
+        state.valid.push_back(slot.clone());
+        state.probing.insert(2);
+
+        let mut probe_runtime = slot.to_runtime_params();
+        probe_runtime.session_has_reset = Some(true);
+        probe_runtime.weekly_has_reset = Some(true);
+        probe_runtime.session_utilization = Some(45.0);
+        probe_runtime.weekly_utilization = Some(17.0);
+        probe_runtime.resets_last_checked_at = Some(1_777_100_000);
+
+        AccountPoolActor::collect_by_id(
+            &mut state,
+            2,
+            probe_runtime,
+            None,
+            Some(CredentialFingerprint::from_oauth_refresh_token("rt_probe")),
+        );
+
+        assert!(
+            !state.probing.contains(&2),
+            "probe runtime release must complete the probing overlay"
+        );
+
+        AccountPoolActor::do_flush(&mut state).await;
+        let accounts = load_all_accounts(&pool).await.unwrap();
+        let runtime = accounts
+            .iter()
+            .find(|account| account.id == 2)
+            .and_then(|account| account.runtime.as_ref())
+            .expect("runtime row must be flushed");
+
+        assert_eq!(runtime.session_utilization, Some(45.0));
+        assert_eq!(runtime.weekly_utilization, Some(17.0));
+        assert_eq!(runtime.resets_last_checked_at, Some(1_777_100_000));
     }
 
     /// C5 race scenario 3: admin reconnected an OAuth account, rotating

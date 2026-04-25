@@ -15,7 +15,7 @@ use crate::{
     },
     error::ClewdrError,
     oauth::{fetch_oauth_snapshot_raw, refresh_oauth_token_with_raw},
-    services::account_pool::AccountPoolHandle,
+    services::account_pool::{AccountPoolHandle, CredentialFingerprint},
     state::AdminEvent,
     stealth::SharedStealthProfile,
     utils::print_out_text,
@@ -728,6 +728,10 @@ async fn run_oauth_probe(
         .as_ref()
         .map(|t| t.access_token.clone())
         .unwrap_or_else(|| token.access_token.clone());
+    let authoritative_refresh_token: String = refreshed_token
+        .as_ref()
+        .map(|t| t.refresh_token.clone())
+        .unwrap_or_else(|| token.refresh_token.clone());
 
     if let Some(new_token) = refreshed_token {
         if let Err(err) = upsert_account_oauth(db, account_id, Some(&new_token), None).await {
@@ -821,6 +825,30 @@ async fn run_oauth_probe(
         let _ = handle.clear_probing(account_id).await;
         return Err(ProbeFailure {
             stage: "persist_runtime",
+            message: msg,
+            http_status: None,
+            is_auth: false,
+        });
+    }
+    if let Err(err) = handle
+        .release_runtime(
+            account_id,
+            snapshot.runtime.clone(),
+            None,
+            Some(CredentialFingerprint::from_oauth_refresh_token(
+                &authoritative_refresh_token,
+            )),
+        )
+        .await
+    {
+        let msg = format!("failed to sync probe runtime into pool: {err}");
+        warn!("[probe][oauth] account {account_id}: {msg}");
+        handle
+            .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
+            .await;
+        let _ = handle.clear_probing(account_id).await;
+        return Err(ProbeFailure {
+            stage: "sync_pool_runtime",
             message: msg,
             http_status: None,
             is_auth: false,

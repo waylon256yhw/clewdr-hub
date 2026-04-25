@@ -180,6 +180,16 @@ impl ClaudeCodeState {
         self.account_pool_handle
             .update_credential(account_id, Some(refreshed.token.clone()))
             .await;
+        self.account_pool_handle
+            .release_runtime(
+                account_id,
+                refreshed.snapshot.runtime.clone(),
+                None,
+                Some(CredentialFingerprint::from_oauth_refresh_token(
+                    &refreshed.token.refresh_token,
+                )),
+            )
+            .await?;
         self.oauth_token = Some(refreshed.token);
         self.organization_uuid = Some(refreshed.snapshot.organization_uuid);
         Ok(())
