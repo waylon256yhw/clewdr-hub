@@ -517,6 +517,7 @@ mod tests {
             last_error: None,
             organization_uuid: Some("org".to_string()),
             invalid_reason: None,
+            last_failure: None,
             email: None,
             account_type: None,
             created_at: None,

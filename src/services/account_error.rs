@@ -126,6 +126,59 @@ pub struct AccountFailureContext {
     pub raw_message: String,
 }
 
+/// Persistence-friendly form of [`AccountFailureContext`].
+///
+/// Step 3.5 C4a: the in-memory `AccountFailureContext` carries
+/// `stage: Option<&'static str>` for zero-allocation classifier
+/// internals, but `&'static str` cannot be deserialized from owned
+/// data. This `Persisted` variant uses owned `String` for `stage`
+/// and gains `Deserialize`. It also exposes
+/// `normalized_reason_type` as a stable snake_case string field —
+/// duplicating the `reason` tag inside the structured
+/// `normalized_reason` enum so consumers (frontend chip, log
+/// queries) don't need to introspect the tagged variant.
+///
+/// All conversion goes through [`From<&AccountFailureContext>`];
+/// callers should never construct this manually outside DB / API
+/// boundaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountFailureContextPersisted {
+    pub action: AccountFailureAction,
+    pub normalized_reason: AccountNormalizedReason,
+    pub normalized_reason_type: String,
+    pub source: FailureSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_http_status: Option<u16>,
+    pub raw_message: String,
+}
+
+impl From<&AccountFailureContext> for AccountFailureContextPersisted {
+    fn from(ctx: &AccountFailureContext) -> Self {
+        Self {
+            action: ctx.action,
+            normalized_reason: ctx.normalized_reason.clone(),
+            normalized_reason_type: ctx.normalized_reason.as_type_str().to_string(),
+            source: ctx.source,
+            stage: ctx.stage.map(String::from),
+            upstream_http_status: ctx.upstream_http_status,
+            raw_message: ctx.raw_message.clone(),
+        }
+    }
+}
+
+impl AccountFailureContextPersisted {
+    /// Tolerant parse from a stored JSON blob.
+    ///
+    /// Returns `None` on any deserialize failure (malformed JSON,
+    /// future schema with unknown variants, etc.) so a corrupted row
+    /// never blocks loading the rest of the account record.
+    pub fn from_json_lenient(raw: &str) -> Option<Self> {
+        serde_json::from_str::<Self>(raw).ok()
+    }
+}
+
 impl AccountFailureAction {
     /// Map to the `request_logs.status` enum value used by
     /// `persist_terminal_request_log` / `persist_probe_log`. C3a
@@ -923,5 +976,74 @@ mod tests {
         assert_eq!(ctx.source, FailureSource::ProbeOauth);
         assert_eq!(ctx.stage, Some("profile"));
         assert!(!ctx.raw_message.is_empty());
+    }
+
+    // ---- Step 3.5 C4a: Persisted DTO round-trip + tolerance ----
+
+    #[test]
+    fn persisted_round_trips_via_serde() {
+        let ctx = classify_stage(
+            ClewdrError::InvalidCookie {
+                reason: Reason::TooManyRequest(123_456),
+            },
+            FailureSource::Messages,
+            "stage_a",
+        );
+        let persisted = AccountFailureContextPersisted::from(&ctx);
+        // The stable string field is populated.
+        assert_eq!(persisted.normalized_reason_type, "rate_limited");
+        // Stage owns the string now.
+        assert_eq!(persisted.stage.as_deref(), Some("stage_a"));
+
+        let json = serde_json::to_string(&persisted).unwrap();
+        let decoded: AccountFailureContextPersisted = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, persisted);
+    }
+
+    #[test]
+    fn persisted_lenient_parse_returns_none_on_garbage() {
+        assert!(AccountFailureContextPersisted::from_json_lenient("not json {").is_none());
+        // Empty string is also not a valid JSON document.
+        assert!(AccountFailureContextPersisted::from_json_lenient("").is_none());
+        // Schema mismatch (missing required field) → None, not panic.
+        assert!(
+            AccountFailureContextPersisted::from_json_lenient(r#"{"action":"terminal_auth"}"#)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn persisted_serializes_normalized_reason_type_alongside_structured() {
+        // The structured `normalized_reason` is still a tagged enum,
+        // and the stable `normalized_reason_type` is exposed as a
+        // separate top-level string. Both must be present.
+        let ctx = classify(
+            ClewdrError::InvalidCookie {
+                reason: Reason::Disabled,
+            },
+            FailureSource::Test,
+        );
+        let persisted = AccountFailureContextPersisted::from(&ctx);
+        let v = serde_json::to_value(&persisted).unwrap();
+        assert_eq!(v["normalized_reason_type"], "organization_disabled");
+        assert_eq!(v["normalized_reason"]["reason"], "organization_disabled");
+        assert_eq!(v["source"], "test");
+    }
+
+    #[test]
+    fn persisted_skips_optional_none_fields() {
+        // No stage / no upstream_http_status → those keys must not
+        // appear in the serialized JSON (frontend depends on
+        // skip_serializing_if to keep the wire shape compact).
+        let ctx = classify(
+            ClewdrError::InvalidCookie {
+                reason: Reason::Banned,
+            },
+            FailureSource::Bootstrap,
+        );
+        let persisted = AccountFailureContextPersisted::from(&ctx);
+        let v = serde_json::to_value(&persisted).unwrap();
+        assert!(v.get("stage").is_none());
+        assert!(v.get("upstream_http_status").is_none());
     }
 }

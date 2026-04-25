@@ -1,0 +1,12 @@
+-- Step 3.5 C4a: persist structured failure context per account.
+--
+-- Holds a serialized `AccountFailureContextPersisted` JSON blob from
+-- the latest classifier event when the account became invalid. NULL
+-- means either the account is currently active, or it became invalid
+-- before this column existed (legacy migration tolerance).
+--
+-- Distinct from `invalid_reason` (the legacy `Reason::to_db_string`
+-- form), which stays as the in-pool identity carrier and has not
+-- been retired in this round. `last_failure_json` is the
+-- richer-context display source for AccountHealth.last_failure.
+ALTER TABLE accounts ADD COLUMN last_failure_json TEXT;
