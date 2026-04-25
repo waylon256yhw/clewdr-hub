@@ -563,7 +563,9 @@ pub async fn update(
                  oauth_expires_at = NULL,
                  last_refresh_at = NULL,
                  auth_source = 'cookie',
+                 status = 'active',
                  invalid_reason = NULL,
+                 last_error = NULL,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = ?2",
         )
@@ -584,6 +586,7 @@ pub async fn update(
                  last_refresh_at = ?4,
                  organization_uuid = ?5,
                  auth_source = 'oauth',
+                 status = 'active',
                  last_error = NULL,
                  invalid_reason = NULL,
                  updated_at = CURRENT_TIMESTAMP
