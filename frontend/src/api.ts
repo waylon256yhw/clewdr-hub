@@ -115,10 +115,58 @@ export interface AccountRuntime {
 }
 
 /**
+ * Step 3.5 C5: structured failure context surfaced on
+ * `AccountHealth.last_failure` for invalid accounts. Mirrors the Rust
+ * `AccountFailureContextPersisted` (`src/services/account_error.rs`).
+ *
+ * The `normalized_reason_type` is a stable snake_case string consumers
+ * should read for chip / badge labels — derived from
+ * `AccountNormalizedReason::as_type_str()`. The structured
+ * `normalized_reason` is the tagged enum (e.g.,
+ * `{ reason: "rate_limited", reset_time: 123 }`); read it only when
+ * you need the variant-specific extras.
+ *
+ * `raw_message` is the original error text and may carry sensitive
+ * upstream context — render only inside admin-only surfaces (tooltips,
+ * detail drawers), never in user-facing API responses.
+ */
+export type AccountFailureSource =
+  | "messages"
+  | "count_tokens"
+  | "test"
+  | "probe_cookie"
+  | "probe_oauth"
+  | "oauth_refresh"
+  | "bootstrap";
+
+export type AccountFailureAction =
+  | { kind: "terminal_auth" }
+  | { kind: "terminal_disabled" }
+  | { kind: "cooldown"; reset_time: number }
+  | { kind: "transient_upstream" }
+  | { kind: "internal_error" };
+
+export interface AccountFailureContext {
+  action: AccountFailureAction;
+  /** Tagged enum: `{ reason: "rate_limited", reset_time: 123 }` etc. */
+  normalized_reason: { reason: string; [k: string]: unknown };
+  /** Stable snake_case string mirroring `AccountNormalizedReason::as_type_str()`. */
+  normalized_reason_type: string;
+  source: AccountFailureSource;
+  stage?: string | null;
+  upstream_http_status?: number | null;
+  raw_message: string;
+}
+
+/**
  * Unified account-health view produced by the Step 2.5 snapshot. The `state`
  * tag is the mutually-exclusive base status (pool bucket authoritative);
  * `probing` and `last_probe_error` are orthogonal overlays — a probing
  * disabled/cooling account keeps its base state.
+ *
+ * Step 3.5 C4c: `last_failure` is added to the `invalid` variant only —
+ * the backend gates the field on the live state, so other variants
+ * never carry it.
  */
 export type AccountHealth =
   | { state: "active"; probing: boolean; last_probe_error?: string | null }
@@ -134,6 +182,7 @@ export type AccountHealth =
       reason?: string | null;
       probing: boolean;
       last_probe_error?: string | null;
+      last_failure?: AccountFailureContext | null;
     }
   | { state: "unconfigured"; probing: boolean; last_probe_error?: string | null };
 
