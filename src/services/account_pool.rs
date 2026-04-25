@@ -33,9 +33,17 @@ const FLUSH_INTERVAL: u64 = 15;
 const SESSION_WINDOW_SECS: i64 = 5 * 60 * 60; // 5h
 const WEEKLY_WINDOW_SECS: i64 = 7 * 24 * 60 * 60; // 7d
 
-/// Build a placeholder cookie string for an oauth-only account so the loader
-/// can construct an `AccountSlot` from a DB row that has no real `cookie_blob`.
-/// The format satisfies `ClewdrCookie`'s regex (`sk-ant-sid\d{2}-[A-Za-z0-9_-]{86,120}-[A-Za-z0-9_-]{6}AA`).
+/// Build a placeholder cookie string for an oauth-only account.
+///
+/// Pre-Step-4 / C8 the loader minted these so an OAuth-only DB row could
+/// still produce an `AccountSlot { cookie: ClewdrCookie, ... }`. Post-C8
+/// the loader uses `AccountSlot::oauth(...)` directly (cookie field is
+/// `Option<ClewdrCookie>`, None for OAuth slots), so production code no
+/// longer touches this function. Test fixtures still rely on it for
+/// constructing OAuth slots; C10 retires it together with
+/// `is_oauth_placeholder_slot` and migrates fixtures to the new
+/// `AccountSlot::oauth(id, token)` constructor.
+#[cfg_attr(not(test), allow(dead_code))]
 fn oauth_placeholder_cookie(account_id: i64) -> String {
     format!("sk-ant-sid99-o{:0>85}-pool00AA", account_id)
 }
@@ -50,7 +58,14 @@ fn oauth_placeholder_cookie(account_id: i64) -> String {
 /// helpers entirely (along with `oauth_placeholder_cookie`).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_oauth_placeholder_slot(cookie: &AccountSlot) -> bool {
-    let raw = cookie.cookie.to_string();
+    // After C8 the cookie field is Option; OAuth slots never had a real
+    // placeholder anyway (loader minted one only to satisfy the old
+    // non-Option type). A None cookie means "no placeholder shape to
+    // match".
+    let Some(blob) = cookie.cookie.as_ref() else {
+        return false;
+    };
+    let raw = blob.to_string();
     // `ClewdrCookie::Display` produces `sessionKey=<inner>`; match the inner pattern.
     raw.contains("sk-ant-sid99-o") && raw.ends_with("-pool00AA")
 }
@@ -101,8 +116,13 @@ impl CredentialFingerprint {
             // Use the inner cookie blob (`Deref<Target = str>`), not
             // `to_string()` — the latter prepends `sessionKey=` which is
             // identical across every cookie account and would collapse
-            // every fingerprint into the same 20-byte prefix.
-            AuthMethod::Cookie => Some(Self::cookie_prefix(slot.cookie.as_ref())),
+            // every fingerprint into the same 20-byte prefix. Cookie kind
+            // invariant: post-C8 a Cookie slot has `cookie = Some(_)`;
+            // None here is a corrupted slot, treat as "no fingerprint".
+            AuthMethod::Cookie => slot
+                .cookie
+                .as_ref()
+                .map(|c| Self::cookie_prefix(c.as_ref())),
             AuthMethod::OAuth => slot
                 .token
                 .as_ref()
@@ -1171,22 +1191,22 @@ impl AccountPoolActor {
                 continue;
             }
 
-            let cs_result = match row.cookie_blob.as_deref() {
-                Some(cookie_str) => AccountSlot::new(cookie_str, None),
-                None if row.oauth_token.is_some() => {
-                    // OAuth-only account: synthesize a placeholder cookie so the loader can
-                    // construct an AccountSlot from a DB row without a real cookie_blob.
-                    // The real credential is in `row.oauth_token` and is attached below.
-                    AccountSlot::new(&oauth_placeholder_cookie(row.id), None)
-                }
-                None => continue,
-            };
-            let mut cs = match cs_result {
-                Ok(cs) => cs,
-                Err(e) => {
-                    warn!("Invalid cookie for account '{}': {e}", row.name);
-                    continue;
-                }
+            // Build the slot from whichever credential the row carries.
+            // Step 4 / C8 onward: OAuth-only rows go through
+            // `AccountSlot::oauth(...)` directly (no placeholder-cookie
+            // synthesis); cookie rows continue through `AccountSlot::new`
+            // which parses the blob. The common tail below stamps the
+            // remaining row metadata onto either kind.
+            let mut cs = match (row.cookie_blob.as_deref(), row.oauth_token.as_ref()) {
+                (Some(cookie_str), _) => match AccountSlot::new(cookie_str, None) {
+                    Ok(cs) => cs,
+                    Err(e) => {
+                        warn!("Invalid cookie for account '{}': {e}", row.name);
+                        continue;
+                    }
+                },
+                (None, Some(token)) => AccountSlot::oauth(row.id, token.clone()),
+                (None, None) => continue,
             };
             cs.account_id = Some(row.id);
             cs.auth_method = AuthMethod::from_auth_source(&row.auth_source);
@@ -3216,7 +3236,7 @@ mod tests {
             .valid
             .iter()
             .find(|c| c.account_id == Some(1))
-            .map(|c| c.cookie.to_string())
+            .and_then(|c| c.cookie.as_ref().map(|cookie| cookie.to_string()))
             .unwrap();
         assert!(
             surviving_blob.contains(&new_blob[..20]),
@@ -3437,5 +3457,72 @@ mod tests {
         );
         let fp_oauth = AccountPoolActor::pool_credential_fingerprint(&state, 100);
         assert!(fp_oauth.is_none());
+    }
+
+    /// Step 4 / C8: loader no longer mints `oauth_placeholder_cookie(...)`
+    /// for OAuth-only DB rows. The reloaded slot must have `cookie = None`
+    /// and `auth_method = OAuth`, with the credential bytes living in
+    /// `slot.token` (set by the loader from `row.oauth_token`).
+    #[tokio::test]
+    async fn reload_builds_oauth_slot_without_placeholder_cookie() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        insert_account_row(
+            &pool,
+            80,
+            "active",
+            "oauth",
+            Some("at_real"),
+            Some("rt_real"),
+            None,
+        )
+        .await;
+
+        let mut state = empty_state(pool);
+        AccountPoolActor::do_reload(&mut state).await;
+
+        let slot = state
+            .valid
+            .iter()
+            .find(|c| c.account_id == Some(80))
+            .expect("oauth account 80 must load");
+        assert_eq!(slot.auth_method, AuthMethod::OAuth);
+        assert!(
+            slot.cookie.is_none(),
+            "post-C8: OAuth slots have no placeholder cookie blob, got: {:?}",
+            slot.cookie
+        );
+        assert_eq!(
+            slot.token.as_ref().map(|t| t.access_token.as_str()),
+            Some("at_real"),
+            "OAuth credential bytes must live in slot.token"
+        );
+        assert_eq!(
+            slot.token.as_ref().map(|t| t.refresh_token.as_str()),
+            Some("rt_real"),
+        );
+    }
+
+    /// `AccountSlot::oauth(id, token)` is the post-C8 canonical OAuth
+    /// constructor. Pin its shape so future call sites don't drift back
+    /// to placeholder-cookie idioms.
+    #[test]
+    fn account_slot_oauth_constructor_shape() {
+        let token = TokenInfo::from_parts(
+            "at_x".to_string(),
+            "rt_x".to_string(),
+            Duration::from_secs(3600),
+            "org-x".to_string(),
+        );
+        let slot = AccountSlot::oauth(123, token);
+        assert_eq!(slot.auth_method, AuthMethod::OAuth);
+        assert!(slot.cookie.is_none());
+        assert_eq!(slot.account_id, Some(123));
+        assert_eq!(
+            slot.token.as_ref().map(|t| t.access_token.as_str()),
+            Some("at_x")
+        );
+        // credential_label uses the post-C7 OAuth tag, never reaches into
+        // the (now-None) cookie field.
+        assert_eq!(slot.credential_label(), "oauth#123");
     }
 }

@@ -124,13 +124,18 @@ impl ClaudeCodeState {
 
         state.cookie_header_value = match auth_method {
             AuthMethod::Cookie => {
+                // Slot is invariantly Cookie-kind here (just dispatched
+                // on auth_method), so `slot.cookie` must be Some — it
+                // was populated by `AccountSlot::new()` when the loader
+                // built it. Surface the inconsistency as an error rather
+                // than panicking if invariant breaks.
                 let cookie_value = state
                     .cookie
                     .as_ref()
+                    .and_then(|slot| slot.cookie.as_ref())
                     .ok_or(ClewdrError::UnexpectedNone {
-                        msg: "Cookie missing while initializing state",
+                        msg: "Cookie kind invariant: slot.cookie missing on Cookie account",
                     })?
-                    .cookie
                     .to_string();
                 HeaderValue::from_str(cookie_value.as_str())?
             }
@@ -218,7 +223,19 @@ impl ClaudeCodeState {
             .await?;
         self.cookie = Some(res.to_owned());
         self.cookie_header_value = match res.auth_method {
-            AuthMethod::Cookie => HeaderValue::from_str(res.cookie.to_string().as_str())?,
+            AuthMethod::Cookie => {
+                // Cookie kind invariant: pool slot for cookie account
+                // has `cookie = Some(_)`. Treat the missing case as an
+                // error rather than panicking on `expect()`.
+                let cookie_value = res
+                    .cookie
+                    .as_ref()
+                    .ok_or(ClewdrError::UnexpectedNone {
+                        msg: "Cookie kind invariant: dispatched cookie slot missing cookie blob",
+                    })?
+                    .to_string();
+                HeaderValue::from_str(cookie_value.as_str())?
+            }
             AuthMethod::OAuth => HeaderValue::from_static(""),
         };
         self.proxy_url = res.proxy_url.clone();

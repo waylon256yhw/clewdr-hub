@@ -99,7 +99,19 @@ impl<'de> Deserialize<'de> for ClewdrCookie {
 /// A struct representing a cookie with its information
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct AccountSlot {
-    pub cookie: ClewdrCookie,
+    /// The session cookie blob, present iff `auth_method == Cookie`.
+    /// Step 4 / C8 flipped this to `Option<ClewdrCookie>`: pre-C8 OAuth
+    /// rows were padded with a synthetic placeholder cookie
+    /// (`oauth_placeholder_cookie(id)`) just so this field could be
+    /// non-Option, which leaked the cookie shape into log lines, slot
+    /// identity, and serialization. The loader (`do_reload`) now
+    /// constructs OAuth slots with `cookie = None` directly.
+    ///
+    /// Hot-path access points (`exchange_token`, `probe_cookie`,
+    /// `from_credential` Cookie arm) gate on `auth_method == Cookie`
+    /// before reading this field, so the `expect("Cookie kind invariant")`
+    /// at those sites is sound.
+    pub cookie: Option<ClewdrCookie>,
     /// Authentication kind (Cookie or OAuth). Loader populates this from
     /// `accounts.auth_source`. `#[serde(default)]` keeps deserialization
     /// of pre-Step-4 snapshots compatible (defaults to Cookie).
@@ -211,7 +223,7 @@ impl AccountSlot {
     pub fn new(cookie: &str, reset_time: Option<i64>) -> Result<Self, ClewdrError> {
         let cookie = ClewdrCookie::from_str(cookie)?;
         Ok(Self {
-            cookie,
+            cookie: Some(cookie),
             auth_method: AuthMethod::Cookie,
             account_id: None,
             proxy_url: None,
@@ -266,6 +278,21 @@ impl AccountSlot {
         self
     }
 
+    /// Construct an OAuth slot directly from `(account_id, token)`. Used
+    /// by the loader (`do_reload`) for oauth-only DB rows and by tests
+    /// (post-C10) replacing the historical `AccountSlot::new(&oauth_placeholder_cookie(id), None)`
+    /// idiom. Step 4 / C8 onward — this is the canonical OAuth slot
+    /// constructor.
+    pub fn oauth(account_id: i64, token: TokenInfo) -> Self {
+        Self {
+            cookie: None,
+            auth_method: AuthMethod::OAuth,
+            account_id: Some(account_id),
+            token: Some(token),
+            ..Self::default()
+        }
+    }
+
     pub fn add_token(&mut self, token: TokenInfo) {
         self.token = Some(token);
     }
@@ -278,7 +305,11 @@ impl AccountSlot {
     /// flip is a one-line change here.
     pub fn credential_label(&self) -> String {
         match self.auth_method {
-            AuthMethod::Cookie => self.cookie.ellipse(),
+            AuthMethod::Cookie => self
+                .cookie
+                .as_ref()
+                .map(|c| c.ellipse())
+                .unwrap_or_else(|| "cookie#?".to_string()),
             AuthMethod::OAuth => match self.account_id {
                 Some(id) => format!("oauth#{id}"),
                 None => "oauth#?".to_string(),

@@ -145,13 +145,15 @@ impl ClaudeCodeState {
             .json(&query_params);
         if let Some(cookie) = self.cookie.as_ref() {
             // exchange_token is the cookie-account-only login flow that
-            // hand-rolls the OAuth code-grant via the session cookie. The
-            // outer caller (`try_chat`/`try_count_tokens`) only enters
-            // this path when `is_pure_oauth_slot` is false, so `cookie`
-            // is invariantly Cookie-kind here. Direct `cookie.cookie`
-            // access stays; C8 migrates to `as_ref().expect(...)` when
-            // the field flips to `Option<ClewdrCookie>`.
-            authorize_req = authorize_req.header(COOKIE, cookie.cookie.to_string());
+            // hand-rolls the OAuth code-grant via the session cookie.
+            // Cookie kind invariant: caller (`try_chat`/`try_count_tokens`)
+            // only enters this path when `is_pure_oauth_slot` is false,
+            // so `cookie.cookie` is `Some(_)` here. C8 flipped the
+            // field to Option; if the invariant breaks we silently skip
+            // the Cookie header rather than crash a chat retry.
+            if let Some(cookie_blob) = cookie.cookie.as_ref() {
+                authorize_req = authorize_req.header(COOKIE, cookie_blob.to_string());
+            }
         }
         let redirect_json = authorize_req
             .send()
