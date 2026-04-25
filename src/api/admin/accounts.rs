@@ -919,11 +919,12 @@ pub async fn test_account(
             .unwrap_or(wreq::StatusCode::INTERNAL_SERVER_ERROR);
         let synthetic = ClewdrError::ClaudeHttpError {
             code,
-            inner: crate::error::ClaudeErrorBody {
+            inner: Box::new(crate::error::ClaudeErrorBody {
                 message: serde_json::json!(""),
                 r#type: "error".to_string(),
                 code: Some(status_u16),
-            },
+                ..Default::default()
+            }),
         };
         crate::services::account_error::classify_account_failure(
             &synthetic,

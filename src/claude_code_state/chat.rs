@@ -1434,11 +1434,12 @@ mod tests {
 
         let http = |status: u16| ClewdrError::ClaudeHttpError {
             code: StatusCode::from_u16(status).unwrap(),
-            inner: ClaudeErrorBody {
+            inner: Box::new(ClaudeErrorBody {
                 message: json!("upstream"),
                 r#type: "error".to_string(),
                 code: Some(status),
-            },
+                ..Default::default()
+            }),
         };
         assert_eq!(
             ClaudeCodeState::oauth_pool_reason(&http(401)),

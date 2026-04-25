@@ -143,7 +143,10 @@ pub enum ClewdrError {
     #[snafu(display("Http error: code: {}, body: {}", code.to_string().red(), inner.to_string()))]
     ClaudeHttpError {
         code: StatusCode,
-        inner: ClaudeErrorBody,
+        // Boxed because `ClaudeErrorBody` carries Step 3.5 C3c diagnostic
+        // metadata fields and pushes the variant past clippy's
+        // `result_large_err` threshold otherwise.
+        inner: Box<ClaudeErrorBody>,
     },
     #[snafu(display("Unexpected None: {}", msg))]
     UnexpectedNone { msg: &'static str },
@@ -240,17 +243,26 @@ impl IntoResponse for ClewdrError {
         // The classifier produces a stable `normalized_reason` that
         // distinguishes oauth_refresh_invalid / organization_disabled /
         // rate_limited / etc., and we expose it as the response
-        // `type` field. `source` / `stage` / `upstream_http_status`
-        // transparency is deferred to C3b (the IntoResponse trait
-        // does not see the calling entry point).
+        // `type` field.
+        //
+        // Step 3.5 C3c: also surface `failure_source / failure_stage /
+        // upstream_http_status / normalized_reason_type` as additive
+        // metadata on the response body. We deliberately do NOT
+        // surface `raw_message` here — `err.to_string()` is the
+        // sanitized display form callers should rely on, and raw
+        // upstream bodies may carry sensitive context. raw_message is
+        // only persisted in the admin-domain `AccountHealth.last_failure`.
         if matches!(&self, ClewdrError::InvalidCookie { .. }) {
             use crate::services::account_error::{FailureSource, classify_account_failure};
-            let normalized =
-                classify_account_failure(&self, FailureSource::Messages, None).normalized_reason;
+            let ctx = classify_account_failure(&self, FailureSource::Messages, None);
             let inner = ClaudeErrorBody {
                 message: json!(self.to_string()),
-                r#type: normalized.as_type_str().to_string(),
+                r#type: ctx.normalized_reason.as_type_str().to_string(),
                 code: Some(StatusCode::BAD_REQUEST.as_u16()),
+                failure_source: Some(ctx.source.as_str().to_string()),
+                failure_stage: ctx.stage.map(|s| s.to_string()),
+                upstream_http_status: ctx.upstream_http_status,
+                normalized_reason_type: Some(ctx.normalized_reason.as_type_str().to_string()),
             };
             return (StatusCode::BAD_REQUEST, Json(ClaudeError { error: inner })).into_response();
         }
@@ -275,7 +287,7 @@ impl IntoResponse for ClewdrError {
                 (source.status(), json!(source.body_text()))
             }
             ClewdrError::ClaudeHttpError { code, inner } => {
-                return (code, Json(ClaudeError { error: inner })).into_response();
+                return (code, Json(ClaudeError { error: *inner })).into_response();
             }
             ClewdrError::TestMessage => {
                 return (
@@ -302,6 +314,7 @@ impl IntoResponse for ClewdrError {
                     message: json!(self.to_string()),
                     r#type: "rate_limit_error".to_string(),
                     code: Some(429),
+                    ..Default::default()
                 };
                 return (
                     StatusCode::TOO_MANY_REQUESTS,
@@ -314,6 +327,7 @@ impl IntoResponse for ClewdrError {
                     message: json!(self.to_string()),
                     r#type: "api_error".to_string(),
                     code: Some(503),
+                    ..Default::default()
                 };
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -335,6 +349,7 @@ impl IntoResponse for ClewdrError {
                 message: msg,
                 r#type: <&str>::from(self).into(),
                 code: Some(status.as_u16()),
+                ..Default::default()
             },
         };
         (status, Json(err)).into_response()
@@ -348,12 +363,32 @@ pub struct ClaudeError {
 }
 
 /// Inner HTTP error response
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, Default)]
 pub struct ClaudeErrorBody {
     pub message: Value,
     pub r#type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<u16>,
+    /// Step 3.5 C3c: classifier `FailureSource` snake_case name. Only
+    /// populated when this body is the `InvalidCookie` IntoResponse path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_source: Option<String>,
+    /// Step 3.5 C3c: optional sub-stage refinement (e.g., "refresh",
+    /// "profile"). Only populated alongside `failure_source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_stage: Option<String>,
+    /// Step 3.5 C3c: HTTP status from the upstream (Anthropic / OAuth)
+    /// when the failure carried one. Distinct from `code`, which is the
+    /// status of *our* response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_http_status: Option<u16>,
+    /// Step 3.5 C3c: stable snake_case name from
+    /// `AccountNormalizedReason::as_type_str()`. This duplicates the
+    /// `type` field on the `InvalidCookie` path (where they are equal),
+    /// but exists as its own field so consumers can read it without
+    /// ambiguity even if `type` is repurposed later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_reason_type: Option<String>,
 }
 
 /// Raw Inner HTTP error response
@@ -361,6 +396,14 @@ pub struct ClaudeErrorBody {
 struct RawBody {
     pub message: String,
     pub r#type: String,
+    #[serde(default)]
+    pub failure_source: Option<String>,
+    #[serde(default)]
+    pub failure_stage: Option<String>,
+    #[serde(default)]
+    pub upstream_http_status: Option<u16>,
+    #[serde(default)]
+    pub normalized_reason_type: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for ClaudeErrorBody {
@@ -370,17 +413,16 @@ impl<'de> Deserialize<'de> for ClaudeErrorBody {
         D: serde::Deserializer<'de>,
     {
         let raw = RawBody::deserialize(deserializer)?;
-        if let Ok(message) = serde_json::from_str::<Value>(&raw.message) {
-            return Ok(ClaudeErrorBody {
-                message,
-                r#type: raw.r#type,
-                code: None,
-            });
-        }
+        let message =
+            serde_json::from_str::<Value>(&raw.message).unwrap_or_else(|_| json!(raw.message));
         Ok(ClaudeErrorBody {
-            message: json!(raw.message),
+            message,
             r#type: raw.r#type,
             code: None,
+            failure_source: raw.failure_source,
+            failure_stage: raw.failure_stage,
+            upstream_http_status: raw.upstream_http_status,
+            normalized_reason_type: raw.normalized_reason_type,
         })
     }
 }
@@ -426,10 +468,11 @@ impl CheckClaudeErr for Response {
                 message: json!("Blocked, check your IP address"),
                 r#type: "error".to_string(),
                 code: Some(status.as_u16()),
+                ..Default::default()
             };
             return Err(ClewdrError::ClaudeHttpError {
                 code: status,
-                inner: error,
+                inner: Box::new(error),
             });
         }
         let text = match self.text().await {
@@ -439,10 +482,11 @@ impl CheckClaudeErr for Response {
                     message: json!(err.to_string()),
                     r#type: "error_get_error_body".to_string(),
                     code: Some(status.as_u16()),
+                    ..Default::default()
                 };
                 return Err(ClewdrError::ClaudeHttpError {
                     code: status,
-                    inner: error,
+                    inner: Box::new(error),
                 });
             }
         };
@@ -451,10 +495,11 @@ impl CheckClaudeErr for Response {
                 message: format!("Unknown error: {text}").into(),
                 r#type: "error_parse_error_body".to_string(),
                 code: Some(status.as_u16()),
+                ..Default::default()
             };
             return Err(ClewdrError::ClaudeHttpError {
                 code: status,
-                inner: error,
+                inner: Box::new(error),
             });
         };
         const OAUTH_PHRASE: &str =
@@ -485,7 +530,7 @@ impl CheckClaudeErr for Response {
             if msg_lower.contains("extra usage is required for long context requests") {
                 return Err(ClewdrError::ClaudeHttpError {
                     code: status,
-                    inner: inner_error,
+                    inner: Box::new(inner_error),
                 });
             }
 
@@ -516,7 +561,7 @@ impl CheckClaudeErr for Response {
         }
         Err(ClewdrError::ClaudeHttpError {
             code: status,
-            inner: inner_error,
+            inner: Box::new(inner_error),
         })
     }
 }
@@ -574,6 +619,17 @@ mod tests {
         parsed.error.r#type
     }
 
+    /// Step 3.5 C3c helper: full body so tests can assert metadata fields.
+    async fn invalid_cookie_response_body(reason: Reason) -> super::ClaudeErrorBody {
+        let err = ClewdrError::InvalidCookie { reason };
+        let response = err.into_response();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let parsed: ClaudeError = serde_json::from_slice(&body).unwrap();
+        parsed.error
+    }
+
     #[tokio::test]
     async fn into_response_invalid_cookie_emits_normalized_type() {
         // Each Reason produces a distinct `type` string — none of them
@@ -604,5 +660,65 @@ mod tests {
         let null_type = invalid_cookie_response_type(Reason::Null).await;
         assert_ne!(null_type, "invalid_cookie");
         assert!(!null_type.is_empty());
+    }
+
+    /// Step 3.5 C3c: InvalidCookie IntoResponse populates additive
+    /// diagnostic fields (`failure_source`, `normalized_reason_type`)
+    /// on the response body. raw_message is intentionally NOT carried
+    /// to the user-facing API.
+    #[tokio::test]
+    async fn into_response_invalid_cookie_emits_failure_metadata() {
+        let body = invalid_cookie_response_body(Reason::TooManyRequest(123)).await;
+        // failure_source is always "messages" on this path — the
+        // IntoResponse impl uses the Messages default since it cannot
+        // see the calling entry point.
+        assert_eq!(body.failure_source.as_deref(), Some("messages"));
+        // normalized_reason_type duplicates `type` field for stable
+        // consumer access.
+        assert_eq!(body.normalized_reason_type.as_deref(), Some("rate_limited"));
+        assert_eq!(body.r#type, "rate_limited");
+        // failure_stage is None for the messages path (no sub-stage).
+        assert!(body.failure_stage.is_none());
+    }
+
+    /// Step 3.5 C3c: 401/403 ClaudeHttpError that's not an account
+    /// failure does not get the normalized metadata — only the
+    /// InvalidCookie path does.
+    #[tokio::test]
+    async fn into_response_non_account_error_skips_failure_metadata() {
+        let err = ClewdrError::NoValidUpstreamAccounts;
+        let response = err.into_response();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let parsed: ClaudeError = serde_json::from_slice(&body).unwrap();
+        assert!(parsed.error.failure_source.is_none());
+        assert!(parsed.error.failure_stage.is_none());
+        assert!(parsed.error.upstream_http_status.is_none());
+        assert!(parsed.error.normalized_reason_type.is_none());
+    }
+
+    /// Step 3.5 C3c: round-trip serde — `RawBody` accepts the new
+    /// fields and `ClaudeErrorBody::deserialize` restores them.
+    #[test]
+    fn claude_error_body_round_trips_failure_metadata() {
+        let body = super::ClaudeErrorBody {
+            message: serde_json::json!("hello"),
+            r#type: "rate_limited".to_string(),
+            code: Some(400),
+            failure_source: Some("messages".to_string()),
+            failure_stage: Some("refresh".to_string()),
+            upstream_http_status: Some(429),
+            normalized_reason_type: Some("rate_limited".to_string()),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        let restored: super::ClaudeErrorBody = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.failure_source.as_deref(), Some("messages"));
+        assert_eq!(restored.failure_stage.as_deref(), Some("refresh"));
+        assert_eq!(restored.upstream_http_status, Some(429));
+        assert_eq!(
+            restored.normalized_reason_type.as_deref(),
+            Some("rate_limited")
+        );
     }
 }

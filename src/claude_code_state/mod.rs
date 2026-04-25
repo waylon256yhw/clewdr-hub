@@ -339,11 +339,12 @@ mod tests {
     fn oauth_auth_failure_classifier_equivalence() {
         let http = |status: u16| ClewdrError::ClaudeHttpError {
             code: StatusCode::from_u16(status).unwrap(),
-            inner: ClaudeErrorBody {
+            inner: Box::new(ClaudeErrorBody {
                 message: json!("upstream"),
                 r#type: "error".to_string(),
                 code: Some(status),
-            },
+                ..Default::default()
+            }),
         };
         assert!(is_oauth_auth_failure(&http(401)));
         assert!(is_oauth_auth_failure(&http(403)));

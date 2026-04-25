@@ -203,11 +203,12 @@ mod tests {
     fn http(status: u16) -> ClewdrError {
         ClewdrError::ClaudeHttpError {
             code: StatusCode::from_u16(status).unwrap(),
-            inner: ClaudeErrorBody {
+            inner: Box::new(ClaudeErrorBody {
                 message: json!("upstream"),
                 r#type: "error".to_string(),
                 code: Some(status),
-            },
+                ..Default::default()
+            }),
         }
     }
 

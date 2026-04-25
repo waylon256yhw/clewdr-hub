@@ -97,6 +97,24 @@ pub enum FailureSource {
     Bootstrap,
 }
 
+impl FailureSource {
+    /// Stable snake_case name. Same shape as the serde-renamed form,
+    /// but available without going through `serde_json` — used by
+    /// `IntoResponse` to populate `ClaudeErrorBody.failure_source` and
+    /// by Persisted DTO conversion.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Messages => "messages",
+            Self::CountTokens => "count_tokens",
+            Self::Test => "test",
+            Self::ProbeCookie => "probe_cookie",
+            Self::ProbeOauth => "probe_oauth",
+            Self::OauthRefresh => "oauth_refresh",
+            Self::Bootstrap => "bootstrap",
+        }
+    }
+}
+
 /// Full classification of a single failure event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AccountFailureContext {
@@ -414,11 +432,12 @@ mod tests {
     fn http_error(status: u16, message: &str) -> ClewdrError {
         ClewdrError::ClaudeHttpError {
             code: StatusCode::from_u16(status).unwrap(),
-            inner: ClaudeErrorBody {
+            inner: Box::new(ClaudeErrorBody {
                 message: json!(message.to_string()),
                 r#type: "error".to_string(),
                 code: Some(status),
-            },
+                ..Default::default()
+            }),
         }
     }
 
