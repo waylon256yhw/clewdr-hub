@@ -20,8 +20,8 @@ use crate::db::accounts::{AccountWithRuntime, active_reset_time};
 /// Base health state for a single account. Mutually exclusive.
 ///
 /// `Probing` is intentionally *not* a variant here — probes run against
-/// accounts in every pool bucket (see `spawn_probe_all` /
-/// `spawn_probe_accounts` in `src/services/account_pool.rs`), so modelling
+/// accounts in every pool bucket (see `spawn_probe_accounts` in
+/// `src/services/account_pool.rs`), so modelling
 /// it as a variant would drop the underlying base state. It lives on
 /// [`AccountHealth`] as an overlay flag instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
