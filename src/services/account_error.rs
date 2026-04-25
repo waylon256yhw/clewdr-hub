@@ -201,17 +201,62 @@ fn refine_null_reason(
     }
 }
 
-fn classify_whatever_message(message: &str) -> Option<AccountNormalizedReason> {
+/// Extract the HTTP status code from a wrapped `Whatever` message of the
+/// form "...status NNN...". Used to keep upstream HTTP status visible
+/// when an OAuth token-endpoint failure is surfaced via
+/// `ClewdrError::Whatever { message: "OAuth token request failed with
+/// status NNN: ..." }` (see `src/oauth.rs::send_oauth_token_request`).
+fn extract_status_code(lowercase_msg: &str) -> Option<u16> {
+    let idx = lowercase_msg.find("status ")?;
+    let after = &lowercase_msg[idx + "status ".len()..];
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    // Require exactly 3 digits in the [100, 599] range so we don't latch
+    // onto unrelated numbers that happen to follow the word "status".
+    if digits.len() != 3 {
+        return None;
+    }
+    let status = digits.parse::<u16>().ok()?;
+    (100..600).contains(&status).then_some(status)
+}
+
+/// Classify a `ClewdrError::Whatever` message body into the action +
+/// normalized reason + upstream HTTP status the wrapped failure
+/// represents.
+///
+/// Returns `None` when the message has no recognisable signal — the
+/// caller treats that as `InternalError`.
+fn classify_whatever_message(
+    message: &str,
+) -> Option<(AccountFailureAction, AccountNormalizedReason, Option<u16>)> {
     let msg = message.to_ascii_lowercase();
     let refresh_token_invalid = msg.contains("invalid_grant")
         || msg.contains("refresh token not found")
         || (msg.contains("refresh token") && (msg.contains("invalid") || msg.contains("expired")))
         || (msg.contains("access token") && (msg.contains("expired") || msg.contains("invalid")));
     if refresh_token_invalid {
-        return Some(AccountNormalizedReason::OauthRefreshInvalid);
+        return Some((
+            AccountFailureAction::TerminalAuth,
+            AccountNormalizedReason::OauthRefreshInvalid,
+            None,
+        ));
     }
-    if msg.contains("status 401") || msg.contains("status 403") {
-        return Some(AccountNormalizedReason::UpstreamAuthRejected);
+    // Preserve upstream HTTP status from "...status NNN..." messages —
+    // OAuth token-endpoint outages (5xx, transient gateway errors)
+    // would otherwise fall through to InternalError, hiding the
+    // upstream from /test, refresh, and probe_oauth diagnostics.
+    if let Some(status) = extract_status_code(&msg) {
+        return Some(match status {
+            401 | 403 => (
+                AccountFailureAction::TerminalAuth,
+                AccountNormalizedReason::UpstreamAuthRejected,
+                Some(status),
+            ),
+            _ => (
+                AccountFailureAction::TransientUpstream,
+                AccountNormalizedReason::UpstreamHttp { status },
+                Some(status),
+            ),
+        });
     }
     None
 }
@@ -304,20 +349,16 @@ pub fn classify_account_failure(
             )
         }
 
-        // OAuth refresh / token rotation surfaces here.
-        ClewdrError::Whatever { message, .. } => match classify_whatever_message(message) {
-            Some(reason @ AccountNormalizedReason::OauthRefreshInvalid) => {
-                (AccountFailureAction::TerminalAuth, reason, None)
-            }
-            Some(reason @ AccountNormalizedReason::UpstreamAuthRejected) => {
-                (AccountFailureAction::TerminalAuth, reason, None)
-            }
-            _ => (
-                AccountFailureAction::InternalError,
-                AccountNormalizedReason::InternalError,
-                None,
-            ),
-        },
+        // OAuth refresh / token rotation surfaces here. The token endpoint
+        // wraps non-2xx responses as `Whatever { message: "OAuth token
+        // request failed with status NNN: ..." }`, so 5xx / 4xx outages
+        // must surface as TransientUpstream + UpstreamHttp{status} (not
+        // InternalError) to keep diagnostics accurate.
+        ClewdrError::Whatever { message, .. } => classify_whatever_message(message).unwrap_or((
+            AccountFailureAction::InternalError,
+            AccountNormalizedReason::InternalError,
+            None,
+        )),
 
         ClewdrError::RequestTokenError { .. } => (
             AccountFailureAction::TerminalAuth,
@@ -678,10 +719,90 @@ mod tests {
             source: None,
         };
         let ctx = classify(err, FailureSource::Messages);
+        assert_eq!(ctx.action, AccountFailureAction::TerminalAuth);
         assert_eq!(
             ctx.normalized_reason,
             AccountNormalizedReason::UpstreamAuthRejected
         );
+        assert_eq!(ctx.upstream_http_status, Some(401));
+    }
+
+    /// P2 fix: `send_oauth_token_request` wraps non-2xx responses as
+    /// `Whatever { message: "OAuth token request failed with status NNN: ..." }`.
+    /// 5xx outages MUST surface as TransientUpstream + UpstreamHttp{status},
+    /// not InternalError, so /test, refresh, and probe_oauth diagnostics
+    /// stay accurate during transient Anthropic / proxy failures.
+    #[test]
+    fn whatever_oauth_token_endpoint_5xx_is_transient_upstream() {
+        for status in [500_u16, 502, 503, 504] {
+            let err = ClewdrError::Whatever {
+                message: format!("OAuth token request failed with status {status}: gateway error"),
+                source: None,
+            };
+            let ctx = classify(err, FailureSource::OauthRefresh);
+            assert_eq!(
+                ctx.action,
+                AccountFailureAction::TransientUpstream,
+                "status {status} should map to TransientUpstream",
+            );
+            assert_eq!(
+                ctx.normalized_reason,
+                AccountNormalizedReason::UpstreamHttp { status },
+            );
+            assert_eq!(ctx.upstream_http_status, Some(status));
+            // 5xx must not persist a Reason — caller must not invalidate
+            // the account on a transient gateway error.
+            assert_eq!(ctx.normalized_reason.to_reason(), None);
+        }
+    }
+
+    /// 4xx other than 401/403 (e.g. 400 without `invalid_grant`, 429 from
+    /// the OAuth endpoint) also flow through as TransientUpstream — the
+    /// account-side decision belongs to ClaudeHttpError 429 with reset
+    /// timestamps, not Whatever 429.
+    #[test]
+    fn whatever_status_400_without_invalid_grant_is_transient_upstream() {
+        let err = ClewdrError::Whatever {
+            message: "OAuth token request failed with status 400: bad request".to_string(),
+            source: None,
+        };
+        let ctx = classify(err, FailureSource::OauthRefresh);
+        assert_eq!(ctx.action, AccountFailureAction::TransientUpstream);
+        assert_eq!(
+            ctx.normalized_reason,
+            AccountNormalizedReason::UpstreamHttp { status: 400 }
+        );
+        assert_eq!(ctx.upstream_http_status, Some(400));
+    }
+
+    /// `invalid_grant` takes precedence over the status code — a 400
+    /// response carrying invalid_grant is still terminal auth failure.
+    #[test]
+    fn whatever_invalid_grant_with_status_400_stays_refresh_invalid() {
+        let err = ClewdrError::Whatever {
+            message: "OAuth token request failed with status 400: invalid_grant".to_string(),
+            source: None,
+        };
+        let ctx = classify(err, FailureSource::OauthRefresh);
+        assert_eq!(ctx.action, AccountFailureAction::TerminalAuth);
+        assert_eq!(
+            ctx.normalized_reason,
+            AccountNormalizedReason::OauthRefreshInvalid
+        );
+    }
+
+    /// `extract_status_code` defends against false positives — e.g. an
+    /// error message that contains the word "status" but isn't followed
+    /// by a 3-digit number must NOT confuse the classifier.
+    #[test]
+    fn whatever_status_word_without_code_falls_through() {
+        let err = ClewdrError::Whatever {
+            message: "could not determine status of refresh".to_string(),
+            source: None,
+        };
+        let ctx = classify(err, FailureSource::OauthRefresh);
+        assert_eq!(ctx.action, AccountFailureAction::InternalError);
+        assert_eq!(ctx.upstream_http_status, None);
     }
 
     #[test]
