@@ -39,10 +39,48 @@ import {
   ApiError,
   type Account,
   type AccountsListResponse,
+  type AccountFailureContext,
   type Proxy,
   type UsageWindow,
 } from "../api";
 import { formatEpochSeconds } from "../lib/format";
+
+/**
+ * Step 3.5 C5-2: stable color hint for an
+ * `AccountFailureContext.action` so the chip / badge color reflects
+ * the scheduler verdict without rebuilding a Reason → color table.
+ */
+function failureBadgeColor(failure: AccountFailureContext): string {
+  switch (failure.action.kind) {
+    case "terminal_auth":
+    case "terminal_disabled":
+      return "red";
+    case "cooldown":
+      return "yellow";
+    case "transient_upstream":
+      return "orange";
+    case "internal_error":
+      return "gray";
+  }
+}
+
+/**
+ * Step 3.5 C5-2: multi-line tooltip body for a structured failure.
+ * Includes source / stage / upstream HTTP / raw_message — admin-only
+ * surface so raw_message is acceptable here.
+ */
+function buildFailureTooltip(failure: AccountFailureContext): string {
+  const parts: string[] = [];
+  parts.push(`来源: ${failure.source}`);
+  if (failure.stage) parts.push(`阶段: ${failure.stage}`);
+  if (failure.upstream_http_status != null) {
+    parts.push(`上游 HTTP: ${failure.upstream_http_status}`);
+  }
+  if (failure.raw_message) {
+    parts.push(`原始信息: ${failure.raw_message}`);
+  }
+  return parts.join("\n");
+}
 
 function normalizeAccountType(t: string): string {
   return t.trim().toLowerCase().replace(/[\s-]+/g, "_").replace(/^claude_/, "");
@@ -183,6 +221,15 @@ function AccountCard({
   const isProbing = account.health?.probing ?? probing;
   const effectiveProbeError = account.health?.last_probe_error ?? probeError;
   const probeCheckedAt = formatProbeCheckedAt(rt?.resets_last_checked_at);
+  // Step 3.5 C5-2: surface structured failure context when available.
+  // Only the `invalid` health variant carries `last_failure`; the
+  // backend gates on live state so we never see it for active /
+  // cooling accounts.
+  const lastFailure =
+    account.health?.state === "invalid" ? account.health.last_failure : null;
+  const lastFailureTooltip = lastFailure
+    ? buildFailureTooltip(lastFailure)
+    : null;
   const testMut = useMutation({
     mutationFn: () => testAccount(account.id),
     onSuccess: (resp) => {
@@ -250,6 +297,21 @@ function AccountCard({
           <Badge color="grape" variant="light" size="sm">
             代理: {account.proxy_name}
           </Badge>
+        )}
+        {/*
+          Step 3.5 C5-2: structured failure chip. Reads
+          `last_failure.normalized_reason_type` (stable snake_case
+          string) for the visible label; the tooltip carries the
+          richer source / stage / upstream HTTP / raw_message context.
+          Hidden whenever the live health is not invalid, so a
+          stale row never leaks past the backend's gating.
+        */}
+        {lastFailure && lastFailureTooltip && (
+          <Tooltip label={lastFailureTooltip} multiline w={320} withArrow>
+            <Badge color={failureBadgeColor(lastFailure)} variant="filled" size="sm">
+              {lastFailure.normalized_reason_type}
+            </Badge>
+          </Tooltip>
         )}
       </Group>
 
