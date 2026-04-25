@@ -235,6 +235,26 @@ pub fn sanitize_account_error_message(raw: &str) -> String {
 
 impl IntoResponse for ClewdrError {
     fn into_response(self) -> axum::response::Response {
+        // Step 3.5 C3a: account-class errors no longer collapse to the
+        // snake_case enum name `invalid_cookie` on the API response.
+        // The classifier produces a stable `normalized_reason` that
+        // distinguishes oauth_refresh_invalid / organization_disabled /
+        // rate_limited / etc., and we expose it as the response
+        // `type` field. `source` / `stage` / `upstream_http_status`
+        // transparency is deferred to C3b (the IntoResponse trait
+        // does not see the calling entry point).
+        if matches!(&self, ClewdrError::InvalidCookie { .. }) {
+            use crate::services::account_error::{FailureSource, classify_account_failure};
+            let normalized =
+                classify_account_failure(&self, FailureSource::Messages, None).normalized_reason;
+            let inner = ClaudeErrorBody {
+                message: json!(self.to_string()),
+                r#type: normalized.as_type_str().to_string(),
+                code: Some(StatusCode::BAD_REQUEST.as_u16()),
+            };
+            return (StatusCode::BAD_REQUEST, Json(ClaudeError { error: inner })).into_response();
+        }
+
         let (status, msg) = match self {
             ClewdrError::UrlError {
                 loc,
@@ -272,7 +292,6 @@ impl IntoResponse for ClewdrError {
                 (source.status(), json!(source.body_text()))
             }
             ClewdrError::TooManyRetries => (StatusCode::GATEWAY_TIMEOUT, json!(self.to_string())),
-            ClewdrError::InvalidCookie { .. } => (StatusCode::BAD_REQUEST, json!(self.to_string())),
             ClewdrError::PathNotFound { .. } => (StatusCode::NOT_FOUND, json!(self.to_string())),
             ClewdrError::InvalidAuth => (StatusCode::UNAUTHORIZED, json!(self.to_string())),
             ClewdrError::UpstreamCoolingDown
@@ -504,7 +523,11 @@ impl CheckClaudeErr for Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_account_invalid_reason, sanitize_account_error_message};
+    use super::{
+        ClaudeError, ClewdrError, display_account_invalid_reason, sanitize_account_error_message,
+    };
+    use crate::config::Reason;
+    use axum::response::IntoResponse;
 
     #[test]
     fn sanitizes_legacy_invalid_cookie_messages() {
@@ -535,5 +558,51 @@ mod tests {
             display_account_invalid_reason("too_many_request:1735689600"),
             "Account cooling down until UTC 2025-01-01 00:00:00"
         );
+    }
+
+    /// Step 3.5 C3a: IntoResponse for `InvalidCookie` no longer emits the
+    /// snake_case enum name `invalid_cookie` as the response `type`.
+    /// Instead each Reason maps to a stable `AccountNormalizedReason`
+    /// snake_case name that distinguishes the failure cause.
+    async fn invalid_cookie_response_type(reason: Reason) -> String {
+        let err = ClewdrError::InvalidCookie { reason };
+        let response = err.into_response();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let parsed: ClaudeError = serde_json::from_slice(&body).unwrap();
+        parsed.error.r#type
+    }
+
+    #[tokio::test]
+    async fn into_response_invalid_cookie_emits_normalized_type() {
+        // Each Reason produces a distinct `type` string — none of them
+        // collapse to "invalid_cookie" any more.
+        assert_eq!(
+            invalid_cookie_response_type(Reason::Disabled).await,
+            "organization_disabled"
+        );
+        assert_eq!(
+            invalid_cookie_response_type(Reason::Banned).await,
+            "account_banned"
+        );
+        assert_eq!(
+            invalid_cookie_response_type(Reason::Free).await,
+            "free_tier"
+        );
+        assert_eq!(
+            invalid_cookie_response_type(Reason::TooManyRequest(123)).await,
+            "rate_limited"
+        );
+        assert_eq!(
+            invalid_cookie_response_type(Reason::Restricted(456)).await,
+            "restricted"
+        );
+        // Reason::Null with default source falls back to the
+        // catch-all oauth-org-not-allowed bucket; still NOT
+        // "invalid_cookie".
+        let null_type = invalid_cookie_response_type(Reason::Null).await;
+        assert_ne!(null_type, "invalid_cookie");
+        assert!(!null_type.is_empty());
     }
 }

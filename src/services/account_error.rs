@@ -108,6 +108,22 @@ pub struct AccountFailureContext {
     pub raw_message: String,
 }
 
+impl AccountFailureAction {
+    /// Map to the `request_logs.status` enum value used by
+    /// `persist_terminal_request_log` / `persist_probe_log`. C3a
+    /// adopters call this so every entry point (messages /
+    /// count_tokens / test / probe / refresh) produces the same
+    /// `status` for the same scheduling action.
+    pub fn to_log_status(self) -> &'static str {
+        match self {
+            Self::TerminalAuth | Self::TerminalDisabled => "auth_rejected",
+            Self::Cooldown { .. } => "no_account_available",
+            Self::TransientUpstream => "upstream_error",
+            Self::InternalError => "internal_error",
+        }
+    }
+}
+
 impl AccountNormalizedReason {
     /// Stable snake_case name used as the API response `type` field.
     pub fn as_type_str(&self) -> &'static str {
@@ -703,6 +719,30 @@ mod tests {
     }
 
     // ---- as_type_str round-trip + uniqueness ----
+
+    #[test]
+    fn action_to_log_status_covers_every_variant() {
+        assert_eq!(
+            AccountFailureAction::TerminalAuth.to_log_status(),
+            "auth_rejected"
+        );
+        assert_eq!(
+            AccountFailureAction::TerminalDisabled.to_log_status(),
+            "auth_rejected"
+        );
+        assert_eq!(
+            AccountFailureAction::Cooldown { reset_time: 0 }.to_log_status(),
+            "no_account_available"
+        );
+        assert_eq!(
+            AccountFailureAction::TransientUpstream.to_log_status(),
+            "upstream_error"
+        );
+        assert_eq!(
+            AccountFailureAction::InternalError.to_log_status(),
+            "internal_error"
+        );
+    }
 
     #[test]
     fn as_type_str_is_unique_across_variants() {

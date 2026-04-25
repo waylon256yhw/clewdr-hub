@@ -775,6 +775,21 @@ pub async fn test_account(
                         }
                         Err(e) => {
                             let error_msg = e.to_string();
+                            // Step 3.5 C3a: derive log status from the
+                            // classifier so an OAuth refresh that hits a
+                            // local error (e.g. transport / serde) is no
+                            // longer hardcoded to `auth_rejected` — it
+                            // surfaces as `internal_error` while real
+                            // refresh-token rejections (`invalid_grant`,
+                            // 401/403) keep the auth_rejected verdict.
+                            let log_status =
+                                crate::services::account_error::classify_account_failure(
+                                    &e,
+                                    crate::services::account_error::FailureSource::Test,
+                                    Some("refresh"),
+                                )
+                                .action
+                                .to_log_status();
                             let ctx = BillingContext {
                                 db: state.db.clone(),
                                 user_id: None,
@@ -788,7 +803,7 @@ pub async fn test_account(
                             persist_probe_log(
                                 &ctx,
                                 RequestType::Test,
-                                "auth_rejected",
+                                log_status,
                                 None,
                                 "",
                                 Some(&error_msg),
