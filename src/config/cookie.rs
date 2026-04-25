@@ -1,6 +1,5 @@
 use std::{
     fmt::{Debug, Display},
-    hash::Hash,
     ops::Deref,
     str::FromStr,
     sync::LazyLock,
@@ -99,7 +98,19 @@ impl<'de> Deserialize<'de> for ClewdrCookie {
 /// A struct representing a cookie with its information
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct AccountSlot {
-    pub cookie: ClewdrCookie,
+    /// The session cookie blob, present iff `auth_method == Cookie`.
+    /// Step 4 / C8 flipped this to `Option<ClewdrCookie>`: pre-C8 OAuth
+    /// rows were padded with a synthetic placeholder cookie
+    /// (`oauth_placeholder_cookie(id)`) just so this field could be
+    /// non-Option, which leaked the cookie shape into log lines, slot
+    /// identity, and serialization. The loader (`do_reload`) now
+    /// constructs OAuth slots with `cookie = None` directly.
+    ///
+    /// Hot-path access points (`exchange_token`, `probe_cookie`,
+    /// `from_credential` Cookie arm) gate on `auth_method == Cookie`
+    /// before reading this field, so the `expect("Cookie kind invariant")`
+    /// at those sites is sound.
+    pub cookie: Option<ClewdrCookie>,
     /// Authentication kind (Cookie or OAuth). Loader populates this from
     /// `accounts.auth_source`. `#[serde(default)]` keeps deserialization
     /// of pre-Step-4 snapshots compatible (defaults to Cookie).
@@ -173,31 +184,18 @@ pub struct AccountSlot {
     pub weekly_opus_utilization: Option<f64>,
 }
 
-impl PartialEq for AccountSlot {
-    fn eq(&self, other: &Self) -> bool {
-        self.cookie == other.cookie
-    }
-}
-
-impl Eq for AccountSlot {}
-
-impl Hash for AccountSlot {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.cookie.hash(state);
-    }
-}
-
-impl Ord for AccountSlot {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.cookie.cmp(&other.cookie)
-    }
-}
-
-impl PartialOrd for AccountSlot {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
+// `AccountSlot` deliberately does not implement `PartialEq` / `Eq` /
+// `Hash` / `Ord` / `PartialOrd`. Step 4 / C9 retired the cookie-keyed
+// impls — pre-Step-4 they hashed/sorted by `self.cookie`, which (a) was
+// the wrong identity once OAuth slots existed (C8 made cookie Optional;
+// two OAuth slots would compare equal under those impls), and (b) had
+// no remaining production caller after Step 2 keyed every pool bucket
+// by `account_id` (HashMap<i64, _> / VecDeque<_>).
+//
+// Code that needs an account identity must use `slot.account_id`
+// explicitly (`Option<i64>`). Code that needs to dedupe / sort must
+// build its own keying strategy. The compiler now enforces that no
+// caller silently leans on cookie-keyed identity.
 
 impl AccountSlot {
     /// Creates a new AccountSlot instance
@@ -211,7 +209,7 @@ impl AccountSlot {
     pub fn new(cookie: &str, reset_time: Option<i64>) -> Result<Self, ClewdrError> {
         let cookie = ClewdrCookie::from_str(cookie)?;
         Ok(Self {
-            cookie,
+            cookie: Some(cookie),
             auth_method: AuthMethod::Cookie,
             account_id: None,
             proxy_url: None,
@@ -266,8 +264,43 @@ impl AccountSlot {
         self
     }
 
+    /// Construct an OAuth slot directly from `(account_id, token)`. Used
+    /// by the loader (`do_reload`) for oauth-only DB rows and by tests
+    /// (post-C10) replacing the historical `AccountSlot::new(&oauth_placeholder_cookie(id), None)`
+    /// idiom. Step 4 / C8 onward — this is the canonical OAuth slot
+    /// constructor.
+    pub fn oauth(account_id: i64, token: TokenInfo) -> Self {
+        Self {
+            cookie: None,
+            auth_method: AuthMethod::OAuth,
+            account_id: Some(account_id),
+            token: Some(token),
+            ..Self::default()
+        }
+    }
+
     pub fn add_token(&mut self, token: TokenInfo) {
         self.token = Some(token);
+    }
+
+    /// Short, log-safe label identifying the credential. Pre-Step-4 / C7
+    /// every call site reached for `slot.cookie.ellipse()` directly,
+    /// which (a) leaks the cookie shape into log messages even for OAuth
+    /// accounts and (b) panics in C8 once `slot.cookie` flips to
+    /// `Option<ClewdrCookie>`. This helper centralizes the label so the
+    /// flip is a one-line change here.
+    pub fn credential_label(&self) -> String {
+        match self.auth_method {
+            AuthMethod::Cookie => self
+                .cookie
+                .as_ref()
+                .map(|c| c.ellipse())
+                .unwrap_or_else(|| "cookie#?".to_string()),
+            AuthMethod::OAuth => match self.account_id {
+                Some(id) => format!("oauth#{id}"),
+                None => "oauth#?".to_string(),
+            },
+        }
     }
 
     pub fn set_count_tokens_allowed(&mut self, value: Option<bool>) {
@@ -660,5 +693,44 @@ mod tests {
         let full = format!("sk-ant-sid01-{base}");
         let slot = AccountSlot::new(&full, None).unwrap();
         assert_eq!(slot.auth_method, AuthMethod::Cookie);
+    }
+
+    /// Step 4 / C7 introduces `credential_label()` as the log/tracing
+    /// substitute for `slot.cookie.ellipse()`. Cookie accounts get the
+    /// same ellipsed cookie blob as before (call sites are wire-compat).
+    /// OAuth accounts get an `oauth#{account_id}` tag instead of the
+    /// placeholder cookie blob, so logs no longer pretend they have a
+    /// session cookie. Slots without an account_id (test fixtures, edge
+    /// case) fall back to `oauth#?`.
+    #[test]
+    fn credential_label_dispatches_by_auth_method() {
+        let base = make_base_cookie_with_len(86);
+        let cookie_blob = format!("sk-ant-sid01-{base}");
+
+        // Cookie account: label is the ellipsed cookie blob.
+        let cookie_slot = AccountSlot::new(&cookie_blob, None).unwrap();
+        let cookie_label = cookie_slot.credential_label();
+        assert!(
+            cookie_label.starts_with("sk-ant-sid01-"),
+            "cookie label should preserve the ellipsed cookie shape, got: {cookie_label}"
+        );
+
+        // OAuth account with id: label is the per-account tag.
+        let oauth_slot = AccountSlot {
+            auth_method: AuthMethod::OAuth,
+            account_id: Some(42),
+            ..AccountSlot::default()
+        };
+        assert_eq!(oauth_slot.credential_label(), "oauth#42");
+
+        // OAuth account without id (test fixture / loader race): falls
+        // back to a clear sentinel rather than panicking on the unwrap
+        // future C8 callers might be tempted to do.
+        let oauth_no_id = AccountSlot {
+            auth_method: AuthMethod::OAuth,
+            account_id: None,
+            ..AccountSlot::default()
+        };
+        assert_eq!(oauth_no_id.credential_label(), "oauth#?");
     }
 }

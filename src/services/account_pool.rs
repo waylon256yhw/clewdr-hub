@@ -33,28 +33,6 @@ const FLUSH_INTERVAL: u64 = 15;
 const SESSION_WINDOW_SECS: i64 = 5 * 60 * 60; // 5h
 const WEEKLY_WINDOW_SECS: i64 = 7 * 24 * 60 * 60; // 7d
 
-/// Build a placeholder cookie string for an oauth-only account so the loader
-/// can construct an `AccountSlot` from a DB row that has no real `cookie_blob`.
-/// The format satisfies `ClewdrCookie`'s regex (`sk-ant-sid\d{2}-[A-Za-z0-9_-]{86,120}-[A-Za-z0-9_-]{6}AA`).
-fn oauth_placeholder_cookie(account_id: i64) -> String {
-    format!("sk-ant-sid99-o{:0>85}-pool00AA", account_id)
-}
-
-/// Returns true if `cookie` was minted by `oauth_placeholder_cookie`.
-///
-/// Pre-Step-4 / C4 this guarded the pool's cookie-style probe paths
-/// (`spawn_probes_for_unprobed`, `spawn_probe_all`, `spawn_probe_accounts`)
-/// from running `probe_cookie` against an oauth-only slot. Post-C4 those
-/// paths dispatch by `auth_source` instead, so the only remaining caller
-/// is the test module — kept compiled until C10 retires the placeholder
-/// helpers entirely (along with `oauth_placeholder_cookie`).
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn is_oauth_placeholder_slot(cookie: &AccountSlot) -> bool {
-    let raw = cookie.cookie.to_string();
-    // `ClewdrCookie::Display` produces `sessionKey=<inner>`; match the inner pattern.
-    raw.contains("sk-ant-sid99-o") && raw.ends_with("-pool00AA")
-}
-
 /// Length of the credential prefix used for fingerprinting in C5's
 /// release_runtime guard. 20 bytes is enough to distinguish admin
 /// replacements (cookie blobs and refresh tokens are both 80+ chars with
@@ -101,8 +79,13 @@ impl CredentialFingerprint {
             // Use the inner cookie blob (`Deref<Target = str>`), not
             // `to_string()` — the latter prepends `sessionKey=` which is
             // identical across every cookie account and would collapse
-            // every fingerprint into the same 20-byte prefix.
-            AuthMethod::Cookie => Some(Self::cookie_prefix(slot.cookie.as_ref())),
+            // every fingerprint into the same 20-byte prefix. Cookie kind
+            // invariant: post-C8 a Cookie slot has `cookie = Some(_)`;
+            // None here is a corrupted slot, treat as "no fingerprint".
+            AuthMethod::Cookie => slot
+                .cookie
+                .as_ref()
+                .map(|c| Self::cookie_prefix(c.as_ref())),
             AuthMethod::OAuth => slot
                 .token
                 .as_ref()
@@ -155,7 +138,6 @@ enum AccountPoolMessage {
     ),
     GetStatus(RpcReplyPort<AccountPoolStatus>),
     ReloadFromDb,
-    ProbeAll(RpcReplyPort<Vec<i64>>),
     ProbeAccounts(
         Vec<i64>,
         broadcast::Sender<AdminEvent>,
@@ -959,23 +941,6 @@ impl AccountPoolActor {
             .collect()
     }
 
-    /// Probe every account currently held in the pool. Currently dead code
-    /// (no business caller); the `ProbeAll` actor message + `pool.probe_all()`
-    /// handle method are scheduled for deletion in Step 4 / C10. Kept here
-    /// only so the `AccountPoolMessage::ProbeAll` arm still compiles.
-    fn spawn_probe_all(state: &mut AccountPoolState) {
-        let ids: Vec<i64> = state
-            .valid
-            .iter()
-            .filter_map(|c| c.account_id)
-            .chain(state.exhausted.keys().copied())
-            .chain(state.invalid.keys().copied())
-            .collect();
-        for account_id in ids {
-            Self::spawn_probe_guarded(state, account_id, None);
-        }
-    }
-
     /// Probe a caller-specified subset of accounts. Used by admin
     /// `POST /accounts/probe` (which now delegates the cookie/oauth split
     /// to `spawn_probe_guarded` instead of pre-routing OAuth itself) and
@@ -1171,22 +1136,22 @@ impl AccountPoolActor {
                 continue;
             }
 
-            let cs_result = match row.cookie_blob.as_deref() {
-                Some(cookie_str) => AccountSlot::new(cookie_str, None),
-                None if row.oauth_token.is_some() => {
-                    // OAuth-only account: synthesize a placeholder cookie so the loader can
-                    // construct an AccountSlot from a DB row without a real cookie_blob.
-                    // The real credential is in `row.oauth_token` and is attached below.
-                    AccountSlot::new(&oauth_placeholder_cookie(row.id), None)
-                }
-                None => continue,
-            };
-            let mut cs = match cs_result {
-                Ok(cs) => cs,
-                Err(e) => {
-                    warn!("Invalid cookie for account '{}': {e}", row.name);
-                    continue;
-                }
+            // Build the slot from whichever credential the row carries.
+            // Step 4 / C8 onward: OAuth-only rows go through
+            // `AccountSlot::oauth(...)` directly (no placeholder-cookie
+            // synthesis); cookie rows continue through `AccountSlot::new`
+            // which parses the blob. The common tail below stamps the
+            // remaining row metadata onto either kind.
+            let mut cs = match (row.cookie_blob.as_deref(), row.oauth_token.as_ref()) {
+                (Some(cookie_str), _) => match AccountSlot::new(cookie_str, None) {
+                    Ok(cs) => cs,
+                    Err(e) => {
+                        warn!("Invalid cookie for account '{}': {e}", row.name);
+                        continue;
+                    }
+                },
+                (None, Some(token)) => AccountSlot::oauth(row.id, token.clone()),
+                (None, None) => continue,
             };
             cs.account_id = Some(row.id);
             cs.auth_method = AuthMethod::from_auth_source(&row.auth_source);
@@ -1360,10 +1325,6 @@ impl Actor for AccountPoolActor {
 
             AccountPoolMessage::ReloadFromDb => {
                 Self::do_reload(state).await;
-            }
-            AccountPoolMessage::ProbeAll(reply_port) => {
-                Self::spawn_probe_all(state);
-                reply_port.send(state.probing.iter().copied().collect())?;
             }
             AccountPoolMessage::ProbeAccounts(account_ids, event_tx, reply_port) => {
                 Self::spawn_probe_accounts(state, &account_ids, Some(event_tx));
@@ -1606,17 +1567,6 @@ impl AccountPoolHandle {
         })
     }
 
-    pub async fn probe_all(&self) -> Result<Vec<i64>, ClewdrError> {
-        ractor::call!(self.actor_ref, AccountPoolMessage::ProbeAll).map_err(|e| {
-            ClewdrError::RactorError {
-                loc: Location::generate(),
-                msg: format!(
-                    "Failed to communicate with AccountPoolActor for probe operation: {e}"
-                ),
-            }
-        })
-    }
-
     pub async fn probe_accounts(
         &self,
         account_ids: Vec<i64>,
@@ -1745,12 +1695,8 @@ impl AccountPoolHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AccountPoolActor, AccountPoolState, CredentialFingerprint, is_oauth_placeholder_slot,
-        oauth_placeholder_cookie,
-    };
+    use super::{AccountPoolActor, AccountPoolState, CredentialFingerprint};
     use std::collections::{HashMap, HashSet, VecDeque};
-    use std::str::FromStr;
     use std::time::Duration;
 
     use moka::sync::Cache;
@@ -1759,59 +1705,30 @@ mod tests {
     use crate::db::accounts::load_all_accounts;
     use crate::services::account_health::compose_health_snapshot;
 
-    use crate::config::{AccountSlot, AuthMethod, ClewdrCookie, Reason, TokenInfo};
+    use crate::config::{AccountSlot, AuthMethod, Reason, TokenInfo};
     use crate::db::init_pool;
 
     #[test]
-    fn oauth_placeholder_cookie_is_unique_per_account_and_accepted_by_parser() {
-        // The synthesized placeholder must (a) satisfy `ClewdrCookie::from_str`'s
-        // regex so the loader can construct an `AccountSlot`, and (b) be distinct
-        // per account_id so debug logs and AccountSlot's cookie-keyed PartialEq
-        // (still in place until Step 3 retires AccountSlot) stay unambiguous.
-        let c1 = oauth_placeholder_cookie(1);
-        let c2 = oauth_placeholder_cookie(2);
-        let c_big = oauth_placeholder_cookie(i64::MAX);
-
-        assert_ne!(c1, c2);
-        assert_ne!(c1, c_big);
-        for raw in [&c1, &c2, &c_big] {
-            ClewdrCookie::from_str(raw)
-                .unwrap_or_else(|e| panic!("placeholder {raw:?} failed regex: {e}"));
-        }
-    }
-
-    #[test]
-    fn oauth_placeholder_detection_distinguishes_synthetic_from_real_cookies() {
-        // The detector is what keeps cookie-style probes (`probe_cookie`) from
-        // running against oauth-only slots. If a real cookie accidentally matches
-        // the placeholder pattern, probes would be skipped for a real account,
-        // so the detector must stay tight.
-        let synthetic = AccountSlot::new(&oauth_placeholder_cookie(42), None).unwrap();
-        assert!(is_oauth_placeholder_slot(&synthetic));
-
-        // Shape of a real-looking Claude session cookie — uses sid01, not sid99.
-        let real_raw = format!("sk-ant-sid01-{}-abcdefAA", "a".repeat(86));
-        let real = AccountSlot::new(&real_raw, None).unwrap();
-        assert!(!is_oauth_placeholder_slot(&real));
-    }
-
-    #[test]
     fn in_memory_runtime_merge_keeps_db_oauth_token_when_present() {
-        let mut reloaded = AccountSlot::new(&oauth_placeholder_cookie(7), None).unwrap();
-        reloaded.token = Some(TokenInfo::from_parts(
-            "db-access".to_string(),
-            "db-refresh".to_string(),
-            Duration::from_secs(3600),
-            "org-db".to_string(),
-        ));
+        let mut reloaded = AccountSlot::oauth(
+            7,
+            TokenInfo::from_parts(
+                "db-access".to_string(),
+                "db-refresh".to_string(),
+                Duration::from_secs(3600),
+                "org-db".to_string(),
+            ),
+        );
 
-        let mut mem = AccountSlot::new(&oauth_placeholder_cookie(7), None).unwrap();
-        mem.token = Some(TokenInfo::from_parts(
-            "mem-access".to_string(),
-            "mem-refresh".to_string(),
-            Duration::from_secs(3600),
-            "org-mem".to_string(),
-        ));
+        let mut mem = AccountSlot::oauth(
+            7,
+            TokenInfo::from_parts(
+                "mem-access".to_string(),
+                "mem-refresh".to_string(),
+                Duration::from_secs(3600),
+                "org-mem".to_string(),
+            ),
+        );
         mem.email = Some("mem@example.com".to_string());
 
         AccountPoolActor::apply_in_memory_runtime(&mut reloaded, mem, false);
@@ -1896,9 +1813,7 @@ mod tests {
         insert_oauth_row(&pool, 1, "at0", "rt0").await;
 
         let mut state = empty_state(pool.clone());
-        let mut slot = AccountSlot::new(&oauth_placeholder_cookie(1), None).unwrap();
-        slot.account_id = Some(1);
-        slot.token = Some(token_with_refresh("rt0"));
+        let slot = oauth_slot_with_refresh(1, "rt0");
         state.valid.push_back(slot);
 
         // A concurrent refresh (probe or chat) rotated the token in DB to rt1
@@ -1932,9 +1847,7 @@ mod tests {
         insert_oauth_row(&pool, 1, "at0", "rt0").await;
 
         let mut state = empty_state(pool);
-        let mut slot = AccountSlot::new(&oauth_placeholder_cookie(1), None).unwrap();
-        slot.account_id = Some(1);
-        slot.token = Some(token_with_refresh("rt0"));
+        let slot = oauth_slot_with_refresh(1, "rt0");
         state.valid.push_back(slot);
 
         AccountPoolActor::update_slot_credential(&mut state, 1, Some(token_with_refresh("rt1")));
@@ -1958,9 +1871,7 @@ mod tests {
     }
 
     fn push_slot(state: &mut AccountPoolState, id: i64, max_slots: u32) {
-        let mut slot = AccountSlot::new(&oauth_placeholder_cookie(id), None).unwrap();
-        slot.account_id = Some(id);
-        slot.token = Some(token_with_refresh(&format!("rt-{id}")));
+        let slot = oauth_slot_with_refresh(id, &format!("rt-{id}"));
         state.inflight.insert(id, (0, max_slots));
         state.valid.push_back(slot);
     }
@@ -2053,8 +1964,7 @@ mod tests {
         let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
         let mut state = empty_state(pool);
 
-        let mut slot = AccountSlot::new(&oauth_placeholder_cookie(1), None).unwrap();
-        slot.account_id = Some(1);
+        let slot = oauth_slot_with_refresh(1, "rt-1");
         // Account is sitting in `invalid` with a sticky reason (auth_error
         // reloaded → Reason::Null).
         state.invalid.insert(
@@ -2190,9 +2100,7 @@ mod tests {
         // `converge_invalidate`'s ability to drop *whatever* pending
         // flush side-effects are queued for an account it just decided
         // to invalidate.
-        let mut slot = AccountSlot::new(&oauth_placeholder_cookie(1), None).unwrap();
-        slot.account_id = Some(1);
-        slot.auth_method = AuthMethod::OAuth;
+        let slot = oauth_slot_with_refresh(1, "rt-1");
         state.valid.push_back(slot);
         state.reactivated.insert(1);
         state.dirty.insert(1);
@@ -2236,9 +2144,7 @@ mod tests {
         let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
         insert_oauth_row(&pool, 1, "at0", "rt0").await;
         let mut state = empty_state(pool);
-        let mut slot = AccountSlot::new(&oauth_placeholder_cookie(1), None).unwrap();
-        slot.account_id = Some(1);
-        slot.token = Some(token_with_refresh("rt0"));
+        let slot = oauth_slot_with_refresh(1, "rt0");
         state.valid.push_back(slot);
 
         // Seed sentinel: get_token sees the slot while it's in `valid`.
@@ -2346,19 +2252,16 @@ mod tests {
         let mut state = empty_state(pool);
 
         // Valid slots for 1 and 2.
-        let mut slot1 = AccountSlot::new(&oauth_placeholder_cookie(1), None).unwrap();
-        slot1.account_id = Some(1);
+        let slot1 = oauth_slot_with_refresh(1, "rt-1");
         state.valid.push_back(slot1);
         state.inflight.insert(1, (0, 5));
 
-        let mut slot2 = AccountSlot::new(&oauth_placeholder_cookie(2), None).unwrap();
-        slot2.account_id = Some(2);
+        let slot2 = oauth_slot_with_refresh(2, "rt-2");
         state.valid.push_back(slot2);
         state.inflight.insert(2, (5, 5));
 
         // Cooling slot in exhausted carries the future reset_time in memory.
-        let mut slot3 = AccountSlot::new(&oauth_placeholder_cookie(3), None).unwrap();
-        slot3.account_id = Some(3);
+        let mut slot3 = oauth_slot_with_refresh(3, "rt-3");
         slot3.reset_time = Some(future);
         state.exhausted.insert(3, slot3);
 
@@ -2469,8 +2372,7 @@ mod tests {
 
         let mut state = empty_state(pool);
 
-        let mut slot5 = AccountSlot::new(&oauth_placeholder_cookie(5), None).unwrap();
-        slot5.account_id = Some(5);
+        let slot5 = oauth_slot_with_refresh(5, "rt-5");
         // Pool slot has no reset_time — the account just got reset()-ed.
         state.valid.push_back(slot5);
         state.inflight.insert(5, (0, 5));
@@ -2518,9 +2420,7 @@ mod tests {
         let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
         let mut state = empty_state(pool);
 
-        let mut slot = AccountSlot::new(&oauth_placeholder_cookie(77), None).unwrap();
-        slot.account_id = Some(77);
-        slot.token = Some(token_with_refresh("rt_authoritative"));
+        let slot = oauth_slot_with_refresh(77, "rt_authoritative");
         state.valid.push_back(slot.clone());
         state.inflight.insert(77, (0, 5));
 
@@ -2657,10 +2557,7 @@ mod tests {
         .await;
 
         let mut state = empty_state(pool);
-        let mut mem_slot = AccountSlot::new(&oauth_placeholder_cookie(42), None).unwrap();
-        mem_slot.account_id = Some(42);
-        mem_slot.auth_method = AuthMethod::OAuth;
-        mem_slot.token = Some(token_with_refresh("rt_stale"));
+        let mut mem_slot = oauth_slot_with_refresh(42, "rt_stale");
         mem_slot.count_tokens_allowed = Some(true);
         mem_slot.supports_claude_1m_sonnet = Some(true);
         state.valid.push_back(mem_slot);
@@ -2705,10 +2602,7 @@ mod tests {
         insert_cookie_account_row(&pool, 43, &cookie_blob).await;
 
         let mut state = empty_state(pool);
-        let mut mem_slot = AccountSlot::new(&oauth_placeholder_cookie(43), None).unwrap();
-        mem_slot.account_id = Some(43);
-        mem_slot.auth_method = AuthMethod::OAuth;
-        mem_slot.token = Some(token_with_refresh("rt_old"));
+        let mut mem_slot = oauth_slot_with_refresh(43, "rt_old");
         mem_slot.count_tokens_allowed = Some(true);
         state.valid.push_back(mem_slot);
         state.probing.insert(43);
@@ -2854,9 +2748,7 @@ mod tests {
         state.valid.push_back(cookie_complete);
 
         // OAuth account 3: missing email → STILL skipped (auth_method gate)
-        let mut oauth_slot = AccountSlot::new(&oauth_placeholder_cookie(3), None).unwrap();
-        oauth_slot.account_id = Some(3);
-        oauth_slot.auth_method = AuthMethod::OAuth;
+        let oauth_slot = oauth_slot_with_refresh(3, "rt-3");
         state.valid.push_back(oauth_slot);
 
         let ids = AccountPoolActor::bootstrap_probe_account_ids(&state);
@@ -3169,11 +3061,7 @@ mod tests {
     }
 
     fn oauth_slot_with_refresh(account_id: i64, refresh: &str) -> AccountSlot {
-        let mut slot = AccountSlot::new(&oauth_placeholder_cookie(account_id), None).unwrap();
-        slot.account_id = Some(account_id);
-        slot.auth_method = AuthMethod::OAuth;
-        slot.token = Some(token_with_refresh(refresh));
-        slot
+        AccountSlot::oauth(account_id, token_with_refresh(refresh))
     }
 
     /// C5 race scenario 1: a chat request acquired a cookie account, then
@@ -3216,7 +3104,7 @@ mod tests {
             .valid
             .iter()
             .find(|c| c.account_id == Some(1))
-            .map(|c| c.cookie.to_string())
+            .and_then(|c| c.cookie.as_ref().map(|cookie| cookie.to_string()))
             .unwrap();
         assert!(
             surviving_blob.contains(&new_blob[..20]),
@@ -3437,5 +3325,72 @@ mod tests {
         );
         let fp_oauth = AccountPoolActor::pool_credential_fingerprint(&state, 100);
         assert!(fp_oauth.is_none());
+    }
+
+    /// Step 4 / C8: loader no longer mints `oauth_placeholder_cookie(...)`
+    /// for OAuth-only DB rows. The reloaded slot must have `cookie = None`
+    /// and `auth_method = OAuth`, with the credential bytes living in
+    /// `slot.token` (set by the loader from `row.oauth_token`).
+    #[tokio::test]
+    async fn reload_builds_oauth_slot_without_placeholder_cookie() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        insert_account_row(
+            &pool,
+            80,
+            "active",
+            "oauth",
+            Some("at_real"),
+            Some("rt_real"),
+            None,
+        )
+        .await;
+
+        let mut state = empty_state(pool);
+        AccountPoolActor::do_reload(&mut state).await;
+
+        let slot = state
+            .valid
+            .iter()
+            .find(|c| c.account_id == Some(80))
+            .expect("oauth account 80 must load");
+        assert_eq!(slot.auth_method, AuthMethod::OAuth);
+        assert!(
+            slot.cookie.is_none(),
+            "post-C8: OAuth slots have no placeholder cookie blob, got: {:?}",
+            slot.cookie
+        );
+        assert_eq!(
+            slot.token.as_ref().map(|t| t.access_token.as_str()),
+            Some("at_real"),
+            "OAuth credential bytes must live in slot.token"
+        );
+        assert_eq!(
+            slot.token.as_ref().map(|t| t.refresh_token.as_str()),
+            Some("rt_real"),
+        );
+    }
+
+    /// `AccountSlot::oauth(id, token)` is the post-C8 canonical OAuth
+    /// constructor. Pin its shape so future call sites don't drift back
+    /// to placeholder-cookie idioms.
+    #[test]
+    fn account_slot_oauth_constructor_shape() {
+        let token = TokenInfo::from_parts(
+            "at_x".to_string(),
+            "rt_x".to_string(),
+            Duration::from_secs(3600),
+            "org-x".to_string(),
+        );
+        let slot = AccountSlot::oauth(123, token);
+        assert_eq!(slot.auth_method, AuthMethod::OAuth);
+        assert!(slot.cookie.is_none());
+        assert_eq!(slot.account_id, Some(123));
+        assert_eq!(
+            slot.token.as_ref().map(|t| t.access_token.as_str()),
+            Some("at_x")
+        );
+        // credential_label uses the post-C7 OAuth tag, never reaches into
+        // the (now-None) cookie field.
+        assert_eq!(slot.credential_label(), "oauth#123");
     }
 }

@@ -374,12 +374,30 @@ async fn run_cookie_probe(
     bundle: &mut Map<String, Value>,
     mut debug_raw_bundle: Option<&mut Map<String, Value>>,
 ) -> Result<(), ProbeFailure> {
-    let cookie_ellipse = cookie.cookie.ellipse();
-    let cookie_prefix = &cookie.cookie[..20.min(cookie.cookie.len())];
+    // probe_cookie is reachable only from `spawn_probe_guarded`'s Cookie
+    // arm (Step 4 / C4) — the slot's `auth_method` is invariantly Cookie
+    // here, and `slot.cookie` carries a real session cookie blob (not a
+    // placeholder). C8 flipped `slot.cookie` to `Option<ClewdrCookie>`;
+    // if the invariant breaks we surface a probe-init failure rather
+    // than panicking.
+    let Some(cookie_blob) = cookie.cookie.as_ref() else {
+        let msg = "Cookie kind invariant: probe slot missing cookie blob".to_string();
+        warn!("[probe] account {account_id}: {msg}");
+        handle.set_probe_error(account_id, msg.clone()).await;
+        let _ = handle.clear_probing(account_id).await;
+        return Err(ProbeFailure {
+            stage: "init",
+            message: msg,
+            http_status: None,
+            is_auth: false,
+        });
+    };
+    let cookie_ellipse = cookie_blob.ellipse();
+    let cookie_prefix = &cookie_blob[..20.min(cookie_blob.len())];
     let cookie_prefix = cookie_prefix.to_string();
     info!("[probe] starting for account {account_id} ({cookie_ellipse})");
 
-    let mut state = match ClaudeCodeState::from_cookie(handle.clone(), cookie, profile) {
+    let mut state = match ClaudeCodeState::from_credential(handle.clone(), cookie, profile) {
         Ok(s) => s,
         Err(e) => {
             let msg = format!("init failed: {e}");

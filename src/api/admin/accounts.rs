@@ -563,7 +563,9 @@ pub async fn update(
                  oauth_expires_at = NULL,
                  last_refresh_at = NULL,
                  auth_source = 'cookie',
+                 status = 'active',
                  invalid_reason = NULL,
+                 last_error = NULL,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = ?2",
         )
@@ -584,6 +586,7 @@ pub async fn update(
                  last_refresh_at = ?4,
                  organization_uuid = ?5,
                  auth_source = 'oauth',
+                 status = 'active',
                  last_error = NULL,
                  invalid_reason = NULL,
                  updated_at = CURRENT_TIMESTAMP
@@ -814,8 +817,11 @@ pub async fn test_account(
             let mut slot = AccountSlot::new(cookie_blob, None)?;
             slot.account_id = Some(id);
             slot.proxy_url = account.proxy_url.clone();
-            let mut cc_state =
-                ClaudeCodeState::from_cookie(state.account_pool.clone(), slot, profile.clone())?;
+            let mut cc_state = ClaudeCodeState::from_credential(
+                state.account_pool.clone(),
+                slot,
+                profile.clone(),
+            )?;
             match cc_state.check_token() {
                 crate::claude_code_state::TokenStatus::None => {
                     let org = cc_state.get_organization().await?;

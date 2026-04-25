@@ -284,7 +284,7 @@ impl ClaudeCodeState {
             }
             .instrument(tracing::info_span!(
                 "claude_code",
-                "cookie" = cookie.cookie.ellipse()
+                "cookie" = cookie.credential_label()
             ));
             match retry.await {
                 Ok(res) => {
@@ -320,7 +320,7 @@ impl ClaudeCodeState {
                     state.release_selected_slot(account_id).await;
                     error!(
                         "[{}] {}",
-                        state.cookie.as_ref().unwrap().cookie.ellipse().green(),
+                        state.cookie.as_ref().unwrap().credential_label().green(),
                         e
                     );
                     // 429 error
@@ -519,7 +519,7 @@ impl ClaudeCodeState {
             }
             .instrument(tracing::info_span!(
                 "claude_code_tokens",
-                "cookie" = cookie.cookie.ellipse()
+                "cookie" = cookie.credential_label()
             ));
             match retry.await {
                 Ok((res, _)) => {
@@ -552,7 +552,7 @@ impl ClaudeCodeState {
                     state.release_selected_slot(account_id).await;
                     error!(
                         "[{}][TOKENS] {}",
-                        state.cookie.as_ref().unwrap().cookie.ellipse().green(),
+                        state.cookie.as_ref().unwrap().credential_label().green(),
                         e
                     );
                     if let ClewdrError::InvalidCookie { reason } = e {
@@ -1278,7 +1278,7 @@ impl ClaudeCodeState {
     ) -> Option<(Option<i64>, Option<i64>, Option<i64>, Option<i64>)> {
         let profile = crate::stealth::global_profile().clone();
         let mut state =
-            ClaudeCodeState::from_cookie(handle.clone(), cookie.clone(), profile).ok()?;
+            ClaudeCodeState::from_credential(handle.clone(), cookie.clone(), profile).ok()?;
         let usage = state.fetch_usage_metrics().await.ok()?;
         state.release_account(None).await;
         if let Some(updated) = state.cookie.clone() {

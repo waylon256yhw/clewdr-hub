@@ -97,6 +97,14 @@ fn test_message_body() -> Value {
     })
 }
 
+fn test_cookie(prefix: char, suffix: char) -> String {
+    format!(
+        "sk-ant-sid01-{}-{}AA",
+        prefix.to_string().repeat(86),
+        suffix.to_string().repeat(6)
+    )
+}
+
 fn real_message_body() -> Value {
     json!({
         "model": "claude-sonnet-4-6",
@@ -163,6 +171,29 @@ async fn setup_app(policy: PolicyConfig) -> TestApp {
         user_id,
         account_pool,
     }
+}
+
+async fn admin_session_cookie(app: &TestApp) -> String {
+    let response = app
+        .request(
+            Method::POST,
+            "/auth/login",
+            Some(json!({ "username": "admin", "password": "password" })),
+            None,
+            &[],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
 }
 
 async fn wait_for_key_touch(pool: &SqlitePool, api_key_id: i64, user_id: i64) -> (String, String) {
@@ -254,6 +285,81 @@ async fn latest_request_log(pool: &SqlitePool) -> (String, Option<i64>, Option<S
     .fetch_one(pool)
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn admin_replacing_disabled_cookie_account_reactivates_slot() {
+    let app = setup_app(PolicyConfig::default()).await;
+    let old_cookie = test_cookie('a', 'b');
+    let new_cookie = test_cookie('c', 'd');
+
+    let result = sqlx::query(
+        "INSERT INTO accounts (
+            name, rr_order, max_slots, status, auth_source, cookie_blob, invalid_reason, last_error
+        ) VALUES (
+            ?1, (SELECT COALESCE(MAX(rr_order), 0) + 1 FROM accounts), 1, 'disabled', 'cookie', ?2, 'disabled', 'old credential failed'
+        )",
+    )
+    .bind(format!("disabled-cookie-{}", uuid::Uuid::new_v4().simple()))
+    .bind(&old_cookie)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    let account_id = result.last_insert_rowid();
+
+    app.account_pool.reload_from_db().await.unwrap();
+    let initial_status = app.account_pool.get_status().await.unwrap();
+    assert!(
+        initial_status
+            .invalid
+            .iter()
+            .any(|slot| slot.account_id == account_id),
+        "disabled account should start in the invalid bucket"
+    );
+
+    let session = admin_session_cookie(&app).await;
+    let response = app
+        .request(
+            Method::PUT,
+            &format!("/api/admin/accounts/{account_id}"),
+            Some(json!({ "cookie_blob": new_cookie })),
+            Some((header::COOKIE.as_str(), session.as_str())),
+            &[],
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["ok"], true);
+
+    let pool_status = app.account_pool.get_status().await.unwrap();
+    assert!(
+        pool_status
+            .valid
+            .iter()
+            .any(|slot| slot.account_id == Some(account_id)),
+        "credential replacement should reload the account into valid"
+    );
+    assert!(
+        !pool_status
+            .invalid
+            .iter()
+            .any(|slot| slot.account_id == account_id),
+        "credential replacement should remove the stale invalid entry"
+    );
+
+    let row = sqlx::query_as::<_, (String, String, Option<String>, Option<String>, Option<String>)>(
+        "SELECT status, auth_source, cookie_blob, invalid_reason, last_error FROM accounts WHERE id = ?1",
+    )
+    .bind(account_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "active");
+    assert_eq!(row.1, "cookie");
+    assert_eq!(row.2.as_deref(), Some(new_cookie.as_str()));
+    assert_eq!(row.3, None);
+    assert_eq!(row.4, None);
 }
 
 #[tokio::test]

@@ -238,7 +238,6 @@ struct AccountPoolState {
 | `CheckReset` | 定时器 (5min) | 检查 exhausted 账号是否可以恢复 |
 | `FlushDirty` | 定时器 (15s) | 批量写脏数据到 DB |
 | `ReloadFromDb` | admin API | 重新加载（保留 inflight 计数） |
-| `ProbeAll` | admin API | 重激活所有 disabled 账号并探测 |
 | `ProbeAccounts` | admin API | 探测指定账号列表 |
 | `BeginProbe` | 探测流程 | 标记账号进入探测状态 |
 | `ClearProbing` | 探测完成 | 清除探测状态标记 |

@@ -15,7 +15,7 @@ use wreq_util::Emulation;
 
 use crate::{
     billing::BillingContext,
-    config::{AccountSlot, CLAUDE_ENDPOINT, Reason, TokenInfo},
+    config::{AccountSlot, AuthMethod, CLAUDE_ENDPOINT, Reason, TokenInfo},
     error::{ClewdrError, WreqSnafu},
     services::account_pool::{AccountPoolHandle, CredentialFingerprint},
     stealth::SharedStealthProfile,
@@ -96,28 +96,51 @@ impl ClaudeCodeState {
         }
     }
 
-    /// Build a ClaudeCodeState initialized with an existing cookie snapshot
-    pub fn from_cookie(
+    /// Build a `ClaudeCodeState` initialized with an existing account
+    /// snapshot, dispatching by `slot.auth_method`:
+    ///
+    /// - `Cookie`: assemble the `Cookie` HTTP header from `slot.cookie`
+    ///   so the wreq client sends it on every request.
+    /// - `OAuth`: leave `cookie_header_value` empty. OAuth requests carry
+    ///   their token via `Authorization: Bearer …` (see `send_chat`),
+    ///   not via Cookie. `build_request` (mod.rs:166) already filters
+    ///   empty cookie headers, so the empty sentinel is a clean no-op.
+    ///
+    /// Step 4 / C7 renamed `from_cookie` → `from_credential` to match
+    /// the post-Step-4 reality that an `AccountSlot` is a credential
+    /// container, not a cookie wrapper. C8 will flip `slot.cookie` to
+    /// `Option<ClewdrCookie>`; the Cookie branch already routes through
+    /// `slot.cookie` (currently `ClewdrCookie`) so that flip becomes a
+    /// local edit instead of a constructor rewrite.
+    pub fn from_credential(
         account_pool_handle: AccountPoolHandle,
-        cookie: AccountSlot,
+        slot: AccountSlot,
         stealth_profile: SharedStealthProfile,
     ) -> Result<Self, ClewdrError> {
         let mut state = Self::new(account_pool_handle, stealth_profile);
-        state.cookie = Some(cookie);
-        let cookie_value = state
-            .cookie
-            .as_ref()
-            .ok_or(ClewdrError::UnexpectedNone {
-                msg: "Cookie missing while initializing state",
-            })?
-            .cookie
-            .to_string();
-        let header_value = HeaderValue::from_str(cookie_value.as_str())?;
-        state.cookie_header_value = header_value.clone();
-        state.proxy_url = state
-            .cookie
-            .as_ref()
-            .and_then(|slot| slot.proxy_url.clone());
+        let auth_method = slot.auth_method;
+        state.proxy_url = slot.proxy_url.clone();
+        state.cookie = Some(slot);
+
+        state.cookie_header_value = match auth_method {
+            AuthMethod::Cookie => {
+                // Slot is invariantly Cookie-kind here (just dispatched
+                // on auth_method), so `slot.cookie` must be Some — it
+                // was populated by `AccountSlot::new()` when the loader
+                // built it. Surface the inconsistency as an error rather
+                // than panicking if invariant breaks.
+                let cookie_value = state
+                    .cookie
+                    .as_ref()
+                    .and_then(|slot| slot.cookie.as_ref())
+                    .ok_or(ClewdrError::UnexpectedNone {
+                        msg: "Cookie kind invariant: slot.cookie missing on Cookie account",
+                    })?
+                    .to_string();
+                HeaderValue::from_str(cookie_value.as_str())?
+            }
+            AuthMethod::OAuth => HeaderValue::from_static(""),
+        };
         state.proxy = proxy_from_url(state.proxy_url.as_deref());
         let mut client = wreq::Client::builder()
             .cookie_store(true)
@@ -126,7 +149,7 @@ impl ClaudeCodeState {
             client = client.proxy(proxy.to_owned());
         }
         state.client = client.build().context(WreqSnafu {
-            msg: "Failed to build client for cookie",
+            msg: "Failed to build client for credential",
         })?;
         Ok(state)
     }
@@ -174,8 +197,20 @@ impl ClaudeCodeState {
         self.cookie_header_value = value;
     }
 
-    /// Requests a new account from the account pool
-    /// Updates the internal state with the new cookie and proxy configuration
+    /// Requests a new account from the account pool and rebuilds the
+    /// per-request HTTP client. Per-auth-method dispatch (Step 4 / C7):
+    ///
+    /// - `Cookie`: `cookie_header_value` is set from the slot's cookie
+    ///   blob so wreq sends `Cookie: …` on every request. The bearer
+    ///   token (if any — set after `exchange_token`) is independent.
+    /// - `OAuth`: `cookie_header_value` stays empty. The bearer token
+    ///   travels via `Authorization: Bearer …` in `send_chat`.
+    ///
+    /// This is the chat / count_tokens hot path entry point — it runs on
+    /// every retry inside `try_chat` / `try_count_tokens`. Pre-C7 it
+    /// unconditionally called `HeaderValue::from_str(res.cookie.to_string())`,
+    /// which (a) tagged OAuth slots with their placeholder cookie blob
+    /// and (b) panics in C8 once `slot.cookie` flips to `Option<…>`.
     pub async fn acquire_account(&mut self) -> Result<AccountSlot, ClewdrError> {
         if let Some(selected_account_id) = &self.selected_account_id
             && let Ok(mut slot) = selected_account_id.lock()
@@ -187,7 +222,22 @@ impl ClaudeCodeState {
             .request(self.system_prompt_hash, &self.bound_account_ids)
             .await?;
         self.cookie = Some(res.to_owned());
-        self.cookie_header_value = HeaderValue::from_str(res.cookie.to_string().as_str())?;
+        self.cookie_header_value = match res.auth_method {
+            AuthMethod::Cookie => {
+                // Cookie kind invariant: pool slot for cookie account
+                // has `cookie = Some(_)`. Treat the missing case as an
+                // error rather than panicking on `expect()`.
+                let cookie_value = res
+                    .cookie
+                    .as_ref()
+                    .ok_or(ClewdrError::UnexpectedNone {
+                        msg: "Cookie kind invariant: dispatched cookie slot missing cookie blob",
+                    })?
+                    .to_string();
+                HeaderValue::from_str(cookie_value.as_str())?
+            }
+            AuthMethod::OAuth => HeaderValue::from_static(""),
+        };
         self.proxy_url = res.proxy_url.clone();
         self.proxy = proxy_from_url(self.proxy_url.as_deref());
         self.endpoint = crate::config::ENDPOINT_URL.to_owned();
