@@ -16,6 +16,7 @@ use serde::Serialize;
 
 use crate::config::Reason;
 use crate::db::accounts::{AccountWithRuntime, active_reset_time};
+use crate::services::account_error::AccountFailureContextPersisted;
 
 /// Base health state for a single account. Mutually exclusive.
 ///
@@ -54,6 +55,15 @@ pub struct AccountHealth {
     pub probing: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_probe_error: Option<String>,
+    /// Step 3.5 C4c: structured failure context from the latest
+    /// classifier event (Step 3.5 C4a column `accounts.last_failure_json`).
+    /// Only populated when `state` is `Invalid` — active or
+    /// cooling-down accounts must not surface a stale failure.
+    /// Frontend chip / tooltip read this field to show
+    /// source / stage / upstream_http_status / normalized_reason_type
+    /// without parsing free-text `last_probe_error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<AccountFailureContextPersisted>,
 }
 
 /// Pool-side context for a single account, passed to [`compose_health`].
@@ -278,10 +288,22 @@ pub fn compose_health(
         None => compose_from_db(account),
     };
 
+    // Step 3.5 C4c: only surface `last_failure` when the account is
+    // Invalid. Active / CoolingDown / Unconfigured must not carry a
+    // stale failure event from a prior auth_error transition that
+    // has since been cleared by reactivation; gating on the live
+    // state prevents that drift even if a flaky DB write left a
+    // stale `last_failure_json` row.
+    let last_failure = match &state {
+        AccountHealthState::Invalid { .. } => account.last_failure.clone(),
+        _ => None,
+    };
+
     AccountHealth {
         state,
         probing: view.probing,
         last_probe_error: view.last_probe_error.map(str::to_owned),
+        last_failure,
     }
 }
 
@@ -1034,6 +1056,7 @@ mod tests {
             state: AccountHealthState::CoolingDown { reset_time: 123 },
             probing: true,
             last_probe_error: Some("transient".to_string()),
+            last_failure: None,
         };
         let json = serde_json::to_value(&h).unwrap();
         assert_eq!(json["state"], "cooling_down");
@@ -1051,11 +1074,131 @@ mod tests {
             },
             probing: false,
             last_probe_error: None,
+            last_failure: None,
         };
         let json = serde_json::to_value(&h).unwrap();
         assert_eq!(json["state"], "invalid");
         assert_eq!(json["kind"], "auth_error");
         assert!(json.get("reason").is_none());
         assert_eq!(json["probing"], false);
+    }
+
+    /// Step 3.5 C4c: `compose_health` surfaces `last_failure` only
+    /// when the live state is Invalid. Active and CoolingDown
+    /// suppress it even if the DB row carries a stale value.
+    #[test]
+    fn compose_health_surfaces_last_failure_only_when_invalid() {
+        use crate::services::account_error::{
+            AccountFailureContextPersisted, FailureSource, classify_account_failure,
+        };
+
+        let err = crate::error::ClewdrError::InvalidCookie {
+            reason: Reason::Disabled,
+        };
+        let ctx = classify_account_failure(&err, FailureSource::Messages, None);
+        let persisted = AccountFailureContextPersisted::from(&ctx);
+
+        // Invalid bucket → last_failure surfaces.
+        let mut acct = account(1, "oauth", "auth_error", None, true, None);
+        acct.last_failure = Some(persisted.clone());
+        let view = PoolAccountView {
+            bucket: Some(PoolBucket::Invalid {
+                reason: &Reason::Disabled,
+            }),
+            ..Default::default()
+        };
+        let h = compose_health(&acct, view, now());
+        let surfaced = h.last_failure.expect("invalid → last_failure surfaces");
+        assert_eq!(surfaced.normalized_reason_type, "organization_disabled");
+
+        // Same DB row, but pool says Valid — last_failure must NOT
+        // leak through (would imply a stale DB write).
+        let mut acct = account(1, "oauth", "active", None, true, None);
+        acct.last_failure = Some(persisted.clone());
+        let view = PoolAccountView {
+            bucket: Some(PoolBucket::Valid),
+            ..Default::default()
+        };
+        let h = compose_health(&acct, view, now());
+        assert!(
+            h.last_failure.is_none(),
+            "active state must hide last_failure"
+        );
+
+        // Cooling down — also hidden.
+        let mut acct = account(1, "oauth", "active", None, true, Some(now() + 3600));
+        acct.last_failure = Some(persisted);
+        let view = PoolAccountView {
+            bucket: Some(PoolBucket::Exhausted {
+                reset_time: Some(now() + 3600),
+            }),
+            ..Default::default()
+        };
+        let h = compose_health(&acct, view, now());
+        assert!(
+            h.last_failure.is_none(),
+            "cooling_down state must hide last_failure"
+        );
+    }
+
+    /// Step 3.5 C4c: an invalid account whose DB row predates the
+    /// migration (last_failure_json is NULL) gets `last_failure: None`
+    /// without breaking the rest of the health composition.
+    #[test]
+    fn compose_health_invalid_without_last_failure_json_is_clean() {
+        let acct = account(1, "oauth", "auth_error", None, true, None);
+        // No last_failure set — simulates pre-migration row.
+        let view = PoolAccountView {
+            bucket: Some(PoolBucket::Invalid {
+                reason: &Reason::Null,
+            }),
+            ..Default::default()
+        };
+        let h = compose_health(&acct, view, now());
+        assert!(matches!(h.state, AccountHealthState::Invalid { .. }));
+        assert!(h.last_failure.is_none());
+    }
+
+    /// Step 3.5 C4c: AccountHealth wire JSON omits `last_failure` when
+    /// None (skip_serializing_if), and includes the structured object
+    /// when Some.
+    #[test]
+    fn account_health_serializes_last_failure_field() {
+        use crate::services::account_error::{
+            AccountFailureContextPersisted, FailureSource, classify_account_failure,
+        };
+
+        let none = AccountHealth {
+            state: AccountHealthState::Invalid {
+                kind: InvalidKind::AuthError,
+                reason: Some(Reason::Null),
+            },
+            probing: false,
+            last_probe_error: None,
+            last_failure: None,
+        };
+        let v = serde_json::to_value(&none).unwrap();
+        assert!(v.get("last_failure").is_none(), "None must skip-serialize");
+
+        let err = crate::error::ClewdrError::InvalidCookie {
+            reason: Reason::TooManyRequest(123),
+        };
+        let ctx = classify_account_failure(&err, FailureSource::Messages, None);
+        let persisted = AccountFailureContextPersisted::from(&ctx);
+        let some = AccountHealth {
+            state: AccountHealthState::Invalid {
+                kind: InvalidKind::AuthError,
+                reason: Some(Reason::TooManyRequest(123)),
+            },
+            probing: false,
+            last_probe_error: None,
+            last_failure: Some(persisted),
+        };
+        let v = serde_json::to_value(&some).unwrap();
+        assert_eq!(
+            v["last_failure"]["normalized_reason_type"], "rate_limited",
+            "Some must serialize the structured DTO"
+        );
+        assert_eq!(v["last_failure"]["source"], "messages");
     }
 }
