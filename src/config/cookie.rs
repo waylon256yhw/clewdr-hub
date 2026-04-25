@@ -537,6 +537,29 @@ impl AccountSlot {
         self.weekly_opus_usage = p.buckets[3].clone();
         self.lifetime_usage = p.buckets[4].clone();
     }
+
+    /// Merge runtime fields owned by the OAuth profile/usage snapshot.
+    ///
+    /// OAuth snapshots report upstream reset boundaries and utilization, but
+    /// they do not carry local-only counters/capability probes. Keep those
+    /// fields from the current slot so a refresh/probe cannot erase locally
+    /// accumulated usage.
+    pub fn apply_oauth_snapshot_runtime(&mut self, p: &RuntimeStateParams) {
+        self.reset_time = p.reset_time;
+        self.session_resets_at = p.session_resets_at;
+        self.weekly_resets_at = p.weekly_resets_at;
+        self.weekly_sonnet_resets_at = p.weekly_sonnet_resets_at;
+        self.weekly_opus_resets_at = p.weekly_opus_resets_at;
+        self.resets_last_checked_at = p.resets_last_checked_at;
+        self.session_has_reset = p.session_has_reset;
+        self.weekly_has_reset = p.weekly_has_reset;
+        self.weekly_sonnet_has_reset = p.weekly_sonnet_has_reset;
+        self.weekly_opus_has_reset = p.weekly_opus_has_reset;
+        self.session_utilization = p.session_utilization;
+        self.weekly_utilization = p.weekly_utilization;
+        self.weekly_sonnet_utilization = p.weekly_sonnet_utilization;
+        self.weekly_opus_utilization = p.weekly_opus_utilization;
+    }
 }
 
 impl Deref for ClewdrCookie {

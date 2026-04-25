@@ -113,6 +113,12 @@ pub struct AccountPoolStatus {
 /// and flow through `UpdateCredential` / reload merge, not release.
 pub type RuntimeUpdate = RuntimeStateParams;
 
+#[derive(Debug, Clone, Copy)]
+enum RuntimeMergeMode {
+    Full,
+    OAuthSnapshot,
+}
+
 #[derive(Debug)]
 enum AccountPoolMessage {
     /// Return an account with an id-keyed runtime update. The pool's own
@@ -133,6 +139,7 @@ enum AccountPoolMessage {
         update: Box<RuntimeUpdate>,
         reason: Option<Reason>,
         expected_fingerprint: Option<CredentialFingerprint>,
+        merge_mode: RuntimeMergeMode,
     },
     CheckReset,
     Request(
@@ -659,6 +666,7 @@ impl AccountPoolActor {
         update: RuntimeUpdate,
         reason: Option<Reason>,
         expected_fingerprint: Option<CredentialFingerprint>,
+        merge_mode: RuntimeMergeMode,
     ) -> bool {
         let removed_probe = state.probing.remove(&account_id);
 
@@ -733,7 +741,10 @@ impl AccountPoolActor {
         // so the rebucket below is the sole writer for this account_id.
         let _ = state.invalid.remove(&account_id);
 
-        slot.apply_runtime_state(&update);
+        match merge_mode {
+            RuntimeMergeMode::Full => slot.apply_runtime_state(&update),
+            RuntimeMergeMode::OAuthSnapshot => slot.apply_oauth_snapshot_runtime(&update),
+        }
 
         let changed_set = match &reason {
             None => {
@@ -1305,9 +1316,16 @@ impl Actor for AccountPoolActor {
                 update,
                 reason,
                 expected_fingerprint,
+                merge_mode,
             } => {
-                let completed_probe =
-                    Self::collect_by_id(state, account_id, *update, reason, expected_fingerprint);
+                let completed_probe = Self::collect_by_id(
+                    state,
+                    account_id,
+                    *update,
+                    reason,
+                    expected_fingerprint,
+                    merge_mode,
+                );
                 if completed_probe {
                     Self::do_flush(state).await;
                     Self::emit_accounts_refresh(state);
@@ -1539,12 +1557,39 @@ impl AccountPoolHandle {
                 update: Box::new(update),
                 reason,
                 expected_fingerprint,
+                merge_mode: RuntimeMergeMode::Full,
             }
         )
         .map_err(|e| ClewdrError::RactorError {
             loc: Location::generate(),
             msg: format!(
                 "Failed to communicate with AccountPoolActor for release_runtime operation: {e}"
+            ),
+        })
+    }
+
+    /// Return OAuth profile/usage snapshot fields without clobbering local
+    /// counters or capability probes in the pool slot.
+    pub async fn release_oauth_snapshot_runtime(
+        &self,
+        account_id: i64,
+        update: RuntimeUpdate,
+        expected_fingerprint: Option<CredentialFingerprint>,
+    ) -> Result<(), ClewdrError> {
+        ractor::cast!(
+            self.actor_ref,
+            AccountPoolMessage::Return {
+                account_id,
+                update: Box::new(update),
+                reason: None,
+                expected_fingerprint,
+                merge_mode: RuntimeMergeMode::OAuthSnapshot,
+            }
+        )
+        .map_err(|e| ClewdrError::RactorError {
+            loc: Location::generate(),
+            msg: format!(
+                "Failed to communicate with AccountPoolActor for release_oauth_snapshot_runtime operation: {e}"
             ),
         })
     }
@@ -1699,7 +1744,7 @@ impl AccountPoolHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccountPoolActor, AccountPoolState, CredentialFingerprint};
+    use super::{AccountPoolActor, AccountPoolState, CredentialFingerprint, RuntimeMergeMode};
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::time::Duration;
 
@@ -1980,7 +2025,14 @@ mod tests {
         // behaviour would take from invalid and push back into valid, then
         // mark `state.reactivated` which drives `set_accounts_active` in
         // do_flush, clobbering the DB auth_error.
-        AccountPoolActor::collect_by_id(&mut state, 1, slot.to_runtime_params(), None, None);
+        AccountPoolActor::collect_by_id(
+            &mut state,
+            1,
+            slot.to_runtime_params(),
+            None,
+            None,
+            RuntimeMergeMode::Full,
+        );
 
         assert!(
             state.invalid.contains_key(&1),
@@ -2025,7 +2077,7 @@ mod tests {
         // normally (reason=None).
         let mut update = slot.to_runtime_params();
         update.reset_time = None;
-        AccountPoolActor::collect_by_id(&mut state, 2, update, None, None);
+        AccountPoolActor::collect_by_id(&mut state, 2, update, None, None, RuntimeMergeMode::Full);
 
         assert!(
             state.valid.iter().any(|c| c.account_id == Some(2)),
@@ -2060,7 +2112,14 @@ mod tests {
             ),
         );
 
-        AccountPoolActor::collect_by_id(&mut state, 2, slot.to_runtime_params(), None, None);
+        AccountPoolActor::collect_by_id(
+            &mut state,
+            2,
+            slot.to_runtime_params(),
+            None,
+            None,
+            RuntimeMergeMode::Full,
+        );
 
         assert!(
             !state.valid.iter().any(|c| c.account_id == Some(2)),
@@ -2432,7 +2491,7 @@ mod tests {
         let mut update = slot.to_runtime_params();
         update.count_tokens_allowed = Some(true);
 
-        AccountPoolActor::collect_by_id(&mut state, 77, update, None, None);
+        AccountPoolActor::collect_by_id(&mut state, 77, update, None, None, RuntimeMergeMode::Full);
 
         let after = state
             .valid
@@ -3091,7 +3150,14 @@ mod tests {
         assert!(stale_fp.is_some());
 
         let update = request_time_slot.to_runtime_params();
-        AccountPoolActor::collect_by_id(&mut state, 1, update, Some(Reason::Null), stale_fp);
+        AccountPoolActor::collect_by_id(
+            &mut state,
+            1,
+            update,
+            Some(Reason::Null),
+            stale_fp,
+            RuntimeMergeMode::Full,
+        );
 
         // Pool slot must remain in valid, untouched. The stale auth_error
         // reason must NOT have demoted the new credential.
@@ -3155,7 +3221,7 @@ mod tests {
         // Bring an interesting runtime mutation through the release.
         let mut update = request_time_slot.to_runtime_params();
         update.count_tokens_allowed = Some(true);
-        AccountPoolActor::collect_by_id(&mut state, 2, update, None, fp);
+        AccountPoolActor::collect_by_id(&mut state, 2, update, None, fp, RuntimeMergeMode::Full);
 
         let after = state
             .valid
@@ -3180,11 +3246,18 @@ mod tests {
         insert_oauth_row(&pool, 2, "at_probe", "rt_probe").await;
         let mut state = empty_state(pool.clone());
 
-        let slot = oauth_slot_with_refresh(2, "rt_probe");
+        let mut slot = oauth_slot_with_refresh(2, "rt_probe");
+        slot.count_tokens_allowed = Some(true);
+        slot.supports_claude_1m_sonnet = Some(true);
+        slot.session_usage.total_input_tokens = 123;
+        slot.lifetime_usage.total_output_tokens = 456;
         state.valid.push_back(slot.clone());
         state.probing.insert(2);
 
         let mut probe_runtime = slot.to_runtime_params();
+        probe_runtime.count_tokens_allowed = None;
+        probe_runtime.supports_claude_1m_sonnet = None;
+        probe_runtime.buckets = Default::default();
         probe_runtime.session_has_reset = Some(true);
         probe_runtime.weekly_has_reset = Some(true);
         probe_runtime.session_utilization = Some(45.0);
@@ -3197,6 +3270,7 @@ mod tests {
             probe_runtime,
             None,
             Some(CredentialFingerprint::from_oauth_refresh_token("rt_probe")),
+            RuntimeMergeMode::OAuthSnapshot,
         );
 
         assert!(
@@ -3215,6 +3289,13 @@ mod tests {
         assert_eq!(runtime.session_utilization, Some(45.0));
         assert_eq!(runtime.weekly_utilization, Some(17.0));
         assert_eq!(runtime.resets_last_checked_at, Some(1_777_100_000));
+        assert_eq!(
+            runtime.count_tokens_allowed,
+            Some(true),
+            "OAuth snapshot release must preserve local capability probes"
+        );
+        assert_eq!(runtime.buckets[0].total_input_tokens, 123);
+        assert_eq!(runtime.buckets[4].total_output_tokens, 456);
     }
 
     /// C5 race scenario 3: admin reconnected an OAuth account, rotating
@@ -3246,6 +3327,7 @@ mod tests {
             update,
             Some(Reason::TooManyRequest(cooldown_until)),
             stale_fp,
+            RuntimeMergeMode::Full,
         );
 
         let after = state
@@ -3278,7 +3360,7 @@ mod tests {
 
         let mut update = state.valid.front().unwrap().to_runtime_params();
         update.count_tokens_allowed = Some(true);
-        AccountPoolActor::collect_by_id(&mut state, 4, update, None, None);
+        AccountPoolActor::collect_by_id(&mut state, 4, update, None, None, RuntimeMergeMode::Full);
 
         let after = state
             .valid

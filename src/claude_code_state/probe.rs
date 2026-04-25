@@ -9,9 +9,9 @@ use crate::{
     billing::{BillingContext, RequestType, persist_probe_log},
     config::{AccountSlot, CLEWDR_CONFIG, Reason},
     db::accounts::{
-        AccountWithRuntime, account_credential_matches_prefix, batch_upsert_runtime_states,
-        get_account_by_id, set_account_active, set_account_auth_error, update_account_metadata,
-        upsert_account_oauth,
+        AccountWithRuntime, account_credential_matches_prefix, get_account_by_id,
+        set_account_active, set_account_auth_error, update_account_metadata, upsert_account_oauth,
+        upsert_oauth_snapshot_runtime_fields,
     },
     error::ClewdrError,
     oauth::{fetch_oauth_snapshot_raw, refresh_oauth_token_with_raw},
@@ -814,8 +814,7 @@ async fn run_oauth_probe(
         }
     }
 
-    if let Err(err) =
-        batch_upsert_runtime_states(db, &[(account_id, snapshot.runtime.clone())]).await
+    if let Err(err) = upsert_oauth_snapshot_runtime_fields(db, account_id, &snapshot.runtime).await
     {
         let msg = format!("failed to persist runtime: {err}");
         warn!("[probe][oauth] account {account_id}: {msg}");
@@ -831,10 +830,9 @@ async fn run_oauth_probe(
         });
     }
     if let Err(err) = handle
-        .release_runtime(
+        .release_oauth_snapshot_runtime(
             account_id,
             snapshot.runtime.clone(),
-            None,
             Some(CredentialFingerprint::from_oauth_refresh_token(
                 &authoritative_refresh_token,
             )),

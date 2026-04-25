@@ -15,8 +15,9 @@ use crate::{
     claude_code_state::{ClaudeCodeState, TokenStatus},
     config::{AuthMethod, ModelFamily, Reason},
     db::accounts::{
-        batch_upsert_runtime_states, set_account_auth_error, set_account_disabled,
-        set_account_reset_time, update_account_metadata_unchecked, upsert_account_oauth,
+        set_account_auth_error, set_account_disabled, set_account_reset_time,
+        update_account_metadata_unchecked, upsert_account_oauth,
+        upsert_oauth_snapshot_runtime_fields,
     },
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
     oauth::refresh_oauth_token,
@@ -160,6 +161,12 @@ impl ClaudeCodeState {
         if !current.is_expired() {
             self.oauth_token = Some(current.clone());
             self.organization_uuid = Some(current.organization.uuid.clone());
+            if let Ok(Some(account)) = crate::db::accounts::get_account_by_id(&db, account_id).await
+                && let (Some(slot), Some(runtime)) =
+                    (self.cookie.as_mut(), account.runtime.as_ref())
+            {
+                slot.apply_oauth_snapshot_runtime(&runtime.to_params());
+            }
             return Ok(());
         }
 
@@ -173,23 +180,24 @@ impl ClaudeCodeState {
             Some(refreshed.snapshot.organization_uuid.as_str()),
         )
         .await?;
-        batch_upsert_runtime_states(&db, &[(account_id, refreshed.snapshot.runtime.clone())])
-            .await?;
+        upsert_oauth_snapshot_runtime_fields(&db, account_id, &refreshed.snapshot.runtime).await?;
         // Mirror the new token into the pool's in-memory slot so concurrent
         // dispatches see the fresh credential without waiting for reload.
         self.account_pool_handle
             .update_credential(account_id, Some(refreshed.token.clone()))
             .await;
         self.account_pool_handle
-            .release_runtime(
+            .release_oauth_snapshot_runtime(
                 account_id,
                 refreshed.snapshot.runtime.clone(),
-                None,
                 Some(CredentialFingerprint::from_oauth_refresh_token(
                     &refreshed.token.refresh_token,
                 )),
             )
             .await?;
+        if let Some(slot) = self.cookie.as_mut() {
+            slot.apply_oauth_snapshot_runtime(&refreshed.snapshot.runtime);
+        }
         self.oauth_token = Some(refreshed.token);
         self.organization_uuid = Some(refreshed.snapshot.organization_uuid);
         Ok(())

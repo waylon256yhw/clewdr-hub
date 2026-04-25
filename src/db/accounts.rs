@@ -489,6 +489,64 @@ pub async fn batch_upsert_runtime_states(
     Ok(())
 }
 
+/// Upsert only the runtime fields owned by an OAuth profile/usage snapshot.
+///
+/// The OAuth usage endpoint reports upstream reset boundaries/utilization, but
+/// not ClewdR-local counters or capability probes. Updating only these columns
+/// keeps session/lifetime buckets and count_tokens_allowed intact.
+pub async fn upsert_oauth_snapshot_runtime_fields(
+    pool: &SqlitePool,
+    account_id: i64,
+    p: &RuntimeStateParams,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO account_runtime_state (
+            account_id, reset_time,
+            session_resets_at, weekly_resets_at, weekly_sonnet_resets_at, weekly_opus_resets_at,
+            resets_last_checked_at,
+            session_has_reset, weekly_has_reset, weekly_sonnet_has_reset, weekly_opus_has_reset,
+            session_utilization, weekly_utilization, weekly_sonnet_utilization, weekly_opus_utilization,
+            updated_at
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+            CURRENT_TIMESTAMP
+        ) ON CONFLICT(account_id) DO UPDATE SET
+            reset_time = excluded.reset_time,
+            session_resets_at = excluded.session_resets_at,
+            weekly_resets_at = excluded.weekly_resets_at,
+            weekly_sonnet_resets_at = excluded.weekly_sonnet_resets_at,
+            weekly_opus_resets_at = excluded.weekly_opus_resets_at,
+            resets_last_checked_at = excluded.resets_last_checked_at,
+            session_has_reset = excluded.session_has_reset,
+            weekly_has_reset = excluded.weekly_has_reset,
+            weekly_sonnet_has_reset = excluded.weekly_sonnet_has_reset,
+            weekly_opus_has_reset = excluded.weekly_opus_has_reset,
+            session_utilization = excluded.session_utilization,
+            weekly_utilization = excluded.weekly_utilization,
+            weekly_sonnet_utilization = excluded.weekly_sonnet_utilization,
+            weekly_opus_utilization = excluded.weekly_opus_utilization,
+            updated_at = CURRENT_TIMESTAMP"#,
+    )
+    .bind(account_id)
+    .bind(p.reset_time)
+    .bind(p.session_resets_at)
+    .bind(p.weekly_resets_at)
+    .bind(p.weekly_sonnet_resets_at)
+    .bind(p.weekly_opus_resets_at)
+    .bind(p.resets_last_checked_at)
+    .bind(bool_to_int(p.session_has_reset))
+    .bind(bool_to_int(p.weekly_has_reset))
+    .bind(bool_to_int(p.weekly_sonnet_has_reset))
+    .bind(bool_to_int(p.weekly_opus_has_reset))
+    .bind(p.session_utilization)
+    .bind(p.weekly_utilization)
+    .bind(p.weekly_sonnet_utilization)
+    .bind(p.weekly_opus_utilization)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Update only the dispatch cooldown timestamp without clobbering usage buckets.
 pub async fn set_account_reset_time(
     pool: &SqlitePool,
@@ -792,8 +850,9 @@ mod tests {
 
     use super::{
         AccountAuthSourceSummary, AccountPoolSummary, AccountStatusSummary, AccountSummary,
-        AccountWithRuntime, RuntimeStateRow, account_credential_matches_prefix, summarize_accounts,
-        update_account_metadata,
+        AccountWithRuntime, RuntimeStateRow, account_credential_matches_prefix,
+        batch_upsert_runtime_states, load_all_accounts, summarize_accounts,
+        update_account_metadata, upsert_oauth_snapshot_runtime_fields,
     };
     use crate::config::{Organization, TokenInfo, UsageBreakdown};
     use crate::db::init_pool;
@@ -1383,6 +1442,50 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn oauth_snapshot_runtime_upsert_preserves_local_fields() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        insert_oauth_account(&pool, 1, "a", 1).await;
+
+        let mut existing = runtime(None).to_params();
+        existing.count_tokens_allowed = Some(true);
+        existing.supports_claude_1m_sonnet = Some(true);
+        existing.buckets[0].total_input_tokens = 123;
+        existing.buckets[4].total_output_tokens = 456;
+        batch_upsert_runtime_states(&pool, &[(1, existing)])
+            .await
+            .unwrap();
+
+        let mut snapshot = runtime(Some(1_777_200_000)).to_params();
+        snapshot.session_has_reset = Some(true);
+        snapshot.weekly_has_reset = Some(true);
+        snapshot.session_utilization = Some(45.0);
+        snapshot.weekly_utilization = Some(17.0);
+        snapshot.resets_last_checked_at = Some(1_777_100_000);
+        snapshot.count_tokens_allowed = None;
+        snapshot.supports_claude_1m_sonnet = None;
+        snapshot.buckets = Default::default();
+        upsert_oauth_snapshot_runtime_fields(&pool, 1, &snapshot)
+            .await
+            .unwrap();
+
+        let account = load_all_accounts(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|account| account.id == 1)
+            .unwrap();
+        let runtime = account.runtime.unwrap();
+        assert_eq!(runtime.reset_time, Some(1_777_200_000));
+        assert_eq!(runtime.session_utilization, Some(45.0));
+        assert_eq!(runtime.weekly_utilization, Some(17.0));
+        assert_eq!(runtime.resets_last_checked_at, Some(1_777_100_000));
+        assert_eq!(runtime.count_tokens_allowed, Some(true));
+        assert_eq!(runtime.supports_claude_1m_sonnet, Some(true));
+        assert_eq!(runtime.buckets[0].total_input_tokens, 123);
+        assert_eq!(runtime.buckets[4].total_output_tokens, 456);
     }
 
     /// Mirrors the consolidated single-statement oauth-row-to-cookie replacement
