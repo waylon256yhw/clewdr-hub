@@ -21,6 +21,9 @@ use crate::{
     },
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
     oauth::refresh_oauth_token,
+    services::account_error::{
+        AccountFailureAction, AccountNormalizedReason, FailureSource, classify_account_failure,
+    },
     services::account_pool::{AccountPoolHandle, CredentialFingerprint},
     types::claude::{CountMessageTokensResponse, CreateMessageParams},
 };
@@ -36,44 +39,43 @@ impl ClaudeCodeState {
         super::is_oauth_auth_failure(err)
     }
 
+    /// Step 3.5: routed through the unified classifier so every entry point
+    /// (messages / count_tokens / probe / refresh / test) reaches the same
+    /// "this account is disabled" verdict. Behavior is preserved: only the
+    /// `OrganizationDisabled` normalized reason triggers the disabled
+    /// branch — `FreeTier` keeps a separate path even though it also maps
+    /// to `AccountFailureAction::TerminalDisabled`.
     fn is_oauth_disabled_failure(err: &ClewdrError) -> bool {
-        match err {
-            ClewdrError::InvalidCookie { reason } => matches!(reason, Reason::Disabled),
-            ClewdrError::ClaudeHttpError { code, inner } => {
-                if code.as_u16() != 400 {
-                    return false;
-                }
-                let msg = inner
-                    .message
-                    .as_str()
-                    .map(|s| s.to_ascii_lowercase())
-                    .unwrap_or_else(|| inner.message.to_string().to_ascii_lowercase());
-                msg.contains("organization has been disabled")
-            }
-            _ => false,
-        }
+        let ctx = classify_account_failure(err, FailureSource::Messages, None);
+        matches!(
+            ctx.normalized_reason,
+            AccountNormalizedReason::OrganizationDisabled
+        )
     }
 
+    /// Step 3.5: routed through the unified classifier. Equivalent to the
+    /// previous `InvalidCookie + Reason::TooManyRequest|Restricted` match —
+    /// any classifier path that produces `AccountFailureAction::Cooldown`
+    /// reports its `reset_time` here.
     fn oauth_cooldown_until(err: &ClewdrError) -> Option<i64> {
-        match err {
-            ClewdrError::InvalidCookie {
-                reason: Reason::TooManyRequest(ts) | Reason::Restricted(ts),
-            } => Some(*ts),
+        match classify_account_failure(err, FailureSource::Messages, None).action {
+            AccountFailureAction::Cooldown { reset_time } => Some(reset_time),
             _ => None,
         }
     }
 
+    /// Step 3.5: routed through the unified classifier. The classifier
+    /// produces a normalized reason for every terminal/cooldown error and
+    /// `to_reason()` bridges it back to the legacy `Reason` enum used by
+    /// the pool's invalidate / collect API. Transient and internal
+    /// classes return `None` so callers do not change account state.
     fn oauth_pool_reason(err: &ClewdrError) -> Option<Reason> {
-        if let ClewdrError::InvalidCookie { reason } = err {
-            Some(reason.clone())
-        } else if Self::is_oauth_disabled_failure(err) {
-            Some(Reason::Disabled)
-        } else if let Some(reset_time) = Self::oauth_cooldown_until(err) {
-            Some(Reason::TooManyRequest(reset_time))
-        } else if Self::is_oauth_auth_failure(err) {
-            Some(Reason::Null)
-        } else {
-            None
+        let ctx = classify_account_failure(err, FailureSource::Messages, None);
+        match ctx.action {
+            AccountFailureAction::TerminalAuth
+            | AccountFailureAction::TerminalDisabled
+            | AccountFailureAction::Cooldown { .. } => ctx.normalized_reason.to_reason(),
+            AccountFailureAction::TransientUpstream | AccountFailureAction::InternalError => None,
         }
     }
 
@@ -1393,6 +1395,68 @@ mod tests {
                 source: None,
             }),
             Some(Reason::Null)
+        );
+    }
+
+    /// Step 3.5 C2 regression guards. The classifier rewrite must preserve
+    /// these subtle edges:
+    /// 1. `Reason::Free` is `TerminalDisabled` at the action level but is
+    ///    NOT `is_oauth_disabled_failure` — it goes through a separate
+    ///    Free-tier path that must not converge with the org-disabled
+    ///    branch.
+    /// 2. Bare 401/403 (no phrase) is auth-rejected and must produce
+    ///    `Reason::Null` for pool eviction.
+    /// 3. Transient / internal errors must not produce a pool reason.
+    #[test]
+    fn oauth_disabled_failure_distinguishes_free_from_org_disabled() {
+        assert!(ClaudeCodeState::is_oauth_disabled_failure(
+            &ClewdrError::InvalidCookie {
+                reason: Reason::Disabled,
+            }
+        ));
+        assert!(!ClaudeCodeState::is_oauth_disabled_failure(
+            &ClewdrError::InvalidCookie {
+                reason: Reason::Free,
+            }
+        ));
+        assert!(!ClaudeCodeState::is_oauth_disabled_failure(
+            &ClewdrError::InvalidCookie {
+                reason: Reason::Banned,
+            }
+        ));
+    }
+
+    #[test]
+    fn oauth_pool_reason_treats_unphrased_401_403_as_null_eviction() {
+        use crate::error::ClaudeErrorBody;
+        use serde_json::json;
+        use wreq::StatusCode;
+
+        let http = |status: u16| ClewdrError::ClaudeHttpError {
+            code: StatusCode::from_u16(status).unwrap(),
+            inner: ClaudeErrorBody {
+                message: json!("upstream"),
+                r#type: "error".to_string(),
+                code: Some(status),
+            },
+        };
+        assert_eq!(
+            ClaudeCodeState::oauth_pool_reason(&http(401)),
+            Some(Reason::Null)
+        );
+        assert_eq!(
+            ClaudeCodeState::oauth_pool_reason(&http(403)),
+            Some(Reason::Null)
+        );
+        // 5xx is transient — must NOT evict.
+        assert_eq!(ClaudeCodeState::oauth_pool_reason(&http(500)), None);
+        // Local logic errors must not evict either.
+        assert_eq!(
+            ClaudeCodeState::oauth_pool_reason(&ClewdrError::Whatever {
+                message: "unrelated local failure".to_string(),
+                source: None,
+            }),
+            None
         );
     }
 

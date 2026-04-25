@@ -15,6 +15,7 @@ use crate::{
     },
     error::ClewdrError,
     oauth::{fetch_oauth_snapshot_raw, refresh_oauth_token_with_raw},
+    services::account_error::{AccountFailureAction, FailureSource, classify_account_failure},
     services::account_pool::{AccountPoolHandle, CredentialFingerprint},
     state::AdminEvent,
     stealth::SharedStealthProfile,
@@ -193,35 +194,24 @@ fn extract_cookie_reason(e: &ClewdrError) -> Option<Reason> {
     }
 }
 
-fn is_oauth_auth_failure(err: &ClewdrError) -> bool {
-    super::is_oauth_auth_failure(err)
-}
-
 struct ProbeFailure {
     stage: &'static str,
     message: String,
     http_status: Option<u16>,
-    is_auth: bool,
+    action: AccountFailureAction,
 }
 
 impl ProbeFailure {
-    fn from_err(stage: &'static str, err: &ClewdrError) -> Self {
-        let (http_status, is_auth) = match err {
-            ClewdrError::ClaudeHttpError { code, .. } => {
-                let code = code.as_u16();
-                (Some(code), matches!(code, 401 | 403))
-            }
-            // Cookie-level rejection (free/disabled/rate-limited/null body) carries no HTTP
-            // status but is logically an auth-style outcome — surface it that way so the
-            // logs UI can filter on `auth_rejected`.
-            ClewdrError::InvalidCookie { .. } => (None, true),
-            _ => (None, is_oauth_auth_failure(err)),
-        };
+    /// Build a ProbeFailure from a ClewdrError by routing through the
+    /// unified classifier so cookie-probe / oauth-probe failures share
+    /// the scheduler-action verdict with messages / count_tokens / test.
+    fn from_err(source: FailureSource, stage: &'static str, err: &ClewdrError) -> Self {
+        let context = classify_account_failure(err, source, Some(stage));
         Self {
             stage,
             message: err.to_string(),
-            http_status,
-            is_auth,
+            http_status: context.upstream_http_status,
+            action: context.action,
         }
     }
 
@@ -246,11 +236,13 @@ async fn persist_probe_row(
     let (status, http_status, err_msg): (&str, Option<u16>, Option<String>) = match outcome {
         Ok(()) => ("ok", Some(200), None),
         Err(failure) => {
-            let status = if failure.is_auth {
-                "auth_rejected"
-            } else {
-                "upstream_error"
-            };
+            // Step 3.5 C3b: cookie/oauth probe row status now derives from
+            // the unified classifier action — same verdict surface as the
+            // messages / count_tokens / test path. This trades the legacy
+            // 2-way auth_rejected/upstream_error split for the full 4-way
+            // classification (auth_rejected / no_account_available /
+            // upstream_error / internal_error).
+            let status = failure.action.to_log_status();
             (status, failure.http_status, Some(failure.message.clone()))
         }
     };
@@ -389,7 +381,7 @@ async fn run_cookie_probe(
             stage: "init",
             message: msg,
             http_status: None,
-            is_auth: false,
+            action: AccountFailureAction::InternalError,
         });
     };
     let cookie_ellipse = cookie_blob.ellipse();
@@ -408,7 +400,7 @@ async fn run_cookie_probe(
                 stage: "init",
                 message: msg,
                 http_status: None,
-                is_auth: false,
+                action: AccountFailureAction::InternalError,
             });
         }
     };
@@ -435,7 +427,11 @@ async fn run_cookie_probe(
                 handle.set_probe_error(account_id, msg).await;
                 let _ = handle.clear_probing(account_id).await;
             }
-            return Err(ProbeFailure::from_err("bootstrap", &e));
+            return Err(ProbeFailure::from_err(
+                FailureSource::ProbeCookie,
+                "bootstrap",
+                &e,
+            ));
         }
     };
 
@@ -466,7 +462,7 @@ async fn run_cookie_probe(
             stage: "bootstrap",
             message: "cookie belongs to a free-tier account and was rejected".to_string(),
             http_status: None,
-            is_auth: true,
+            action: AccountFailureAction::TerminalDisabled,
         });
     }
 
@@ -488,7 +484,11 @@ async fn run_cookie_probe(
                 handle.set_probe_error(account_id, msg).await;
                 state.release_account(None).await;
             }
-            return Err(ProbeFailure::from_err("oauth_code", &e));
+            return Err(ProbeFailure::from_err(
+                FailureSource::ProbeCookie,
+                "oauth_code",
+                &e,
+            ));
         }
     };
     if let Err(e) = state.exchange_token(code_res).await {
@@ -500,7 +500,11 @@ async fn run_cookie_probe(
             handle.set_probe_error(account_id, msg).await;
             state.release_account(None).await;
         }
-        return Err(ProbeFailure::from_err("oauth_token", &e));
+        return Err(ProbeFailure::from_err(
+            FailureSource::ProbeCookie,
+            "oauth_token",
+            &e,
+        ));
     }
 
     // 5. Fetch usage metrics → set resets_at + has_reset flags
@@ -572,7 +576,11 @@ async fn run_cookie_probe(
         Err(e) => {
             if let Some(reason) = extract_cookie_reason(&e) {
                 state.release_account(Some(reason)).await;
-                return Err(ProbeFailure::from_err("usage", &e));
+                return Err(ProbeFailure::from_err(
+                    FailureSource::ProbeCookie,
+                    "usage",
+                    &e,
+                ));
             }
             let msg = format!("usage fetch failed: {e}");
             warn!("[probe] account {account_id}: {msg}");
@@ -581,7 +589,11 @@ async fn run_cookie_probe(
             // but surface the failure to the probe log.
             state.release_account(None).await;
             info!("[probe] completed for account {account_id} (usage fetch failed)");
-            return Err(ProbeFailure::from_err("usage", &e));
+            return Err(ProbeFailure::from_err(
+                FailureSource::ProbeCookie,
+                "usage",
+                &e,
+            ));
         }
     }
 
@@ -639,7 +651,7 @@ async fn run_oauth_probe(
             stage: "token",
             message: msg,
             http_status: None,
-            is_auth: false,
+            action: AccountFailureAction::InternalError,
         });
     };
 
@@ -745,7 +757,7 @@ async fn run_oauth_probe(
                 stage: "persist_token",
                 message: msg,
                 http_status: None,
-                is_auth: false,
+                action: AccountFailureAction::InternalError,
             });
         }
         // Mirror the freshly-rotated token into the pool so subsequent
@@ -775,7 +787,7 @@ async fn run_oauth_probe(
             stage: "persist_metadata",
             message: msg,
             http_status: None,
-            is_auth: false,
+            action: AccountFailureAction::InternalError,
         });
     }
 
@@ -809,7 +821,7 @@ async fn run_oauth_probe(
                 stage: "fingerprint_check",
                 message: msg,
                 http_status: None,
-                is_auth: false,
+                action: AccountFailureAction::InternalError,
             });
         }
     }
@@ -826,7 +838,7 @@ async fn run_oauth_probe(
             stage: "persist_runtime",
             message: msg,
             http_status: None,
-            is_auth: false,
+            action: AccountFailureAction::InternalError,
         });
     }
     if let Err(err) = handle
@@ -849,7 +861,7 @@ async fn run_oauth_probe(
             stage: "sync_pool_runtime",
             message: msg,
             http_status: None,
-            is_auth: false,
+            action: AccountFailureAction::InternalError,
         });
     }
     let did_reactivate = if account.status == "auth_error" {
@@ -866,7 +878,7 @@ async fn run_oauth_probe(
                     stage: "reactivate",
                     message: msg,
                     http_status: None,
-                    is_auth: false,
+                    action: AccountFailureAction::InternalError,
                 });
             }
         }
@@ -908,7 +920,12 @@ async fn probe_oauth_upstream_failure(
 ) -> Result<(), ProbeFailure> {
     let msg = err.to_string();
     warn!("[probe][oauth] account {account_id}: {msg}");
-    let auth = is_oauth_auth_failure(&err);
+    // Step 3.5 C3b: classify once and use the action both for the
+    // internal `set_account_auth_error` decision and for the
+    // ProbeFailure surfaced to the probe row. `auth` is preserved as
+    // a name for readability — it is exactly `TerminalAuth`.
+    let context = classify_account_failure(&err, FailureSource::ProbeOauth, Some("refresh"));
+    let auth = matches!(context.action, AccountFailureAction::TerminalAuth);
     let still_current =
         match account_credential_matches_prefix(db, account_id, "oauth", expected_prefix).await {
             Ok(v) => v,
@@ -962,15 +979,10 @@ async fn probe_oauth_upstream_failure(
         handle.clear_probe_error(account_id).await;
     }
     let _ = handle.clear_probing(account_id).await;
-    let http_status = if let ClewdrError::ClaudeHttpError { code, .. } = &err {
-        Some(code.as_u16())
-    } else {
-        None
-    };
     Err(ProbeFailure {
         stage: "refresh",
         message: msg,
-        http_status,
-        is_auth: auth,
+        http_status: context.upstream_http_status,
+        action: context.action,
     })
 }

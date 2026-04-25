@@ -1,3 +1,4 @@
+pub mod account_error;
 pub mod account_health;
 pub mod account_pool;
 pub mod log_rotation;

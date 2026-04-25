@@ -775,6 +775,21 @@ pub async fn test_account(
                         }
                         Err(e) => {
                             let error_msg = e.to_string();
+                            // Step 3.5 C3a: derive log status from the
+                            // classifier so an OAuth refresh that hits a
+                            // local error (e.g. transport / serde) is no
+                            // longer hardcoded to `auth_rejected` — it
+                            // surfaces as `internal_error` while real
+                            // refresh-token rejections (`invalid_grant`,
+                            // 401/403) keep the auth_rejected verdict.
+                            let log_status =
+                                crate::services::account_error::classify_account_failure(
+                                    &e,
+                                    crate::services::account_error::FailureSource::Test,
+                                    Some("refresh"),
+                                )
+                                .action
+                                .to_log_status();
                             let ctx = BillingContext {
                                 db: state.db.clone(),
                                 user_id: None,
@@ -788,7 +803,7 @@ pub async fn test_account(
                             persist_probe_log(
                                 &ctx,
                                 RequestType::Test,
-                                "auth_rejected",
+                                log_status,
                                 None,
                                 "",
                                 Some(&error_msg),
@@ -890,11 +905,36 @@ pub async fn test_account(
     };
 
     // 7. Log result
+    // Step 3.5 C3b: derive log status from the unified classifier so
+    // /test final-request failures share the verdict surface with
+    // messages / count_tokens / probe. Wrap the upstream HTTP status
+    // into a synthetic `ClaudeHttpError` (no body phrase) and route
+    // through `classify_account_failure` — the classifier covers the
+    // 401/403 -> auth_rejected and 5xx/4xx -> upstream_error mapping
+    // that this site previously open-coded.
     let log_status = if success {
         "ok"
-    } else if matches!(http_status, Some(401) | Some(403)) {
-        "auth_rejected"
+    } else if let Some(status_u16) = http_status {
+        let code = wreq::StatusCode::from_u16(status_u16)
+            .unwrap_or(wreq::StatusCode::INTERNAL_SERVER_ERROR);
+        let synthetic = ClewdrError::ClaudeHttpError {
+            code,
+            inner: crate::error::ClaudeErrorBody {
+                message: serde_json::json!(""),
+                r#type: "error".to_string(),
+                code: Some(status_u16),
+            },
+        };
+        crate::services::account_error::classify_account_failure(
+            &synthetic,
+            crate::services::account_error::FailureSource::Test,
+            None,
+        )
+        .action
+        .to_log_status()
     } else {
+        // Transport-level error — no upstream response. Same surface
+        // as classifier's TransientUpstream / WreqError path.
         "upstream_error"
     };
     let ctx = BillingContext {

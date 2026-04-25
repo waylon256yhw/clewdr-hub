@@ -287,22 +287,19 @@ impl ClaudeCodeState {
 }
 
 pub(crate) fn is_oauth_auth_failure(err: &ClewdrError) -> bool {
-    match err {
-        ClewdrError::InvalidCookie { reason } => matches!(reason, Reason::Null | Reason::Banned),
-        ClewdrError::ClaudeHttpError { code, .. } => matches!(code.as_u16(), 401 | 403),
-        ClewdrError::Whatever { message, .. } => {
-            let msg = message.to_ascii_lowercase();
-            msg.contains("invalid_grant")
-                || msg.contains("refresh token not found")
-                || msg.contains("refresh token")
-                    && (msg.contains("invalid") || msg.contains("expired"))
-                || msg.contains("status 401")
-                || msg.contains("status 403")
-                || msg.contains("access token")
-                    && (msg.contains("expired") || msg.contains("invalid"))
-        }
-        _ => false,
-    }
+    use crate::services::account_error::{
+        AccountFailureAction, FailureSource, classify_account_failure,
+    };
+    // Step 3.5: route through the unified classifier so every entry point
+    // (messages / count_tokens / probe / refresh / test) reaches the same
+    // "this account's auth is rejected" verdict. The classifier already
+    // covers `InvalidCookie + Reason::Null|Banned`, `ClaudeHttpError 401|403`
+    // and `Whatever` messages with `invalid_grant` / refresh-token /
+    // `status 401|403` phrases.
+    matches!(
+        classify_account_failure(err, FailureSource::Messages, None).action,
+        AccountFailureAction::TerminalAuth
+    )
 }
 
 pub enum TokenStatus {
@@ -314,7 +311,12 @@ pub enum TokenStatus {
 #[cfg(test)]
 mod tests {
     use super::is_oauth_auth_failure;
-    use crate::{config::Reason, error::ClewdrError};
+    use crate::{
+        config::Reason,
+        error::{ClaudeErrorBody, ClewdrError},
+    };
+    use serde_json::json;
+    use wreq::StatusCode;
 
     #[test]
     fn oauth_auth_failure_detects_invalid_cookie_null_and_banned() {
@@ -326,6 +328,40 @@ mod tests {
         }));
         assert!(!is_oauth_auth_failure(&ClewdrError::InvalidCookie {
             reason: Reason::Disabled,
+        }));
+    }
+
+    /// Step 3.5 C2: regression guard. The classifier must preserve the
+    /// "auth failure" verdict for unphrased 401/403 responses (the chat
+    /// path historically treats those as oauth auth failures), and must
+    /// keep transient/internal classes out of the auth failure set.
+    #[test]
+    fn oauth_auth_failure_classifier_equivalence() {
+        let http = |status: u16| ClewdrError::ClaudeHttpError {
+            code: StatusCode::from_u16(status).unwrap(),
+            inner: ClaudeErrorBody {
+                message: json!("upstream"),
+                r#type: "error".to_string(),
+                code: Some(status),
+            },
+        };
+        assert!(is_oauth_auth_failure(&http(401)));
+        assert!(is_oauth_auth_failure(&http(403)));
+        assert!(!is_oauth_auth_failure(&http(500)));
+        assert!(!is_oauth_auth_failure(&http(429)));
+        assert!(!is_oauth_auth_failure(&ClewdrError::InvalidCookie {
+            reason: Reason::TooManyRequest(123),
+        }));
+        assert!(!is_oauth_auth_failure(&ClewdrError::InvalidCookie {
+            reason: Reason::Free,
+        }));
+        assert!(is_oauth_auth_failure(&ClewdrError::Whatever {
+            message: "oauth refresh: invalid_grant".to_string(),
+            source: None,
+        }));
+        assert!(!is_oauth_auth_failure(&ClewdrError::Whatever {
+            message: "unrelated local failure".to_string(),
+            source: None,
         }));
     }
 }
