@@ -270,6 +270,22 @@ impl AccountSlot {
         self.token = Some(token);
     }
 
+    /// Short, log-safe label identifying the credential. Pre-Step-4 / C7
+    /// every call site reached for `slot.cookie.ellipse()` directly,
+    /// which (a) leaks the cookie shape into log messages even for OAuth
+    /// accounts and (b) panics in C8 once `slot.cookie` flips to
+    /// `Option<ClewdrCookie>`. This helper centralizes the label so the
+    /// flip is a one-line change here.
+    pub fn credential_label(&self) -> String {
+        match self.auth_method {
+            AuthMethod::Cookie => self.cookie.ellipse(),
+            AuthMethod::OAuth => match self.account_id {
+                Some(id) => format!("oauth#{id}"),
+                None => "oauth#?".to_string(),
+            },
+        }
+    }
+
     pub fn set_count_tokens_allowed(&mut self, value: Option<bool>) {
         self.count_tokens_allowed = value;
     }
@@ -660,5 +676,44 @@ mod tests {
         let full = format!("sk-ant-sid01-{base}");
         let slot = AccountSlot::new(&full, None).unwrap();
         assert_eq!(slot.auth_method, AuthMethod::Cookie);
+    }
+
+    /// Step 4 / C7 introduces `credential_label()` as the log/tracing
+    /// substitute for `slot.cookie.ellipse()`. Cookie accounts get the
+    /// same ellipsed cookie blob as before (call sites are wire-compat).
+    /// OAuth accounts get an `oauth#{account_id}` tag instead of the
+    /// placeholder cookie blob, so logs no longer pretend they have a
+    /// session cookie. Slots without an account_id (test fixtures, edge
+    /// case) fall back to `oauth#?`.
+    #[test]
+    fn credential_label_dispatches_by_auth_method() {
+        let base = make_base_cookie_with_len(86);
+        let cookie_blob = format!("sk-ant-sid01-{base}");
+
+        // Cookie account: label is the ellipsed cookie blob.
+        let cookie_slot = AccountSlot::new(&cookie_blob, None).unwrap();
+        let cookie_label = cookie_slot.credential_label();
+        assert!(
+            cookie_label.starts_with("sk-ant-sid01-"),
+            "cookie label should preserve the ellipsed cookie shape, got: {cookie_label}"
+        );
+
+        // OAuth account with id: label is the per-account tag.
+        let oauth_slot = AccountSlot {
+            auth_method: AuthMethod::OAuth,
+            account_id: Some(42),
+            ..AccountSlot::default()
+        };
+        assert_eq!(oauth_slot.credential_label(), "oauth#42");
+
+        // OAuth account without id (test fixture / loader race): falls
+        // back to a clear sentinel rather than panicking on the unwrap
+        // future C8 callers might be tempted to do.
+        let oauth_no_id = AccountSlot {
+            auth_method: AuthMethod::OAuth,
+            account_id: None,
+            ..AccountSlot::default()
+        };
+        assert_eq!(oauth_no_id.credential_label(), "oauth#?");
     }
 }

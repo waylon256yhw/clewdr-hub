@@ -66,7 +66,7 @@ impl ClaudeCodeState {
         }
         println!(
             "[{}]\nemail: {}\ncapabilities: {}",
-            self.cookie.as_ref().unwrap().cookie.ellipse().green(),
+            self.cookie.as_ref().unwrap().credential_label().green(),
             info.email.blue(),
             info.capabilities.join(", ").blue()
         );

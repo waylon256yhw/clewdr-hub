@@ -814,8 +814,11 @@ pub async fn test_account(
             let mut slot = AccountSlot::new(cookie_blob, None)?;
             slot.account_id = Some(id);
             slot.proxy_url = account.proxy_url.clone();
-            let mut cc_state =
-                ClaudeCodeState::from_cookie(state.account_pool.clone(), slot, profile.clone())?;
+            let mut cc_state = ClaudeCodeState::from_credential(
+                state.account_pool.clone(),
+                slot,
+                profile.clone(),
+            )?;
             match cc_state.check_token() {
                 crate::claude_code_state::TokenStatus::None => {
                     let org = cc_state.get_organization().await?;

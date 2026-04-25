@@ -374,12 +374,17 @@ async fn run_cookie_probe(
     bundle: &mut Map<String, Value>,
     mut debug_raw_bundle: Option<&mut Map<String, Value>>,
 ) -> Result<(), ProbeFailure> {
+    // probe_cookie is reachable only from `spawn_probe_guarded`'s Cookie
+    // arm (Step 4 / C4) — the slot's `auth_method` is invariantly Cookie
+    // here, and `slot.cookie` carries a real session cookie blob (not a
+    // placeholder). Direct access remains; the comment is a beacon for
+    // C8 to migrate when `slot.cookie` becomes `Option<ClewdrCookie>`.
     let cookie_ellipse = cookie.cookie.ellipse();
     let cookie_prefix = &cookie.cookie[..20.min(cookie.cookie.len())];
     let cookie_prefix = cookie_prefix.to_string();
     info!("[probe] starting for account {account_id} ({cookie_ellipse})");
 
-    let mut state = match ClaudeCodeState::from_cookie(handle.clone(), cookie, profile) {
+    let mut state = match ClaudeCodeState::from_credential(handle.clone(), cookie, profile) {
         Ok(s) => s,
         Err(e) => {
             let msg = format!("init failed: {e}");
