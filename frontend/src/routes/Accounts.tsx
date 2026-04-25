@@ -334,6 +334,7 @@ function AccountCard({
         text from contradicting the green/yellow badge above.
       */}
       {account.invalid_reason &&
+        !lastFailure &&
         (!account.health || account.health.state === "invalid") && (
           <Text size="xs" c="red" mb="xs">{account.invalid_reason}</Text>
         )}
@@ -343,6 +344,7 @@ function AccountCard({
       )}
 
       {account.last_error &&
+        !lastFailure &&
         (!account.health || account.health.state === "invalid") && (
           <Text size="xs" c="orange" mb="xs">OAuth: {account.last_error}</Text>
         )}
