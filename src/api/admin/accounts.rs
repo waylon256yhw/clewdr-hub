@@ -905,11 +905,36 @@ pub async fn test_account(
     };
 
     // 7. Log result
+    // Step 3.5 C3b: derive log status from the unified classifier so
+    // /test final-request failures share the verdict surface with
+    // messages / count_tokens / probe. Wrap the upstream HTTP status
+    // into a synthetic `ClaudeHttpError` (no body phrase) and route
+    // through `classify_account_failure` — the classifier covers the
+    // 401/403 -> auth_rejected and 5xx/4xx -> upstream_error mapping
+    // that this site previously open-coded.
     let log_status = if success {
         "ok"
-    } else if matches!(http_status, Some(401) | Some(403)) {
-        "auth_rejected"
+    } else if let Some(status_u16) = http_status {
+        let code = wreq::StatusCode::from_u16(status_u16)
+            .unwrap_or(wreq::StatusCode::INTERNAL_SERVER_ERROR);
+        let synthetic = ClewdrError::ClaudeHttpError {
+            code,
+            inner: crate::error::ClaudeErrorBody {
+                message: serde_json::json!(""),
+                r#type: "error".to_string(),
+                code: Some(status_u16),
+            },
+        };
+        crate::services::account_error::classify_account_failure(
+            &synthetic,
+            crate::services::account_error::FailureSource::Test,
+            None,
+        )
+        .action
+        .to_log_status()
     } else {
+        // Transport-level error — no upstream response. Same surface
+        // as classifier's TransientUpstream / WreqError path.
         "upstream_error"
     };
     let ctx = BillingContext {
