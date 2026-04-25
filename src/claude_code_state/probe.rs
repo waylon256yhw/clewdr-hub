@@ -10,12 +10,15 @@ use crate::{
     config::{AccountSlot, CLEWDR_CONFIG, Reason},
     db::accounts::{
         AccountWithRuntime, account_credential_matches_prefix, get_account_by_id,
-        set_account_active, set_account_auth_error, update_account_metadata, upsert_account_oauth,
-        upsert_oauth_snapshot_runtime_fields,
+        set_account_active, set_account_auth_error, set_account_last_failure,
+        update_account_metadata, upsert_account_oauth, upsert_oauth_snapshot_runtime_fields,
     },
     error::ClewdrError,
     oauth::{fetch_oauth_snapshot_raw, refresh_oauth_token_with_raw},
-    services::account_error::{AccountFailureAction, FailureSource, classify_account_failure},
+    services::account_error::{
+        AccountFailureAction, AccountFailureContextPersisted, FailureSource,
+        classify_account_failure,
+    },
     services::account_pool::{AccountPoolHandle, CredentialFingerprint},
     state::AdminEvent,
     stealth::SharedStealthProfile,
@@ -23,6 +26,35 @@ use crate::{
 };
 
 const PROBE_BODY_MAX_BYTES: usize = 262_144;
+
+/// Step 3.5 C4b: best-effort persist of structured failure context to
+/// `accounts.last_failure_json` on probe failure paths that mark the
+/// account invalid. Distinct from `set_account_auth_error` /
+/// `release_account(Some(reason))` — those carry the legacy `Reason`
+/// for in-pool identity. This writes the richer classifier context
+/// for AccountHealth display only.
+///
+/// Caller must classify before `.await` (see chat.rs sibling helper)
+/// so the `&ClewdrError` borrow does not cross any non-Send await
+/// boundary in the surrounding probe future.
+async fn persist_probe_last_failure(
+    db: &SqlitePool,
+    account_id: i64,
+    persisted: AccountFailureContextPersisted,
+) {
+    if let Err(db_err) = set_account_last_failure(db, account_id, Some(&persisted)).await {
+        warn!("[probe] account {account_id}: failed to persist last_failure: {db_err}");
+    }
+}
+
+fn classify_probe_persisted(
+    err: &ClewdrError,
+    source: FailureSource,
+    stage: &'static str,
+) -> AccountFailureContextPersisted {
+    let ctx = classify_account_failure(err, source, Some(stage));
+    AccountFailureContextPersisted::from(&ctx)
+}
 
 fn probe_bundle_component_sizes(bundle: &Map<String, Value>) -> Map<String, Value> {
     let mut sizes = Map::new();
@@ -420,7 +452,10 @@ async fn run_cookie_probe(
         Err(e) => {
             if let Some(reason) = extract_cookie_reason(&e) {
                 warn!("[probe] account {account_id} invalid: {reason}");
+                let persisted =
+                    classify_probe_persisted(&e, FailureSource::ProbeCookie, "bootstrap");
                 state.release_account(Some(reason)).await;
+                persist_probe_last_failure(db, account_id, persisted).await;
             } else {
                 let msg = format!("bootstrap failed: {e}");
                 warn!("[probe] account {account_id} (transient): {msg}");
@@ -457,7 +492,15 @@ async fn run_cookie_probe(
 
     // 3. Free account → invalidate
     if info.account_type == "free" {
+        // Synthesize an InvalidCookie + Reason::Free for the classifier so
+        // the Persisted form carries `normalized_reason_type=free_tier`.
+        let synthetic = ClewdrError::InvalidCookie {
+            reason: Reason::Free,
+        };
+        let persisted =
+            classify_probe_persisted(&synthetic, FailureSource::ProbeCookie, "bootstrap");
         state.release_account(Some(Reason::Free)).await;
+        persist_probe_last_failure(db, account_id, persisted).await;
         return Err(ProbeFailure {
             stage: "bootstrap",
             message: "cookie belongs to a free-tier account and was rejected".to_string(),
@@ -477,7 +520,10 @@ async fn run_cookie_probe(
         Ok(r) => r,
         Err(e) => {
             if let Some(reason) = extract_cookie_reason(&e) {
+                let persisted =
+                    classify_probe_persisted(&e, FailureSource::ProbeCookie, "oauth_code");
                 state.release_account(Some(reason)).await;
+                persist_probe_last_failure(db, account_id, persisted).await;
             } else {
                 let msg = format!("OAuth code exchange failed: {e}");
                 warn!("[probe] account {account_id}: {msg}");
@@ -493,7 +539,9 @@ async fn run_cookie_probe(
     };
     if let Err(e) = state.exchange_token(code_res).await {
         if let Some(reason) = extract_cookie_reason(&e) {
+            let persisted = classify_probe_persisted(&e, FailureSource::ProbeCookie, "oauth_token");
             state.release_account(Some(reason)).await;
+            persist_probe_last_failure(db, account_id, persisted).await;
         } else {
             let msg = format!("OAuth token exchange failed: {e}");
             warn!("[probe] account {account_id}: {msg}");
@@ -575,7 +623,9 @@ async fn run_cookie_probe(
         }
         Err(e) => {
             if let Some(reason) = extract_cookie_reason(&e) {
+                let persisted = classify_probe_persisted(&e, FailureSource::ProbeCookie, "usage");
                 state.release_account(Some(reason)).await;
+                persist_probe_last_failure(db, account_id, persisted).await;
                 return Err(ProbeFailure::from_err(
                     FailureSource::ProbeCookie,
                     "usage",
@@ -938,8 +988,20 @@ async fn probe_oauth_upstream_failure(
         };
 
     if auth && still_current {
+        let persisted = AccountFailureContextPersisted::from(&context);
         match set_account_auth_error(db, account_id, &msg).await {
             Ok(()) => {
+                // Step 3.5 C4b: persist structured failure context
+                // alongside the legacy auth_error transition. The
+                // classifier output is reused from the `context`
+                // already computed above.
+                if let Err(db_err) =
+                    set_account_last_failure(db, account_id, Some(&persisted)).await
+                {
+                    warn!(
+                        "[probe][oauth] failed to persist last_failure for account {account_id}: {db_err}"
+                    );
+                }
                 // DB is authoritative; only after the status write succeeds
                 // do we converge the pool's in-memory view. Mirrors chat.rs's
                 // mark_oauth_account_auth_error pattern so a transient DB

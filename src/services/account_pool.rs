@@ -668,6 +668,21 @@ impl AccountPoolActor {
         expected_fingerprint: Option<CredentialFingerprint>,
         merge_mode: RuntimeMergeMode,
     ) -> bool {
+        // Step 3.5 C4b note: `collect_by_id` only carries `Option<Reason>`
+        // — it has no access to the original `ClewdrError` /
+        // `AccountFailureContext` that produced this transition. The
+        // structured `accounts.last_failure_json` column is therefore
+        // NEVER written here. Real-context writes happen at the
+        // direct DB writers in `chat.rs` (mark_oauth_account_*,
+        // cookie InvalidCookie path) and `probe.rs`
+        // (run_cookie_probe error arms, probe_oauth_upstream_failure)
+        // BEFORE they call `release_runtime` / `release_account` to
+        // queue the bucket move. By the time the work reaches
+        // `collect_by_id`, the persistence write is already done.
+        //
+        // Routing the full context through `release_runtime` /
+        // `AccountPoolMessage::Return` would require widening every
+        // pool message — explicitly out of scope for v1.2.0.
         let removed_probe = state.probing.remove(&account_id);
 
         // Sticky-reason guard: must peek `invalid` BEFORE we remove, so a

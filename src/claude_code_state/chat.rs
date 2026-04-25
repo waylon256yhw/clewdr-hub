@@ -15,14 +15,15 @@ use crate::{
     claude_code_state::{ClaudeCodeState, TokenStatus},
     config::{AuthMethod, ModelFamily, Reason},
     db::accounts::{
-        set_account_auth_error, set_account_disabled, set_account_reset_time,
-        update_account_metadata_unchecked, upsert_account_oauth,
+        set_account_auth_error, set_account_disabled, set_account_last_failure,
+        set_account_reset_time, update_account_metadata_unchecked, upsert_account_oauth,
         upsert_oauth_snapshot_runtime_fields,
     },
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
     oauth::refresh_oauth_token,
     services::account_error::{
-        AccountFailureAction, AccountNormalizedReason, FailureSource, classify_account_failure,
+        AccountFailureAction, AccountFailureContextPersisted, AccountNormalizedReason,
+        FailureSource, classify_account_failure,
     },
     services::account_pool::{AccountPoolHandle, CredentialFingerprint},
     types::claude::{CountMessageTokensResponse, CreateMessageParams},
@@ -79,13 +80,65 @@ impl ClaudeCodeState {
         }
     }
 
-    async fn mark_oauth_account_auth_error(&mut self, account_id: i64, message: String) {
+    /// Step 3.5 C4b: persist a pre-classified structured failure
+    /// context to `accounts.last_failure_json` for AccountHealth
+    /// display. Used by both OAuth and cookie failure paths in the
+    /// messages / count_tokens flow.
+    ///
+    /// Best-effort: a serialization or DB error logs and returns
+    /// without affecting the surrounding state transition. The
+    /// in-pool legacy `Reason` carrier is unrelated and lives on
+    /// `set_account_auth_error` / `set_account_disabled` /
+    /// `collect_by_id`.
+    ///
+    /// Takes the owned `AccountFailureContextPersisted` rather than
+    /// `&ClewdrError` because `ClewdrError: !Sync` (the `Whatever`
+    /// variant's `dyn Error + Send` source has no `+ Sync`), so a
+    /// borrow held across `.await` makes the surrounding future
+    /// non-Send.
+    async fn persist_last_failure(
+        &self,
+        account_id: i64,
+        persisted: AccountFailureContextPersisted,
+    ) {
+        let Some(db) = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()) else {
+            return;
+        };
+        if let Err(db_err) = set_account_last_failure(&db, account_id, Some(&persisted)).await {
+            warn!("Failed to persist last_failure for account {account_id}: {db_err}");
+        }
+    }
+
+    /// Step 3.5 C4b: classify a borrowed `ClewdrError` to the owned
+    /// persistence DTO before any `.await`, so the caller can drop
+    /// the borrow before crossing into a non-Send-bound future.
+    fn classify_persisted(
+        err: &ClewdrError,
+        source: FailureSource,
+    ) -> AccountFailureContextPersisted {
+        let ctx = classify_account_failure(err, source, None);
+        AccountFailureContextPersisted::from(&ctx)
+    }
+
+    async fn mark_oauth_account_auth_error(
+        &mut self,
+        account_id: i64,
+        message: String,
+        persisted: AccountFailureContextPersisted,
+    ) {
         let Some(db) = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()) else {
             return;
         };
         if let Err(db_err) = set_account_auth_error(&db, account_id, &message).await {
             warn!("Failed to set OAuth auth_error for account {account_id}: {db_err}");
             return;
+        }
+        // Step 3.5 C4b: persist structured failure context alongside the
+        // legacy auth_error transition so AccountHealth.last_failure can
+        // read source/stage/upstream_http_status without losing the
+        // failure scene.
+        if let Err(db_err) = set_account_last_failure(&db, account_id, Some(&persisted)).await {
+            warn!("Failed to persist last_failure for account {account_id}: {db_err}");
         }
         // DB is authoritative; converge the pool's in-memory view so the
         // account stops being dispatched and any affinity pointing at it is
@@ -95,13 +148,22 @@ impl ClaudeCodeState {
             .await;
     }
 
-    async fn mark_oauth_account_disabled(&mut self, account_id: i64) {
+    async fn mark_oauth_account_disabled(
+        &mut self,
+        account_id: i64,
+        persisted: AccountFailureContextPersisted,
+    ) {
         let Some(db) = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()) else {
             return;
         };
         if let Err(db_err) = set_account_disabled(&db, account_id, "disabled").await {
             warn!("Failed to set OAuth account {account_id} disabled: {db_err}");
             return;
+        }
+        // Step 3.5 C4b: persist structured failure context alongside the
+        // legacy disabled transition.
+        if let Err(db_err) = set_account_last_failure(&db, account_id, Some(&persisted)).await {
+            warn!("Failed to persist last_failure for account {account_id}: {db_err}");
         }
         self.account_pool_handle
             .invalidate(account_id, Reason::Disabled)
@@ -319,12 +381,17 @@ impl ClaudeCodeState {
                         let pool_reason = Self::oauth_pool_reason(&e);
                         if let Some(aid) = account_id {
                             if Self::is_oauth_disabled_failure(&e) {
-                                state.mark_oauth_account_disabled(aid).await;
+                                let persisted =
+                                    Self::classify_persisted(&e, FailureSource::Messages);
+                                state.mark_oauth_account_disabled(aid, persisted).await;
                             } else if let Some(reset_time) = Self::oauth_cooldown_until(&e) {
                                 state.mark_oauth_account_cooldown(aid, reset_time).await;
                             } else if Self::is_oauth_auth_failure(&e) {
+                                let message = e.to_string();
+                                let persisted =
+                                    Self::classify_persisted(&e, FailureSource::Messages);
                                 state
-                                    .mark_oauth_account_auth_error(aid, e.to_string())
+                                    .mark_oauth_account_auth_error(aid, message, persisted)
                                     .await;
                             }
                         }
@@ -345,6 +412,21 @@ impl ClaudeCodeState {
                     );
                     // 429 error
                     if let ClewdrError::InvalidCookie { reason } = e {
+                        // Step 3.5 C4b: cookie flow's invalid path persists
+                        // structured failure context to DB before the pool
+                        // flush eventually writes the legacy invalid_reason.
+                        // collect_by_id only carries `Reason`, so the rich
+                        // context must be written here while we still have
+                        // the original ClewdrError.
+                        if let Some(aid) = account_id {
+                            let persisted = Self::classify_persisted(
+                                &ClewdrError::InvalidCookie {
+                                    reason: reason.clone(),
+                                },
+                                FailureSource::Messages,
+                            );
+                            state.persist_last_failure(aid, persisted).await;
+                        }
                         state.release_account(Some(reason.to_owned())).await;
                         continue;
                     }
@@ -551,12 +633,17 @@ impl ClaudeCodeState {
                         let pool_reason = Self::oauth_pool_reason(&e);
                         if let Some(aid) = account_id {
                             if Self::is_oauth_disabled_failure(&e) {
-                                state.mark_oauth_account_disabled(aid).await;
+                                let persisted =
+                                    Self::classify_persisted(&e, FailureSource::CountTokens);
+                                state.mark_oauth_account_disabled(aid, persisted).await;
                             } else if let Some(reset_time) = Self::oauth_cooldown_until(&e) {
                                 state.mark_oauth_account_cooldown(aid, reset_time).await;
                             } else if Self::is_oauth_auth_failure(&e) {
+                                let message = e.to_string();
+                                let persisted =
+                                    Self::classify_persisted(&e, FailureSource::CountTokens);
                                 state
-                                    .mark_oauth_account_auth_error(aid, e.to_string())
+                                    .mark_oauth_account_auth_error(aid, message, persisted)
                                     .await;
                             }
                         }
@@ -576,6 +663,18 @@ impl ClaudeCodeState {
                         e
                     );
                     if let ClewdrError::InvalidCookie { reason } = e {
+                        // Step 3.5 C4b: cookie flow's invalid path persists
+                        // structured failure context to DB. See sibling
+                        // comment in `claude_code_messages` retry loop.
+                        if let Some(aid) = account_id {
+                            let persisted = Self::classify_persisted(
+                                &ClewdrError::InvalidCookie {
+                                    reason: reason.clone(),
+                                },
+                                FailureSource::CountTokens,
+                            );
+                            state.persist_last_failure(aid, persisted).await;
+                        }
                         state.release_account(Some(reason.to_owned())).await;
                         continue;
                     }
@@ -1497,5 +1596,55 @@ mod tests {
             ..AccountSlot::default()
         };
         assert!(oauth_slot.auth_method == AuthMethod::OAuth);
+    }
+
+    /// Step 3.5 C4b: `classify_persisted` produces a Send-safe owned
+    /// DTO that the caller can carry across `.await` boundaries. This
+    /// is the convention used by both messages / count_tokens
+    /// failure paths.
+    #[test]
+    fn classify_persisted_produces_owned_send_dto() {
+        use crate::error::ClewdrError;
+        use crate::services::account_error::FailureSource;
+
+        let err = ClewdrError::InvalidCookie {
+            reason: Reason::TooManyRequest(123),
+        };
+        let persisted = super::ClaudeCodeState::classify_persisted(&err, FailureSource::Messages);
+
+        // Sanity: source threaded through, normalized_reason_type is
+        // the stable string consumers will actually read.
+        assert_eq!(persisted.source, FailureSource::Messages);
+        assert_eq!(persisted.normalized_reason_type, "rate_limited");
+
+        // Send check: we can move the persisted into a tokio::spawn
+        // body. If the field types regress to non-Send (e.g.,
+        // accidentally adopting `Rc` or borrowing static refs),
+        // this test fails to compile.
+        fn assert_send<T: Send + 'static>(_: &T) {}
+        assert_send(&persisted);
+    }
+
+    /// Step 3.5 C4b: a CountTokens-source classification carries the
+    /// distinct source through to the persisted DTO so AccountHealth
+    /// can show "this failed during count_tokens, not messages".
+    #[test]
+    fn classify_persisted_distinguishes_count_tokens_source() {
+        use crate::error::ClewdrError;
+        use crate::services::account_error::FailureSource;
+
+        let err = ClewdrError::InvalidCookie {
+            reason: Reason::Null,
+        };
+        let messages = super::ClaudeCodeState::classify_persisted(&err, FailureSource::Messages);
+        let count = super::ClaudeCodeState::classify_persisted(&err, FailureSource::CountTokens);
+        assert_eq!(messages.source, FailureSource::Messages);
+        assert_eq!(count.source, FailureSource::CountTokens);
+        // Same Reason::Null + same default stage → same normalized
+        // type; only `source` differs.
+        assert_eq!(
+            messages.normalized_reason_type,
+            count.normalized_reason_type
+        );
     }
 }
