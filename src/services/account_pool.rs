@@ -1786,8 +1786,8 @@ mod tests {
     fn oauth_placeholder_cookie_is_unique_per_account_and_accepted_by_parser() {
         // The synthesized placeholder must (a) satisfy `ClewdrCookie::from_str`'s
         // regex so the loader can construct an `AccountSlot`, and (b) be distinct
-        // per account_id so debug logs and AccountSlot's cookie-keyed PartialEq
-        // (still in place until Step 3 retires AccountSlot) stay unambiguous.
+        // per account_id so debug logs (and pre-Step-4 cookie-keyed
+        // identity, retired in C9) stay unambiguous.
         let c1 = oauth_placeholder_cookie(1);
         let c2 = oauth_placeholder_cookie(2);
         let c_big = oauth_placeholder_cookie(i64::MAX);

@@ -1,6 +1,5 @@
 use std::{
     fmt::{Debug, Display},
-    hash::Hash,
     ops::Deref,
     str::FromStr,
     sync::LazyLock,
@@ -185,31 +184,18 @@ pub struct AccountSlot {
     pub weekly_opus_utilization: Option<f64>,
 }
 
-impl PartialEq for AccountSlot {
-    fn eq(&self, other: &Self) -> bool {
-        self.cookie == other.cookie
-    }
-}
-
-impl Eq for AccountSlot {}
-
-impl Hash for AccountSlot {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.cookie.hash(state);
-    }
-}
-
-impl Ord for AccountSlot {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.cookie.cmp(&other.cookie)
-    }
-}
-
-impl PartialOrd for AccountSlot {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
+// `AccountSlot` deliberately does not implement `PartialEq` / `Eq` /
+// `Hash` / `Ord` / `PartialOrd`. Step 4 / C9 retired the cookie-keyed
+// impls — pre-Step-4 they hashed/sorted by `self.cookie`, which (a) was
+// the wrong identity once OAuth slots existed (C8 made cookie Optional;
+// two OAuth slots would compare equal under those impls), and (b) had
+// no remaining production caller after Step 2 keyed every pool bucket
+// by `account_id` (HashMap<i64, _> / VecDeque<_>).
+//
+// Code that needs an account identity must use `slot.account_id`
+// explicitly (`Option<i64>`). Code that needs to dedupe / sort must
+// build its own keying strategy. The compiler now enforces that no
+// caller silently leans on cookie-keyed identity.
 
 impl AccountSlot {
     /// Creates a new AccountSlot instance
