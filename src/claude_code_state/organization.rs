@@ -15,6 +15,18 @@ pub struct BootstrapInfo {
     pub org_uuid: String,
     pub account_type: String,
     pub capabilities: Vec<String>,
+    /// e.g. `default_claude_max_20x`, `default_claude_max_5x`,
+    /// `default_claude_pro`. Refines `account_type` for Max users.
+    pub rate_limit_tier: Option<String>,
+    /// e.g. `google_play_subscription`, `stripe`. Informational.
+    pub billing_type: Option<String>,
+    /// Best-available proxy for "subscription start". The cookie
+    /// bootstrap response does not expose `subscription_created_at`
+    /// directly, so this falls back through `organization.created_at`
+    /// → `selected_membership.created_at`. For personal Pro/Max
+    /// accounts these typically match the real subscription start;
+    /// see callers for the caveat.
+    pub subscription_created_at: Option<String>,
 }
 
 fn derive_account_type(capabilities: &[String]) -> String {
@@ -81,14 +93,16 @@ fn parse_bootstrap_info(bootstrap: &Value) -> Result<BootstrapInfo, ClewdrError>
     let memberships = bootstrap["account"]["memberships"]
         .as_array()
         .ok_or(Reason::Null)?;
-    let boot_acc_info = memberships
+    let selected_membership = memberships
         .iter()
         .find(|m| {
             m["organization"]["capabilities"]
                 .as_array()
                 .is_some_and(|c| c.iter().any(|c| c.as_str() == Some("chat")))
         })
-        .and_then(|m| m["organization"].as_object())
+        .ok_or(Reason::Null)?;
+    let boot_acc_info = selected_membership["organization"]
+        .as_object()
         .ok_or(Reason::Null)?;
     let capabilities = boot_acc_info["capabilities"]
         .as_array()
@@ -110,10 +124,36 @@ fn parse_bootstrap_info(bootstrap: &Value) -> Result<BootstrapInfo, ClewdrError>
         .to_string();
     let account_type = derive_account_type(&capabilities);
 
+    let rate_limit_tier = boot_acc_info
+        .get("rate_limit_tier")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let billing_type = boot_acc_info
+        .get("billing_type")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    // Cookie bootstrap has no `subscription_created_at`. Prefer the org
+    // creation timestamp (closer to subscription start for personal
+    // orgs), then fall back to the membership's own creation timestamp
+    // before giving up.
+    let subscription_created_at = boot_acc_info
+        .get("subscription_created_at")
+        .and_then(Value::as_str)
+        .or_else(|| boot_acc_info.get("created_at").and_then(Value::as_str))
+        .or_else(|| {
+            selected_membership
+                .get("created_at")
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string);
+
     Ok(BootstrapInfo {
         email,
         org_uuid: uuid,
         account_type,
         capabilities,
+        rate_limit_tier,
+        billing_type,
+        subscription_created_at,
     })
 }

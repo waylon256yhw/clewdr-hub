@@ -75,6 +75,17 @@ pub struct AccountResponse {
     pub last_error: Option<String>,
     pub email: Option<String>,
     pub account_type: Option<String>,
+    /// e.g. `default_claude_max_20x`. Lets the frontend render the
+    /// 5x / 20x distinction instead of the coarser `account_type`.
+    pub rate_limit_tier: Option<String>,
+    /// RFC3339 anchor for the renewal-countdown UI. Origin differs by
+    /// auth source: OAuth populates from
+    /// `profile.organization.subscription_created_at`; Cookie falls
+    /// back to the org's `created_at` (see BootstrapInfo for details).
+    pub subscription_created_at: Option<String>,
+    /// e.g. `google_play_subscription`, `stripe`. Tooltip-only on the
+    /// AccountCard; informational.
+    pub billing_type: Option<String>,
     pub invalid_reason: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
@@ -131,6 +142,9 @@ fn map_account(row: &AccountWithRuntime, health: Option<AccountHealth>) -> Accou
             .map(sanitize_account_error_message),
         email: row.email.clone(),
         account_type: row.account_type.clone(),
+        rate_limit_tier: row.rate_limit_tier.clone(),
+        subscription_created_at: row.subscription_created_at.clone(),
+        billing_type: row.billing_type.clone(),
         invalid_reason: row
             .invalid_reason
             .as_deref()
@@ -350,8 +364,9 @@ pub async fn create(
             name, rr_order, max_slots, proxy_id, status, auth_source, cookie_blob,
             oauth_access_token, oauth_refresh_token, oauth_expires_at,
             organization_uuid, last_refresh_at, last_error, email, account_type,
+            rate_limit_tier, subscription_created_at, billing_type,
             drain_first
-        ) VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14)",
+        ) VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17)",
     )
     .bind(&req.name)
     .bind(rr_order)
@@ -374,6 +389,21 @@ pub async fn create(
         oauth
             .as_ref()
             .and_then(|v| v.snapshot.account_type.as_deref()),
+    )
+    .bind(
+        oauth
+            .as_ref()
+            .and_then(|v| v.snapshot.rate_limit_tier.as_deref()),
+    )
+    .bind(
+        oauth
+            .as_ref()
+            .and_then(|v| v.snapshot.subscription_created_at.as_deref()),
+    )
+    .bind(
+        oauth
+            .as_ref()
+            .and_then(|v| v.snapshot.billing_type.as_deref()),
     )
     .bind(req.drain_first.unwrap_or(false) as i64)
     .execute(&db)
@@ -620,9 +650,14 @@ pub async fn update(
         update_account_metadata_unchecked(
             &db,
             id,
-            oauth.snapshot.email.as_deref(),
-            oauth.snapshot.account_type.as_deref(),
-            Some(oauth.snapshot.organization_uuid.as_str()),
+            crate::db::accounts::AccountMetadataUpdate {
+                email: oauth.snapshot.email.as_deref(),
+                account_type: oauth.snapshot.account_type.as_deref(),
+                organization_uuid: Some(oauth.snapshot.organization_uuid.as_str()),
+                rate_limit_tier: oauth.snapshot.rate_limit_tier.as_deref(),
+                subscription_created_at: oauth.snapshot.subscription_created_at.as_deref(),
+                billing_type: oauth.snapshot.billing_type.as_deref(),
+            },
         )
         .await?;
         batch_upsert_runtime_states(&db, &[(id, oauth.snapshot.runtime.clone())]).await?;

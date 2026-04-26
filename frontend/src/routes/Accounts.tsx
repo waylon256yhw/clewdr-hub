@@ -106,6 +106,133 @@ function accountTypeLabel(t: string): string {
   }
 }
 
+/**
+ * Decompose a rate_limit_tier string like `default_claude_max_20x` into
+ * `{ plan: "max", multiplier: "20x" }`. Returns null when the string
+ * does not match the expected shape; callers should fall back to
+ * `account_type` in that case.
+ */
+function parseRateLimitTier(
+  tier: string,
+): { plan: string; multiplier: string | null } | null {
+  const m = tier.trim().toLowerCase().match(/^default_claude_([a-z]+)(?:_(\d+x))?$/);
+  if (!m) return null;
+  return { plan: m[1], multiplier: m[2] ?? null };
+}
+
+const RECOGNIZED_PLANS = new Set(["max", "pro", "enterprise", "free"]);
+
+/**
+ * Display label preferring `rate_limit_tier` (Max 20x / Max 5x / Pro / ...).
+ *
+ * The tier is only preferred when it carries information beyond
+ * `account_type`: a recognized plan family (max/pro/enterprise/free)
+ * or a Max-style multiplier suffix. Generic upstream values like
+ * `default_claude_ai` parse to plan="ai" with no multiplier — we'd
+ * render an "ai" badge that's both wrong and less informative than
+ * the derived `account_type` ("Pro"), so fall back in that case.
+ */
+function planTierLabel(
+  rateLimitTier: string | null,
+  accountType: string | null,
+): string | null {
+  if (rateLimitTier) {
+    const parsed = parseRateLimitTier(rateLimitTier);
+    if (parsed && (RECOGNIZED_PLANS.has(parsed.plan) || parsed.multiplier)) {
+      const planLabel = RECOGNIZED_PLANS.has(parsed.plan)
+        ? accountTypeLabel(parsed.plan)
+        : parsed.plan;
+      return parsed.multiplier ? `${planLabel} ${parsed.multiplier}` : planLabel;
+    }
+  }
+  if (accountType) return accountTypeLabel(accountType);
+  return null;
+}
+
+/** Same precedence as planTierLabel — color tracks the plan family. */
+function planTierColor(
+  rateLimitTier: string | null,
+  accountType: string | null,
+): string {
+  if (rateLimitTier) {
+    const parsed = parseRateLimitTier(rateLimitTier);
+    if (parsed && (RECOGNIZED_PLANS.has(parsed.plan) || parsed.multiplier)) {
+      return accountTypeColor(parsed.plan);
+    }
+  }
+  if (accountType) return accountTypeColor(accountType);
+  return "gray";
+}
+
+/**
+ * Compute the next monthly renewal anchor. Walks calendar months from
+ * `startIso` until the candidate exceeds `now`. When the start day
+ * does not exist in the target month (e.g. 1/31 → Feb), clamps to the
+ * last day of that month — matches typical subscription billing
+ * behavior and `chrono::Months` semantics on the backend.
+ */
+function nextRenewalDate(startIso: string, now: Date = new Date()): Date | null {
+  const start = new Date(startIso);
+  if (Number.isNaN(start.getTime())) return null;
+  const day = start.getUTCDate();
+  const hh = start.getUTCHours();
+  const mm = start.getUTCMinutes();
+  const ss = start.getUTCSeconds();
+  const lastDayOf = (year: number, monthIdx: number) =>
+    new Date(Date.UTC(year, monthIdx + 1, 0)).getUTCDate();
+  const buildCandidate = (year: number, monthIdx: number) => {
+    const clampedDay = Math.min(day, lastDayOf(year, monthIdx));
+    return new Date(Date.UTC(year, monthIdx, clampedDay, hh, mm, ss));
+  };
+
+  let year = now.getUTCFullYear();
+  let monthIdx = now.getUTCMonth();
+  let candidate = buildCandidate(year, monthIdx);
+  while (candidate.getTime() <= now.getTime()) {
+    monthIdx += 1;
+    if (monthIdx > 11) {
+      monthIdx = 0;
+      year += 1;
+    }
+    candidate = buildCandidate(year, monthIdx);
+  }
+  return candidate;
+}
+
+/** Whole days from now until next renewal. Negative is impossible
+ *  by construction (nextRenewalDate always returns a future date),
+ *  but treat the boundary day as 0. */
+function daysUntilRenewal(startIso: string): number | null {
+  const next = nextRenewalDate(startIso);
+  if (!next) return null;
+  const diffMs = next.getTime() - Date.now();
+  return Math.max(0, Math.ceil(diffMs / (24 * 3600 * 1000)));
+}
+
+/**
+ * Three-band color for the renewal countdown:
+ *   * green  — fresh (used < ~1 week into a 30-day cycle, ≥22 days left)
+ *   * yellow — mid-cycle (8-21 days left)
+ *   * red    — last week of the cycle (≤7 days), pay attention before quota resets
+ */
+function renewalCountdownColor(days: number): string {
+  if (days <= 7) return "red";
+  if (days <= 21) return "yellow";
+  return "teal";
+}
+
+/** Short date "2026-04-10" in Asia/Shanghai. */
+function formatSubscriptionDate(iso: string): string | null {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toLocaleDateString("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+}
+
 function authSourceLabel(source: Account["auth_source"]): string {
   switch (source) {
     case "oauth": return "OAuth";
@@ -288,11 +415,37 @@ function AccountCard({
         </Badge>
         {isProbing && <Badge color="blue" variant="light" size="sm">probing</Badge>}
         <Badge color="dark" variant="outline" size="sm">{authSourceLabel(account.auth_source)}</Badge>
-        {account.account_type && (
-          <Badge color={accountTypeColor(account.account_type)} variant="light" size="sm">
-            {accountTypeLabel(account.account_type)}
-          </Badge>
-        )}
+        {(() => {
+          const label = planTierLabel(account.rate_limit_tier, account.account_type);
+          if (!label) return null;
+          // Tooltip body: stash billing_type here when available — too
+          // niche for a dedicated chip but useful when triaging
+          // payment-method-specific issues (Play Store family plans,
+          // self-serve Stripe, etc.).
+          const tooltipParts: string[] = [];
+          if (account.rate_limit_tier) {
+            tooltipParts.push(`tier: ${account.rate_limit_tier}`);
+          }
+          if (account.billing_type) {
+            tooltipParts.push(`billing: ${account.billing_type}`);
+          }
+          const badge = (
+            <Badge
+              color={planTierColor(account.rate_limit_tier, account.account_type)}
+              variant="light"
+              size="sm"
+            >
+              {label}
+            </Badge>
+          );
+          return tooltipParts.length > 0 ? (
+            <Tooltip label={tooltipParts.join("\n")} multiline withArrow>
+              {badge}
+            </Tooltip>
+          ) : (
+            badge
+          );
+        })()}
         {account.proxy_name && (
           <Badge color="grape" variant="light" size="sm">
             代理: {account.proxy_name}
@@ -318,6 +471,27 @@ function AccountCard({
       {account.email && (
         <Text size="xs" c="dimmed" mb="xs" lineClamp={1}>{account.email}</Text>
       )}
+
+      {account.subscription_created_at && (() => {
+        const days = daysUntilRenewal(account.subscription_created_at);
+        if (days === null) return null;
+        const startLabel = formatSubscriptionDate(account.subscription_created_at);
+        const body = (
+          <Text size="xs" c="dimmed" mb="xs">
+            剩余{" "}
+            <Text component="span" fw={700} c={renewalCountdownColor(days)}>
+              {days <= 0 ? "<1 天" : `${days} 天`}
+            </Text>
+          </Text>
+        );
+        return startLabel ? (
+          <Tooltip label={`订阅创建于 ${startLabel}`} withArrow>
+            {body}
+          </Tooltip>
+        ) : (
+          body
+        );
+      })()}
 
       {probeCheckedAt && (
         <Text size="xs" c="dimmed" mb="xs">探测更新时间: {probeCheckedAt}</Text>

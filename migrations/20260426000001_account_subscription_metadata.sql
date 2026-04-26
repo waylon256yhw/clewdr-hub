@@ -1,0 +1,31 @@
+-- Persist additional probe-derived subscription metadata per account.
+--
+-- Already persisted (20260401000005): email, account_type
+-- Already persisted (20260406000004): organization_uuid
+--
+-- This migration adds three more fields surfaced via probe responses but
+-- previously kept only inside request_logs JSON bundles:
+--
+-- * rate_limit_tier         — refines account_type (e.g.
+--                             default_claude_max_20x vs
+--                             default_claude_max_5x). Available on both
+--                             bootstrap.organization (cookie) and
+--                             profile.organization (oauth).
+--
+-- * subscription_created_at — RFC3339 anchor for the monthly renewal
+--                             countdown UI. Sourced first from the
+--                             explicit subscription_created_at field
+--                             (oauth profile), then falling back in
+--                             order to organization.created_at /
+--                             selected_membership.created_at (cookie
+--                             bootstrap, where the explicit field is
+--                             absent).
+--
+-- * billing_type            — informational (e.g.
+--                             google_play_subscription, stripe).
+--                             Surfaced via tooltip only; useful for
+--                             spotting Play Store family-plan accounts
+--                             and similar non-default scenarios.
+ALTER TABLE accounts ADD COLUMN rate_limit_tier TEXT;
+ALTER TABLE accounts ADD COLUMN subscription_created_at TEXT;
+ALTER TABLE accounts ADD COLUMN billing_type TEXT;

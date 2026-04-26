@@ -9,8 +9,8 @@ use crate::{
     billing::{BillingContext, RequestType, persist_probe_log},
     config::{AccountSlot, CLEWDR_CONFIG, Reason},
     db::accounts::{
-        AccountWithRuntime, account_credential_matches_prefix, get_account_by_id,
-        set_account_active, set_account_auth_error, set_account_last_failure,
+        AccountMetadataUpdate, AccountWithRuntime, account_credential_matches_prefix,
+        get_account_by_id, set_account_active, set_account_auth_error, set_account_last_failure,
         update_account_metadata, upsert_account_oauth, upsert_oauth_snapshot_runtime_fields,
     },
     error::ClewdrError,
@@ -479,9 +479,14 @@ async fn run_cookie_probe(
     if let Err(e) = update_account_metadata(
         db,
         account_id,
-        Some(&info.email),
-        Some(&info.account_type),
-        Some(&info.org_uuid),
+        AccountMetadataUpdate {
+            email: Some(&info.email),
+            account_type: Some(&info.account_type),
+            organization_uuid: Some(&info.org_uuid),
+            rate_limit_tier: info.rate_limit_tier.as_deref(),
+            subscription_created_at: info.subscription_created_at.as_deref(),
+            billing_type: info.billing_type.as_deref(),
+        },
         "cookie",
         &cookie_prefix,
     )
@@ -819,9 +824,14 @@ async fn run_oauth_probe(
     if let Err(err) = update_account_metadata(
         db,
         account_id,
-        snapshot.email.as_deref(),
-        snapshot.account_type.as_deref(),
-        Some(snapshot.organization_uuid.as_str()),
+        AccountMetadataUpdate {
+            email: snapshot.email.as_deref(),
+            account_type: snapshot.account_type.as_deref(),
+            organization_uuid: Some(snapshot.organization_uuid.as_str()),
+            rate_limit_tier: snapshot.rate_limit_tier.as_deref(),
+            subscription_created_at: snapshot.subscription_created_at.as_deref(),
+            billing_type: snapshot.billing_type.as_deref(),
+        },
         "oauth",
         access_prefix,
     )

@@ -239,9 +239,14 @@ impl ClaudeCodeState {
         update_account_metadata_unchecked(
             &db,
             account_id,
-            refreshed.snapshot.email.as_deref(),
-            refreshed.snapshot.account_type.as_deref(),
-            Some(refreshed.snapshot.organization_uuid.as_str()),
+            crate::db::accounts::AccountMetadataUpdate {
+                email: refreshed.snapshot.email.as_deref(),
+                account_type: refreshed.snapshot.account_type.as_deref(),
+                organization_uuid: Some(refreshed.snapshot.organization_uuid.as_str()),
+                rate_limit_tier: refreshed.snapshot.rate_limit_tier.as_deref(),
+                subscription_created_at: refreshed.snapshot.subscription_created_at.as_deref(),
+                billing_type: refreshed.snapshot.billing_type.as_deref(),
+            },
         )
         .await?;
         upsert_oauth_snapshot_runtime_fields(&db, account_id, &refreshed.snapshot.runtime).await?;

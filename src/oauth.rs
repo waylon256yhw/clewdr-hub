@@ -90,6 +90,9 @@ struct OAuthProfileAccount {
 struct OAuthProfileOrg {
     uuid: Option<String>,
     organization_type: Option<String>,
+    rate_limit_tier: Option<String>,
+    billing_type: Option<String>,
+    subscription_created_at: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -144,6 +147,16 @@ pub struct OAuthAccountSnapshot {
     pub email: Option<String>,
     pub account_type: Option<String>,
     pub organization_uuid: String,
+    /// e.g. `default_claude_max_20x`. Pulled directly from
+    /// `profile.organization.rate_limit_tier`. Refines `account_type`
+    /// to expose 5x vs 20x for Max users.
+    pub rate_limit_tier: Option<String>,
+    /// e.g. `google_play_subscription`. Informational; surfaced via
+    /// tooltip on the AccountCard.
+    pub billing_type: Option<String>,
+    /// RFC3339 timestamp from `profile.organization.subscription_created_at`.
+    /// Anchor for the monthly renewal countdown.
+    pub subscription_created_at: Option<String>,
     pub runtime: RuntimeStateParams,
 }
 
@@ -475,6 +488,9 @@ pub async fn fetch_oauth_snapshot_raw(
             .context(UnexpectedNoneSnafu {
                 msg: "OAuth profile missing organization UUID",
             })?,
+        rate_limit_tier: profile.organization.rate_limit_tier.clone(),
+        billing_type: profile.organization.billing_type.clone(),
+        subscription_created_at: profile.organization.subscription_created_at.clone(),
         runtime: RuntimeStateParams {
             reset_time: [
                 (session_utilization, session_resets_at),

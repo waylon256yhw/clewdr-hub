@@ -202,6 +202,9 @@ export interface Account {
   last_error: string | null;
   email: string | null;
   account_type: string | null;
+  rate_limit_tier: string | null;
+  subscription_created_at: string | null;
+  billing_type: string | null;
   invalid_reason: string | null;
   created_at: string | null;
   updated_at: string | null;

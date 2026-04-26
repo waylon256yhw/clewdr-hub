@@ -29,6 +29,9 @@ pub struct AccountWithRuntime {
     pub last_failure: Option<AccountFailureContextPersisted>,
     pub email: Option<String>,
     pub account_type: Option<String>,
+    pub rate_limit_tier: Option<String>,
+    pub subscription_created_at: Option<String>,
+    pub billing_type: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub runtime: Option<RuntimeStateRow>,
@@ -204,7 +207,8 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
             a.oauth_access_token, a.oauth_refresh_token, a.oauth_expires_at,
             a.organization_uuid, a.last_refresh_at, a.last_error, a.invalid_reason,
             a.last_failure_json,
-            a.email, a.account_type, a.created_at, a.updated_at,
+            a.email, a.account_type, a.rate_limit_tier, a.subscription_created_at, a.billing_type,
+            a.created_at, a.updated_at,
             a.drain_first,
             rs.account_id AS rs_marker,
             rs.reset_time,
@@ -349,6 +353,9 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
                 .and_then(AccountFailureContextPersisted::from_json_lenient),
             email: row.get("email"),
             account_type: row.get("account_type"),
+            rate_limit_tier: row.get("rate_limit_tier"),
+            subscription_created_at: row.get("subscription_created_at"),
+            billing_type: row.get("billing_type"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
             runtime,
@@ -675,10 +682,25 @@ pub async fn set_account_active(pool: &SqlitePool, account_id: i64) -> Result<()
     Ok(())
 }
 
-/// Update account telemetry metadata (email, account_type, org_uuid) only
-/// if the account's current credential still matches the fingerprint the
-/// caller started with. Prevents stale probes from overwriting metadata
-/// after a credential rotation (cookie replacement or OAuth re-auth).
+/// Probe-derived metadata payload for [`update_account_metadata`] and
+/// [`update_account_metadata_unchecked`]. `None` for any field
+/// preserves the existing column value (COALESCE semantics) — not
+/// every probe path populates every field, so callers can pass
+/// `..Default::default()` when only a subset is known.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AccountMetadataUpdate<'a> {
+    pub email: Option<&'a str>,
+    pub account_type: Option<&'a str>,
+    pub organization_uuid: Option<&'a str>,
+    pub rate_limit_tier: Option<&'a str>,
+    pub subscription_created_at: Option<&'a str>,
+    pub billing_type: Option<&'a str>,
+}
+
+/// Update account telemetry metadata only if the account's current
+/// credential still matches the fingerprint the caller started with.
+/// Prevents stale probes from overwriting metadata after a credential
+/// rotation (cookie replacement or OAuth re-auth).
 ///
 /// For `auth_source = "cookie"`, the guard matches against `cookie_blob`
 /// (with a legacy `sessionKey=` variant for pre-normalization rows). For
@@ -687,20 +709,18 @@ pub async fn set_account_active(pool: &SqlitePool, account_id: i64) -> Result<()
 /// `LIKE prefix%` so SQLite wildcard characters (`_`, `%`) in the prefix
 /// bytes do not relax the guard.
 ///
-/// `email`, `account_type`, and `org_uuid` are `Option<&str>`: `None`
+/// Each field on [`AccountMetadataUpdate`] is `Option<&str>`: `None`
 /// preserves the existing DB value (COALESCE semantics), matching
 /// `update_account_metadata_unchecked`. This is the shape OAuth probe
-/// snapshots deliver — not every profile endpoint populates email /
-/// account_type.
+/// snapshots deliver — not every profile endpoint populates every
+/// field.
 ///
 /// Returns Ok(()) with a warn log if the guard misses — callers treat a
 /// missed update as a no-op, not an error.
 pub async fn update_account_metadata(
     pool: &SqlitePool,
     account_id: i64,
-    email: Option<&str>,
-    account_type: Option<&str>,
-    org_uuid: Option<&str>,
+    update: AccountMetadataUpdate<'_>,
     expected_auth_source: &str,
     expected_credential_prefix: &str,
 ) -> Result<(), sqlx::Error> {
@@ -710,11 +730,23 @@ pub async fn update_account_metadata(
             let legacy_prefix = format!("sessionKey={expected_credential_prefix}");
             let legacy_plen = legacy_prefix.len() as i64;
             sqlx::query(
-                "UPDATE accounts SET email = COALESCE(?1, email), account_type = COALESCE(?2, account_type), organization_uuid = COALESCE(?3, organization_uuid), updated_at = CURRENT_TIMESTAMP WHERE id = ?4 AND (substr(cookie_blob, 1, ?5) = ?6 OR substr(cookie_blob, 1, ?7) = ?8)",
+                "UPDATE accounts SET
+                    email = COALESCE(?1, email),
+                    account_type = COALESCE(?2, account_type),
+                    organization_uuid = COALESCE(?3, organization_uuid),
+                    rate_limit_tier = COALESCE(?4, rate_limit_tier),
+                    subscription_created_at = COALESCE(?5, subscription_created_at),
+                    billing_type = COALESCE(?6, billing_type),
+                    updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?7
+                   AND (substr(cookie_blob, 1, ?8) = ?9 OR substr(cookie_blob, 1, ?10) = ?11)",
             )
-            .bind(email)
-            .bind(account_type)
-            .bind(org_uuid)
+            .bind(update.email)
+            .bind(update.account_type)
+            .bind(update.organization_uuid)
+            .bind(update.rate_limit_tier)
+            .bind(update.subscription_created_at)
+            .bind(update.billing_type)
             .bind(account_id)
             .bind(plen)
             .bind(expected_credential_prefix)
@@ -726,11 +758,22 @@ pub async fn update_account_metadata(
         "oauth" => {
             let plen = expected_credential_prefix.len() as i64;
             sqlx::query(
-                "UPDATE accounts SET email = COALESCE(?1, email), account_type = COALESCE(?2, account_type), organization_uuid = COALESCE(?3, organization_uuid), updated_at = CURRENT_TIMESTAMP WHERE id = ?4 AND substr(oauth_access_token, 1, ?5) = ?6",
+                "UPDATE accounts SET
+                    email = COALESCE(?1, email),
+                    account_type = COALESCE(?2, account_type),
+                    organization_uuid = COALESCE(?3, organization_uuid),
+                    rate_limit_tier = COALESCE(?4, rate_limit_tier),
+                    subscription_created_at = COALESCE(?5, subscription_created_at),
+                    billing_type = COALESCE(?6, billing_type),
+                    updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?7 AND substr(oauth_access_token, 1, ?8) = ?9",
             )
-            .bind(email)
-            .bind(account_type)
-            .bind(org_uuid)
+            .bind(update.email)
+            .bind(update.account_type)
+            .bind(update.organization_uuid)
+            .bind(update.rate_limit_tier)
+            .bind(update.subscription_created_at)
+            .bind(update.billing_type)
             .bind(account_id)
             .bind(plen)
             .bind(expected_credential_prefix)
@@ -807,22 +850,26 @@ pub async fn account_credential_matches_prefix(
 pub async fn update_account_metadata_unchecked(
     pool: &SqlitePool,
     account_id: i64,
-    email: Option<&str>,
-    account_type: Option<&str>,
-    org_uuid: Option<&str>,
+    update: AccountMetadataUpdate<'_>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE accounts
          SET email = COALESCE(?1, email),
              account_type = COALESCE(?2, account_type),
              organization_uuid = COALESCE(?3, organization_uuid),
+             rate_limit_tier = COALESCE(?4, rate_limit_tier),
+             subscription_created_at = COALESCE(?5, subscription_created_at),
+             billing_type = COALESCE(?6, billing_type),
              invalid_reason = NULL,
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?4",
+         WHERE id = ?7",
     )
-    .bind(email)
-    .bind(account_type)
-    .bind(org_uuid)
+    .bind(update.email)
+    .bind(update.account_type)
+    .bind(update.organization_uuid)
+    .bind(update.rate_limit_tier)
+    .bind(update.subscription_created_at)
+    .bind(update.billing_type)
     .bind(account_id)
     .execute(pool)
     .await?;
@@ -905,8 +952,8 @@ mod tests {
     use sqlx::Row;
 
     use super::{
-        AccountAuthSourceSummary, AccountPoolSummary, AccountStatusSummary, AccountSummary,
-        AccountWithRuntime, RuntimeStateRow, account_credential_matches_prefix,
+        AccountAuthSourceSummary, AccountMetadataUpdate, AccountPoolSummary, AccountStatusSummary,
+        AccountSummary, AccountWithRuntime, RuntimeStateRow, account_credential_matches_prefix,
         batch_upsert_runtime_states, load_all_accounts, summarize_accounts,
         update_account_metadata, upsert_oauth_snapshot_runtime_fields,
     };
@@ -973,6 +1020,9 @@ mod tests {
             last_failure: None,
             email: None,
             account_type: None,
+            rate_limit_tier: None,
+            subscription_created_at: None,
+            billing_type: None,
             created_at: None,
             updated_at: None,
             runtime: Some(runtime(reset_time)),
@@ -1042,9 +1092,12 @@ mod tests {
         update_account_metadata(
             &pool,
             1,
-            Some("n@example.com"),
-            Some("pro"),
-            Some("org-normal"),
+            AccountMetadataUpdate {
+                email: Some("n@example.com"),
+                account_type: Some("pro"),
+                organization_uuid: Some("org-normal"),
+                ..Default::default()
+            },
             "cookie",
             prefix,
         )
@@ -1053,9 +1106,12 @@ mod tests {
         update_account_metadata(
             &pool,
             2,
-            Some("l@example.com"),
-            Some("pro"),
-            Some("org-legacy"),
+            AccountMetadataUpdate {
+                email: Some("l@example.com"),
+                account_type: Some("pro"),
+                organization_uuid: Some("org-legacy"),
+                ..Default::default()
+            },
             "cookie",
             prefix,
         )
@@ -1064,9 +1120,12 @@ mod tests {
         update_account_metadata(
             &pool,
             3,
-            Some("e@example.com"),
-            Some("pro"),
-            Some("org-embedded"),
+            AccountMetadataUpdate {
+                email: Some("e@example.com"),
+                account_type: Some("pro"),
+                organization_uuid: Some("org-embedded"),
+                ..Default::default()
+            },
             "cookie",
             prefix,
         )
@@ -1143,9 +1202,12 @@ mod tests {
         update_account_metadata(
             &pool,
             1,
-            Some("o@example.com"),
-            Some("max"),
-            Some("org-fresh"),
+            AccountMetadataUpdate {
+                email: Some("o@example.com"),
+                account_type: Some("max"),
+                organization_uuid: Some("org-fresh"),
+                ..Default::default()
+            },
             "oauth",
             "at-abc123",
         )
@@ -1187,9 +1249,12 @@ mod tests {
         update_account_metadata(
             &pool,
             2,
-            Some("stale@example.com"),
-            Some("max"),
-            Some("stale-org"),
+            AccountMetadataUpdate {
+                email: Some("stale@example.com"),
+                account_type: Some("max"),
+                organization_uuid: Some("stale-org"),
+                ..Default::default()
+            },
             "oauth",
             "at-old-prefix",
         )
@@ -1226,9 +1291,12 @@ mod tests {
         update_account_metadata(
             &pool,
             3,
-            Some("should@not.write"),
-            Some("pro"),
-            Some("should-not-write"),
+            AccountMetadataUpdate {
+                email: Some("should@not.write"),
+                account_type: Some("pro"),
+                organization_uuid: Some("should-not-write"),
+                ..Default::default()
+            },
             "oauth",
             "sk-ant-sid02",
         )
@@ -1276,9 +1344,12 @@ mod tests {
         update_account_metadata(
             &pool,
             4,
-            Some("stale@example.com"),
-            Some("max"),
-            Some("stale-org"),
+            AccountMetadataUpdate {
+                email: Some("stale@example.com"),
+                account_type: Some("max"),
+                organization_uuid: Some("stale-org"),
+                ..Default::default()
+            },
             "oauth",
             "at-new_token-r",
         )
