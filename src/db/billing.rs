@@ -195,6 +195,25 @@ pub async fn get_current_period_cost(
     Ok(row.map(|(c,)| c).unwrap_or(0))
 }
 
+/// Delete a single usage_rollups row for the given user/period.
+/// Returns rows deleted (0 if no row existed for that period).
+pub async fn delete_usage_rollup(
+    pool: &SqlitePool,
+    user_id: i64,
+    period_type: &str,
+    period_start: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM usage_rollups WHERE user_id = ?1 AND period_type = ?2 AND period_start = ?3",
+    )
+    .bind(user_id)
+    .bind(period_type)
+    .bind(period_start)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Delete request logs older than retention_days. Returns rows deleted.
 pub async fn delete_old_request_logs(
     pool: &SqlitePool,

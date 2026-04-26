@@ -5,10 +5,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use tokio::sync::broadcast;
 
 use super::common::{Paginated, PaginationParams};
 use crate::error::ClewdrError;
 use crate::services::user_limiter::UserLimiterMap;
+use crate::state::AdminEvent;
 
 #[derive(Serialize, sqlx::FromRow)]
 pub struct UserResponse {
@@ -46,6 +48,11 @@ pub struct UpdateUserRequest {
     pub policy_id: Option<i64>,
     pub disabled: Option<bool>,
     pub notes: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ResetUsageRequest {
+    pub period: String,
 }
 
 fn current_week_start() -> String {
@@ -357,4 +364,50 @@ pub async fn remove(
     limiter.remove(id).await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn reset_usage(
+    State(db): State<SqlitePool>,
+    State(event_tx): State<broadcast::Sender<AdminEvent>>,
+    Path(id): Path<i64>,
+    Json(req): Json<ResetUsageRequest>,
+) -> Result<Json<UserResponse>, ClewdrError> {
+    let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM users WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(&db)
+        .await?;
+    if exists.is_none() {
+        return Err(ClewdrError::NotFound {
+            msg: "user not found",
+        });
+    }
+
+    let week_start = current_week_start();
+    let month_start = current_month_start();
+
+    match req.period.as_str() {
+        "week" => {
+            crate::db::billing::delete_usage_rollup(&db, id, "week", &week_start).await?;
+        }
+        "month" => {
+            crate::db::billing::delete_usage_rollup(&db, id, "month", &month_start).await?;
+        }
+        "all" => {
+            crate::db::billing::delete_usage_rollup(&db, id, "week", &week_start).await?;
+            crate::db::billing::delete_usage_rollup(&db, id, "month", &month_start).await?;
+        }
+        _ => {
+            return Err(ClewdrError::BadRequest {
+                msg: "period must be one of: week, month, all",
+            });
+        }
+    }
+
+    let _ = event_tx.send(AdminEvent::user_usage_reset(id));
+
+    let base = user_list_query(&week_start, &month_start);
+    let query = format!("{base} WHERE u.id = ?1");
+    let row: UserResponse = sqlx::query_as(&query).bind(id).fetch_one(&db).await?;
+
+    Ok(Json(row))
 }

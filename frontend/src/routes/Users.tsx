@@ -18,6 +18,7 @@ import {
   Alert,
   ScrollArea,
   Tooltip,
+  Menu,
 } from "@mantine/core";
 import { useForm } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
@@ -27,12 +28,14 @@ import {
   IconTrash,
   IconPlayerPlay,
   IconPlayerPause,
+  IconRefresh,
 } from "@tabler/icons-react";
 import {
   listUsers,
   createUser,
   updateUser,
   deleteUser,
+  resetUserUsage,
   listPolicies,
   createPolicy,
   updatePolicy,
@@ -41,6 +44,7 @@ import {
   ApiError,
   type UserRow,
   type Policy,
+  type ResetUsagePeriod,
 } from "../api";
 import { formatCost, formatDate } from "../lib/format";
 
@@ -150,6 +154,45 @@ function DeleteConfirm({
   );
 }
 
+// ─── Reset Usage Confirm ───
+
+function ResetUsageConfirm({
+  payload,
+  onClose,
+  onConfirm,
+  loading,
+}: {
+  payload: { user: UserRow; period: ResetUsagePeriod } | null;
+  onClose: () => void;
+  onConfirm: () => void;
+  loading: boolean;
+}) {
+  const periodLabel =
+    payload?.period === "week"
+      ? "本周"
+      : payload?.period === "month"
+      ? "本月"
+      : "本周与本月";
+  return (
+    <Modal opened={!!payload} onClose={onClose} title="重置用量">
+      <Stack>
+        <Text>
+          确定要重置用户 <b>{payload?.user.username}</b> 的{periodLabel}用量吗？
+        </Text>
+        <Text size="xs" c="dimmed">
+          此操作不可撤销，但 request_logs 仍会保留作为审计源。重置后该用户立即恢复对应周期的配额。
+        </Text>
+        <Group justify="flex-end">
+          <Button variant="default" onClick={onClose}>取消</Button>
+          <Button color="orange" loading={loading} onClick={onConfirm}>
+            重置{periodLabel}
+          </Button>
+        </Group>
+      </Stack>
+    </Modal>
+  );
+}
+
 // ─── Policy Form Modal ───
 
 function PolicyFormModal({
@@ -225,6 +268,9 @@ function UsersTab({ onEdit }: { onEdit: (user: UserRow) => void }) {
   const queryClient = useQueryClient();
   const { data, isLoading, error } = useQuery({ queryKey: qk.users, queryFn: listUsers });
   const [deleting, setDeleting] = useState<UserRow | null>(null);
+  const [resetting, setResetting] = useState<{ user: UserRow; period: ResetUsagePeriod } | null>(
+    null,
+  );
 
   const toggleMut = useMutation({
     mutationFn: ({ id, disabled }: { id: number; disabled: boolean }) =>
@@ -244,6 +290,18 @@ function UsersTab({ onEdit }: { onEdit: (user: UserRow) => void }) {
       queryClient.invalidateQueries({ queryKey: qk.overview });
       notifications.show({ message: "用户已删除", color: "green" });
       setDeleting(null);
+    },
+    onError: (e) =>
+      notifications.show({ message: e instanceof ApiError ? e.message : "操作失败", color: "red" }),
+  });
+
+  const resetMut = useMutation({
+    mutationFn: () => resetUserUsage(resetting!.user.id, resetting!.period),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: qk.users });
+      queryClient.invalidateQueries({ queryKey: qk.overview });
+      notifications.show({ message: "用量已重置", color: "green" });
+      setResetting(null);
     },
     onError: (e) =>
       notifications.show({ message: e instanceof ApiError ? e.message : "操作失败", color: "red" }),
@@ -307,6 +365,32 @@ function UsersTab({ onEdit }: { onEdit: (user: UserRow) => void }) {
                         </Tooltip>
                       )}
                       {u.role !== "admin" && (
+                        <Menu shadow="md" width={160} withinPortal>
+                          <Menu.Target>
+                            <ActionIcon
+                              variant="subtle"
+                              size="sm"
+                              color="orange"
+                              aria-label="重置用量"
+                              title="重置用量"
+                            >
+                              <IconRefresh size={14} />
+                            </ActionIcon>
+                          </Menu.Target>
+                          <Menu.Dropdown>
+                            <Menu.Item onClick={() => setResetting({ user: u, period: "week" })}>
+                              重置本周用量
+                            </Menu.Item>
+                            <Menu.Item onClick={() => setResetting({ user: u, period: "month" })}>
+                              重置本月用量
+                            </Menu.Item>
+                            <Menu.Item onClick={() => setResetting({ user: u, period: "all" })}>
+                              全部重置
+                            </Menu.Item>
+                          </Menu.Dropdown>
+                        </Menu>
+                      )}
+                      {u.role !== "admin" && (
                         <Tooltip label="删除">
                           <ActionIcon variant="subtle" size="sm" color="red" onClick={() => setDeleting(u)}>
                             <IconTrash size={14} />
@@ -328,6 +412,12 @@ function UsersTab({ onEdit }: { onEdit: (user: UserRow) => void }) {
         onClose={() => setDeleting(null)}
         onConfirm={() => deleteMut.mutate()}
         loading={deleteMut.isPending}
+      />
+      <ResetUsageConfirm
+        payload={resetting}
+        onClose={() => setResetting(null)}
+        onConfirm={() => resetMut.mutate()}
+        loading={resetMut.isPending}
       />
     </>
   );

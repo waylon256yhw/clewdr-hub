@@ -175,6 +175,10 @@ function useGlobalAdminEvents() {
             queryClient.invalidateQueries({ queryKey: qk.accounts });
             queryClient.invalidateQueries({ queryKey: qk.overview });
           }
+          if (payload.topic === "users") {
+            queryClient.invalidateQueries({ queryKey: qk.users });
+            queryClient.invalidateQueries({ queryKey: qk.overview });
+          }
         } catch {
           queryClient.invalidateQueries({ queryKey: ["requests"] });
           queryClient.invalidateQueries({ queryKey: ["opsUsage"] });

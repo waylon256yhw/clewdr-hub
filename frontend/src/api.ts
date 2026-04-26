@@ -469,6 +469,12 @@ export const updateUser = (id: number, data: Record<string, unknown>) =>
   apiFetch<UserRow>(`/api/admin/users/${id}`, { method: "PUT", body: data });
 export const deleteUser = (id: number) =>
   apiFetch<void>(`/api/admin/users/${id}`, { method: "DELETE" });
+export type ResetUsagePeriod = "week" | "month" | "all";
+export const resetUserUsage = (id: number, period: ResetUsagePeriod) =>
+  apiFetch<UserRow>(`/api/admin/users/${id}/usage/reset`, {
+    method: "POST",
+    body: { period },
+  });
 
 // Policies
 export const listPolicies = () =>

@@ -30,6 +30,7 @@ pub fn admin_router() -> Router<AppState> {
         // Users
         .route("/users", get(users::list).post(users::create))
         .route("/users/{id}", put(users::update).delete(users::remove))
+        .route("/users/{id}/usage/reset", post(users::reset_usage))
         // Keys
         .route("/keys", get(keys::list).post(keys::create))
         .route("/keys/{id}", delete(keys::remove))

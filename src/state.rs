@@ -17,6 +17,8 @@ pub struct AdminEvent {
     pub request_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<i64>,
 }
 
 impl AdminEvent {
@@ -25,6 +27,7 @@ impl AdminEvent {
             topic: "request_logs".to_string(),
             request_type: Some(request_type.to_string()),
             status: Some(status.to_string()),
+            user_id: None,
         }
     }
 
@@ -33,6 +36,7 @@ impl AdminEvent {
             topic: "request_logs".to_string(),
             request_type: None,
             status: None,
+            user_id: None,
         }
     }
 
@@ -41,6 +45,16 @@ impl AdminEvent {
             topic: "accounts".to_string(),
             request_type: None,
             status: None,
+            user_id: None,
+        }
+    }
+
+    pub fn user_usage_reset(user_id: i64) -> Self {
+        Self {
+            topic: "users".to_string(),
+            request_type: None,
+            status: Some("usage_reset".to_string()),
+            user_id: Some(user_id),
         }
     }
 }
