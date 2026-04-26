@@ -524,6 +524,15 @@ impl AccountPoolActor {
                     }
                 }
                 Some(pos) => {
+                    if !state.drain_first_ids.contains(&cached_id)
+                        && let Some(drain_pos) = state.valid.iter().position(|c| {
+                            is_usable(c, &state.inflight)
+                                && c.account_id
+                                    .is_some_and(|id| state.drain_first_ids.contains(&id))
+                        })
+                    {
+                        return Self::commit_dispatch(state, drain_pos, cache_key, true);
+                    }
                     if is_usable(&state.valid[pos], &state.inflight) {
                         return Self::commit_dispatch(state, pos, cache_key, false);
                     }
@@ -1966,6 +1975,31 @@ mod tests {
             state.moka.get(&77),
             Some(1),
             "cache must remain bound to A — slot-full is overflow, not rebinding"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_normal_account_yields_to_available_drain_first() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        let mut state = empty_state(pool);
+        push_slot(&mut state, 1, 5); // normal
+        push_slot(&mut state, 2, 5); // drain_first
+        state.drain_first_ids.insert(2);
+        state.moka.insert(77, 1);
+
+        let actor = AccountPoolActor;
+        let dispatched = actor.dispatch(&mut state, Some(77), &[]).unwrap();
+
+        assert_eq!(
+            dispatched.account_id,
+            Some(2),
+            "drain_first must win over a cached normal account"
+        );
+        state.moka.run_pending_tasks();
+        assert_eq!(
+            state.moka.get(&77),
+            Some(2),
+            "cache must rebind to drain_first"
         );
     }
 
