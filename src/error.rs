@@ -88,6 +88,8 @@ pub enum ClewdrError {
     BadRequest { msg: &'static str },
     #[snafu(display("Retries exceeded"))]
     TooManyRetries,
+    #[snafu(display("Upstream request timed out: {}", msg))]
+    UpstreamTimeout { msg: &'static str },
     #[snafu(display("EventSource error: {}", source))]
     #[snafu(context(false))]
     EventSourceAxumError {
@@ -305,7 +307,9 @@ impl IntoResponse for ClewdrError {
             ClewdrError::JsonRejection { ref source } => {
                 (source.status(), json!(source.body_text()))
             }
-            ClewdrError::TooManyRetries => (StatusCode::GATEWAY_TIMEOUT, json!(self.to_string())),
+            ClewdrError::TooManyRetries | ClewdrError::UpstreamTimeout { .. } => {
+                (StatusCode::GATEWAY_TIMEOUT, json!(self.to_string()))
+            }
             ClewdrError::PathNotFound { .. } => (StatusCode::NOT_FOUND, json!(self.to_string())),
             ClewdrError::InvalidAuth => (StatusCode::UNAUTHORIZED, json!(self.to_string())),
             ClewdrError::UpstreamCoolingDown

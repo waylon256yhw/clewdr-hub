@@ -438,6 +438,7 @@ pub fn classify_account_failure(
         ),
 
         ClewdrError::WreqError { .. }
+        | ClewdrError::UpstreamTimeout { .. }
         | ClewdrError::EventSourceAxumError { .. }
         | ClewdrError::EventSourceRquestError { .. }
         | ClewdrError::HttpError { .. } => (

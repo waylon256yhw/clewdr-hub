@@ -7,6 +7,7 @@ use eventsource_stream::Eventsource;
 use futures::{StreamExt, TryStreamExt};
 use http::header::{ACCEPT, USER_AGENT};
 use snafu::{GenerateImplicitData, ResultExt};
+use std::{future::Future, time::Duration};
 use tracing::{Instrument, error, info, warn};
 use wreq::Method;
 
@@ -31,11 +32,26 @@ use crate::{
 
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MAX_RETRIES: usize = 5;
+const MESSAGES_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const COUNT_TOKENS_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
 const CLAUDE_BETA_BASE: &str = "oauth-2025-04-20";
 const CLAUDE_BETA_CONTEXT_1M_TOKEN: &str = "context-1m-2025-08-07";
 const CLAUDE_API_VERSION: &str = "2023-06-01";
 
 impl ClaudeCodeState {
+    async fn timeout_upstream<T, F>(
+        timeout: Duration,
+        label: &'static str,
+        future: F,
+    ) -> Result<T, ClewdrError>
+    where
+        F: Future<Output = Result<T, ClewdrError>>,
+    {
+        tokio::time::timeout(timeout, future)
+            .await
+            .map_err(|_| ClewdrError::UpstreamTimeout { msg: label })?
+    }
+
     fn is_oauth_auth_failure(err: &ClewdrError) -> bool {
         super::is_oauth_auth_failure(err)
     }
@@ -373,7 +389,13 @@ impl ClaudeCodeState {
                 "claude_code",
                 "cookie" = cookie.credential_label()
             ));
-            match retry.await {
+            let retry_result = Self::timeout_upstream(
+                MESSAGES_UPSTREAM_TIMEOUT,
+                "Claude messages request exceeded 600 seconds before response handoff",
+                retry,
+            )
+            .await;
+            match retry_result {
                 Ok(res) => {
                     // For streaming, the slot is released in MessageStop handler
                     if !self.stream {
@@ -628,7 +650,13 @@ impl ClaudeCodeState {
                 "claude_code_tokens",
                 "cookie" = cookie.credential_label()
             ));
-            match retry.await {
+            let retry_result = Self::timeout_upstream(
+                COUNT_TOKENS_UPSTREAM_TIMEOUT,
+                "Claude count_tokens request exceeded 60 seconds",
+                retry,
+            )
+            .await;
+            match retry_result {
                 Ok((res, _)) => {
                     state.release_selected_slot(account_id).await;
                     return Ok(res);

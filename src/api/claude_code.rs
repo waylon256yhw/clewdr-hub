@@ -25,6 +25,7 @@ fn error_to_log_status(err: &ClewdrError) -> (&'static str, u16) {
         ClewdrError::UpstreamCoolingDown => return ("no_account_available", 429),
         ClewdrError::NoValidUpstreamAccounts => return ("no_account_available", 503),
         ClewdrError::TooManyRetries => return ("no_account_available", 504),
+        ClewdrError::UpstreamTimeout { .. } => return ("upstream_error", 504),
         _ => {}
     }
 
