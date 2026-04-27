@@ -169,16 +169,14 @@ pub async fn api_claude_code_count_tokens(
     State(state): State<AppState>,
     ClaudeCodePreprocess(mut params, context): ClaudeCodePreprocess,
 ) -> Result<Response, ClewdrError> {
-    let _permit = if let (Some(user_id), Some(max_c), Some(rpm)) =
+    if let (Some(user_id), Some(max_c), Some(rpm)) =
         (context.user_id, context.max_concurrent, context.rpm_limit)
     {
-        match state.user_limiter.acquire(user_id, max_c, rpm).await {
-            Ok(permit) => Some(permit),
+        match state.user_limiter.check_rpm(user_id, max_c, rpm).await {
+            Ok(()) => {}
             Err(e) => return Err(e),
         }
-    } else {
-        None
-    };
+    }
 
     params.stream = Some(false);
     match state

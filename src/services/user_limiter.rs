@@ -65,25 +65,42 @@ impl UserLimiterMap {
             .try_acquire_owned()
             .map_err(|_| ClewdrError::UserConcurrencyExceeded)?;
 
-        // RPM check (std Mutex — held briefly, no await inside)
-        {
-            let mut rpm = limiter.rpm.lock().unwrap();
-            let now = Instant::now();
-            while rpm
-                .front()
-                .is_some_and(|t| now.duration_since(*t).as_secs() >= 60)
-            {
-                rpm.pop_front();
-            }
-            if rpm.len() >= rpm_limit as usize {
-                return Err(ClewdrError::RpmExceeded);
-            }
-            rpm.push_back(now);
-        }
+        Self::check_rpm_limit(&limiter, rpm_limit)?;
 
         Ok(UserPermit {
             _permit: Arc::new(permit),
         })
+    }
+
+    /// Check per-user RPM without consuming a concurrency slot.
+    /// Used for lightweight auxiliary endpoints such as count_tokens.
+    pub async fn check_rpm(
+        &self,
+        user_id: i64,
+        max_concurrent: i32,
+        rpm_limit: i32,
+    ) -> Result<(), ClewdrError> {
+        let max_concurrent = max_concurrent.max(1) as u32;
+        let rpm_limit = rpm_limit.max(1) as u32;
+        let limiter = self.get_or_create(user_id, max_concurrent, rpm_limit).await;
+        Self::check_rpm_limit(&limiter, rpm_limit)
+    }
+
+    fn check_rpm_limit(limiter: &UserLimiter, rpm_limit: u32) -> Result<(), ClewdrError> {
+        // RPM check (std Mutex — held briefly, no await inside)
+        let mut rpm = limiter.rpm.lock().unwrap();
+        let now = Instant::now();
+        while rpm
+            .front()
+            .is_some_and(|t| now.duration_since(*t).as_secs() >= 60)
+        {
+            rpm.pop_front();
+        }
+        if rpm.len() >= rpm_limit as usize {
+            return Err(ClewdrError::RpmExceeded);
+        }
+        rpm.push_back(now);
+        Ok(())
     }
 
     async fn get_or_create(
@@ -121,5 +138,39 @@ impl UserLimiterMap {
         });
         map.insert(user_id, limiter.clone());
         limiter
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UserLimiterMap;
+    use crate::error::ClewdrError;
+
+    #[tokio::test]
+    async fn check_rpm_does_not_consume_concurrency_slots() {
+        let limiter = UserLimiterMap::new();
+        let permit = limiter.acquire(1, 1, 10).await.unwrap();
+
+        limiter.check_rpm(1, 1, 10).await.unwrap();
+
+        assert!(matches!(
+            limiter.acquire(1, 1, 10).await,
+            Err(ClewdrError::UserConcurrencyExceeded)
+        ));
+
+        drop(permit);
+        limiter.acquire(1, 1, 10).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn check_rpm_still_enforces_rpm_limit() {
+        let limiter = UserLimiterMap::new();
+
+        limiter.check_rpm(1, 10, 1).await.unwrap();
+
+        assert!(matches!(
+            limiter.check_rpm(1, 10, 1).await,
+            Err(ClewdrError::RpmExceeded)
+        ));
     }
 }
