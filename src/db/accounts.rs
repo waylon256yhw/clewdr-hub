@@ -1,4 +1,4 @@
-use sqlx::{Row, SqlitePool};
+use sqlx::{Executor, Row, Sqlite, SqlitePool};
 
 use crate::config::{RuntimeStateParams, TokenInfo, UsageBreakdown};
 use crate::services::account_error::AccountFailureContextPersisted;
@@ -35,6 +35,12 @@ pub struct AccountWithRuntime {
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub runtime: Option<RuntimeStateRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountIdentityConflict {
+    pub id: i64,
+    pub name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -943,6 +949,30 @@ pub async fn get_account_by_id(
         .find(|account| account.id == account_id))
 }
 
+pub async fn find_account_by_organization_uuid<'e, E>(
+    executor: E,
+    organization_uuid: &str,
+    excluded_account_id: Option<i64>,
+) -> Result<Option<AccountIdentityConflict>, sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let row: Option<(i64, String)> = sqlx::query_as(
+        "SELECT id, name
+         FROM accounts
+         WHERE organization_uuid = ?1
+           AND (?2 IS NULL OR id != ?2)
+         ORDER BY id ASC
+         LIMIT 1",
+    )
+    .bind(organization_uuid)
+    .bind(excluded_account_id)
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(row.map(|(id, name)| AccountIdentityConflict { id, name }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -952,9 +982,10 @@ mod tests {
     use sqlx::Row;
 
     use super::{
-        AccountAuthSourceSummary, AccountMetadataUpdate, AccountPoolSummary, AccountStatusSummary,
-        AccountSummary, AccountWithRuntime, RuntimeStateRow, account_credential_matches_prefix,
-        batch_upsert_runtime_states, load_all_accounts, summarize_accounts,
+        AccountAuthSourceSummary, AccountIdentityConflict, AccountMetadataUpdate,
+        AccountPoolSummary, AccountStatusSummary, AccountSummary, AccountWithRuntime,
+        RuntimeStateRow, account_credential_matches_prefix, batch_upsert_runtime_states,
+        find_account_by_organization_uuid, load_all_accounts, summarize_accounts,
         update_account_metadata, upsert_oauth_snapshot_runtime_fields,
     };
     use crate::config::{Organization, TokenInfo, UsageBreakdown};
@@ -1067,6 +1098,61 @@ mod tests {
                     cookie: 2,
                 },
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn find_account_by_organization_uuid_excludes_current_account() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (
+                id, name, rr_order, max_slots, status, auth_source, cookie_blob,
+                organization_uuid, drain_first
+            ) VALUES (1, 'existing-cookie', 1, 5, 'active', 'cookie', 'ck-1', 'org-dupe', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            find_account_by_organization_uuid(&pool, "org-dupe", None)
+                .await
+                .unwrap(),
+            Some(AccountIdentityConflict {
+                id: 1,
+                name: "existing-cookie".to_string(),
+            })
+        );
+        assert_eq!(
+            find_account_by_organization_uuid(&pool, "org-dupe", Some(1))
+                .await
+                .unwrap(),
+            None
+        );
+
+        sqlx::query(
+            "INSERT INTO accounts (
+                id, name, rr_order, max_slots, status, auth_source,
+                oauth_access_token, oauth_refresh_token, oauth_expires_at,
+                organization_uuid, drain_first
+            ) VALUES (
+                2, 'existing-oauth', 2, 5, 'active', 'oauth',
+                'at-2', 'rt-2', '2030-01-01T00:00:00Z',
+                'org-dupe', 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            find_account_by_organization_uuid(&pool, "org-dupe", Some(1))
+                .await
+                .unwrap(),
+            Some(AccountIdentityConflict {
+                id: 2,
+                name: "existing-oauth".to_string(),
+            })
         );
     }
 

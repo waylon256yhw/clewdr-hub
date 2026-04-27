@@ -295,9 +295,11 @@ async fn admin_replacing_disabled_cookie_account_reactivates_slot() {
 
     let result = sqlx::query(
         "INSERT INTO accounts (
-            name, rr_order, max_slots, status, auth_source, cookie_blob, invalid_reason, last_error
+            name, rr_order, max_slots, status, auth_source, cookie_blob,
+            organization_uuid, email, account_type, invalid_reason, last_error
         ) VALUES (
-            ?1, (SELECT COALESCE(MAX(rr_order), 0) + 1 FROM accounts), 1, 'disabled', 'cookie', ?2, 'disabled', 'old credential failed'
+            ?1, (SELECT COALESCE(MAX(rr_order), 0) + 1 FROM accounts), 1, 'disabled', 'cookie', ?2,
+            'stale-org', 'stale@example.com', 'max', 'disabled', 'old credential failed'
         )",
     )
     .bind(format!("disabled-cookie-{}", uuid::Uuid::new_v4().simple()))
@@ -348,8 +350,22 @@ async fn admin_replacing_disabled_cookie_account_reactivates_slot() {
         "credential replacement should remove the stale invalid entry"
     );
 
-    let row = sqlx::query_as::<_, (String, String, Option<String>, Option<String>, Option<String>)>(
-        "SELECT status, auth_source, cookie_blob, invalid_reason, last_error FROM accounts WHERE id = ?1",
+    let row = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
+        "SELECT status, auth_source, cookie_blob, invalid_reason, last_error,
+                organization_uuid, email, account_type
+         FROM accounts WHERE id = ?1",
     )
     .bind(account_id)
     .fetch_one(&app.pool)
@@ -360,6 +376,9 @@ async fn admin_replacing_disabled_cookie_account_reactivates_slot() {
     assert_eq!(row.2.as_deref(), Some(new_cookie.as_str()));
     assert_eq!(row.3, None);
     assert_eq!(row.4, None);
+    assert_eq!(row.5, None);
+    assert_eq!(row.6, None);
+    assert_eq!(row.7, None);
 }
 
 #[tokio::test]

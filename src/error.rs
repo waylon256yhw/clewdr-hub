@@ -174,6 +174,8 @@ pub enum ClewdrError {
     NotFound { msg: &'static str },
     #[snafu(display("Conflict: {}", msg))]
     Conflict { msg: &'static str },
+    #[snafu(display("Conflict: {}", msg))]
+    ConflictMessage { msg: String },
     #[snafu(display("Database error: {}", source))]
     #[snafu(context(false))]
     SqlxError {
@@ -336,7 +338,9 @@ impl IntoResponse for ClewdrError {
                     .into_response();
             }
             ClewdrError::NotFound { .. } => (StatusCode::NOT_FOUND, json!(self.to_string())),
-            ClewdrError::Conflict { .. } => (StatusCode::CONFLICT, json!(self.to_string())),
+            ClewdrError::Conflict { .. } | ClewdrError::ConflictMessage { .. } => {
+                (StatusCode::CONFLICT, json!(self.to_string()))
+            }
             ClewdrError::BadRequest { .. } => (StatusCode::BAD_REQUEST, json!(self.to_string())),
             ClewdrError::InvalidHeaderValue { .. } => {
                 (StatusCode::BAD_REQUEST, json!(self.to_string()))

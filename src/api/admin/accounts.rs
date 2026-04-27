@@ -8,7 +8,7 @@ use axum::{
 use http::header::USER_AGENT;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
-use sqlx::SqlitePool;
+use sqlx::{Executor, Sqlite, SqlitePool};
 
 use super::common::PaginationParams;
 use crate::{
@@ -16,8 +16,9 @@ use crate::{
     claude_code_state::{ClaudeCodeState, build_api_client},
     config::{AccountSlot, CLAUDE_ENDPOINT, ClewdrCookie},
     db::accounts::{
-        AccountWithRuntime, batch_upsert_runtime_states, get_account_by_id, load_all_accounts,
-        update_account_metadata_unchecked, upsert_account_oauth,
+        AccountWithRuntime, batch_upsert_runtime_states, find_account_by_organization_uuid,
+        get_account_by_id, load_all_accounts, update_account_metadata_unchecked,
+        upsert_account_oauth,
     },
     db::proxies::{build_proxy_url, get_proxy_by_id},
     error::{
@@ -211,6 +212,27 @@ fn normalize_cookie_blob(value: Option<String>) -> Result<Option<String>, Clewdr
     Ok(Some((*parsed).to_owned()))
 }
 
+async fn reject_duplicate_oauth_identity<'e, E>(
+    executor: E,
+    organization_uuid: &str,
+    excluded_account_id: Option<i64>,
+) -> Result<(), ClewdrError>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    if let Some(conflict) =
+        find_account_by_organization_uuid(executor, organization_uuid, excluded_account_id).await?
+    {
+        return Err(ClewdrError::ConflictMessage {
+            msg: format!(
+                "该 OAuth 账号已被账号 #{} ({}) 使用",
+                conflict.id, conflict.name
+            ),
+        });
+    }
+    Ok(())
+}
+
 async fn resolve_proxy_url(
     db: &SqlitePool,
     proxy_id: Option<i64>,
@@ -336,11 +358,13 @@ pub async fn create(
         None,
     )?;
 
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+
     if let Some(ref cookie_blob) = cookie_blob {
         let dup: Option<(String,)> =
             sqlx::query_as("SELECT name FROM accounts WHERE cookie_blob = ?1")
                 .bind(cookie_blob)
-                .fetch_optional(&db)
+                .fetch_optional(&mut *tx)
                 .await?;
         if dup.is_some() {
             return Err(ClewdrError::Conflict {
@@ -348,12 +372,15 @@ pub async fn create(
             });
         }
     }
+    if let Some(ref oauth) = oauth {
+        reject_duplicate_oauth_identity(&mut *tx, &oauth.snapshot.organization_uuid, None).await?;
+    }
 
     let rr_order = match req.rr_order {
         Some(v) => v,
         None => {
             let (max_rr,): (Option<i64>,) = sqlx::query_as("SELECT MAX(rr_order) FROM accounts")
-                .fetch_one(&db)
+                .fetch_one(&mut *tx)
                 .await?;
             max_rr.unwrap_or(-1) + 1
         }
@@ -406,7 +433,7 @@ pub async fn create(
             .and_then(|v| v.snapshot.billing_type.as_deref()),
     )
     .bind(req.drain_first.unwrap_or(false) as i64)
-    .execute(&db)
+    .execute(&mut *tx)
     .await
     .map_err(|e| {
         if let sqlx::Error::Database(ref de) = e
@@ -419,6 +446,8 @@ pub async fn create(
         ClewdrError::from(e)
     })?
     .last_insert_rowid();
+
+    tx.commit().await?;
 
     if let Some(ref oauth) = oauth {
         batch_upsert_runtime_states(&db, &[(id, oauth.snapshot.runtime.clone())]).await?;
@@ -489,7 +518,11 @@ pub async fn update(
         Some(existing.auth_source.as_str()),
     )?;
 
-    let mut tx = db.begin().await?;
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    if let Some(ref oauth) = oauth {
+        reject_duplicate_oauth_identity(&mut *tx, &oauth.snapshot.organization_uuid, Some(id))
+            .await?;
+    }
 
     if let Some(ref name) = req.name {
         sqlx::query("UPDATE accounts SET name = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
@@ -593,6 +626,12 @@ pub async fn update(
                  oauth_refresh_token = NULL,
                  oauth_expires_at = NULL,
                  last_refresh_at = NULL,
+                 organization_uuid = NULL,
+                 email = NULL,
+                 account_type = NULL,
+                 rate_limit_tier = NULL,
+                 subscription_created_at = NULL,
+                 billing_type = NULL,
                  auth_source = 'cookie',
                  status = 'active',
                  invalid_reason = NULL,
