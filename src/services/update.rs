@@ -33,6 +33,13 @@ struct GitHubAsset {
     browser_download_url: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct UpdateStatus {
+    pub current_version: String,
+    pub latest_version: String,
+    pub update_available: bool,
+}
+
 /// Updater for the ClewdR application
 /// Handles checking for updates and updating the application
 pub struct ClewdrUpdater {
@@ -77,6 +84,44 @@ impl ClewdrUpdater {
         })
     }
 
+    /// Fetch the latest GitHub release and compare it with the running
+    /// binary. This is a read-only status check; it never performs a
+    /// self-update and is used by presentation layers such as `clewdr menu`.
+    pub async fn check_update_status(&self) -> Result<UpdateStatus, ClewdrError> {
+        let release = self.fetch_latest_release().await?;
+        let latest_version = release.tag_name.trim_start_matches('v').to_string();
+        let current_version = env!("CARGO_PKG_VERSION").to_string();
+
+        let current_v = parse_clewdr_version(&current_version)?;
+        let latest_v = parse_clewdr_version(&latest_version)?;
+        let update_available = is_newer_release(&current_v, &latest_v);
+
+        Ok(UpdateStatus {
+            current_version,
+            latest_version,
+            update_available,
+        })
+    }
+
+    /// Download and atomically replace the current binary with the latest
+    /// release when it is newer than the running version. This exits the
+    /// process after a successful replacement, matching the existing
+    /// `clewdr update` behavior.
+    pub async fn update_to_latest(&self) -> Result<bool, ClewdrError> {
+        let release = self.fetch_latest_release().await?;
+        let latest_version = release.tag_name.trim_start_matches('v');
+        let current_version = env!("CARGO_PKG_VERSION");
+
+        let current_v = parse_clewdr_version(current_version)?;
+        let latest_v = parse_clewdr_version(latest_version)?;
+        if !is_newer_release(&current_v, &latest_v) {
+            return Ok(false);
+        }
+
+        self.perform_update(&release).await?;
+        Ok(true)
+    }
+
     /// Checks for updates by comparing the current version to the latest release on GitHub
     /// Performs automatic update if `force` is true or auto_update is enabled in config.
     ///
@@ -101,28 +146,7 @@ impl ClewdrUpdater {
         info!("Checking for updates...");
         // info!("User-Agent: {}", self.user_agent);
 
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/releases/latest",
-            self.repo_owner, self.repo_name
-        );
-
-        let response = self
-            .client
-            .get(&url)
-            .header(USER_AGENT, &self.user_agent)
-            .send()
-            .await
-            .context(WreqSnafu {
-                msg: "Failed to fetch latest release from GitHub",
-            })?
-            .error_for_status()
-            .context(WreqSnafu {
-                msg: "Fetch latest release from GitHub returned an error",
-            })?;
-
-        let release: GitHubRelease = response.json().await.context(WreqSnafu {
-            msg: "Failed to parse GitHub release response",
-        })?;
+        let release = self.fetch_latest_release().await?;
         let latest_version = release.tag_name.trim_start_matches('v');
         let current_version = env!("CARGO_PKG_VERSION");
 
@@ -150,6 +174,31 @@ impl ClewdrUpdater {
         }
 
         Ok(true)
+    }
+
+    async fn fetch_latest_release(&self) -> Result<GitHubRelease, ClewdrError> {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/releases/latest",
+            self.repo_owner, self.repo_name
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .header(USER_AGENT, &self.user_agent)
+            .send()
+            .await
+            .context(WreqSnafu {
+                msg: "Failed to fetch latest release from GitHub",
+            })?
+            .error_for_status()
+            .context(WreqSnafu {
+                msg: "Fetch latest release from GitHub returned an error",
+            })?;
+
+        response.json().await.context(WreqSnafu {
+            msg: "Failed to parse GitHub release response",
+        })
     }
 
     /// Performs the update process

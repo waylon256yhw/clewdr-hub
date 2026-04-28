@@ -123,7 +123,7 @@ async fn run_action(action: MenuAction) -> Result<(), ClewdrError> {
         MenuAction::ServiceInstall => menu_service_install().await,
         MenuAction::ServiceUninstall => menu_service_uninstall().await,
         #[cfg(feature = "portable")]
-        MenuAction::Update => cli::run_update().await,
+        MenuAction::Update => menu_check_update().await,
         MenuAction::Quit => Ok(()), // handled by caller; here for completeness
     }
 }
@@ -307,6 +307,36 @@ async fn menu_service_uninstall() -> Result<(), ClewdrError> {
         },
     ))
     .await
+}
+
+#[cfg(feature = "portable")]
+async fn menu_check_update() -> Result<(), ClewdrError> {
+    let updater = crate::services::update::ClewdrUpdater::new()?;
+    let status = updater.check_update_status().await?;
+
+    eprintln!("当前版本：v{}", status.current_version);
+    eprintln!("最新版本：v{}", status.latest_version);
+    if !status.update_available {
+        eprintln!("结论：已是最新版本。");
+        return Ok(());
+    }
+
+    eprintln!("结论：发现新版本。");
+    let update_now =
+        Confirm::new("是否立即下载并替换当前程序？更新成功后会自动退出，请重新进入菜单。")
+            .with_default(true)
+            .prompt()
+            .map_err(wrap_or_cancel)?;
+    if !update_now {
+        eprintln!("已取消更新。");
+        return Ok(());
+    }
+
+    eprintln!("正在下载并替换当前程序...");
+    if !updater.update_to_latest().await? {
+        eprintln!("更新检查结果已变化：当前已是最新版本。");
+    }
+    Ok(())
 }
 
 /// Resolve the (systemd, termux_boot) flag pair for the service verbs.
