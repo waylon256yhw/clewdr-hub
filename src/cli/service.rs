@@ -143,7 +143,6 @@ mod systemd {
     const LOG_DIR: &str = "/opt/clewdr/log";
     const PURGE_DB_PATH: &str = "/opt/clewdr/clewdr.db";
     const PURGE_CONFIG_PATH: &str = "/opt/clewdr/clewdr.toml";
-
     pub async fn install() -> Result<(), ClewdrError> {
         require_root("install systemd unit")?;
         ensure_user_exists()?;
@@ -200,7 +199,13 @@ mod systemd {
     }
 
     /// Generates the systemd unit content with the running binary path
-    /// substituted. Pure — covered by `tests::systemd_unit_file_*`.
+    /// substituted. The data paths (`--config`, `--db`, `--log-dir`) are
+    /// pinned to [`WORKING_DIR`] so the `clewdr` system user can actually
+    /// write them — the running binary may live anywhere
+    /// (`/usr/local/bin/clewdr`, `/opt/clewdr/clewdr`, …) and the
+    /// `portable` feature otherwise resolves config/db relative to
+    /// `current_exe().parent()`, which is typically root-owned and
+    /// unwritable. Pure — covered by `tests::systemd_unit_file_*`.
     pub(super) fn unit_file_contents(binary: &Path) -> String {
         format!(
             "[Unit]\n\
@@ -212,7 +217,7 @@ mod systemd {
              User={user}\n\
              Group={group}\n\
              WorkingDirectory={workdir}\n\
-             ExecStart={binary} --log-dir {log_dir}\n\
+             ExecStart={binary} --config {config} --db {db} --log-dir {log_dir}\n\
              Restart=on-failure\n\
              RestartSec=5\n\
              \n\
@@ -229,6 +234,8 @@ mod systemd {
             group = SERVICE_GROUP,
             workdir = WORKING_DIR,
             binary = binary.display(),
+            config = PURGE_CONFIG_PATH,
+            db = PURGE_DB_PATH,
             log_dir = LOG_DIR,
         )
     }
@@ -330,8 +337,6 @@ mod systemd {
 // ──────────────────────────────────────────────────────────────────────────
 
 mod termux {
-    use std::os::unix::fs::PermissionsExt;
-
     use super::*;
 
     const F_DROID_HINT: &str = "https://f-droid.org/packages/com.termux.boot/";
@@ -356,9 +361,7 @@ mod termux {
         let log_dir = home.join(".local/clewdr/log");
         let contents = boot_script_contents(&binary, &log_dir);
         fs::write(&script_path, contents)?;
-        let mut perms = fs::metadata(&script_path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script_path, perms)?;
+        make_executable(&script_path)?;
 
         eprintln!(
             "{} wrote {} (mode 0755)",
@@ -425,6 +428,32 @@ mod termux {
             .ok_or(ClewdrError::BadRequest {
                 msg: "HOME env var is not set; cannot locate ~/.termux/boot",
             })
+    }
+
+    /// chmod 0755 the just-written script. Cfg-gated because the
+    /// `set_mode` API lives under `std::os::unix::fs` — Termux:Boot
+    /// itself only runs on Android, but the crate must still compile
+    /// on Windows targets that never reach this code at runtime.
+    #[cfg(unix)]
+    fn make_executable(path: &Path) -> Result<(), ClewdrError> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms)?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn make_executable(_path: &Path) -> Result<(), ClewdrError> {
+        // Termux is Android-only; reaching this branch means the user
+        // forced --termux-boot on a non-unix host. The boot script we
+        // just wrote isn't executable yet, but the script also can't
+        // run on this OS, so the missing chmod isn't the problem here.
+        // Surface a clear error rather than pretending we installed
+        // something usable.
+        Err(ClewdrError::BadRequest {
+            msg: "Termux:Boot is only supported on Android/Unix; --termux-boot has no effect on this platform",
+        })
     }
 }
 
@@ -541,8 +570,16 @@ mod tests {
     #[test]
     fn systemd_unit_file_pins_paths_and_substitutes_binary() {
         let unit = systemd::unit_file_contents(Path::new("/opt/clewdr/clewdr"));
+        // ExecStart must point config + db + log_dir at the workdir
+        // we chowned for `clewdr`. Without --config / --db the binary
+        // would otherwise resolve them via current_exe().parent()
+        // under the `portable` feature, which is typically root-owned
+        // and unwritable by the service user (review #10 P1).
         assert!(
-            unit.contains("ExecStart=/opt/clewdr/clewdr --log-dir /opt/clewdr/log"),
+            unit.contains(
+                "ExecStart=/opt/clewdr/clewdr --config /opt/clewdr/clewdr.toml \
+                 --db /opt/clewdr/clewdr.db --log-dir /opt/clewdr/log"
+            ),
             "unit:\n{unit}"
         );
         assert!(unit.contains("WorkingDirectory=/opt/clewdr"));
@@ -560,14 +597,32 @@ mod tests {
     fn systemd_unit_file_substitutes_alternate_binary_path() {
         // current_exe() returns the *test* binary path under cargo
         // test, so the template MUST honor whatever path it's handed
-        // — not hardcode /opt/clewdr/clewdr.
+        // — not hardcode /opt/clewdr/clewdr. Crucially, a binary at
+        // /usr/local/bin/clewdr still gets data paths inside
+        // /opt/clewdr (review #10 P1: the `clewdr` system user can't
+        // write under /usr/local/bin).
         let unit = systemd::unit_file_contents(Path::new("/usr/local/bin/clewdr"));
         assert!(
-            unit.contains("ExecStart=/usr/local/bin/clewdr --log-dir /opt/clewdr/log"),
+            unit.contains(
+                "ExecStart=/usr/local/bin/clewdr --config /opt/clewdr/clewdr.toml \
+                 --db /opt/clewdr/clewdr.db --log-dir /opt/clewdr/log"
+            ),
             "unit:\n{unit}"
         );
         // WorkingDirectory still pins to the systemd-mode default.
         assert!(unit.contains("WorkingDirectory=/opt/clewdr"));
+    }
+
+    #[test]
+    fn systemd_unit_file_data_paths_match_purge_paths() {
+        // The unit's --config / --db / --log-dir args must point at
+        // the same paths the --purge flow tries to delete. Otherwise
+        // an operator who switches binaries (e.g. portable -> deb)
+        // could end up with --purge missing the actual on-disk data.
+        let unit = systemd::unit_file_contents(Path::new("/opt/clewdr/clewdr"));
+        assert!(unit.contains("/opt/clewdr/clewdr.toml"));
+        assert!(unit.contains("/opt/clewdr/clewdr.db"));
+        assert!(unit.contains("/opt/clewdr/log"));
     }
 
     #[test]
