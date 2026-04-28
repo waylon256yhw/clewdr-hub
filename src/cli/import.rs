@@ -151,6 +151,7 @@ pub async fn run(args: Args) -> Result<(), ClewdrError> {
     let raw = fs::read(&args.path)?;
     let bundle = parse_bundle(&raw)?;
     check_version_compatibility(&bundle, args.force)?;
+    detect_redacted_bundle(&bundle)?;
 
     let db_path = DB_PATH.to_owned();
     let pool = if args.init {
@@ -218,6 +219,77 @@ fn parse_clewdr_version(s: &str) -> Result<Version, ClewdrError> {
     })
 }
 
+/// Refuse to import a `--no-secrets`-redacted bundle.
+///
+/// Bundles produced by `export-config --no-secrets` null out secret
+/// columns (cookie_blob, oauth_*_token, plaintext_key, key_hash,
+/// password_hash, proxies.password). Those columns participate in
+/// NOT NULL / CHECK constraints in the live schema — `accounts.cookie_blob
+/// NOT NULL` for cookie auth, `api_keys.key_hash NOT NULL` always, the
+/// users table CHECK that requires admin to have a password_hash. So a
+/// redacted bundle can't actually be restored: the INSERTs roll back at
+/// the constraint check, leaving the operator with a generic SQLite
+/// error instead of a usable backup.
+///
+/// We catch this up front, before BEGIN, with an explicit message that
+/// points at the right fix (re-export without `--no-secrets`).
+fn detect_redacted_bundle(bundle: &Bundle) -> Result<(), ClewdrError> {
+    if let Some(rows) = bundle.tables.get("accounts") {
+        for row in rows {
+            let auth = match row.get("auth_source") {
+                Some(CellValue::Text(s)) => s.as_str(),
+                _ => continue,
+            };
+            let null_or_missing =
+                |col: &str| -> bool { matches!(row.get(col), None | Some(CellValue::Null)) };
+            match auth {
+                "cookie" if null_or_missing("cookie_blob") => {
+                    return Err(ClewdrError::BadRequest {
+                        msg: "bundle has accounts row with cookie auth but cookie_blob is NULL — \
+                              this bundle was produced with --no-secrets and cannot be imported. \
+                              Re-export without --no-secrets, or rotate credentials manually after a partial restore.",
+                    });
+                }
+                "oauth"
+                    if null_or_missing("oauth_access_token")
+                        || null_or_missing("oauth_refresh_token") =>
+                {
+                    return Err(ClewdrError::BadRequest {
+                        msg: "bundle has accounts row with oauth auth but oauth tokens are NULL — \
+                              this bundle was produced with --no-secrets and cannot be imported. \
+                              Re-export without --no-secrets.",
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(rows) = bundle.tables.get("api_keys") {
+        for row in rows {
+            if matches!(row.get("key_hash"), None | Some(CellValue::Null)) {
+                return Err(ClewdrError::BadRequest {
+                    msg: "bundle has api_keys row with NULL key_hash — \
+                          this bundle was produced with --no-secrets and cannot be imported. \
+                          Re-export without --no-secrets, or recreate keys after partial restore.",
+                });
+            }
+        }
+    }
+    if let Some(rows) = bundle.tables.get("users") {
+        for row in rows {
+            let role = matches!(row.get("role"), Some(CellValue::Text(s)) if s == "admin");
+            if role && matches!(row.get("password_hash"), None | Some(CellValue::Null)) {
+                return Err(ClewdrError::BadRequest {
+                    msg: "bundle has admin user with NULL password_hash — \
+                          this bundle was produced with --no-secrets and cannot be imported. \
+                          Re-export without --no-secrets, then run `clewdr reset-admin-password` if you want to rotate.",
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Apply bundle (single transaction)
 // ──────────────────────────────────────────────────────────────────────────
@@ -279,16 +351,21 @@ async fn apply_bundle(
 
     let result = apply_tables(&mut conn, bundle, args, &plans, &mut summary).await;
 
-    // Always end the transaction. Dry-run rolls back unconditionally;
-    // production import commits on success and rolls back on error.
-    let final_sql = if args.dry_run || result.is_err() {
-        "ROLLBACK"
+    // End the transaction.
+    //
+    // - dry-run: roll back unconditionally; we never want writes to land.
+    // - apply_tables errored: roll back; bubble the original error up.
+    // - apply_tables OK + COMMIT OK: success.
+    // - apply_tables OK + COMMIT errored: deferred-FK violations only
+    //   surface at COMMIT time, so swallowing this would let us report
+    //   "import committed" while SQLite has actually rolled the txn back.
+    //   Treat the COMMIT error as the import error.
+    if args.dry_run || result.is_err() {
+        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+        result?;
     } else {
-        "COMMIT"
-    };
-    let _ = sqlx::query(final_sql).execute(&mut *conn).await;
-
-    result?;
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+    }
     Ok(summary)
 }
 
@@ -299,12 +376,13 @@ async fn apply_tables(
     plans: &BTreeMap<String, ColumnPlan>,
     summary: &mut ImportSummary,
 ) -> Result<(), ClewdrError> {
-    // Restore mode wipes config tables in reverse FK order before inserts.
+    // Restore mode: wipe every table in TABLE_DELETE_ORDER_RESTORE,
+    // *regardless* of whether the bundle contains rows for it. Restore
+    // means "the live DB matches the bundle exactly"; a table missing
+    // from an older bundle should be left empty, not preserved with
+    // local rows.
     if args.mode == Mode::Restore {
         for table in TABLE_DELETE_ORDER_RESTORE {
-            if !plans.contains_key(*table) {
-                continue;
-            }
             let res = wipe_table(conn, table).await?;
             summary
                 .per_table
@@ -313,6 +391,21 @@ async fn apply_tables(
                 .deleted_first = res;
         }
     }
+
+    // Cache local-admin presence once per import. The admin protection in
+    // merge mode only kicks in when there *is* a local admin to preserve;
+    // a fresh DB (or one that lost its admin somehow) needs to accept the
+    // bundle's admin or the resulting DB has no login + every bundled
+    // api_keys row FK-violates at COMMIT.
+    let preserve_local_admin = if args.mode == Mode::Merge && !args.overwrite_admin {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM users WHERE username = 'admin' LIMIT 1")
+                .fetch_optional(&mut *conn)
+                .await?;
+        row.is_some()
+    } else {
+        false
+    };
 
     for table in TABLE_INSERT_ORDER {
         let Some(plan) = plans.get(*table) else {
@@ -335,15 +428,14 @@ async fn apply_tables(
 
         let counts = summary.per_table.entry((*table).to_string()).or_default();
         for row in rows {
-            // Admin protection: only applies in merge mode. In restore
-            // mode, we just wiped the entire users table — skipping the
-            // bundle's admin would leave a userless DB and any api_keys
-            // row in the bundle would FK-violate at COMMIT. Restore is
-            // the "I want this exact state" mode, so the admin row from
-            // the bundle is part of that state.
+            // Admin protection: skip the bundle's admin row only when
+            // there's a *local* admin worth preserving. On `--init` or
+            // any DB without an admin, we must let the bundle's admin
+            // through — otherwise the resulting DB has no login and any
+            // bundled api_keys.user_id pointing at the admin will FK-
+            // violate at COMMIT.
             if *table == "users"
-                && args.mode == Mode::Merge
-                && !args.overwrite_admin
+                && preserve_local_admin
                 && matches!(row.get("username"), Some(CellValue::Text(s)) if s == "admin")
             {
                 counts.skipped_admin += 1;
@@ -357,7 +449,7 @@ async fn apply_tables(
                 continue;
             }
 
-            execute_row_insert(conn, table, plan, row).await?;
+            execute_row_insert(conn, table, plan, row, args.mode).await?;
             counts.inserted += 1;
         }
     }
@@ -369,18 +461,23 @@ async fn execute_row_insert(
     table: &str,
     plan: &ColumnPlan,
     row: &BTreeMap<String, CellValue>,
+    mode: Mode,
 ) -> Result<(), ClewdrError> {
     if plan.writable.is_empty() {
         return Ok(());
     }
 
-    // INSERT OR REPLACE handles both id collisions (PK) and natural-key
-    // collisions (UNIQUE). The conflict resolution is: bundle wins, the
-    // existing local row is deleted (CASCADE-deleting any dependents)
-    // before the bundle row lands.
     let cols = plan.writable.join(", ");
     let placeholders = vec!["?"; plan.writable.len()].join(", ");
-    let sql = format!("INSERT OR REPLACE INTO {table} ({cols}) VALUES ({placeholders})");
+    let sql = match mode {
+        Mode::Restore => {
+            // Tables were wiped first — no conflict possible. Plain INSERT
+            // is the simplest form here and gives clean errors if the
+            // bundle is internally inconsistent (duplicate natural keys).
+            format!("INSERT INTO {table} ({cols}) VALUES ({placeholders})")
+        }
+        Mode::Merge => build_merge_upsert_sql(table, &plan.writable),
+    };
 
     let mut q = sqlx::query(&sql);
     for col in &plan.writable {
@@ -389,6 +486,75 @@ async fn execute_row_insert(
     }
     q.execute(&mut *conn).await?;
     Ok(())
+}
+
+/// Per-table UNIQUE columns that we use as the UPSERT conflict target in
+/// merge mode. Picking the natural key (rather than the synthetic id) keeps
+/// merge semantics intuitive: "row with the same name / username / model_id
+/// gets updated in place; everything else is new."
+fn merge_conflict_target(table: &str) -> &'static [&'static str] {
+    match table {
+        "policies" => &["name"],
+        "users" => &["username"],
+        "proxies" => &["name"],
+        "accounts" => &["name"],
+        "api_keys" => &["lookup_key"],
+        "api_key_account_bindings" => &["api_key_id", "account_id"],
+        "settings" => &["key"],
+        "models" => &["model_id"],
+        "model_pricing" => &["pricing_key"],
+        _ => &[],
+    }
+}
+
+/// Build the `INSERT … ON CONFLICT(natural_key) DO UPDATE SET col=excluded.col …`
+/// statement used by merge mode.
+///
+/// Critically, this does NOT use `INSERT OR REPLACE`. Replace would
+/// implement conflict resolution by *deleting* the existing row before
+/// inserting the bundle row — and ON DELETE CASCADE on child tables would
+/// then drop local-only rows that don't conflict with the bundle (e.g. a
+/// local user's local-only api_keys when merging the user). True UPSERT
+/// keeps the same row id, so cascades never fire.
+fn build_merge_upsert_sql(table: &str, cols: &[String]) -> String {
+    let cols_list = cols.join(", ");
+    let placeholders = vec!["?"; cols.len()].join(", ");
+    let target_cols = merge_conflict_target(table);
+    if target_cols.is_empty() {
+        // No declared conflict target — fall back to a permissive insert.
+        return format!("INSERT OR IGNORE INTO {table} ({cols_list}) VALUES ({placeholders})");
+    }
+    let target = target_cols.join(", ");
+    let updates: Vec<String> = cols
+        .iter()
+        .filter(|c| !target_cols.contains(&c.as_str()))
+        .filter(|c| c.as_str() != "id") // never reassign row id on update
+        .map(|c| format!("{c} = excluded.{c}"))
+        .collect();
+    if updates.is_empty() {
+        format!(
+            "INSERT INTO {table} ({cols_list}) VALUES ({placeholders}) ON CONFLICT({target}) DO NOTHING"
+        )
+    } else {
+        format!(
+            "INSERT INTO {table} ({cols_list}) VALUES ({placeholders}) ON CONFLICT({target}) DO UPDATE SET {set}",
+            set = updates.join(", ")
+        )
+    }
+}
+
+fn bind_cell<'q>(
+    q: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    cell: CellValue,
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+    match cell {
+        // Any T works for a NULL bind; pick a small one.
+        CellValue::Null => q.bind(Option::<i64>::None),
+        CellValue::Integer(i) => q.bind(i),
+        CellValue::Real(f) => q.bind(f),
+        CellValue::Text(s) => q.bind(s),
+        CellValue::Blob(b) => q.bind(b),
+    }
 }
 
 /// Delete every row from `table`, except for `settings` rows whose `key`
@@ -411,20 +577,6 @@ async fn wipe_table(conn: &mut SqliteConnection, table: &str) -> Result<usize, C
         .execute(&mut *conn)
         .await?;
     Ok(res.rows_affected() as usize)
-}
-
-fn bind_cell<'q>(
-    q: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
-    cell: CellValue,
-) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
-    match cell {
-        // Any T works for a NULL bind; pick a small one.
-        CellValue::Null => q.bind(Option::<i64>::None),
-        CellValue::Integer(i) => q.bind(i),
-        CellValue::Real(f) => q.bind(f),
-        CellValue::Text(s) => q.bind(s),
-        CellValue::Blob(b) => q.bind(b),
-    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -988,6 +1140,299 @@ mod tests {
         let mut buf = ENCRYPTED_BUNDLE_MAGIC.to_vec();
         buf.extend_from_slice(&[0u8; 64]);
         assert!(parse_bundle(&buf).is_err());
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Regression tests for review #7 fixes
+    // ──────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn commit_failure_propagates_when_deferred_fk_violates() {
+        // Build a bundle whose api_keys row references a user that the
+        // bundle doesn't carry. With deferred FKs the INSERT succeeds
+        // and the failure only surfaces at COMMIT — apply_bundle must
+        // propagate that error rather than reporting "import committed".
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("nope.toml");
+        let src_db = seeded_db(&dir).await;
+        let bundle_path = dir.path().join("bundle.json");
+        let mut bundle = build_bundle(&src_db, &cfg_path, &export_args(bundle_path.clone()))
+            .await
+            .unwrap();
+        // Sabotage: remove every users row from the bundle so the api_keys
+        // entry we leave behind has no parent.
+        bundle.tables.get_mut("users").unwrap().clear();
+
+        // Restore against a fresh DB so the wipe + insert path runs.
+        let tgt_db = dir.path().join("tgt.db");
+        let pool = crate::db::init_pool(&tgt_db).await.unwrap();
+        crate::db::seed_admin(&pool).await.unwrap();
+        pool.close().await;
+
+        let pool = crate::db::open_existing_pool(&tgt_db).await.unwrap();
+        let res = apply_bundle(
+            &pool,
+            &bundle,
+            &Args {
+                path: bundle_path,
+                mode: Mode::Restore,
+                yes: true,
+                overwrite_admin: false,
+                dry_run: false,
+                init: false,
+                force: false,
+                passphrase_stdin: false,
+            },
+        )
+        .await;
+        // Must be an Err — this is the case where the previous
+        // implementation silently succeeded.
+        assert!(
+            res.is_err(),
+            "apply_bundle reported success despite COMMIT failure"
+        );
+
+        // And the on-disk DB must still have its admin row (the rollback
+        // restored everything).
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE username = 'admin'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "rollback didn't restore the admin row");
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn merge_does_not_cascade_delete_local_only_children() {
+        // Local has admin + a local-only api_key for admin. Bundle has the
+        // same admin (different password_hash) but no api_keys. Under the
+        // old INSERT OR REPLACE strategy, REPLACE would DELETE the local
+        // admin row, CASCADE-deleting the local-only api_key. The new
+        // ON CONFLICT(username) DO UPDATE keeps the same row id so no
+        // cascade fires.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("nope.toml");
+
+        // Source DB has its own admin and no api_keys (we'll wipe rows
+        // before exporting so the bundle has just admin + system tables).
+        let src_db = dir.path().join("src.db");
+        let pool = crate::db::init_pool(&src_db).await.unwrap();
+        crate::db::seed_admin(&pool).await.unwrap();
+        pool.close().await;
+        let bundle_path = dir.path().join("bundle.json");
+        let bundle = build_bundle(&src_db, &cfg_path, &export_args(bundle_path.clone()))
+            .await
+            .unwrap();
+
+        // Target DB: admin (id=1) + a local-only api_key for admin.
+        let tgt_db = dir.path().join("tgt.db");
+        let pool = crate::db::init_pool(&tgt_db).await.unwrap();
+        crate::db::seed_admin(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO api_keys (user_id, label, lookup_key, key_hash, plaintext_key)
+             VALUES (1, 'local-only-key', 'sk-local-keep', X'CCCC', 'sk-local')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        // Force the bundle's admin row to *differ* from the local admin
+        // (different password_hash) so the UPSERT actually has work to do.
+        let mut bundle = bundle;
+        for row in bundle.tables.get_mut("users").unwrap() {
+            if matches!(row.get("username"), Some(CellValue::Text(s)) if s == "admin") {
+                row.insert(
+                    "password_hash".to_string(),
+                    CellValue::Text("$argon2id$BUNDLE_HASH".to_string()),
+                );
+            }
+        }
+
+        let pool = crate::db::open_existing_pool(&tgt_db).await.unwrap();
+        let mut args = import_args(bundle_path, Mode::Merge);
+        args.overwrite_admin = true; // we want the upsert path, not skip
+        apply_bundle(&pool, &bundle, &args).await.unwrap();
+
+        // Local-only api_key must still be there. Under the buggy
+        // implementation it would have been CASCADE-deleted when REPLACE
+        // dropped the local admin row.
+        let (n,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM api_keys WHERE label = 'local-only-key'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            n, 1,
+            "local-only api_key was cascade-deleted by merge UPSERT"
+        );
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn merge_imports_admin_when_no_local_admin_exists() {
+        // Fresh DB with no admin (mimics `--init` against a new file).
+        // The merge mode admin-skip must NOT fire — otherwise the resulting
+        // DB has no login and bundled api_keys.user_id=1 would FK-violate.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("nope.toml");
+        let src_db = seeded_db(&dir).await;
+        let bundle_path = dir.path().join("bundle.json");
+        let bundle = build_bundle(&src_db, &cfg_path, &export_args(bundle_path.clone()))
+            .await
+            .unwrap();
+
+        // Target: schema only, NO seed_admin. users table is empty.
+        let tgt_db = dir.path().join("tgt.db");
+        let pool = crate::db::init_pool(&tgt_db).await.unwrap();
+        let (n_before,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n_before, 0, "fixture should start empty");
+        pool.close().await;
+
+        let pool = crate::db::open_existing_pool(&tgt_db).await.unwrap();
+        let summary = apply_bundle(&pool, &bundle, &import_args(bundle_path, Mode::Merge))
+            .await
+            .unwrap();
+
+        let (n_admin,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM users WHERE username = 'admin'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            n_admin, 1,
+            "admin from bundle was wrongly skipped against an empty DB"
+        );
+        // skipped_admin should be 0 in this scenario.
+        assert_eq!(summary.per_table["users"].skipped_admin, 0);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn redacted_no_secrets_bundle_is_refused_at_preflight() {
+        // Build a normal bundle, then redact like --no-secrets would.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("nope.toml");
+        let src_db = seeded_db(&dir).await;
+        let bundle_path = dir.path().join("bundle.json");
+        let mut bundle = build_bundle(&src_db, &cfg_path, &export_args(bundle_path.clone()))
+            .await
+            .unwrap();
+        // Null cookie_blob on every cookie account, mirroring --no-secrets.
+        for row in bundle.tables.get_mut("accounts").unwrap() {
+            if matches!(row.get("auth_source"), Some(CellValue::Text(s)) if s == "cookie") {
+                row.insert("cookie_blob".to_string(), CellValue::Null);
+            }
+        }
+
+        let tgt_db = dir.path().join("tgt.db");
+        let pool = crate::db::init_pool(&tgt_db).await.unwrap();
+        crate::db::seed_admin(&pool).await.unwrap();
+        pool.close().await;
+
+        // The reading path goes through fs::read so we round-trip through
+        // disk to exercise the public entry point as much as feasible.
+        std::fs::write(
+            dir.path().join("redacted.json"),
+            serde_json::to_vec(&bundle).unwrap(),
+        )
+        .unwrap();
+
+        let pool = crate::db::open_existing_pool(&tgt_db).await.unwrap();
+        let res = apply_bundle(
+            &pool,
+            &bundle,
+            &import_args(bundle_path.clone(), Mode::Merge),
+        )
+        .await;
+        // apply_bundle itself is OK — preflight runs in `run`. So we
+        // emulate the preflight directly.
+        // (We exercise apply_bundle here for completeness; the redaction
+        // detection lives upstream of it.)
+        let _ = res;
+
+        // The actual contract:
+        assert!(detect_redacted_bundle(&bundle).is_err());
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn restore_wipes_tables_missing_from_bundle() {
+        // Local has an extra proxy and an extra account. Bundle's
+        // accounts table is empty; bundle is missing `proxies` entirely
+        // (simulating an older / partial export). Restore must still
+        // wipe both: restored state is "the bundle, exactly", and the
+        // bundle says "no proxies / no accounts".
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("nope.toml");
+
+        // Source DB exports a bundle with no accounts and no proxies.
+        let src_db = dir.path().join("src.db");
+        let pool = crate::db::init_pool(&src_db).await.unwrap();
+        crate::db::seed_admin(&pool).await.unwrap();
+        pool.close().await;
+        let bundle_path = dir.path().join("bundle.json");
+        let mut bundle = build_bundle(&src_db, &cfg_path, &export_args(bundle_path.clone()))
+            .await
+            .unwrap();
+        // Remove proxies entirely from the bundle to mimic an older
+        // export that predates the proxies table.
+        bundle.tables.remove("proxies");
+        bundle.schema.remove("proxies");
+
+        // Target DB has a local-only proxy + a local-only account.
+        let tgt_db = dir.path().join("tgt.db");
+        let pool = crate::db::init_pool(&tgt_db).await.unwrap();
+        crate::db::seed_admin(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO proxies (name, protocol, host, port) VALUES ('local-proxy', 'http', 'h.example', 1080)",
+        )
+        .execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO accounts (name, rr_order, max_slots, status, auth_source, cookie_blob, organization_uuid)
+             VALUES ('local-acct', 1, 5, 'active', 'cookie', X'AA', 'org')",
+        )
+        .execute(&pool).await.unwrap();
+        pool.close().await;
+
+        let pool = crate::db::open_existing_pool(&tgt_db).await.unwrap();
+        apply_bundle(
+            &pool,
+            &bundle,
+            &Args {
+                path: bundle_path,
+                mode: Mode::Restore,
+                yes: true,
+                overwrite_admin: false,
+                dry_run: false,
+                init: false,
+                force: false,
+                passphrase_stdin: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (n_proxies,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM proxies")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            n_proxies, 0,
+            "restore left local proxies behind because bundle had no proxies table"
+        );
+        let (n_accounts,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM accounts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            n_accounts, 0,
+            "restore left local accounts behind because bundle's accounts was empty"
+        );
+        pool.close().await;
     }
 
     fn sample_bundle() -> Bundle {
