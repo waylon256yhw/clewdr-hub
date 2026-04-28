@@ -20,11 +20,20 @@ set -euo pipefail
 
 PURGE=0
 INSTALL_DIR_OVERRIDE="${CLEWDR_INSTALL_DIR:-}"
+NO_SERVICE="${CLEWDR_NO_SERVICE:-0}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --purge)
             PURGE=1
+            shift
+            ;;
+        --no-service)
+            # Equivalent to CLEWDR_NO_SERVICE=1; useful when the user
+            # installed binary-only (CLEWDR_NO_SERVICE=1) and the host
+            # *does* have a service backend (systemd) but no service
+            # was ever registered.
+            NO_SERVICE=1
             shift
             ;;
         -h|--help)
@@ -33,7 +42,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "unknown argument: $1" >&2
-            echo "usage: $0 [--purge]" >&2
+            echo "usage: $0 [--purge] [--no-service]" >&2
             exit 2
             ;;
     esac
@@ -50,19 +59,21 @@ info() { echo "${GREEN}${BOLD}==>${RESET} $*"; }
 warn() { echo "${YELLOW}${BOLD}warn:${RESET} $*" >&2; }
 
 # Returns 0 iff `clewdr service uninstall` has a backend it can talk
-# to on this host. Mirror of the same gate in install.sh: the verb
-# only supports systemd and Termux:Boot, and on hosts without either
-# (macOS, sysvinit Linux, containers) it errors before doing anything,
-# which would `set -e` us out of the binary cleanup that should still
-# run. Kept verbatim instead of sourced — the two scripts are
-# delivered independently and small duplication is cheaper than
-# trying to share a library file across the curl|bash entry points.
+# to on this host AND the caller has the privileges it needs. Mirror
+# of the gate in install.sh — Termux:Boot needs no root, systemd
+# does. A non-root user on a systemd host who installed binary-only
+# (e.g. CLEWDR_NO_SERVICE=1 + CLEWDR_INSTALL_DIR=$HOME/clewdr) would
+# otherwise hit `service uninstall` -> require_root() -> set -e
+# aborts before the binary cleanup. Kept verbatim instead of sourced
+# — the two scripts are delivered independently and small duplication
+# is cheaper than trying to share a library file across the curl|bash
+# entry points.
 service_supported() {
     if [[ -n "${PREFIX:-}" && "$PREFIX" == *com.termux* ]] \
        || [[ -d /data/data/com.termux/files/usr ]]; then
         return 0
     fi
-    if [[ "$(uname -s)" == "Linux" ]] && [[ -d /run/systemd/system ]]; then
+    if [[ "$(uname -s)" == "Linux" ]] && [[ -d /run/systemd/system ]] && (( EUID == 0 )); then
         return 0
     fi
     return 1
@@ -100,14 +111,20 @@ info "found install at ${BOLD}${install_dir}${RESET}"
 # data confirmation prompt runs inside the verb, where it lives next
 # to the path constants the verb already knows.
 #
-# Skip the call when no service backend is available (macOS, no-
-# systemd Linux, CLEWDR_NO_SERVICE installs). Otherwise the verb
-# errors out before binary removal and `set -e` aborts cleanup
-# entirely. If --purge was requested in that case, warn the operator
-# that the data path can't be reached from bash without re-deriving
-# the binary's path-resolution logic — they're better off running
-# the binary directly or deleting by hand.
-if service_supported; then
+# Skip the call when:
+#   - --no-service / CLEWDR_NO_SERVICE=1 was passed (operator did a
+#     binary-only install and asks for the matching uninstall);
+#   - or no service backend is available with current privileges
+#     (macOS, no-systemd Linux, non-root user on a systemd host).
+# Otherwise the verb errors out before binary removal and `set -e`
+# aborts cleanup entirely. If --purge was requested in that case,
+# warn the operator that the data path can't be reached from bash
+# without re-deriving the binary's path-resolution logic — they're
+# better off running the binary directly or deleting by hand.
+service_called=0
+if [[ "$NO_SERVICE" == "1" ]]; then
+    info "skipping \`$bin service uninstall\` (CLEWDR_NO_SERVICE / --no-service)"
+elif service_supported; then
     if [[ "$PURGE" == "1" ]]; then
         info "calling: $bin service uninstall --purge"
         "$bin" service uninstall --purge
@@ -115,15 +132,18 @@ if service_supported; then
         info "calling: $bin service uninstall"
         "$bin" service uninstall
     fi
+    service_called=1
 else
-    info "no supported service backend (no systemd, not Termux); skipping \`$bin service uninstall\`."
-    if [[ "$PURGE" == "1" ]]; then
-        warn "--purge requested but the service verb's purge path isn't available here."
-        warn "delete data manually if needed; common locations:"
-        warn "  - ${install_dir}/clewdr.{toml,db}"
-        warn "  - ${install_dir}/log/"
-        warn "  - \$HOME/.local/clewdr/log/  (Termux logs)"
-    fi
+    info "no usable service backend for this user (no Termux, no systemd, or systemd needs root); skipping \`$bin service uninstall\`."
+    info "if you installed with sudo + systemd, re-run this script with sudo to tear the unit down too."
+fi
+
+if [[ "$PURGE" == "1" && "$service_called" != "1" ]]; then
+    warn "--purge requested but the service verb's purge path was skipped above."
+    warn "delete data manually if needed; common locations:"
+    warn "  - ${install_dir}/clewdr.{toml,db}"
+    warn "  - ${install_dir}/log/"
+    warn "  - \$HOME/.local/clewdr/log/  (Termux logs)"
 fi
 
 # 2) Remove the binary itself + the libc++_shared.so we may have

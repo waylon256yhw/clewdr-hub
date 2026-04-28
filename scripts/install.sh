@@ -79,11 +79,18 @@ version_at_least() {
 # Best-effort glibc version probe. `getconf GNU_LIBC_VERSION` is the
 # preferred source; falls back to parsing `ldd --version`'s first line.
 # Echoes a MAJOR.MINOR string, or empty if neither source produced one.
+#
+# Both lookups are guarded by `command -v` AND `|| true` because the
+# script runs under `set -euo pipefail`: if `getconf` is missing (127)
+# the pipeline's pipefail status would propagate through `$(...)` and
+# kill the script before the ldd fallback ever ran.
 host_glibc_version() {
-    local v
-    v=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')
-    if [[ -z "$v" ]]; then
-        v=$(ldd --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    local v=""
+    if command -v getconf >/dev/null 2>&1; then
+        v=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}') || v=""
+    fi
+    if [[ -z "$v" ]] && command -v ldd >/dev/null 2>&1; then
+        v=$(ldd --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1) || v=""
     fi
     echo "$v"
 }
@@ -179,21 +186,30 @@ resolve_install_dir() {
     esac
 }
 
-# Returns 0 iff `clewdr service install` has a backend on this host.
-# The verb supports only systemd (Linux) and Termux:Boot (Android);
-# macOS, BSDs, and stripped-down Linux containers without systemd
-# would fail with "no supported service manager found" and leave a
-# half-installed binary. Used to gate the auto-call at the end of
-# install.sh and the matching uninstall step.
+# Returns 0 iff `clewdr service install` has a backend on this host
+# AND the caller has the privileges the verb needs. The verb supports
+# only systemd (Linux, requires root) and Termux:Boot (Android, no
+# root needed). macOS, BSDs, stripped containers without systemd, and
+# non-root users on systemd hosts all need to be skipped — otherwise
+# the verb errors after the binary is already in place and `set -e`
+# aborts the rest of the script.
 service_supported() {
     local target=$1
     case "$target" in
-        android-*) return 0 ;;                       # Termux:Boot
+        android-*)
+            # Termux:Boot doesn't need root.
+            return 0
+            ;;
         linux-*|musllinux-*)
-            [[ -d /run/systemd/system ]] && return 0 # systemd
+            # systemd backend AND root.
+            [[ -d /run/systemd/system ]] || return 1
+            (( EUID == 0 )) || return 1
+            return 0
+            ;;
+        *)
+            # macOS / windows / unknown.
             return 1
             ;;
-        *) return 1 ;;                               # macOS, windows, …
     esac
 }
 
