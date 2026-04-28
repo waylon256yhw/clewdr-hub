@@ -1,5 +1,5 @@
 use clewdr_hub::{
-    FIG, IS_DEBUG,
+    ARGS, Args, Command, FIG, IS_DEBUG,
     config::{CLEWDR_CONFIG, CONFIG_PATH, DB_PATH, LOG_DIR},
     error::ClewdrError,
     version_info_colored,
@@ -54,14 +54,25 @@ fn admin_panel_url(addr: SocketAddr) -> String {
     format!("http://{}:{}", host, addr.port())
 }
 
-/// Application entry point
-/// Sets up logging, checks for updates, initializes the application state,
-/// creates the router, and starts the server
+/// Application entry point.
 ///
-/// # Returns
-/// Result indicating success or failure of the application execution
+/// Order matters here:
+/// 1. Install global crypto provider + ANSI/color setup (cheap, side-effect-free).
+/// 2. Dispatch CLI subcommands. They MUST run before logging or
+///    [`CLEWDR_CONFIG`] initialization, because touching `CLEWDR_CONFIG`
+///    spawns an async writeback to `clewdr.toml` that would race with
+///    `clewdr import-config`.
+/// 3. Only the bare-server path proceeds to logging + config + DB + axum.
 #[tokio::main]
 async fn main() -> Result<(), ClewdrError> {
+    // Strict argv validation: surface unknown flags (typos, removed args) as a
+    // normal clap error and exit BEFORE anything else runs. The library
+    // [`ARGS`] LazyLock uses `try_parse` with a default fallback so that test
+    // harnesses and other library consumers tolerate unrelated argv; the
+    // binary itself wants the strict behaviour.
+    use clap::Parser;
+    let _ = Args::parse();
+
     // Ensure a crypto provider is installed before rustls usage (yup-oauth2 / hyper-rustls).
     #[cfg(target_os = "android")]
     rustls::crypto::ring::default_provider()
@@ -83,6 +94,36 @@ async fn main() -> Result<(), ClewdrError> {
     let stdout_is_tty = std::io::stdout().is_terminal();
     colored::control::set_override(stdout_is_tty);
 
+    // ---- Early CLI dispatch (must precede logging + CLEWDR_CONFIG) ----
+    if let Some(cmd) = ARGS.command.clone() {
+        if !matches!(cmd, Command::Serve) {
+            return verb_finish(clewdr_hub::cli::dispatch(cmd).await);
+        }
+    }
+    #[cfg(feature = "portable")]
+    if ARGS.update {
+        return verb_finish(clewdr_hub::cli::run_update().await);
+    }
+
+    // ---- From here on it's the serve path; logging + CLEWDR_CONFIG are fair game ----
+    serve().await
+}
+
+/// Convert a CLI verb's `Result` into a process-level outcome.
+///
+/// On success we just return `Ok(())` so `#[tokio::main]` exits 0. On error
+/// we print the [`ClewdrError`]'s `Display` form (which carries the carefully
+/// crafted user-facing text — DbNotFound, BadRequest, etc.) and exit 1
+/// directly, bypassing tokio's default `Debug`-formatted error printout.
+fn verb_finish(result: Result<(), ClewdrError>) -> Result<(), ClewdrError> {
+    if let Err(e) = result {
+        eprintln!("{} {e}", "Error:".red().bold());
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+async fn serve() -> Result<(), ClewdrError> {
     // set up logging time format
     let timer = ChronoLocal::new("%H:%M:%S%.3f".to_string());
     // set up logging
@@ -94,6 +135,7 @@ async fn main() -> Result<(), ClewdrError> {
     let env_filter = tracing_subscriber::EnvFilter::builder()
         .with_default_directive(filter.into())
         .from_env_lossy();
+    let stdout_is_tty = std::io::stdout().is_terminal();
     let subscriber = Registry::default().with(
         fmt::Layer::default()
             .with_writer(std::io::stdout)
@@ -128,7 +170,7 @@ async fn main() -> Result<(), ClewdrError> {
     {
         use tracing::warn;
         let updater = clewdr_hub::services::update::ClewdrUpdater::new()?;
-        if let Err(e) = updater.check_for_updates().await {
+        if let Err(e) = updater.check_for_updates(false).await {
             warn!("Update check failed: {}", e);
         }
     }

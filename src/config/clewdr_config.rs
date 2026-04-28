@@ -3,7 +3,6 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 
-use clap::Parser;
 use colored::Colorize;
 use figment::{
     Figment,
@@ -17,7 +16,7 @@ use wreq::Proxy;
 
 use super::{CONFIG_PATH, ENDPOINT_URL};
 use crate::{
-    Args,
+    ARGS,
     config::{CC_CLIENT_ID, default_check_update, default_ip, default_port},
     error::ClewdrError,
 };
@@ -108,7 +107,7 @@ impl ClewdrConfig {
                 error!("Failed to load config: {}", e);
             })
             .unwrap_or_default();
-        if let Some(ref f) = Args::try_parse().ok().and_then(|a| a.file)
+        if let Some(f) = ARGS.global.file.as_ref()
             && f.exists()
         {
             tracing::warn!("--file flag is deprecated; manage cookies via admin API instead");

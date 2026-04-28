@@ -13,9 +13,9 @@ use wreq::Client;
 use zip::ZipArchive;
 
 use crate::{
-    Args,
     config::CLEWDR_CONFIG,
     error::{ClewdrError, WreqSnafu},
+    services::version::{is_newer_release, parse_clewdr_version},
 };
 
 const DEFAULT_REPO_OWNER: &str = "waylon256yhw";
@@ -78,19 +78,23 @@ impl ClewdrUpdater {
     }
 
     /// Checks for updates by comparing the current version to the latest release on GitHub
-    /// Performs automatic update if enabled in config or explicitly requested
+    /// Performs automatic update if `force` is true or auto_update is enabled in config.
+    ///
+    /// # Arguments
+    /// * `force` — when `true`, the check ignores `check_update=false` and always
+    ///   performs the update if a newer version is available. Set by callers
+    ///   that originate from `clewdr --update` or `clewdr update`.
     ///
     /// # Returns
     /// * `Result<bool, ClewdrError>` - True if update available, false otherwise
-    pub async fn check_for_updates(&self) -> Result<bool, ClewdrError> {
+    pub async fn check_for_updates(&self, force: bool) -> Result<bool, ClewdrError> {
         if CLEWDR_CONFIG.load().no_fs {
             // If no_fs feature is enabled, skip update check
             info!("Update check skipped due to no_fs feature");
             return Ok(false);
         }
 
-        let args: Args = clap::Parser::parse();
-        if !args.update && !CLEWDR_CONFIG.load().check_update {
+        if !force && !CLEWDR_CONFIG.load().check_update {
             return Ok(false);
         }
 
@@ -122,7 +126,14 @@ impl ClewdrUpdater {
         let latest_version = release.tag_name.trim_start_matches('v');
         let current_version = env!("CARGO_PKG_VERSION");
 
-        let update_available = self.compare_versions(current_version, latest_version)?;
+        // SemVer 2.0 precedence: prereleases don't outrank matching
+        // stables, *and* build metadata is ignored. Default `Ord` on
+        // semver::Version compares build metadata too, which would make
+        // a release like `v1.2.4+build.5` look "newer" than a running
+        // `1.2.4` and self-replace with the same binary on every check.
+        let current_v = parse_clewdr_version(current_version)?;
+        let latest_v = parse_clewdr_version(latest_version)?;
+        let update_available = is_newer_release(&current_v, &latest_v);
 
         if !update_available {
             info!("Already at the latest version {}", current_version.green());
@@ -133,8 +144,8 @@ impl ClewdrUpdater {
             latest_version.green().italic(),
             current_version.yellow()
         );
-        // Auto update if enabled
-        if args.update || CLEWDR_CONFIG.load().auto_update {
+        // Auto update if forced or enabled in config
+        if force || CLEWDR_CONFIG.load().auto_update {
             self.perform_update(&release).await?;
         }
 
@@ -291,30 +302,6 @@ impl ClewdrUpdater {
             .ok_or(ClewdrError::AssetError {
                 msg: format!("No suitable asset found for platform: {target}"),
             })
-    }
-
-    /// Compares two version strings to determine if an update is needed
-    /// Parses versions in the format major.minor.patch
-    ///
-    /// # Arguments
-    /// * `current` - Current version string
-    /// * `latest` - Latest version string from GitHub
-    ///
-    /// # Returns
-    /// * `Result<bool, ClewdrError>` - True if latest is newer than current, false otherwise
-    fn compare_versions(&self, current: &str, latest: &str) -> Result<bool, ClewdrError> {
-        let parse_version = |v: &str| -> Result<(u32, u32, u32), ClewdrError> {
-            let vec = v.split('.').collect::<Vec<_>>();
-            let [major, minor, patch, ..] = vec.as_slice() else {
-                return Err(ClewdrError::InvalidVersion {
-                    version: v.to_string(),
-                });
-            };
-            Ok((major.parse()?, minor.parse()?, patch.parse()?))
-        };
-        let current = parse_version(current)?;
-        let latest = parse_version(latest)?;
-        Ok(current < latest)
     }
 }
 

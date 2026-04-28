@@ -86,6 +86,8 @@ pub enum ClewdrError {
     InvalidHeaderValue { source: InvalidHeaderValue },
     #[snafu(display("Bad request: {}", msg))]
     BadRequest { msg: &'static str },
+    #[snafu(display("Bad request: {}", msg))]
+    BadRequestMessage { msg: String },
     #[snafu(display("Retries exceeded"))]
     TooManyRetries,
     #[snafu(display("Upstream request timed out: {}", msg))]
@@ -152,6 +154,8 @@ pub enum ClewdrError {
     },
     #[snafu(display("Unexpected None: {}", msg))]
     UnexpectedNone { msg: &'static str },
+    #[snafu(display("Unexpected None: {}", msg))]
+    UnexpectedMessage { msg: String },
     #[snafu(display("IO error: {}", source))]
     #[snafu(context(false))]
     IoError {
@@ -174,6 +178,11 @@ pub enum ClewdrError {
 
     #[snafu(display("Not found: {}", msg))]
     NotFound { msg: &'static str },
+    #[snafu(display(
+        "Database not found at {}. Check the --db path, or run `clewdr serve` first to create a fresh database at the default location.",
+        path.display()
+    ))]
+    DbNotFound { path: std::path::PathBuf },
     #[snafu(display("Conflict: {}", msg))]
     Conflict { msg: &'static str },
     #[snafu(display("Conflict: {}", msg))]
@@ -345,7 +354,9 @@ impl IntoResponse for ClewdrError {
             ClewdrError::Conflict { .. } | ClewdrError::ConflictMessage { .. } => {
                 (StatusCode::CONFLICT, json!(self.to_string()))
             }
-            ClewdrError::BadRequest { .. } => (StatusCode::BAD_REQUEST, json!(self.to_string())),
+            ClewdrError::BadRequest { .. } | ClewdrError::BadRequestMessage { .. } => {
+                (StatusCode::BAD_REQUEST, json!(self.to_string()))
+            }
             ClewdrError::InvalidHeaderValue { .. } => {
                 (StatusCode::BAD_REQUEST, json!(self.to_string()))
             }

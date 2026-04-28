@@ -56,7 +56,7 @@ self-replace = { version = "1", optional = true }
 zip = { version = "8", optional = true, default-features = false, features = [
     "deflate",
 ] }
-tempfile = { version = "3", optional = true }
+tempfile = "3"
 axum-auth = "0.8"
 tiktoken-rs = "0.9"
 passwords = "3"
@@ -92,6 +92,10 @@ argon2 = { version = "0.5.3", features = ["std"] }
 blake3 = "1.8.3"
 rand = { version = "0.10.0", features = ["std_rng"] }
 hmac = "0.12"
+rpassword = "7"
+semver = "1"
+aes-gcm = { version = "0.10", optional = true }
+inquire = { version = "0.7", default-features = false, features = ["crossterm"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 enable-ansi-support = "0.3"
@@ -105,11 +109,15 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] 
 
 
 [features]
-default = ["portable", "external-resource"]
+default = ["portable", "external-resource", "tui", "encrypt"]
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]
-portable = ["dep:zip", "dep:self-replace", "dep:tempfile"]
+portable = ["dep:zip", "dep:self-replace"]
 xdg = ["dep:etcetera"]
 embed-resource = ["dep:tower-serve-static", "dep:include_dir"]
 external-resource = ["tower-http/fs"]
 mimalloc = ["dep:mimalloc"]
 dhat-heap = ["dep:dhat"]
+# Encrypted export/import bundle (Argon2id KDF + AES-256-GCM).
+encrypt = ["dep:aes-gcm"]
+# Interactive TUI menu (commit #11 — inquire-based, default-on).
+tui = ["dep:inquire"]

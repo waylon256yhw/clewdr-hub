@@ -5,10 +5,9 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use clap::Parser;
 use url::Url;
 
-use crate::{Args, config::ClewdrConfig};
+use crate::{ARGS, config::ClewdrConfig};
 
 pub const CONFIG_NAME: &str = "clewdr.toml";
 pub const CLAUDE_ENDPOINT: &str = "https://api.anthropic.com/";
@@ -25,7 +24,7 @@ pub static ENDPOINT_URL: LazyLock<Url> = LazyLock::new(|| {
     })
 });
 pub static LOG_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
-    if let Some(path) = Args::try_parse().ok().and_then(|a| a.log_dir) {
+    if let Some(path) = ARGS.global.log_dir.clone() {
         path
     } else {
         #[cfg(feature = "portable")]
@@ -51,7 +50,7 @@ pub static CLEWDR_CONFIG: LazyLock<ArcSwap<ClewdrConfig>> = LazyLock::new(|| {
 });
 
 pub static DB_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
-    if let Some(path) = Args::try_parse().ok().and_then(|a| a.db) {
+    if let Some(path) = ARGS.global.db.clone() {
         path
     } else {
         #[cfg(feature = "portable")]
@@ -73,7 +72,7 @@ pub static DB_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
 });
 
 pub static CONFIG_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
-    if let Some(path) = Args::try_parse().ok().and_then(|a| a.config) {
+    if let Some(path) = ARGS.global.config.clone() {
         path
     } else {
         #[cfg(feature = "portable")]
