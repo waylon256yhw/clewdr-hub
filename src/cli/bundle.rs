@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use sqlx::{Column, Row as SqlxRow, SqlitePool, TypeInfo, ValueRef};
+use sqlx::{Column, Row as SqlxRow, SqliteConnection, TypeInfo, ValueRef};
 
 use crate::error::ClewdrError;
 
@@ -169,13 +169,16 @@ impl<'de> Deserialize<'de> for CellValue {
 // Schema + row readers (PRAGMA table_info + SELECT *)
 // ──────────────────────────────────────────────────────────────────────────
 
-pub async fn read_table_schema(pool: &SqlitePool, table: &str) -> Result<TableSchema, ClewdrError> {
+pub async fn read_table_schema(
+    conn: &mut SqliteConnection,
+    table: &str,
+) -> Result<TableSchema, ClewdrError> {
     // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk.
     // Composite PKs use 1-indexed positions on the pk column; we capture
     // them in PK order.
     let rows: Vec<(i64, String, String, i64, Option<String>, i64)> =
         sqlx::query_as(&format!("PRAGMA table_info({table})"))
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await?;
     if rows.is_empty() {
         return Err(ClewdrError::NotFound {
@@ -201,12 +204,12 @@ pub async fn read_table_schema(pool: &SqlitePool, table: &str) -> Result<TableSc
 }
 
 pub async fn read_table_rows(
-    pool: &SqlitePool,
+    conn: &mut SqliteConnection,
     table: &str,
     schema: &TableSchema,
 ) -> Result<Vec<Row>, ClewdrError> {
     let sql = format!("SELECT * FROM {table}");
-    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+    let rows = sqlx::query(&sql).fetch_all(&mut *conn).await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let mut cells: Row = BTreeMap::new();
@@ -276,9 +279,19 @@ fn read_cell(row: &sqlx::sqlite::SqliteRow, name: &str) -> Result<CellValue, Cle
 /// set, these are nulled before serialization. Centralised here so import
 /// can later reason about "this row was redacted on export" without
 /// re-deriving the list.
+///
+/// Note on `api_keys`:
+/// - `plaintext_key` is the literal `sk-clewdr-…` string the user copies
+///   into a client. Bundling it with `--no-secrets` would defeat the flag.
+/// - `key_hash` is the blake3 verification hash; with the lookup_key
+///   prefix it's enough to brute-force narrow keyspaces, so we strip it
+///   too. Net effect: a `--no-secrets` bundle keeps api_keys metadata
+///   (label, user_id, expiry, lookup_key prefix) but cannot be used to
+///   authenticate — the operator must rotate keys after restore.
 pub fn secret_columns_for(table: &str) -> &'static [&'static str] {
     match table {
         "accounts" => &["cookie_blob", "oauth_access_token", "oauth_refresh_token"],
+        "api_keys" => &["plaintext_key", "key_hash"],
         "proxies" => &["password"],
         "users" => &["password_hash"],
         _ => &[],
@@ -465,7 +478,8 @@ mod tests {
         let pool = crate::db::init_pool(std::path::Path::new(":memory:"))
             .await
             .unwrap();
-        let schema = read_table_schema(&pool, "users").await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let schema = read_table_schema(&mut conn, "users").await.unwrap();
         let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
         // We don't pin the exact column set (migrations evolve it), but
         // these load-bearing ones must always be present.
@@ -484,8 +498,9 @@ mod tests {
             .await
             .unwrap();
         crate::db::seed_admin(&pool).await.unwrap();
-        let schema = read_table_schema(&pool, "models").await.unwrap();
-        let rows = read_table_rows(&pool, "models", &schema).await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let schema = read_table_schema(&mut conn, "models").await.unwrap();
+        let rows = read_table_rows(&mut conn, "models", &schema).await.unwrap();
         assert!(!rows.is_empty(), "expected seeded model rows");
         let first = &rows[0];
         assert!(matches!(first.get("model_id"), Some(CellValue::Text(_))));

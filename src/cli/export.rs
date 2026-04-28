@@ -28,6 +28,13 @@ use crate::{
     error::ClewdrError,
 };
 
+/// Top-level TOML keys whose values may carry session-bearing credentials
+/// (proxy URL with `user:pass@host`, etc.). When the operator passes
+/// `--no-secrets`, we drop these from the embedded `clewdr.toml` before
+/// writing the bundle. Centralised here so `secret_columns_for` and this
+/// list stay reviewable side-by-side.
+const TOML_KEYS_REDACTED_FOR_NO_SECRETS: &[&str] = &["proxy"];
+
 #[derive(clap::Args, Debug, Clone)]
 pub struct Args {
     /// Output bundle path.
@@ -131,13 +138,67 @@ async fn build_bundle_from_pool(
     cfg_path: &Path,
     args: &Args,
 ) -> Result<Bundle, ClewdrError> {
-    use std::collections::BTreeMap;
+    // Pin a single read snapshot for the entire export. Without this, two
+    // back-to-back `SELECT *` calls can observe different committed states
+    // if the running server commits writes between them — leaving the
+    // bundle with, say, an api_keys row whose user_id refers to a user the
+    // earlier `users` SELECT missed. SQLite WAL mode hands the snapshot to
+    // a transaction's first read; rolling back at the end releases the
+    // read locks without writing anything.
+    let mut conn = pool.acquire().await?;
+    sqlx::query("BEGIN").execute(&mut *conn).await?;
+    // Touch the snapshot immediately so it's pinned before any other
+    // future on the runtime can interleave a write that beats us to the
+    // first SELECT.
+    let _: (i64,) = sqlx::query_as("SELECT 1").fetch_one(&mut *conn).await?;
 
-    let config_toml = if cfg_path.exists() {
+    let inner = build_bundle_inner(&mut conn, args).await;
+
+    // We never wrote anything — release the snapshot regardless of inner result.
+    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+
+    let (schema_map, tables_map, skipped) = inner?;
+
+    let raw_toml = if cfg_path.exists() {
         std::fs::read_to_string(cfg_path).unwrap_or_default()
     } else {
         String::new()
     };
+    let config_toml = if args.no_secrets {
+        // Same redaction discipline as the database half: when the
+        // operator says "strip secrets", strip them everywhere — DB rows
+        // *and* config file. Otherwise a `proxy = "http://user:pass@host"`
+        // line would walk straight into the bundle.
+        sanitize_toml_for_no_secrets(&raw_toml)?
+    } else {
+        raw_toml
+    };
+
+    Ok(Bundle {
+        version: bundle::BUNDLE_VERSION,
+        produced_at: Utc::now().to_rfc3339(),
+        clewdr_version: env!("CARGO_PKG_VERSION").to_string(),
+        schema: schema_map,
+        config_toml,
+        tables: tables_map,
+        skipped,
+    })
+}
+
+/// Read every selected table inside the caller's pinned snapshot, returning
+/// the schema map, the row map, and the list of intentionally-skipped tables.
+async fn build_bundle_inner(
+    conn: &mut sqlx::SqliteConnection,
+    args: &Args,
+) -> Result<
+    (
+        std::collections::BTreeMap<String, TableSchema>,
+        std::collections::BTreeMap<String, Vec<bundle::Row>>,
+        Vec<String>,
+    ),
+    ClewdrError,
+> {
+    use std::collections::BTreeMap;
 
     let mut tables_to_export: Vec<&str> = DEFAULT_TABLES.to_vec();
     if args.include_runtime {
@@ -154,15 +215,15 @@ async fn build_bundle_from_pool(
     let mut tables_map: BTreeMap<String, Vec<bundle::Row>> = BTreeMap::new();
 
     for table in tables_to_export {
-        let schema = read_table_schema(pool, table).await?;
-        let mut rows = read_table_rows(pool, table, &schema).await?;
+        let schema = read_table_schema(&mut *conn, table).await?;
+        let mut rows = read_table_rows(&mut *conn, table, &schema).await?;
 
         // Settings: always strip the never-exported keys.
         if table == "settings" {
             drop_blocked_settings_rows(&mut rows);
         }
 
-        // --no-secrets: null cookie_blob / oauth_*_token / password / etc.
+        // --no-secrets: null cookie_blob / oauth_*_token / api_key plaintext / etc.
         if args.no_secrets && !secret_columns_for(table).is_empty() {
             redact_secrets_in_place(table, &mut rows);
         }
@@ -171,15 +232,23 @@ async fn build_bundle_from_pool(
         tables_map.insert(table.to_string(), rows);
     }
 
-    Ok(Bundle {
-        version: bundle::BUNDLE_VERSION,
-        produced_at: Utc::now().to_rfc3339(),
-        clewdr_version: env!("CARGO_PKG_VERSION").to_string(),
-        schema: schema_map,
-        config_toml,
-        tables: tables_map,
-        skipped,
-    })
+    Ok((schema_map, tables_map, skipped))
+}
+
+/// Strip TOML keys that may carry secrets (currently `proxy`, whose URL
+/// form supports embedded credentials). Returns an empty string for empty
+/// input. Errors propagate as TOML parse / serialize errors.
+pub(crate) fn sanitize_toml_for_no_secrets(raw: &str) -> Result<String, ClewdrError> {
+    if raw.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let mut value: toml::Value = toml::from_str(raw)?;
+    if let toml::Value::Table(t) = &mut value {
+        for key in TOML_KEYS_REDACTED_FOR_NO_SECRETS {
+            t.remove(*key);
+        }
+    }
+    Ok(toml::to_string_pretty(&value)?)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -271,6 +340,17 @@ mod tests {
                                    organization_uuid)
              VALUES ('oauth-acct', 2, 5, 'active', 'oauth',
                      X'AAAA', X'CAFEBABE', '2099-01-01T00:00:00Z', 'org-oauth')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Issue an API key for the seeded admin (user_id=1) so we can
+        // verify the --no-secrets path strips both `plaintext_key` and
+        // `key_hash`.
+        sqlx::query(
+            "INSERT INTO api_keys (user_id, label, lookup_key, key_hash, plaintext_key)
+             VALUES (1, 'test-key', 'sk-prefix', X'AABB', 'sk-clewdr-test-secret')",
         )
         .execute(&pool)
         .await
@@ -397,6 +477,112 @@ mod tests {
                 assert_ne!(k, "session_secret", "session_secret leaked into the bundle");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn no_secrets_redacts_api_key_plaintext_and_hash() {
+        // P1 from review #6: --no-secrets must strip api_keys.plaintext_key
+        // and api_keys.key_hash so a "secret-free" bundle can't be used to
+        // authenticate against the proxy.
+        let (dir, db) = fixture_db().await;
+        let cfg = dir.path().join("nope.toml");
+
+        // Sanity: with secrets, both columns survive verbatim.
+        let bundle = build_bundle(&db, &cfg, &args_for(dir.path().join("a"), false))
+            .await
+            .unwrap();
+        let key = bundle.tables["api_keys"]
+            .iter()
+            .find(|r| matches!(r.get("label"), Some(CellValue::Text(s)) if s == "test-key"))
+            .expect("test-key row");
+        assert_eq!(
+            key.get("plaintext_key"),
+            Some(&CellValue::Text("sk-clewdr-test-secret".to_string()))
+        );
+        match key.get("key_hash") {
+            Some(CellValue::Blob(b)) => assert_eq!(b, &vec![0xAA, 0xBB]),
+            other => panic!("key_hash not preserved: {other:?}"),
+        }
+
+        // With --no-secrets, both are nulled while metadata stays.
+        let bundle = build_bundle(&db, &cfg, &args_for(dir.path().join("b"), true))
+            .await
+            .unwrap();
+        let key = bundle.tables["api_keys"]
+            .iter()
+            .find(|r| matches!(r.get("label"), Some(CellValue::Text(s)) if s == "test-key"))
+            .unwrap();
+        assert_eq!(key.get("plaintext_key"), Some(&CellValue::Null));
+        assert_eq!(key.get("key_hash"), Some(&CellValue::Null));
+        assert_eq!(
+            key.get("label"),
+            Some(&CellValue::Text("test-key".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn no_secrets_redacts_proxy_url_in_toml() {
+        // P2 from review #6: --no-secrets must also sanitize clewdr.toml
+        // because the `proxy` URL form supports embedded credentials.
+        let (dir, db) = fixture_db().await;
+        let cfg = dir.path().join("clewdr.toml");
+        std::fs::write(
+            &cfg,
+            "ip = \"127.0.0.1\"\nport = 8484\nproxy = \"http://user:pass@upstream.example:3128\"\n",
+        )
+        .unwrap();
+
+        // Without --no-secrets the proxy URL must round-trip verbatim.
+        let bundle = build_bundle(&db, &cfg, &args_for(dir.path().join("a"), false))
+            .await
+            .unwrap();
+        assert!(
+            bundle.config_toml.contains("user:pass@upstream.example"),
+            "expected proxy creds preserved without --no-secrets, got:\n{}",
+            bundle.config_toml
+        );
+
+        // With --no-secrets the entire `proxy` key must be gone.
+        let bundle = build_bundle(&db, &cfg, &args_for(dir.path().join("b"), true))
+            .await
+            .unwrap();
+        assert!(
+            !bundle.config_toml.contains("proxy"),
+            "expected `proxy` removed under --no-secrets, got:\n{}",
+            bundle.config_toml
+        );
+        assert!(
+            !bundle.config_toml.contains("user:pass"),
+            "proxy credentials leaked under --no-secrets:\n{}",
+            bundle.config_toml
+        );
+        // Other keys untouched.
+        assert!(bundle.config_toml.contains("port"));
+    }
+
+    #[test]
+    fn sanitize_toml_handles_empty_input() {
+        assert_eq!(sanitize_toml_for_no_secrets("").unwrap(), "");
+        assert_eq!(sanitize_toml_for_no_secrets("   \n").unwrap(), "");
+    }
+
+    #[test]
+    fn sanitize_toml_drops_only_redacted_keys() {
+        let input = "ip = \"0.0.0.0\"\nport = 8484\nproxy = \"http://x@y\"\nno_fs = false\n";
+        let out = sanitize_toml_for_no_secrets(input).unwrap();
+        assert!(out.contains("ip"));
+        assert!(out.contains("port"));
+        assert!(out.contains("no_fs"));
+        assert!(!out.contains("proxy"));
+        assert!(!out.contains("\"http://x@y\""));
+    }
+
+    #[test]
+    fn sanitize_toml_passes_through_when_no_proxy() {
+        let input = "ip = \"127.0.0.1\"\nport = 8484\n";
+        let out = sanitize_toml_for_no_secrets(input).unwrap();
+        assert!(out.contains("ip"));
+        assert!(out.contains("port"));
     }
 
     #[tokio::test]

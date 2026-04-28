@@ -56,7 +56,7 @@ self-replace = { version = "1", optional = true }
 zip = { version = "8", optional = true, default-features = false, features = [
     "deflate",
 ] }
-tempfile = { version = "3", optional = true }
+tempfile = "3"
 axum-auth = "0.8"
 tiktoken-rs = "0.9"
 passwords = "3"
@@ -108,7 +108,7 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] 
 [features]
 default = ["portable", "external-resource", "tui", "encrypt"]
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]
-portable = ["dep:zip", "dep:self-replace", "dep:tempfile"]
+portable = ["dep:zip", "dep:self-replace"]
 xdg = ["dep:etcetera"]
 embed-resource = ["dep:tower-serve-static", "dep:include_dir"]
 external-resource = ["tower-http/fs"]
