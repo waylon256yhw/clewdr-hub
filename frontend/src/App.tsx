@@ -10,6 +10,7 @@ import {
   Group,
   ActionIcon,
   Alert,
+  Badge,
   Button,
   SimpleGrid,
   Skeleton,
@@ -216,6 +217,8 @@ function useFrontendVersionSync() {
   useEffect(() => {
     reloadIfFrontendOutdated(data?.version);
   }, [data?.version]);
+
+  return data?.version;
 }
 
 function AdminShell() {
@@ -223,7 +226,7 @@ function AdminShell() {
   const [opened, { toggle, close }] = useDisclosure();
   const { logout } = useAuth();
   useGlobalAdminEvents();
-  useFrontendVersionSync();
+  const version = useFrontendVersionSync();
 
   return (
     <AppShell
@@ -237,6 +240,11 @@ function AdminShell() {
             <Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
             <img src="/logo.svg" alt="" width={28} height={28} />
             <Title order={4}>clewdr-hub</Title>
+            {version && (
+              <Badge size="sm" radius="sm" variant="gradient" gradient={{ from: "cyan", to: "blue" }}>
+                {version}
+              </Badge>
+            )}
           </Group>
           <Group gap="xs">
             <ColorSchemeToggle />

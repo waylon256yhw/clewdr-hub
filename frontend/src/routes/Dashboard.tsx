@@ -132,10 +132,7 @@ export default function Dashboard() {
 
   return (
     <>
-      <Group justify="space-between" mb="md">
-        <Title order={3}>总览</Title>
-        <Text size="xs" c="dimmed">{data.version}</Text>
-      </Group>
+      <Title order={3} mb="md">总览</Title>
       <SimpleGrid cols={{ base: 1, xs: 2, md: 3 }} spacing="md">
         {cards.map((card) => (
           <Paper
