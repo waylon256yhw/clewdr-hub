@@ -15,6 +15,7 @@ use zip::ZipArchive;
 use crate::{
     config::CLEWDR_CONFIG,
     error::{ClewdrError, WreqSnafu},
+    services::version::parse_clewdr_version,
 };
 
 const DEFAULT_REPO_OWNER: &str = "waylon256yhw";
@@ -125,7 +126,13 @@ impl ClewdrUpdater {
         let latest_version = release.tag_name.trim_start_matches('v');
         let current_version = env!("CARGO_PKG_VERSION");
 
-        let update_available = self.compare_versions(current_version, latest_version)?;
+        // semver-aware: prerelease tags don't outrank matching stables,
+        // build metadata is ignored for ordering, anything malformed
+        // surfaces as ClewdrError::InvalidVersion with the offending
+        // string in the message.
+        let current_v = parse_clewdr_version(current_version)?;
+        let latest_v = parse_clewdr_version(latest_version)?;
+        let update_available = latest_v > current_v;
 
         if !update_available {
             info!("Already at the latest version {}", current_version.green());
@@ -294,30 +301,6 @@ impl ClewdrUpdater {
             .ok_or(ClewdrError::AssetError {
                 msg: format!("No suitable asset found for platform: {target}"),
             })
-    }
-
-    /// Compares two version strings to determine if an update is needed
-    /// Parses versions in the format major.minor.patch
-    ///
-    /// # Arguments
-    /// * `current` - Current version string
-    /// * `latest` - Latest version string from GitHub
-    ///
-    /// # Returns
-    /// * `Result<bool, ClewdrError>` - True if latest is newer than current, false otherwise
-    fn compare_versions(&self, current: &str, latest: &str) -> Result<bool, ClewdrError> {
-        let parse_version = |v: &str| -> Result<(u32, u32, u32), ClewdrError> {
-            let vec = v.split('.').collect::<Vec<_>>();
-            let [major, minor, patch, ..] = vec.as_slice() else {
-                return Err(ClewdrError::InvalidVersion {
-                    version: v.to_string(),
-                });
-            };
-            Ok((major.parse()?, minor.parse()?, patch.parse()?))
-        };
-        let current = parse_version(current)?;
-        let latest = parse_version(latest)?;
-        Ok(current < latest)
     }
 }
 

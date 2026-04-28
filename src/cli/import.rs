@@ -28,7 +28,6 @@ use std::{
 
 use chrono::Utc;
 use colored::Colorize;
-use semver::Version;
 use serde::Deserialize;
 use sqlx::{SqliteConnection, SqlitePool};
 
@@ -40,6 +39,7 @@ use crate::{
     cli::crypto,
     config::{CONFIG_PATH, DB_PATH},
     error::ClewdrError,
+    services::version::parse_clewdr_version,
 };
 
 /// Order rows are written into the DB. Parents-before-children — even
@@ -298,12 +298,6 @@ fn check_version_compatibility(bundle: &Bundle, force: bool) -> Result<(), Clewd
         });
     }
     Ok(())
-}
-
-fn parse_clewdr_version(s: &str) -> Result<Version, ClewdrError> {
-    Version::parse(s.trim_start_matches('v')).map_err(|_| ClewdrError::BadRequest {
-        msg: "version string is not valid semver",
-    })
 }
 
 /// Refuse to import a `--no-secrets`-redacted bundle.
