@@ -34,6 +34,7 @@ import {
   IconActivity,
   IconSun,
   IconMoon,
+  IconBrandGithub,
   IconLogout,
 } from "@tabler/icons-react";
 import { theme } from "./theme";
@@ -239,6 +240,17 @@ function AdminShell() {
           </Group>
           <Group gap="xs">
             <ColorSchemeToggle />
+            <ActionIcon
+              component="a"
+              href="https://github.com/waylon256yhw/clewdr-hub"
+              target="_blank"
+              rel="noreferrer"
+              variant="default"
+              size="lg"
+              aria-label="打开 GitHub 仓库"
+            >
+              <IconBrandGithub size={18} />
+            </ActionIcon>
             <ActionIcon variant="default" size="lg" onClick={logout} aria-label="退出登录">
               <IconLogout size={18} />
             </ActionIcon>
