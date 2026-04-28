@@ -13,7 +13,6 @@ use wreq::Client;
 use zip::ZipArchive;
 
 use crate::{
-    Args,
     config::CLEWDR_CONFIG,
     error::{ClewdrError, WreqSnafu},
 };
@@ -78,19 +77,23 @@ impl ClewdrUpdater {
     }
 
     /// Checks for updates by comparing the current version to the latest release on GitHub
-    /// Performs automatic update if enabled in config or explicitly requested
+    /// Performs automatic update if `force` is true or auto_update is enabled in config.
+    ///
+    /// # Arguments
+    /// * `force` — when `true`, the check ignores `check_update=false` and always
+    ///   performs the update if a newer version is available. Set by callers
+    ///   that originate from `clewdr --update` or `clewdr update`.
     ///
     /// # Returns
     /// * `Result<bool, ClewdrError>` - True if update available, false otherwise
-    pub async fn check_for_updates(&self) -> Result<bool, ClewdrError> {
+    pub async fn check_for_updates(&self, force: bool) -> Result<bool, ClewdrError> {
         if CLEWDR_CONFIG.load().no_fs {
             // If no_fs feature is enabled, skip update check
             info!("Update check skipped due to no_fs feature");
             return Ok(false);
         }
 
-        let args: Args = clap::Parser::parse();
-        if !args.update && !CLEWDR_CONFIG.load().check_update {
+        if !force && !CLEWDR_CONFIG.load().check_update {
             return Ok(false);
         }
 
@@ -133,8 +136,8 @@ impl ClewdrUpdater {
             latest_version.green().italic(),
             current_version.yellow()
         );
-        // Auto update if enabled
-        if args.update || CLEWDR_CONFIG.load().auto_update {
+        // Auto update if forced or enabled in config
+        if force || CLEWDR_CONFIG.load().auto_update {
             self.perform_update(&release).await?;
         }
 

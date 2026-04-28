@@ -105,7 +105,7 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] 
 
 
 [features]
-default = ["portable", "external-resource"]
+default = ["portable", "external-resource", "tui", "encrypt"]
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]
 portable = ["dep:zip", "dep:self-replace", "dep:tempfile"]
 xdg = ["dep:etcetera"]
@@ -113,3 +113,7 @@ embed-resource = ["dep:tower-serve-static", "dep:include_dir"]
 external-resource = ["tower-http/fs"]
 mimalloc = ["dep:mimalloc"]
 dhat-heap = ["dep:dhat"]
+# Encrypted export/import bundle (placeholder — wired up in commit #8).
+encrypt = []
+# Interactive TUI menu (placeholder — wired up in commit #11).
+tui = []

@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::LazyLock};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use colored::Colorize;
 
 use crate::config::CLEWDR_CONFIG;
@@ -8,6 +8,7 @@ use crate::config::CLEWDR_CONFIG;
 pub mod api;
 pub mod billing;
 pub mod claude_code_state;
+pub mod cli;
 pub mod config;
 pub mod db;
 pub mod error;
@@ -27,6 +28,12 @@ pub static IS_DEV: LazyLock<bool> = LazyLock::new(|| std::env::var("CARGO_MANIFE
 
 pub static VERSION_INFO: LazyLock<String> =
     LazyLock::new(|| format!("v{}", env!("CARGO_PKG_VERSION")));
+
+/// Process-wide parsed CLI arguments. Initialised on first access.
+///
+/// Touching this LazyLock has no side effects beyond `argv` parsing — it is
+/// safe to read from anywhere, including before logging initialisation.
+pub static ARGS: LazyLock<Args> = LazyLock::new(Args::parse);
 
 /// Returns version info with colors for terminal output
 pub fn version_info_colored() -> String {
@@ -52,31 +59,78 @@ pub fn version_info_colored() -> String {
 }
 
 pub const FIG: &str = r#"
-    //   ) )                                    //   ) ) 
-   //        //  ___                   ___   / //___/ /  
-  //        // //___) ) //  / /  / / //   ) / / ___ (    
- //        // //       //  / /  / / //   / / //   | |    
-((____/ / // ((____   ((__( (__/ / ((___/ / //    | |    
+    //   ) )                                    //   ) )
+   //        //  ___                   ___   / //___/ /
+  //        // //___) ) //  / /  / / //   ) / / ___ (
+ //        // //       //  / /  / / //   / / //   | |
+((____/ / // ((____   ((__( (__/ / ((___/ / //    | |
 "#;
 
 /// Reverse Proxy API for Claude
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 pub struct Args {
+    #[command(flatten)]
+    pub global: GlobalOpts,
+
     #[cfg(feature = "portable")]
-    #[arg(short, long)]
     /// Force update of the application
+    #[arg(short, long, global = true)]
     pub update: bool,
-    #[arg(short, long)]
-    /// load cookie from file
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// Path-related flags shared by every subcommand and the bare `serve` entry.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct GlobalOpts {
+    /// load cookie from file (deprecated)
+    #[arg(short, long, global = true)]
     pub file: Option<PathBuf>,
+
     /// Alternative config file
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     pub config: Option<PathBuf>,
-    #[arg(short, long)]
+
     /// Alternative log directory
+    #[arg(short, long, global = true)]
     pub log_dir: Option<PathBuf>,
-    #[arg(short = 'd', long)]
+
     /// Alternative database path
+    #[arg(short = 'd', long, global = true)]
     pub db: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Run the HTTP server (default when no subcommand is given).
+    Serve,
+
+    /// Reset the admin user's password (requires existing database).
+    ResetAdminPassword(cli::reset::Args),
+
+    /// Export config and configuration tables to a portable bundle.
+    ExportConfig(cli::export::Args),
+
+    /// Import a previously exported bundle.
+    ImportConfig(cli::import::Args),
+
+    /// Read-only health check.
+    Diagnose(cli::diagnose::Args),
+
+    /// Show running state, port, and version.
+    Status(cli::status::Args),
+
+    /// Manage service registration (systemd / Termux:Boot).
+    #[command(subcommand)]
+    Service(cli::service::ServiceCommand),
+
+    /// Interactive TUI menu.
+    #[cfg(feature = "tui")]
+    Menu,
+
+    /// Force a one-shot self-update (alias of `--update`).
+    #[cfg(feature = "portable")]
+    Update,
 }
