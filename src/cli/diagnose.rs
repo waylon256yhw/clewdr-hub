@@ -52,6 +52,20 @@ struct CheckResult {
 }
 
 pub async fn run(args: Args) -> Result<(), ClewdrError> {
+    if run_and_report(args).await {
+        // CLI path: any FAIL -> exit 1 so wrappers / shell scripts /
+        // CI can branch on it. Other callers (the menu TUI) reach for
+        // run_and_report directly so they can stay in their own loop.
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Non-exiting variant. Runs every check, prints the report (JSON or
+/// human, per `args.json`), and returns `true` iff at least one check
+/// reported [`Status::Fail`]. Used by the TUI menu so a failed
+/// diagnose doesn't kill the whole menu loop.
+pub async fn run_and_report(args: Args) -> bool {
     let checks = run_all_checks().await;
 
     if args.json {
@@ -60,10 +74,7 @@ pub async fn run(args: Args) -> Result<(), ClewdrError> {
         print_human(&checks);
     }
 
-    if checks.iter().any(|c| c.status == Status::Fail) {
-        std::process::exit(1);
-    }
-    Ok(())
+    checks.iter().any(|c| c.status == Status::Fail)
 }
 
 async fn run_all_checks() -> Vec<CheckResult> {

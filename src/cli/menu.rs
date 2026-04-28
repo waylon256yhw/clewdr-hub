@@ -115,19 +115,11 @@ fn prompt_main_menu() -> Result<Option<MenuAction>, ClewdrError> {
 async fn run_action(action: MenuAction) -> Result<(), ClewdrError> {
     match action {
         MenuAction::Status => cli::status::run(cli::status::Args { json: false }).await,
-        MenuAction::Diagnose => cli::diagnose::run(cli::diagnose::Args { json: false }).await,
+        MenuAction::Diagnose => menu_diagnose().await,
         MenuAction::ResetAdmin => menu_reset_admin().await,
         MenuAction::ExportConfig => menu_export_config().await,
         MenuAction::ImportConfig => menu_import_config().await,
-        MenuAction::ServiceInstall => {
-            cli::service::run(cli::service::ServiceCommand::Install(
-                cli::service::InstallArgs {
-                    systemd: false,
-                    termux_boot: false,
-                },
-            ))
-            .await
-        }
+        MenuAction::ServiceInstall => menu_service_install().await,
         MenuAction::ServiceUninstall => menu_service_uninstall().await,
         #[cfg(feature = "portable")]
         MenuAction::Update => cli::run_update().await,
@@ -138,6 +130,21 @@ async fn run_action(action: MenuAction) -> Result<(), ClewdrError> {
 // ──────────────────────────────────────────────────────────────────────────
 // Per-verb prompt builders
 // ──────────────────────────────────────────────────────────────────────────
+
+async fn menu_diagnose() -> Result<(), ClewdrError> {
+    // diagnose::run() exits the process on any FAIL — that's correct
+    // for the CLI path (CI / shell scripts want to branch on exit
+    // status), but it would silently kill the menu loop. Use the
+    // non-exiting entry point and surface the failure as a normal
+    // menu error so the operator can keep working.
+    let any_fail = cli::diagnose::run_and_report(cli::diagnose::Args { json: false }).await;
+    if any_fail {
+        return Err(ClewdrError::BadRequest {
+            msg: "diagnose reported at least one FAIL — see the report above",
+        });
+    }
+    Ok(())
+}
 
 async fn menu_reset_admin() -> Result<(), ClewdrError> {
     let username = Text::new("Username to reset:")
@@ -229,20 +236,53 @@ async fn menu_import_config() -> Result<(), ClewdrError> {
         .with_default(false)
         .prompt()
         .map_err(wrap_or_cancel)?;
+    // --init: allow opening (creating) a fresh DB. Default off so a
+    // typo'd --db path doesn't silently spawn an empty database. When
+    // intentionally importing into a brand-new install (e.g. fresh
+    // VPS, no clewdr.db yet), the operator wants this on.
+    let init = Confirm::new("Initialize a new database if it doesn't exist? (--init)")
+        .with_default(false)
+        .with_help_message(
+            "Off = refuse to import unless the target DB already exists. Turn on for a fresh install.",
+        )
+        .prompt()
+        .map_err(wrap_or_cancel)?;
+    // --force: bypass the same-major / newer-minor refusal. Major
+    // mismatch is *always* refused regardless of --force, so this
+    // only loosens the minor-bump check.
+    let force = Confirm::new("Bypass minor version mismatch refusal? (--force)")
+        .with_default(false)
+        .with_help_message(
+            "Bundle from a newer minor version of clewdr would normally be refused; --force overrides. Major mismatch is always refused.",
+        )
+        .prompt()
+        .map_err(wrap_or_cancel)?;
     cli::import::run(cli::import::Args {
         path: expand_tilde(&path),
         mode,
         yes,
         overwrite_admin,
         dry_run,
-        init: false,
-        force: false,
+        init,
+        force,
         passphrase_stdin: false,
     })
     .await
 }
 
+async fn menu_service_install() -> Result<(), ClewdrError> {
+    let (systemd, termux_boot) = prompt_service_target()?;
+    cli::service::run(cli::service::ServiceCommand::Install(
+        cli::service::InstallArgs {
+            systemd,
+            termux_boot,
+        },
+    ))
+    .await
+}
+
 async fn menu_service_uninstall() -> Result<(), ClewdrError> {
+    let (systemd, termux_boot) = prompt_service_target()?;
     let purge = Confirm::new("--purge: also delete clewdr.db, clewdr.toml, and the log dir?")
         .with_default(false)
         .with_help_message(
@@ -252,12 +292,47 @@ async fn menu_service_uninstall() -> Result<(), ClewdrError> {
         .map_err(wrap_or_cancel)?;
     cli::service::run(cli::service::ServiceCommand::Uninstall(
         cli::service::UninstallArgs {
-            systemd: false,
-            termux_boot: false,
+            systemd,
+            termux_boot,
             purge,
         },
     ))
     .await
+}
+
+/// Resolve the (systemd, termux_boot) flag pair for the service verbs.
+/// Auto-detect is the right answer 99% of the time; the explicit
+/// overrides exist for edge cases the underlying error message itself
+/// flags ("auto-detection got it wrong"). Returning false/false means
+/// "let detect_environment() decide".
+fn prompt_service_target() -> Result<(bool, bool), ClewdrError> {
+    let label = Select::new(
+        "Service target:",
+        vec![
+            "Auto-detect (recommended)",
+            "Force systemd",
+            "Force Termux:Boot",
+        ],
+    )
+    .with_help_message(
+        "Override only when auto-detect picks the wrong path (e.g. systemd inside a Termux chroot).",
+    )
+    .prompt()
+    .map_err(wrap_or_cancel)?;
+    Ok(parse_service_target(&label))
+}
+
+/// Pure label → (systemd, termux_boot) mapping for the service-target
+/// Select. Factored out so the mapping can be unit-tested without
+/// driving the inquire prompt from a TTY.
+fn parse_service_target(label: &str) -> (bool, bool) {
+    if label.starts_with("Force systemd") {
+        (true, false)
+    } else if label.starts_with("Force Termux") {
+        (false, true)
+    } else {
+        (false, false)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -389,5 +464,23 @@ mod tests {
         // real IO error during prompting would silently exit the menu.
         let io_err = InquireError::IO(std::io::Error::other("not a cancel"));
         assert!(!is_user_cancel(&io_err));
+    }
+
+    #[test]
+    fn parse_service_target_maps_each_label() {
+        // Auto-detect is the default — both flags off so
+        // detect_environment() runs.
+        assert_eq!(
+            parse_service_target("Auto-detect (recommended)"),
+            (false, false)
+        );
+        // Override labels must turn on exactly one flag. A future edit
+        // that breaks the label prefix would silently fall through to
+        // auto-detect; this test catches that.
+        assert_eq!(parse_service_target("Force systemd"), (true, false));
+        assert_eq!(parse_service_target("Force Termux:Boot"), (false, true));
+        // Anything unrecognised falls through to auto-detect (safest
+        // default).
+        assert_eq!(parse_service_target("garbage"), (false, false));
     }
 }
