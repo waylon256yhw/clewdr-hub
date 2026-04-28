@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# scripts/uninstall.sh — reverse install.sh.
+#
+# Default behaviour: call `clewdr service uninstall` (which removes the
+# systemd unit / Termux:Boot script) and delete the binary. clewdr.db,
+# clewdr.toml, and the log directory are *preserved* — the service
+# uninstall verb only deletes them when --purge is passed.
+#
+# Pass --purge here to forward it to the verb AND let the service-side
+# interactive 'yes' confirmation gate the data deletion.
+#
+# Usage:
+#   bash uninstall.sh [--purge]
+#
+# Environment overrides:
+#   CLEWDR_INSTALL_DIR    install dir to clean up (default: auto-detect
+#                         /opt/clewdr or $HOME/clewdr).
+
+set -euo pipefail
+
+PURGE=0
+INSTALL_DIR_OVERRIDE="${CLEWDR_INSTALL_DIR:-}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --purge)
+            PURGE=1
+            shift
+            ;;
+        -h|--help)
+            sed -n '2,/^$/p' "$0" | sed 's|^# \{0,1\}||'
+            exit 0
+            ;;
+        *)
+            echo "unknown argument: $1" >&2
+            echo "usage: $0 [--purge]" >&2
+            exit 2
+            ;;
+    esac
+done
+
+if [[ -t 1 ]]; then
+    RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+    BOLD=$'\033[1m'; RESET=$'\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; BOLD=''; RESET=''
+fi
+err()  { echo "${RED}${BOLD}error:${RESET} $*" >&2; exit 1; }
+info() { echo "${GREEN}${BOLD}==>${RESET} $*"; }
+warn() { echo "${YELLOW}${BOLD}warn:${RESET} $*" >&2; }
+
+# Find the install dir. Honors the env override; otherwise probes the
+# two install.sh defaults in priority order. We deliberately don't
+# fall back to `which clewdr` — the binary on $PATH might be a
+# different (e.g. cargo install'd) copy that this script shouldn't
+# touch.
+resolve_install_dir() {
+    if [[ -n "$INSTALL_DIR_OVERRIDE" ]]; then
+        echo "$INSTALL_DIR_OVERRIDE"
+        return
+    fi
+    if [[ -x /opt/clewdr/clewdr ]]; then
+        echo /opt/clewdr
+        return
+    fi
+    if [[ -x "${HOME}/clewdr/clewdr" ]]; then
+        echo "${HOME}/clewdr"
+        return
+    fi
+    err "couldn't find a clewdr install at /opt/clewdr or \$HOME/clewdr — set CLEWDR_INSTALL_DIR if you installed elsewhere"
+}
+
+install_dir=$(resolve_install_dir)
+bin="${install_dir}/clewdr"
+[[ -x "$bin" ]] || err "no executable at $bin"
+
+info "found install at ${BOLD}${install_dir}${RESET}"
+
+# 1) Service uninstall — let the verb tear down the unit / boot script
+# and (with --purge) the data dir. Forwarding --purge here means the
+# data confirmation prompt runs inside the verb, where it lives next
+# to the path constants the verb already knows.
+if [[ "$PURGE" == "1" ]]; then
+    info "calling: $bin service uninstall --purge"
+    "$bin" service uninstall --purge
+else
+    info "calling: $bin service uninstall"
+    "$bin" service uninstall
+fi
+
+# 2) Remove the binary itself + the libc++_shared.so we may have
+# placed alongside it on Android. Same root-required rule as install.sh
+# for /opt or /usr paths.
+if [[ "$install_dir" == /opt/* || "$install_dir" == /usr/* ]] && [[ $EUID -ne 0 ]]; then
+    err "removing ${install_dir} requires root — re-run with sudo"
+fi
+
+rm -f "$bin"
+rm -f "${install_dir}/clewdr.exe"
+rm -f "${install_dir}/libc++_shared.so"
+
+# Try to remove the install dir, but only if it's empty. If --purge
+# wasn't passed, clewdr.db / clewdr.toml / log/ are still in there —
+# rmdir will fail and we leave the dir alone, which is what we want
+# (those files belong to the user, not this script).
+rmdir "$install_dir" 2>/dev/null || true
+
+info "${GREEN}${BOLD}uninstall complete${RESET}"
+if [[ "$PURGE" != "1" ]]; then
+    info "data preserved (clewdr.db / clewdr.toml / log/ are untouched)."
+    info "re-run with --purge to delete them."
+fi

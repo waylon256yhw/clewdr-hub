@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# scripts/install.sh — fetch the latest clewdr release, install the binary,
+# and (by default) hand off to `clewdr service install` to register
+# autostart. Pure bash; the network + filesystem + platform detection
+# half lives here, every privileged data-touching step happens inside
+# the binary so the two paths stay in lockstep.
+#
+# Usage:
+#   curl -fL https://raw.githubusercontent.com/<owner>/<repo>/master/scripts/install.sh | bash
+#   bash install.sh
+#
+# Environment overrides (all optional):
+#   CLEWDR_REPO_OWNER     repo owner; default: waylon256yhw
+#   CLEWDR_REPO_NAME      repo name;  default: clewdr-hub
+#   CLEWDR_RELEASE_TAG    release tag (e.g. v1.2.4) or "latest" (default).
+#   CLEWDR_INSTALL_DIR    override install dir (default: /opt/clewdr on
+#                         Linux/macOS, $HOME/clewdr on Termux).
+#   CLEWDR_NO_SERVICE=1   don't run `clewdr service install` at the end.
+#                         Operator can run it later by hand.
+#
+# Exit codes: 0 success; 1 hard failure (network / extraction / perms);
+# 2 unsupported platform.
+
+set -euo pipefail
+
+# ──────────────────────────────────────────────────────────────────────
+# config / constants
+# ──────────────────────────────────────────────────────────────────────
+
+REPO_OWNER="${CLEWDR_REPO_OWNER:-waylon256yhw}"
+REPO_NAME="${CLEWDR_REPO_NAME:-clewdr-hub}"
+RELEASE_TAG="${CLEWDR_RELEASE_TAG:-latest}"
+INSTALL_DIR_OVERRIDE="${CLEWDR_INSTALL_DIR:-}"
+NO_SERVICE="${CLEWDR_NO_SERVICE:-0}"
+
+# Color helpers; auto-disable when stdout isn't a TTY (curl|bash piping
+# to something that captures stdout).
+if [[ -t 1 ]]; then
+    RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+    BOLD=$'\033[1m'; RESET=$'\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; BOLD=''; RESET=''
+fi
+err()  { echo "${RED}${BOLD}error:${RESET} $*" >&2; exit 1; }
+info() { echo "${GREEN}${BOLD}==>${RESET} $*"; }
+warn() { echo "${YELLOW}${BOLD}warn:${RESET} $*" >&2; }
+
+require() {
+    command -v "$1" >/dev/null 2>&1 || err "missing required tool: $1 (install it first, then re-run)"
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# platform detection
+# ──────────────────────────────────────────────────────────────────────
+
+# Returns "<os>-<arch>" matching the asset names produced by
+# .github/workflows/build.yml: `clewdr-{os}-{arch}.zip`.
+detect_target() {
+    local uname_s uname_m os arch
+    uname_s=$(uname -s)
+    uname_m=$(uname -m)
+
+    # Termux check first — Termux on Android reports `uname -s`=Linux
+    # but exposes the com.termux PREFIX env var. The build matrix names
+    # this target "android".
+    if [[ -n "${PREFIX:-}" && "$PREFIX" == *com.termux* ]] \
+       || [[ -d /data/data/com.termux/files/usr ]]; then
+        os="android"
+    else
+        case "$uname_s" in
+            Linux)
+                # libc detection. ldd's `--version` reports glibc on
+                # glibc systems and "musl libc" on musl. The grep pipe
+                # is best-effort; on weird hosts we fall back to "linux"
+                # (glibc), which is the more common build matrix entry.
+                if ldd --version 2>&1 | grep -qiE 'musl'; then
+                    os="musllinux"
+                else
+                    os="linux"
+                fi
+                ;;
+            Darwin) os="macos" ;;
+            *)      err "unsupported OS: $uname_s (this script supports Linux, macOS, Termux/Android)" ;;
+        esac
+    fi
+
+    case "$uname_m" in
+        x86_64|amd64) arch="x86_64" ;;
+        aarch64|arm64) arch="aarch64" ;;
+        *) err "unsupported architecture: $uname_m" ;;
+    esac
+
+    # Android only ships aarch64 in the build matrix; x86_64 is
+    # excluded there per .github/workflows/build.yml.
+    if [[ "$os" == "android" && "$arch" != "aarch64" ]]; then
+        err "android build only ships aarch64; this device reports $arch"
+    fi
+
+    echo "${os}-${arch}"
+}
+
+# Decide the install dir. Termux installs are user-local because the
+# user has no privileged path — and Android refuses chmod +x under
+# /sdcard, so anywhere in $HOME is the only option (plan §8 risk #8).
+# Linux/macOS go to /opt/clewdr to match the systemd unit's
+# WorkingDirectory.
+resolve_install_dir() {
+    local target=$1
+    if [[ -n "$INSTALL_DIR_OVERRIDE" ]]; then
+        echo "$INSTALL_DIR_OVERRIDE"
+        return
+    fi
+    case "$target" in
+        android-*) echo "${HOME}/clewdr" ;;
+        *)         echo "/opt/clewdr" ;;
+    esac
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# release lookup
+# ──────────────────────────────────────────────────────────────────────
+
+# Builds the GitHub releases API URL for the selected tag.
+release_api_url() {
+    if [[ "$RELEASE_TAG" == "latest" ]]; then
+        echo "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
+    else
+        echo "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/tags/${RELEASE_TAG}"
+    fi
+}
+
+# Pull the matching asset URL out of a GitHub release JSON. Pure stdin
+# transformer — kept separate so it's easy to feed a fixture in tests.
+# Returns empty (and exits 0) when no asset matches; the caller checks
+# for empty and emits a friendlier error than `grep | head | sed`'s
+# `set -e` abort on a missing pattern.
+extract_asset_url() {
+    local target=$1 asset_name
+    asset_name="clewdr-${target}.zip"
+    {
+        grep -oE "\"browser_download_url\"[[:space:]]*:[[:space:]]*\"[^\"]*${asset_name}\"" \
+            | head -1 \
+            | sed -E 's/.*"(https[^"]+)".*/\1/'
+    } || true
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# main
+# ──────────────────────────────────────────────────────────────────────
+
+require curl
+require unzip
+
+target=$(detect_target)
+info "platform: ${BOLD}${target}${RESET}"
+
+install_dir=$(resolve_install_dir "$target")
+info "install dir: ${BOLD}${install_dir}${RESET}"
+
+api_url=$(release_api_url)
+info "fetching release metadata from ${api_url}"
+release_json=$(curl -fsSL "$api_url") || err "failed to fetch release metadata (network or rate-limit?)"
+
+download_url=$(echo "$release_json" | extract_asset_url "$target")
+[[ -n "$download_url" ]] \
+    || err "no asset matching clewdr-${target}.zip in release ${RELEASE_TAG} (mismatched build matrix?)"
+info "asset: $download_url"
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+info "downloading..."
+curl -fsSL "$download_url" -o "$tmpdir/clewdr.zip"
+
+info "extracting..."
+mkdir -p "$tmpdir/extracted"
+unzip -q "$tmpdir/clewdr.zip" -d "$tmpdir/extracted"
+
+bin_name="clewdr"
+[[ "$target" == windows-* ]] && bin_name="clewdr.exe"
+[[ -f "$tmpdir/extracted/$bin_name" ]] \
+    || err "extracted archive doesn't contain $bin_name (asset corrupted?)"
+
+# /opt and /usr need root. The systemd path will need root anyway for
+# `service install`, so failing here with a clear message is friendlier
+# than discovering it three steps later.
+if [[ "$install_dir" == /opt/* || "$install_dir" == /usr/* ]] && [[ $EUID -ne 0 ]]; then
+    err "writing to ${install_dir} requires root — re-run with sudo, or set CLEWDR_INSTALL_DIR=\$HOME/clewdr for a user-local install"
+fi
+
+mkdir -p "$install_dir"
+mv "$tmpdir/extracted/$bin_name" "$install_dir/$bin_name"
+chmod +x "$install_dir/$bin_name"
+
+# Android NDK builds ship libc++_shared.so alongside the binary; it
+# must end up in the same dir or the dynamic loader can't find it.
+if [[ "$target" == android-* ]] && [[ -f "$tmpdir/extracted/libc++_shared.so" ]]; then
+    mv "$tmpdir/extracted/libc++_shared.so" "$install_dir/"
+fi
+
+info "installed: ${BOLD}${install_dir}/${bin_name}${RESET}"
+
+# Service registration. The binary handles env detection (systemd vs
+# Termux:Boot) and the privileged setup (useradd, /etc/systemd/, etc.),
+# so this script doesn't need any per-OS branching here.
+if [[ "$NO_SERVICE" == "1" ]]; then
+    warn "skipping service registration (CLEWDR_NO_SERVICE=1)"
+    info "register later with: ${install_dir}/${bin_name} service install"
+else
+    info "registering service..."
+    "$install_dir/$bin_name" service install
+fi
+
+info "${GREEN}${BOLD}install complete${RESET}"
+info "diagnose:  ${install_dir}/${bin_name} diagnose"
+info "menu:      ${install_dir}/${bin_name} menu"

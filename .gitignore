@@ -15,7 +15,9 @@ static/
 .idea
 .codex
 test
-scripts
+scripts/*
+!scripts/install.sh
+!scripts/uninstall.sh
 AGENTS.md
 docs/
 .serena/
