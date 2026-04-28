@@ -7,7 +7,14 @@ use eventsource_stream::Eventsource;
 use futures::{StreamExt, TryStreamExt};
 use http::header::{ACCEPT, USER_AGENT};
 use snafu::{GenerateImplicitData, ResultExt};
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tracing::{Instrument, error, info, warn};
 use wreq::Method;
 
@@ -37,6 +44,108 @@ const COUNT_TOKENS_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
 const CLAUDE_BETA_BASE: &str = "oauth-2025-04-20";
 const CLAUDE_BETA_CONTEXT_1M_TOKEN: &str = "context-1m-2025-08-07";
 const CLAUDE_API_VERSION: &str = "2023-06-01";
+
+struct SelectedSlotState {
+    handle: AccountPoolHandle,
+    account_id: Option<i64>,
+    slot_released: AtomicBool,
+}
+
+#[derive(Clone)]
+struct SelectedSlotAbortLog {
+    ctx: crate::billing::BillingContext,
+    stream: bool,
+}
+
+#[derive(Clone)]
+struct SelectedSlotHandle {
+    state: Arc<SelectedSlotState>,
+}
+
+struct SelectedSlotGuard {
+    state: Arc<SelectedSlotState>,
+    abort_log: Option<SelectedSlotAbortLog>,
+    completed: bool,
+}
+
+impl SelectedSlotGuard {
+    fn new(
+        handle: AccountPoolHandle,
+        account_id: Option<i64>,
+        abort_log: Option<SelectedSlotAbortLog>,
+    ) -> Self {
+        let state = Arc::new(SelectedSlotState {
+            handle,
+            account_id,
+            slot_released: AtomicBool::new(false),
+        });
+        Self {
+            state,
+            abort_log,
+            completed: false,
+        }
+    }
+
+    fn handle(&self) -> SelectedSlotHandle {
+        SelectedSlotHandle {
+            state: self.state.clone(),
+        }
+    }
+
+    async fn finish(&mut self) {
+        self.handle().release_slot_only().await;
+        self.disarm();
+    }
+
+    fn disarm(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl SelectedSlotHandle {
+    async fn release_slot_only(&self) {
+        if let Some(account_id) = self.state.account_id
+            && !self.state.slot_released.swap(true, Ordering::Relaxed)
+        {
+            self.state.handle.release_slot(account_id).await;
+        }
+    }
+}
+
+impl Drop for SelectedSlotGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let account_id = self.state.account_id;
+        let should_release_slot =
+            account_id.is_some() && !self.state.slot_released.swap(true, Ordering::Relaxed);
+        let handle = self.state.handle.clone();
+        let abort_log = self.abort_log.clone();
+        tokio::spawn(async move {
+            if should_release_slot && let Some(account_id) = account_id {
+                handle.release_slot(account_id).await;
+            }
+            if let Some(log) = abort_log {
+                crate::billing::persist_terminal_request_log(
+                    &log.ctx,
+                    TerminalLogOptions {
+                        request_type: RequestType::Messages,
+                        stream: log.stream,
+                        status: "client_abort",
+                        http_status: Some(499),
+                        usage: None,
+                        error_code: Some("client_abort"),
+                        error_message: Some("request task dropped before response completed"),
+                        update_rollups: false,
+                        response_body: None,
+                    },
+                )
+                .await;
+            }
+        });
+    }
+}
 
 impl ClaudeCodeState {
     async fn timeout_upstream<T, F>(
@@ -195,12 +304,6 @@ impl ClaudeCodeState {
         }
     }
 
-    async fn release_selected_slot(&self, account_id: Option<i64>) {
-        if let Some(aid) = account_id {
-            self.account_pool_handle.release_slot(aid).await;
-        }
-    }
-
     async fn persist_oauth_refresh(&mut self, account_id: i64) -> Result<(), ClewdrError> {
         let Some(fallback) = self.oauth_token.clone() else {
             return Ok(());
@@ -332,6 +435,15 @@ impl ClaudeCodeState {
             if let Some(ref mut ctx) = state.billing_ctx {
                 ctx.account_id = account_id;
             }
+            let mut slot_guard = SelectedSlotGuard::new(
+                state.account_pool_handle.clone(),
+                account_id,
+                state.billing_ctx.clone().map(|ctx| SelectedSlotAbortLog {
+                    ctx,
+                    stream: state.stream,
+                }),
+            );
+            let slot_handle = slot_guard.handle();
 
             let retry = async {
                 match state.check_token() {
@@ -383,7 +495,9 @@ impl ClaudeCodeState {
                     .ok_or(ClewdrError::UnexpectedNone {
                         msg: "No access token found in cookie",
                     })?;
-                state.send_chat(access_token, p).await
+                state
+                    .send_chat(access_token, p, Some(slot_handle.clone()))
+                    .await
             }
             .instrument(tracing::info_span!(
                 "claude_code",
@@ -397,9 +511,12 @@ impl ClaudeCodeState {
             .await;
             match retry_result {
                 Ok(res) => {
-                    // For streaming, the slot is released in MessageStop handler
-                    if !self.stream {
-                        state.release_selected_slot(account_id).await;
+                    if self.stream {
+                        // Streaming uses its own SlotDropGuard on the response body;
+                        // this acquire-time guard only covers failures before handoff.
+                        slot_guard.disarm();
+                    } else {
+                        slot_guard.finish().await;
                     }
                     return Ok(res);
                 }
@@ -422,7 +539,7 @@ impl ClaudeCodeState {
                                     .await;
                             }
                         }
-                        state.release_selected_slot(account_id).await;
+                        slot_guard.finish().await;
                         if pool_reason.is_some() {
                             state.release_account(pool_reason).await;
                         }
@@ -431,7 +548,7 @@ impl ClaudeCodeState {
                         }
                         return Err(e);
                     }
-                    state.release_selected_slot(account_id).await;
+                    slot_guard.finish().await;
                     error!(
                         "[{}] {}",
                         state.cookie.as_ref().unwrap().credential_label().green(),
@@ -464,14 +581,16 @@ impl ClaudeCodeState {
         Err(ClewdrError::TooManyRetries)
     }
 
-    pub async fn send_chat(
+    async fn send_chat(
         &mut self,
         access_token: String,
         p: CreateMessageParams,
+        slot_guard: Option<SelectedSlotHandle>,
     ) -> Result<axum::response::Response, ClewdrError> {
         let model_family = Self::classify_model(&p.model);
         let response = self.execute_claude_request(&access_token, &p).await?;
-        self.handle_success_response(response, model_family).await
+        self.handle_success_response(response, model_family, slot_guard)
+            .await
     }
 
     async fn execute_claude_request(
@@ -589,9 +708,13 @@ impl ClaudeCodeState {
             if let Some(ref mut ctx) = state.billing_ctx {
                 ctx.account_id = account_id;
             }
+            // count_tokens does not have a request_logs terminal row today;
+            // this guard only protects the account-pool inflight slot.
+            let mut slot_guard =
+                SelectedSlotGuard::new(state.account_pool_handle.clone(), account_id, None);
             let cookie_disallows = matches!(cookie.count_tokens_allowed, Some(false));
             if cookie_disallows {
-                state.release_selected_slot(account_id).await;
+                slot_guard.finish().await;
                 state.persist_count_tokens_allowed(false).await;
                 let (response, _) = Self::local_count_tokens_response(&p);
                 return Ok(response);
@@ -658,7 +781,7 @@ impl ClaudeCodeState {
             .await;
             match retry_result {
                 Ok((res, _)) => {
-                    state.release_selected_slot(account_id).await;
+                    slot_guard.finish().await;
                     return Ok(res);
                 }
                 Err(e) => {
@@ -680,7 +803,7 @@ impl ClaudeCodeState {
                                     .await;
                             }
                         }
-                        state.release_selected_slot(account_id).await;
+                        slot_guard.finish().await;
                         if pool_reason.is_some() {
                             state.release_account(pool_reason).await;
                         }
@@ -689,7 +812,7 @@ impl ClaudeCodeState {
                         }
                         return Err(e);
                     }
-                    state.release_selected_slot(account_id).await;
+                    slot_guard.finish().await;
                     error!(
                         "[{}][TOKENS] {}",
                         state.cookie.as_ref().unwrap().credential_label().green(),
@@ -746,6 +869,7 @@ impl ClaudeCodeState {
         &mut self,
         response: wreq::Response,
         model_family: ModelFamily,
+        slot_guard: Option<SelectedSlotHandle>,
     ) -> Result<axum::response::Response, ClewdrError> {
         if !self.stream {
             let (resp, billing_usage) = Self::materialize_non_stream_response(response).await?;
@@ -758,7 +882,12 @@ impl ClaudeCodeState {
             });
             self.persist_usage_totals(bu.input_tokens, bu.output_tokens, model_family)
                 .await;
-            // Billing DB write (awaited for non-streaming)
+            if let Some(guard) = slot_guard.as_ref() {
+                guard.release_slot_only().await;
+            }
+            // Billing/request log writes are intentionally after slot release:
+            // runtime state has already been queued, and accounting DB latency
+            // should not keep an account unavailable for dispatch.
             if let Some(ref ctx) = self.billing_ctx {
                 crate::billing::persist_billing_to_db(ctx, bu, false).await;
             }
@@ -1340,7 +1469,15 @@ impl ClaudeCodeState {
         }
 
         cookie.resets_last_checked_at = Some(now);
-        if let Some((sess, week, opus, sonnet)) = Self::fetch_usage_resets(cookie, handle).await {
+        let fetched = tokio::time::timeout(
+            Duration::from_secs(15),
+            Self::fetch_usage_resets(cookie, handle),
+        )
+        .await
+        .ok()
+        .flatten();
+
+        if let Some((sess, week, opus, sonnet)) = fetched {
             // Unknown -> decide track/not-track
             if unknown(cookie.session_has_reset) {
                 cookie.session_has_reset = Some(sess.is_some());
