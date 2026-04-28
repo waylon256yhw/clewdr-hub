@@ -45,6 +45,43 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, ClewdrError> {
     Ok(pool)
 }
 
+/// Opens an existing SQLite database without auto-creating one.
+///
+/// Subcommands like `reset-admin-password`, `export-config`, and `diagnose`
+/// must NOT silently create a fresh empty DB when the user typos a `--db`
+/// path or runs the verb before any server has ever been started. They use
+/// this helper, which returns [`ClewdrError::DbNotFound`] in that case.
+///
+/// `:memory:` paths bypass the existence check (used by tests).
+///
+/// Migrations still run after a successful connect, so an old on-disk DB
+/// gets upgraded transparently — only auto-creation is suppressed.
+pub async fn open_existing_pool(db_path: &Path) -> Result<SqlitePool, ClewdrError> {
+    let is_memory = db_path.to_str().is_some_and(|s| s.contains(":memory:"));
+
+    if !is_memory && !db_path.exists() {
+        return Err(ClewdrError::DbNotFound {
+            path: db_path.to_path_buf(),
+        });
+    }
+
+    let options = SqliteConnectOptions::new()
+        .filename(db_path)
+        .create_if_missing(false)
+        .pragma("journal_mode", "WAL")
+        .pragma("foreign_keys", "ON")
+        .pragma("busy_timeout", "5000");
+
+    let max_conn = if is_memory { 1 } else { MAX_CONNECTIONS };
+    let pool = SqlitePoolOptions::new()
+        .max_connections(max_conn)
+        .connect_with(options)
+        .await?;
+
+    sqlx::migrate!().run(&pool).await?;
+    Ok(pool)
+}
+
 const DEFAULT_PASSWORD_HASH: &str = "$argon2id$v=19$m=65536,t=3,p=1$Li5+S+9BeUmy3TFviGbZ9Q$tI+ZLpzW3LhrR5OA8izKSR+mw4APjT6m4rQTicuXNsE";
 
 pub async fn seed_admin(pool: &SqlitePool) -> Result<(), ClewdrError> {
@@ -112,6 +149,43 @@ pub async fn seed_admin(pool: &SqlitePool) -> Result<(), ClewdrError> {
 
     seed_models(pool).await?;
 
+    Ok(())
+}
+
+/// Replace the admin user's password hash and clear the
+/// `must_change_password` flag.
+///
+/// Bumps `session_version` to invalidate any active session cookies — without
+/// this, a forgotten / leaked password would still hand the attacker live
+/// sessions even after the operator runs `reset-admin-password`.
+///
+/// Returns [`ClewdrError::NotFound`] when no admin row matches `username`.
+/// We deliberately do not auto-seed in that case: a missing admin row means
+/// the database is corrupted or pointed at a stale path, and silently
+/// reinstating an admin would mask that.
+pub async fn reset_admin_password(
+    pool: &SqlitePool,
+    username: &str,
+    password_hash: &str,
+) -> Result<(), ClewdrError> {
+    let result = sqlx::query(
+        "UPDATE users
+         SET password_hash = ?1,
+             must_change_password = 0,
+             session_version = session_version + 1,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE username = ?2 AND role = 'admin'",
+    )
+    .bind(password_hash)
+    .bind(username)
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ClewdrError::NotFound {
+            msg: "no admin user with that username",
+        });
+    }
     Ok(())
 }
 
@@ -192,4 +266,139 @@ fn hash_password(password: &str) -> Result<String, ClewdrError> {
 /// Public wrapper for admin API user creation/update.
 pub fn hash_password_public(password: &str) -> Result<String, ClewdrError> {
     hash_password(password)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a fresh in-memory pool with the full migration set applied.
+    async fn fresh_memory_pool() -> SqlitePool {
+        init_pool(Path::new(":memory:"))
+            .await
+            .expect("init_pool :memory:")
+    }
+
+    #[tokio::test]
+    async fn open_existing_pool_rejects_missing_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("nope.db");
+        let res = open_existing_pool(&missing).await;
+        match res {
+            Err(ClewdrError::DbNotFound { path }) => assert_eq!(path, missing),
+            other => panic!("expected DbNotFound, got {other:?}"),
+        }
+        // The bad path must not have been created as a side effect.
+        assert!(!missing.exists(), "open_existing_pool created {missing:?}");
+    }
+
+    #[tokio::test]
+    async fn open_existing_pool_opens_existing_db_and_runs_migrations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ok.db");
+        // Seed via init_pool (which creates + migrates), then drop the pool
+        // so the file is closed and we exercise open_existing_pool against
+        // a real on-disk file the way a CLI verb would.
+        {
+            let pool = init_pool(&path).await.expect("init_pool");
+            pool.close().await;
+        }
+        let pool = open_existing_pool(&path).await.expect("open_existing_pool");
+        // Migrations table is the unambiguous proof that schema was applied.
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(&pool)
+            .await
+            .expect("query _sqlx_migrations");
+        assert!(n >= 1, "expected applied migrations");
+    }
+
+    #[tokio::test]
+    async fn open_existing_pool_accepts_memory_path() {
+        // Memory paths must bypass the on-disk existence check so unit
+        // tests and ephemeral CLI runs (no_fs) can still open them.
+        let pool = open_existing_pool(Path::new(":memory:"))
+            .await
+            .expect("memory pool");
+        let _: (i64,) = sqlx::query_as("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("query");
+    }
+
+    #[tokio::test]
+    async fn reset_admin_password_errors_when_admin_missing() {
+        let pool = fresh_memory_pool().await;
+        // Don't call seed_admin; users table is empty.
+        let res = reset_admin_password(&pool, "admin", "$argon2id$dummy").await;
+        match res {
+            Err(ClewdrError::NotFound { msg }) => {
+                assert!(msg.contains("admin"));
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_admin_password_updates_hash_and_bumps_session_version() {
+        // Use init_pool then seed_admin so the row carries the default
+        // password + must_change=1 starting state.
+        let pool = fresh_memory_pool().await;
+        seed_admin(&pool).await.expect("seed_admin");
+
+        let (old_hash, must_change_before, session_v_before): (String, i32, i64) = sqlx::query_as(
+            "SELECT password_hash, must_change_password, session_version
+             FROM users WHERE username = 'admin'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read seeded admin");
+        assert_eq!(must_change_before, 1, "fresh seed should require change");
+
+        let new_hash = hash_password("hunter2").expect("hash");
+        reset_admin_password(&pool, "admin", &new_hash)
+            .await
+            .expect("reset");
+
+        let (after_hash, must_change_after, session_v_after): (String, i32, i64) = sqlx::query_as(
+            "SELECT password_hash, must_change_password, session_version
+             FROM users WHERE username = 'admin'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read updated admin");
+
+        assert_ne!(after_hash, old_hash, "password hash must change");
+        assert_eq!(after_hash, new_hash);
+        assert_eq!(must_change_after, 0, "must_change should be cleared");
+        assert_eq!(
+            session_v_after,
+            session_v_before + 1,
+            "session_version must be bumped to invalidate live sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_admin_password_rejects_non_admin_user() {
+        let pool = fresh_memory_pool().await;
+        seed_admin(&pool).await.expect("seed_admin");
+
+        // Targeting a username that doesn't exist (or isn't admin) must NOT
+        // touch the existing admin row.
+        let (admin_hash_before,): (String,) =
+            sqlx::query_as("SELECT password_hash FROM users WHERE username = 'admin'")
+                .fetch_one(&pool)
+                .await
+                .expect("read admin");
+
+        let new_hash = hash_password("anything").expect("hash");
+        let res = reset_admin_password(&pool, "not-admin", &new_hash).await;
+        assert!(matches!(res, Err(ClewdrError::NotFound { .. })));
+
+        let (admin_hash_after,): (String,) =
+            sqlx::query_as("SELECT password_hash FROM users WHERE username = 'admin'")
+                .fetch_one(&pool)
+                .await
+                .expect("read admin");
+        assert_eq!(admin_hash_before, admin_hash_after);
+    }
 }
