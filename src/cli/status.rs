@@ -1,6 +1,37 @@
-//! `clewdr status` — running state, port, version.
+//! `clewdr status` — running state, port, version, service registration.
+//!
+//! Authoritative source for "is it running" is the HTTP probe to
+//! `/api/version` on the configured listener address. Service-layer
+//! detection (systemd / Termux:Boot) is layered on top so we can
+//! distinguish "service active but not yet answering" from "stopped" and
+//! report the right next step to the operator.
+//!
+//! State precedence:
+//! 1. HTTP `GET /api/version` succeeds + body matches `v\d+\.\d+\.\d+...`
+//!    → `Running` (with live-vs-binary version match)
+//! 2. HTTP succeeds + body is foreign → `PortOccupiedOther`
+//! 3. HTTP fails + service active → `StartingOrBroken`
+//! 4. HTTP fails + service inactive / not registered → `Stopped`
+//!
+//! Reads clewdr.toml via Figment (not via `CLEWDR_CONFIG`) to keep the
+//! verb side-effect-free.
 
-use crate::error::ClewdrError;
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use colored::Colorize;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    config::{CONFIG_PATH, DB_PATH},
+    error::ClewdrError,
+};
+
+const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
+const SYSTEMD_UNIT: &str = "clewdr.service";
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct Args {
@@ -9,6 +40,600 @@ pub struct Args {
     pub json: bool,
 }
 
-pub async fn run(_args: Args) -> Result<(), ClewdrError> {
-    unimplemented!("status is implemented in commit #5")
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum State {
+    Running,
+    StartingOrBroken,
+    Stopped,
+    PortOccupiedOther,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ServiceInfo {
+    Systemd {
+        unit: String,
+        active_state: String,
+        active: bool,
+    },
+    TermuxBoot {
+        script: String,
+        present: bool,
+    },
+    NotRegistered,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StatusReport {
+    binary: String,
+    binary_version: String,
+    state: State,
+    bind_address: String,
+    probe_address: String,
+    live_version: Option<String>,
+    version_match: Option<bool>,
+    /// HTTP status code returned by the local probe when something other
+    /// than clewdr was holding the port. `None` for the running / refused /
+    /// timeout cases.
+    probe_http_status: Option<u16>,
+    /// Last-resort debug string when the probe failed for a reason we
+    /// couldn't classify (TLS issue, DNS, etc.). `None` for clean states.
+    probe_error: Option<String>,
+    pid: Option<u32>,
+    service: ServiceInfo,
+    db_path: String,
+    db_size_bytes: Option<u64>,
+    no_fs: bool,
+}
+
+pub async fn run(args: Args) -> Result<(), ClewdrError> {
+    let report = build_report().await;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
+    } else {
+        print_human(&report);
+    }
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Report assembly
+// ──────────────────────────────────────────────────────────────────────────
+
+async fn build_report() -> StatusReport {
+    let cfg = read_minimal_config();
+    let bind = cfg.bind_address();
+    let probe = cfg.probe_address();
+    let binary = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let binary_version = format!("v{}", env!("CARGO_PKG_VERSION"));
+
+    let service = detect_service().await;
+    let probe_outcome = http_probe(probe).await;
+    let state = compute_state(&probe_outcome, &service);
+    let pid = pid_for_listener(&cfg);
+
+    let live_version = match &probe_outcome {
+        ProbeOutcome::Clewdr { version } => Some(version.clone()),
+        _ => None,
+    };
+    let version_match = live_version.as_deref().map(|live| live == binary_version);
+    let probe_http_status = match &probe_outcome {
+        ProbeOutcome::ForeignHttp { status } => Some(*status),
+        _ => None,
+    };
+    let probe_error = match &probe_outcome {
+        ProbeOutcome::Error { msg } => Some(msg.clone()),
+        _ => None,
+    };
+
+    let db_path = DB_PATH.to_owned();
+    let db_size_bytes = if cfg.no_fs() {
+        None
+    } else {
+        std::fs::metadata(&db_path).ok().map(|m| m.len())
+    };
+
+    StatusReport {
+        binary,
+        binary_version,
+        state,
+        bind_address: bind.to_string(),
+        probe_address: probe.to_string(),
+        live_version,
+        version_match,
+        probe_http_status,
+        probe_error,
+        pid,
+        service,
+        db_path: db_path.display().to_string(),
+        db_size_bytes,
+        no_fs: cfg.no_fs(),
+    }
+}
+
+fn compute_state(probe: &ProbeOutcome, service: &ServiceInfo) -> State {
+    match probe {
+        ProbeOutcome::Clewdr { .. } => State::Running,
+        ProbeOutcome::ForeignHttp { .. } => State::PortOccupiedOther,
+        ProbeOutcome::Refused | ProbeOutcome::Unreachable => match service {
+            ServiceInfo::Systemd { active: true, .. } => State::StartingOrBroken,
+            ServiceInfo::Systemd { active: false, .. } => State::Stopped,
+            ServiceInfo::TermuxBoot { present: true, .. } => State::Stopped,
+            ServiceInfo::TermuxBoot { present: false, .. } => State::Stopped,
+            ServiceInfo::NotRegistered => State::Stopped,
+        },
+        ProbeOutcome::Error { .. } => State::Unknown,
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Config (Figment, no CLEWDR_CONFIG side effects)
+// ──────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Default, Deserialize)]
+struct StatusConfig {
+    ip: Option<IpAddr>,
+    port: Option<u16>,
+    no_fs: Option<bool>,
+}
+
+impl StatusConfig {
+    fn ip(&self) -> IpAddr {
+        self.ip
+            .unwrap_or_else(|| IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+    }
+    fn port(&self) -> u16 {
+        self.port.unwrap_or(8484)
+    }
+    fn no_fs(&self) -> bool {
+        self.no_fs.unwrap_or(false)
+    }
+    fn bind_address(&self) -> SocketAddr {
+        SocketAddr::new(self.ip(), self.port())
+    }
+    /// Substitute loopback only for wildcard binds; preserve explicit IPs
+    /// (mirrors the diagnose verb's logic so we don't false-negative a
+    /// LAN-bound or `[::1]`-bound server).
+    fn probe_address(&self) -> SocketAddr {
+        let probe_ip = match self.ip() {
+            IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            other => other,
+        };
+        SocketAddr::new(probe_ip, self.port())
+    }
+}
+
+fn read_minimal_config() -> StatusConfig {
+    use figment::{
+        Figment,
+        providers::{Env, Format, Toml},
+    };
+    Figment::from(Toml::file(CONFIG_PATH.as_path()))
+        .admerge(Env::prefixed("CLEWDR_").split("__"))
+        .extract()
+        .unwrap_or_default()
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// HTTP probe — same shape as diagnose, but classifies into outcomes the
+// state machine consumes.
+// ──────────────────────────────────────────────────────────────────────────
+
+enum ProbeOutcome {
+    /// 200 + body matches a clewdr version string.
+    Clewdr { version: String },
+    /// 200 + body that is *not* a clewdr version (some other HTTP server is
+    /// holding the port).
+    ForeignHttp { status: u16 },
+    /// TCP connect refused — nothing listening at all.
+    Refused,
+    /// TCP connected but the request didn't complete (timeout, partial,
+    /// reset). Treated like Refused for state purposes.
+    Unreachable,
+    /// HTTP client itself failed to construct (extremely rare).
+    Error { msg: String },
+}
+
+async fn http_probe(addr: SocketAddr) -> ProbeOutcome {
+    let url = format!("http://{addr}/api/version");
+    let client = match wreq::Client::builder().timeout(HTTP_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => return ProbeOutcome::Error { msg: e.to_string() },
+    };
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            // Heuristic: if the error string mentions "refused" treat as a
+            // clean Refused; otherwise it's "Unreachable" (timeout, reset,
+            // TLS, etc.). We don't currently have a structured kind on the
+            // wreq error.
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("refused") {
+                return ProbeOutcome::Refused;
+            }
+            return ProbeOutcome::Unreachable;
+        }
+    };
+    if !resp.status().is_success() {
+        return ProbeOutcome::ForeignHttp {
+            status: resp.status().as_u16(),
+        };
+    }
+    let body = resp.text().await.unwrap_or_default();
+    let trimmed = body.trim();
+    if trimmed.starts_with('v') && is_semver_ish(&trimmed[1..]) {
+        ProbeOutcome::Clewdr {
+            version: trimmed.to_string(),
+        }
+    } else {
+        ProbeOutcome::ForeignHttp { status: 200 }
+    }
+}
+
+fn is_semver_ish(s: &str) -> bool {
+    let mut parts = s.split('.');
+    let (a, b, c) = (parts.next(), parts.next(), parts.next());
+    match (a, b, c) {
+        (Some(x), Some(y), Some(z)) => {
+            let z_num: String = z.chars().take_while(|c| c.is_ascii_digit()).collect();
+            x.chars().all(|c| c.is_ascii_digit())
+                && y.chars().all(|c| c.is_ascii_digit())
+                && !z_num.is_empty()
+        }
+        _ => false,
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Service detection — systemd, Termux:Boot, or none
+// ──────────────────────────────────────────────────────────────────────────
+
+async fn detect_service() -> ServiceInfo {
+    if is_termux() {
+        return detect_termux_boot();
+    }
+    if Path::new("/run/systemd/system").exists() {
+        if let Some(info) = detect_systemd().await {
+            return info;
+        }
+    }
+    ServiceInfo::NotRegistered
+}
+
+fn is_termux() -> bool {
+    std::env::var("PREFIX")
+        .ok()
+        .map(|p| p.contains("com.termux"))
+        .unwrap_or(false)
+        || Path::new("/data/data/com.termux").exists()
+}
+
+fn detect_termux_boot() -> ServiceInfo {
+    let home = std::env::var("HOME")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/data/data/com.termux/files/home"));
+    let script = home.join(".termux/boot/clewdr-hub");
+    let present = script.exists();
+    ServiceInfo::TermuxBoot {
+        script: script.display().to_string(),
+        present,
+    }
+}
+
+async fn detect_systemd() -> Option<ServiceInfo> {
+    // `systemctl is-active <unit>`:
+    //   exit 0 + stdout "active"     → running
+    //   exit 3 + stdout "inactive"   → unit exists but stopped
+    //   exit 4 + stdout "inactive\n" → unit doesn't exist (Linux), or "unknown"
+    // We don't try to distinguish "no unit" from "inactive" because the
+    // shell-out cost is the same and the human output covers both.
+    //
+    // Uses std::process::Command (sync) rather than tokio::process to avoid
+    // pulling in the `process` tokio feature; the call returns in under
+    // 10ms on every system we care about.
+    let out = std::process::Command::new("systemctl")
+        .args(["is-active", SYSTEMD_UNIT])
+        .output()
+        .ok()?;
+    let active_state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let active = out.status.success();
+    Some(ServiceInfo::Systemd {
+        unit: SYSTEMD_UNIT.to_string(),
+        active_state,
+        active,
+    })
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// PID lookup — best-effort, /proc-only (Linux + Android/Termux)
+// ──────────────────────────────────────────────────────────────────────────
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn pid_for_listener(cfg: &StatusConfig) -> Option<u32> {
+    proc_pid_for_port(cfg.port())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn pid_for_listener(_cfg: &StatusConfig) -> Option<u32> {
+    None
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn proc_pid_for_port(port: u16) -> Option<u32> {
+    use std::{
+        fs,
+        io::{BufRead, BufReader},
+    };
+
+    // Step 1: collect socket inodes that are LISTEN-ing on `port`.
+    let mut inodes: Vec<u64> = Vec::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(f) = fs::File::open(table) else {
+            continue;
+        };
+        for line in BufReader::new(f).lines().map_while(Result::ok).skip(1) {
+            // sl  local_address rem_address st tx_q rx_q tr tm->when retrnsmt   uid timeout inode
+            //  0  CD000000:21A4 ...        0A   ...                                         12345
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 10 || fields[3] != "0A" {
+                continue; // not LISTEN
+            }
+            let local = fields[1];
+            let Some((_addr, port_hex)) = local.split_once(':') else {
+                continue;
+            };
+            let Ok(p) = u16::from_str_radix(port_hex, 16) else {
+                continue;
+            };
+            if p != port {
+                continue;
+            }
+            if let Ok(inode) = fields[9].parse::<u64>() {
+                inodes.push(inode);
+            }
+        }
+    }
+    if inodes.is_empty() {
+        return None;
+    }
+
+    // Step 2: walk /proc/<pid>/fd looking for `socket:[<inode>]` symlinks.
+    // Permissions: an unprivileged caller can only see their own fds, so
+    // this returns None when checking on a server that runs as a different
+    // user (common with the systemd unit). That's acceptable — `pid` is a
+    // best-effort field.
+    let entries = fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let fd_dir = entry.path().join("fd");
+        let Ok(fds) = fs::read_dir(&fd_dir) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(target) = fs::read_link(fd.path()) else {
+                continue;
+            };
+            let s = target.to_string_lossy();
+            if let Some(rest) = s.strip_prefix("socket:[")
+                && let Some(num) = rest.strip_suffix(']')
+                && let Ok(inode) = num.parse::<u64>()
+                && inodes.contains(&inode)
+            {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Output
+// ──────────────────────────────────────────────────────────────────────────
+
+fn print_human(r: &StatusReport) {
+    println!("{}", "clewdr status".bold());
+    line("binary", &format!("{} ({})", r.binary, r.binary_version));
+    line("state", &state_line(r));
+    line("bind", &r.bind_address);
+    if r.bind_address != r.probe_address {
+        line(
+            "probe",
+            &format!("{} (loopback substitute)", r.probe_address),
+        );
+    }
+    if let Some(pid) = r.pid {
+        line("pid", &pid.to_string());
+    } else if r.state == State::Running {
+        line("pid", "(unknown — different uid or unsupported platform)");
+    }
+    line("service", &service_line(&r.service));
+    if r.no_fs {
+        line("data", "in-memory (no_fs mode)");
+    } else {
+        match r.db_size_bytes {
+            Some(n) => {
+                let mb = n as f64 / 1024.0 / 1024.0;
+                line("data", &format!("{} ({:.1} MB)", r.db_path, mb));
+            }
+            None => line("data", &format!("{} (not yet created)", r.db_path)),
+        }
+    }
+}
+
+fn line(label: &str, value: &str) {
+    println!("  {:<8} {}", format!("{label}:"), value);
+}
+
+fn state_line(r: &StatusReport) -> String {
+    match r.state {
+        State::Running => match (r.live_version.as_deref(), r.version_match) {
+            (Some(live), Some(true)) => {
+                format!(
+                    "{} — live={live} (matches binary)",
+                    "RUNNING".green().bold()
+                )
+            }
+            (Some(live), Some(false)) => {
+                format!(
+                    "{} — live={live}, binary={} ({})",
+                    "RUNNING".yellow().bold(),
+                    r.binary_version,
+                    "restart needed to pick up the new binary".yellow()
+                )
+            }
+            _ => format!("{}", "RUNNING".green().bold()),
+        },
+        State::StartingOrBroken => format!(
+            "{} — service active but {} not answering. Check `journalctl -u clewdr` for the cause.",
+            "STARTING_OR_BROKEN".yellow().bold(),
+            r.probe_address
+        ),
+        State::Stopped => format!("{}", "STOPPED".red().bold()),
+        State::PortOccupiedOther => {
+            let extra = match r.probe_http_status {
+                Some(c) => format!(" (HTTP {c})"),
+                None => String::new(),
+            };
+            format!(
+                "{} — {}{} responded but isn't a clewdr server",
+                "PORT_OCCUPIED_OTHER".yellow().bold(),
+                r.probe_address,
+                extra
+            )
+        }
+        State::Unknown => {
+            let extra = match &r.probe_error {
+                Some(e) => format!(" ({e})"),
+                None => String::new(),
+            };
+            format!("{}{}", "UNKNOWN".yellow().bold(), extra)
+        }
+    }
+}
+
+fn service_line(s: &ServiceInfo) -> String {
+    match s {
+        ServiceInfo::Systemd {
+            unit,
+            active_state,
+            active,
+        } => {
+            let tag = if *active {
+                active_state.green().to_string()
+            } else {
+                active_state.yellow().to_string()
+            };
+            format!("systemd: {unit} ({tag})")
+        }
+        ServiceInfo::TermuxBoot { script, present } => {
+            if *present {
+                format!("Termux:Boot script at {script} ({})", "present".green())
+            } else {
+                format!(
+                    "Termux:Boot script at {script} ({} — install with `clewdr service install`)",
+                    "missing".yellow()
+                )
+            }
+        }
+        ServiceInfo::NotRegistered => format!(
+            "{} (running ad-hoc; install with `clewdr service install`)",
+            "not registered".yellow()
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_default() -> StatusConfig {
+        StatusConfig::default()
+    }
+
+    #[test]
+    fn semver_ish_matches_api_version_format() {
+        // Mirrors what /api/version returns: `v1.2.3`, with the leading
+        // `v` stripped before this helper runs.
+        assert!(is_semver_ish("1.2.3"));
+        assert!(is_semver_ish("1.2.3-pre"));
+        assert!(!is_semver_ish("hello"));
+        assert!(!is_semver_ish("1.2"));
+    }
+
+    #[test]
+    fn probe_address_substitutes_only_wildcards() {
+        let mut cfg = cfg_default();
+        cfg.ip = Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(cfg.probe_address().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        cfg.ip = Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert_eq!(cfg.probe_address().ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+
+        let lan = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+        cfg.ip = Some(lan);
+        assert_eq!(cfg.probe_address().ip(), lan);
+
+        let v6_loop = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        cfg.ip = Some(v6_loop);
+        assert_eq!(cfg.probe_address().ip(), v6_loop);
+    }
+
+    #[test]
+    fn compute_state_clewdr_response_is_running() {
+        let probe = ProbeOutcome::Clewdr {
+            version: "v1.2.3".into(),
+        };
+        let svc = ServiceInfo::NotRegistered;
+        assert_eq!(compute_state(&probe, &svc), State::Running);
+    }
+
+    #[test]
+    fn compute_state_foreign_http_is_port_occupied() {
+        let probe = ProbeOutcome::ForeignHttp { status: 200 };
+        let svc = ServiceInfo::NotRegistered;
+        assert_eq!(compute_state(&probe, &svc), State::PortOccupiedOther);
+    }
+
+    #[test]
+    fn compute_state_refused_with_active_service_is_starting_or_broken() {
+        let probe = ProbeOutcome::Refused;
+        let svc = ServiceInfo::Systemd {
+            unit: "clewdr.service".into(),
+            active_state: "active".into(),
+            active: true,
+        };
+        assert_eq!(compute_state(&probe, &svc), State::StartingOrBroken);
+    }
+
+    #[test]
+    fn compute_state_refused_with_inactive_service_is_stopped() {
+        let probe = ProbeOutcome::Refused;
+        let svc = ServiceInfo::Systemd {
+            unit: "clewdr.service".into(),
+            active_state: "inactive".into(),
+            active: false,
+        };
+        assert_eq!(compute_state(&probe, &svc), State::Stopped);
+    }
+
+    #[test]
+    fn compute_state_refused_without_service_is_stopped() {
+        let probe = ProbeOutcome::Refused;
+        let svc = ServiceInfo::NotRegistered;
+        assert_eq!(compute_state(&probe, &svc), State::Stopped);
+    }
 }
