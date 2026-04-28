@@ -95,6 +95,7 @@ hmac = "0.12"
 rpassword = "7"
 semver = "1"
 aes-gcm = { version = "0.10", optional = true }
+inquire = { version = "0.7", default-features = false, features = ["crossterm"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 enable-ansi-support = "0.3"
@@ -118,5 +119,5 @@ mimalloc = ["dep:mimalloc"]
 dhat-heap = ["dep:dhat"]
 # Encrypted export/import bundle (Argon2id KDF + AES-256-GCM).
 encrypt = ["dep:aes-gcm"]
-# Interactive TUI menu (placeholder — wired up in commit #11).
-tui = []
+# Interactive TUI menu (commit #11 — inquire-based, default-on).
+tui = ["dep:inquire"]
