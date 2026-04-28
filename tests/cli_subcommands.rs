@@ -114,3 +114,29 @@ fn unknown_subcommand_is_rejected() {
     let res = Args::try_parse_from(["clewdr", "definitely-not-a-verb"]);
     assert!(res.is_err());
 }
+
+/// Regression: library globals that touch [`clewdr_hub::ARGS`] must NOT call
+/// `process::exit` when the host process passes argv this binary doesn't
+/// recognise. Cargo test harnesses pass `--quiet`, `--nocapture`, etc., and
+/// downstream library consumers may pass anything. The LazyLock has to be
+/// graceful — only `main.rs`'s explicit `Args::parse()` is allowed to abort.
+#[test]
+fn unknown_argv_falls_back_to_default() {
+    let res = Args::try_parse_from(["clewdr", "--quiet", "--nocapture"]);
+    assert!(res.is_err(), "unknown argv should still parse-fail");
+    let fallback = res.unwrap_or_default();
+    assert!(fallback.command.is_none());
+    assert!(fallback.global.config.is_none());
+    assert!(fallback.global.db.is_none());
+    #[cfg(feature = "portable")]
+    assert!(!fallback.update);
+}
+
+/// The very fact this test ran proves the LazyLock didn't `process::exit` on
+/// the cargo-test argv (e.g. `--quiet`, `--exact`, `--show-output`).
+#[test]
+fn lazy_args_does_not_abort_under_test_argv() {
+    // Touch the lock; if it had used the strict parser we'd never reach the
+    // assertion (process would have exited during init).
+    let _ = &*clewdr_hub::ARGS;
+}

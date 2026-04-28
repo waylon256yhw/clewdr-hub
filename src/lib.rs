@@ -29,11 +29,19 @@ pub static IS_DEV: LazyLock<bool> = LazyLock::new(|| std::env::var("CARGO_MANIFE
 pub static VERSION_INFO: LazyLock<String> =
     LazyLock::new(|| format!("v{}", env!("CARGO_PKG_VERSION")));
 
-/// Process-wide parsed CLI arguments. Initialised on first access.
+/// Process-wide parsed CLI arguments.
 ///
-/// Touching this LazyLock has no side effects beyond `argv` parsing — it is
-/// safe to read from anywhere, including before logging initialisation.
-pub static ARGS: LazyLock<Args> = LazyLock::new(Args::parse);
+/// Touching this LazyLock parses `std::env::args()` *gracefully* — if argv
+/// contains flags this binary doesn't recognise (notably the integration test
+/// harness, which passes things like `--quiet` / `--nocapture`), the lock
+/// initialises to [`Args::default`] instead of calling `process::exit`. This
+/// matches the pre-refactor behaviour where each `LazyLock<PathBuf>` used
+/// `Args::try_parse().ok().and_then(...)`.
+///
+/// The actual `clewdr` binary still wants strict validation: `main.rs` calls
+/// [`Args::parse`] explicitly at startup, so user typos surface as a normal
+/// clap error and exit before any library code runs.
+pub static ARGS: LazyLock<Args> = LazyLock::new(|| Args::try_parse().unwrap_or_default());
 
 /// Returns version info with colors for terminal output
 pub fn version_info_colored() -> String {
@@ -67,7 +75,7 @@ pub const FIG: &str = r#"
 "#;
 
 /// Reverse Proxy API for Claude
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Default)]
 #[command(version, about, long_about = None)]
 pub struct Args {
     #[command(flatten)]

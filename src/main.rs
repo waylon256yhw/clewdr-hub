@@ -1,5 +1,5 @@
 use clewdr_hub::{
-    ARGS, Command, FIG, IS_DEBUG,
+    ARGS, Args, Command, FIG, IS_DEBUG,
     config::{CLEWDR_CONFIG, CONFIG_PATH, DB_PATH, LOG_DIR},
     error::ClewdrError,
     version_info_colored,
@@ -65,6 +65,14 @@ fn admin_panel_url(addr: SocketAddr) -> String {
 /// 3. Only the bare-server path proceeds to logging + config + DB + axum.
 #[tokio::main]
 async fn main() -> Result<(), ClewdrError> {
+    // Strict argv validation: surface unknown flags (typos, removed args) as a
+    // normal clap error and exit BEFORE anything else runs. The library
+    // [`ARGS`] LazyLock uses `try_parse` with a default fallback so that test
+    // harnesses and other library consumers tolerate unrelated argv; the
+    // binary itself wants the strict behaviour.
+    use clap::Parser;
+    let _ = Args::parse();
+
     // Ensure a crypto provider is installed before rustls usage (yup-oauth2 / hyper-rustls).
     #[cfg(target_os = "android")]
     rustls::crypto::ring::default_provider()
