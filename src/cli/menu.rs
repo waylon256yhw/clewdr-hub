@@ -27,7 +27,7 @@ pub async fn run() -> Result<(), ClewdrError> {
     // `--help` for the equivalent subcommands.
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err(ClewdrError::BadRequest {
-            msg: "menu requires an interactive TTY for stdin and stdout — see `clewdr --help` for the equivalent subcommands",
+            msg: "菜单需要交互式终端 stdin/stdout；非交互环境请使用 `clewdr --help` 查看等价子命令",
         });
     }
 
@@ -70,20 +70,20 @@ enum MenuAction {
 
 fn menu_entries() -> Vec<(&'static str, MenuAction)> {
     let mut entries: Vec<(&'static str, MenuAction)> = vec![
-        ("Show status", MenuAction::Status),
-        ("Diagnose (read-only health check)", MenuAction::Diagnose),
-        ("Reset admin password", MenuAction::ResetAdmin),
-        ("Export config to bundle", MenuAction::ExportConfig),
-        ("Import config from bundle", MenuAction::ImportConfig),
+        ("查看运行状态", MenuAction::Status),
+        ("运行诊断（只读健康检查）", MenuAction::Diagnose),
+        ("重置管理员密码", MenuAction::ResetAdmin),
+        ("导出配置备份包", MenuAction::ExportConfig),
+        ("导入配置备份包", MenuAction::ImportConfig),
         (
-            "Install service (systemd / Termux:Boot)",
+            "安装自启动服务（systemd / Termux:Boot）",
             MenuAction::ServiceInstall,
         ),
-        ("Uninstall service", MenuAction::ServiceUninstall),
+        ("卸载自启动服务", MenuAction::ServiceUninstall),
     ];
     #[cfg(feature = "portable")]
-    entries.push(("Check for updates", MenuAction::Update));
-    entries.push(("Quit", MenuAction::Quit));
+    entries.push(("检查更新", MenuAction::Update));
+    entries.push(("退出", MenuAction::Quit));
     entries
 }
 
@@ -93,8 +93,9 @@ fn menu_entries() -> Vec<(&'static str, MenuAction)> {
 fn prompt_main_menu() -> Result<Option<MenuAction>, ClewdrError> {
     let entries = menu_entries();
     let labels: Vec<&str> = entries.iter().map(|(l, _)| *l).collect();
-    let result = Select::new("clewdr menu — pick an action:", labels.clone())
-        .with_help_message("↑/↓ to navigate · enter to select · esc/Ctrl-C to quit")
+    let result = Select::new("请选择要执行的操作：", labels.clone())
+        .with_page_size(labels.len())
+        .with_help_message("↑/↓ 选择 · Enter 确认 · Esc/Ctrl-C 退出")
         .prompt();
     match result {
         Ok(label) => {
@@ -103,7 +104,7 @@ fn prompt_main_menu() -> Result<Option<MenuAction>, ClewdrError> {
                 .find(|(l, _)| *l == label)
                 .map(|(_, a)| *a)
                 .ok_or(ClewdrError::BadRequest {
-                    msg: "selected menu label has no matching action (this is a bug)",
+                    msg: "选中的菜单项没有对应操作（这是程序错误）",
                 })?;
             Ok(Some(action))
         }
@@ -140,31 +141,31 @@ async fn menu_diagnose() -> Result<(), ClewdrError> {
     let any_fail = cli::diagnose::run_and_report(cli::diagnose::Args { json: false }).await;
     if any_fail {
         return Err(ClewdrError::BadRequest {
-            msg: "diagnose reported at least one FAIL — see the report above",
+            msg: "诊断发现至少一个 FAIL，请查看上方报告",
         });
     }
     Ok(())
 }
 
 async fn menu_reset_admin() -> Result<(), ClewdrError> {
-    let username = Text::new("Username to reset:")
+    let username = Text::new("要重置的用户名：")
         .with_default("admin")
         .prompt()
         .map_err(wrap_or_cancel)?;
-    let password = Text::new("New admin password (visible):")
+    let password = Text::new("新的管理员密码（明文显示）：")
         .prompt()
         .map_err(wrap_or_cancel)?;
     if password.is_empty() {
         return Err(ClewdrError::BadRequest {
-            msg: "password cannot be empty",
+            msg: "密码不能为空",
         });
     }
-    let confirm = Text::new("Confirm new admin password (visible):")
+    let confirm = Text::new("再次输入新密码（明文显示）：")
         .prompt()
         .map_err(wrap_or_cancel)?;
     if password != confirm {
         return Err(ClewdrError::BadRequest {
-            msg: "passwords do not match",
+            msg: "两次输入的密码不一致",
         });
     }
 
@@ -177,22 +178,21 @@ async fn menu_reset_admin() -> Result<(), ClewdrError> {
 }
 
 async fn menu_export_config() -> Result<(), ClewdrError> {
-    let path = Text::new("Bundle output path:")
-        .with_help_message("e.g. ~/clewdr.bundle (~ is expanded)")
+    let path = Text::new("备份包输出路径：")
+        .with_help_message("例如 ~/clewdr.bundle（会展开 ~）")
         .prompt()
         .map_err(wrap_or_cancel)?;
     // Same default as `clewdr export-config` (no `--no-encrypt`):
     // bundles ship encrypted unless the operator explicitly opts out.
-    let encrypt = Confirm::new("Encrypt the bundle? (Argon2id KDF + AES-256-GCM)")
+    let encrypt = Confirm::new("是否加密备份包？（Argon2id KDF + AES-256-GCM）")
         .with_default(true)
         .prompt()
         .map_err(wrap_or_cancel)?;
-    let no_secrets =
-        Confirm::new("Strip secrets (cookies, OAuth tokens, password hashes, proxy creds)?")
-            .with_default(false)
-            .prompt()
-            .map_err(wrap_or_cancel)?;
-    let include_runtime = Confirm::new("Include runtime tables (usage rollups, account state)?")
+    let no_secrets = Confirm::new("是否移除敏感信息？（cookies、OAuth token、密码哈希、代理凭据）")
+        .with_default(false)
+        .prompt()
+        .map_err(wrap_or_cancel)?;
+    let include_runtime = Confirm::new("是否包含运行时表？（用量统计、账号状态）")
         .with_default(false)
         .prompt()
         .map_err(wrap_or_cancel)?;
@@ -207,20 +207,20 @@ async fn menu_export_config() -> Result<(), ClewdrError> {
 }
 
 async fn menu_import_config() -> Result<(), ClewdrError> {
-    let path = Text::new("Bundle path:")
-        .with_help_message("absolute path or ~/clewdr.bundle")
+    let path = Text::new("备份包路径：")
+        .with_help_message("绝对路径或 ~/clewdr.bundle")
         .prompt()
         .map_err(wrap_or_cancel)?;
     let mode_label = Select::new(
-        "Conflict mode:",
+        "导入模式：",
         vec![
-            "merge (UPSERT — preserves local rows that aren't in the bundle)",
-            "restore (truncate & re-insert — destroys local data)",
+            "合并（UPSERT；保留备份包中不存在的本地数据）",
+            "恢复（清空并重建；会删除本地数据）",
         ],
     )
     .prompt()
     .map_err(wrap_or_cancel)?;
-    let mode = if mode_label.starts_with("merge") {
+    let mode = if mode_label.starts_with("合并") {
         cli::import::Mode::Merge
     } else {
         cli::import::Mode::Restore
@@ -229,23 +229,23 @@ async fn menu_import_config() -> Result<(), ClewdrError> {
     // reason. Surface that as an explicit prompt rather than silently
     // setting yes=true; the operator should consciously opt in.
     let yes = if mode == cli::import::Mode::Restore {
-        let ok = Confirm::new("Restore wipes existing tables. Continue?")
+        let ok = Confirm::new("恢复模式会清空现有表，确定继续？")
             .with_default(false)
             .prompt()
             .map_err(wrap_or_cancel)?;
         if !ok {
-            eprintln!("restore aborted");
+            eprintln!("已取消恢复");
             return Ok(());
         }
         true
     } else {
         false
     };
-    let dry_run = Confirm::new("Dry run? (parse + report counts, no writes)")
+    let dry_run = Confirm::new("是否只演练？（仅解析并报告数量，不写入）")
         .with_default(true)
         .prompt()
         .map_err(wrap_or_cancel)?;
-    let overwrite_admin = Confirm::new("Overwrite the local admin row from the bundle?")
+    let overwrite_admin = Confirm::new("是否用备份包中的 admin 覆盖本地管理员？")
         .with_default(false)
         .prompt()
         .map_err(wrap_or_cancel)?;
@@ -253,20 +253,18 @@ async fn menu_import_config() -> Result<(), ClewdrError> {
     // typo'd --db path doesn't silently spawn an empty database. When
     // intentionally importing into a brand-new install (e.g. fresh
     // VPS, no clewdr.db yet), the operator wants this on.
-    let init = Confirm::new("Initialize a new database if it doesn't exist? (--init)")
+    let init = Confirm::new("如果目标数据库不存在，是否新建？（--init）")
         .with_default(false)
-        .with_help_message(
-            "Off = refuse to import unless the target DB already exists. Turn on for a fresh install.",
-        )
+        .with_help_message("关闭 = 目标 DB 不存在就拒绝导入；新安装机器可打开。")
         .prompt()
         .map_err(wrap_or_cancel)?;
     // --force: bypass the same-major / newer-minor refusal. Major
     // mismatch is *always* refused regardless of --force, so this
     // only loosens the minor-bump check.
-    let force = Confirm::new("Bypass minor version mismatch refusal? (--force)")
+    let force = Confirm::new("是否忽略小版本不匹配？（--force）")
         .with_default(false)
         .with_help_message(
-            "Bundle from a newer minor version of clewdr would normally be refused; --force overrides. Major mismatch is always refused.",
+            "来自更新小版本的备份包默认会被拒绝；--force 可覆盖。大版本不匹配始终拒绝。",
         )
         .prompt()
         .map_err(wrap_or_cancel)?;
@@ -296,11 +294,9 @@ async fn menu_service_install() -> Result<(), ClewdrError> {
 
 async fn menu_service_uninstall() -> Result<(), ClewdrError> {
     let (systemd, termux_boot) = prompt_service_target()?;
-    let purge = Confirm::new("--purge: also delete clewdr.db, clewdr.toml, and the log dir?")
+    let purge = Confirm::new("--purge：是否同时删除 clewdr.db、clewdr.toml 和日志目录？")
         .with_default(false)
-        .with_help_message(
-            "Off by default; the verb will ask for `yes` confirmation if you say yes here",
-        )
+        .with_help_message("默认关闭；如果这里选择是，后续仍会要求输入 `yes` 二次确认。")
         .prompt()
         .map_err(wrap_or_cancel)?;
     cli::service::run(cli::service::ServiceCommand::Uninstall(
@@ -320,16 +316,14 @@ async fn menu_service_uninstall() -> Result<(), ClewdrError> {
 /// "let detect_environment() decide".
 fn prompt_service_target() -> Result<(bool, bool), ClewdrError> {
     let label = Select::new(
-        "Service target:",
+        "服务目标：",
         vec![
-            "Auto-detect (recommended)",
-            "Force systemd",
-            "Force Termux:Boot",
+            "自动检测（推荐）",
+            "强制使用 systemd",
+            "强制使用 Termux:Boot",
         ],
     )
-    .with_help_message(
-        "Override only when auto-detect picks the wrong path (e.g. systemd inside a Termux chroot).",
-    )
+    .with_help_message("只有自动检测选错时才需要覆盖，例如 Termux chroot 内的 systemd。")
     .prompt()
     .map_err(wrap_or_cancel)?;
     Ok(parse_service_target(&label))
@@ -339,9 +333,9 @@ fn prompt_service_target() -> Result<(bool, bool), ClewdrError> {
 /// Select. Factored out so the mapping can be unit-tested without
 /// driving the inquire prompt from a TTY.
 fn parse_service_target(label: &str) -> (bool, bool) {
-    if label.starts_with("Force systemd") {
+    if label.starts_with("强制使用 systemd") {
         (true, false)
-    } else if label.starts_with("Force Termux") {
+    } else if label.starts_with("强制使用 Termux") {
         (false, true)
     } else {
         (false, false)
@@ -357,11 +351,6 @@ fn print_banner() {
         "{} {}",
         "clewdr".green().bold(),
         format!("v{}", env!("CARGO_PKG_VERSION")).dimmed()
-    );
-    eprintln!(
-        "  {}",
-        "operations menu — every action calls the same code path as the equivalent subcommand."
-            .dimmed()
     );
     eprintln!();
 }
@@ -395,7 +384,7 @@ fn is_user_cancel(e: &InquireError) -> bool {
 /// abort — the outer loop will redisplay the main menu.
 fn wrap_or_cancel(e: InquireError) -> ClewdrError {
     if is_user_cancel(&e) {
-        ClewdrError::BadRequest { msg: "canceled" }
+        ClewdrError::BadRequest { msg: "已取消" }
     } else {
         wrap_inquire(e)
     }
@@ -483,15 +472,12 @@ mod tests {
     fn parse_service_target_maps_each_label() {
         // Auto-detect is the default — both flags off so
         // detect_environment() runs.
-        assert_eq!(
-            parse_service_target("Auto-detect (recommended)"),
-            (false, false)
-        );
+        assert_eq!(parse_service_target("自动检测（推荐）"), (false, false));
         // Override labels must turn on exactly one flag. A future edit
         // that breaks the label prefix would silently fall through to
         // auto-detect; this test catches that.
-        assert_eq!(parse_service_target("Force systemd"), (true, false));
-        assert_eq!(parse_service_target("Force Termux:Boot"), (false, true));
+        assert_eq!(parse_service_target("强制使用 systemd"), (true, false));
+        assert_eq!(parse_service_target("强制使用 Termux:Boot"), (false, true));
         // Anything unrecognised falls through to auto-detect (safest
         // default).
         assert_eq!(parse_service_target("garbage"), (false, false));
