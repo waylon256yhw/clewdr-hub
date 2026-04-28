@@ -15,6 +15,8 @@
 #   CLEWDR_RELEASE_TAG    release tag (e.g. v1.2.4) or "latest" (default).
 #   CLEWDR_INSTALL_DIR    override install dir (default: /opt/clewdr on
 #                         Linux/macOS, $HOME/clewdr on Termux).
+#   CLEWDR_BIN_LINK       override PATH symlink (default: /usr/local/bin/clewdr
+#                         on Linux/macOS, $PREFIX/bin/clewdr on Termux).
 #   CLEWDR_NO_SERVICE=1   don't run `clewdr service install` at the end.
 #                         Operator can run it later by hand.
 #
@@ -32,6 +34,7 @@ REPO_NAME="${CLEWDR_REPO_NAME:-clewdr-hub}"
 RELEASE_TAG="${CLEWDR_RELEASE_TAG:-latest}"
 INSTALL_DIR_OVERRIDE="${CLEWDR_INSTALL_DIR:-}"
 NO_SERVICE="${CLEWDR_NO_SERVICE:-0}"
+BIN_LINK_PATH="${CLEWDR_BIN_LINK:-}"
 
 # Minimum host glibc that can run the GitHub `linux-*` build artifacts.
 # CI builds them on ubuntu-latest (glibc 2.39 at the time of writing);
@@ -186,6 +189,14 @@ resolve_install_dir() {
     esac
 }
 
+default_bin_link_path() {
+    local target=$1
+    case "$target" in
+        android-*) echo "${PREFIX:-/data/data/com.termux/files/usr}/bin/clewdr" ;;
+        *)         echo "/usr/local/bin/clewdr" ;;
+    esac
+}
+
 # Returns 0 iff `clewdr service install` has a backend on this host
 # AND the caller has the privileges the verb needs. The verb supports
 # only systemd (Linux, requires root) and Termux:Boot (Android, no
@@ -211,6 +222,46 @@ service_supported() {
             return 1
             ;;
     esac
+}
+
+install_path_link() {
+    local target=$1 install_dir=$2 bin_name=$3
+
+    case "$target" in
+        android-*|linux-*|musllinux-*|macos-*) ;;
+        *) return 0 ;;
+    esac
+
+    if [[ "$BIN_LINK_PATH" == /opt/* || "$BIN_LINK_PATH" == /usr/* ]] && [[ $EUID -ne 0 ]]; then
+        warn "skipping PATH link at ${BIN_LINK_PATH}; creating it requires root"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$BIN_LINK_PATH")"
+    if [[ -e "$BIN_LINK_PATH" || -L "$BIN_LINK_PATH" ]]; then
+        local existing=""
+        existing=$(readlink "$BIN_LINK_PATH" 2>/dev/null || true)
+        if [[ "$existing" != "${install_dir}/${bin_name}" ]]; then
+            warn "skipping PATH link; ${BIN_LINK_PATH} already exists"
+            warn "run directly with: ${install_dir}/${bin_name}"
+            return 0
+        fi
+    fi
+
+    ln -sfn "${install_dir}/${bin_name}" "$BIN_LINK_PATH"
+    info "PATH link: ${BOLD}${BIN_LINK_PATH}${RESET} -> ${install_dir}/${bin_name}"
+}
+
+clewdr_on_path_points_to_install() {
+    local install_dir=$1 bin_name=$2 found="" link_target=""
+    found=$(command -v clewdr 2>/dev/null || true)
+    [[ "$found" == /* ]] || return 1
+    [[ "$found" == "${install_dir}/${bin_name}" ]] && return 0
+    if [[ -L "$found" ]]; then
+        link_target=$(readlink "$found" 2>/dev/null || true)
+        [[ "$link_target" == "${install_dir}/${bin_name}" ]] && return 0
+    fi
+    return 1
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -250,6 +301,10 @@ require unzip
 
 target=$(detect_target)
 info "platform: ${BOLD}${target}${RESET}"
+
+if [[ -z "$BIN_LINK_PATH" ]]; then
+    BIN_LINK_PATH=$(default_bin_link_path "$target")
+fi
 
 install_dir=$(resolve_install_dir "$target")
 info "install dir: ${BOLD}${install_dir}${RESET}"
@@ -296,6 +351,7 @@ if [[ "$target" == android-* ]] && [[ -f "$tmpdir/extracted/libc++_shared.so" ]]
 fi
 
 info "installed: ${BOLD}${install_dir}/${bin_name}${RESET}"
+install_path_link "$target" "$install_dir" "$bin_name"
 
 # Service registration. The binary handles env detection (systemd vs
 # Termux:Boot) and the privileged setup (useradd, /etc/systemd/, etc.),
@@ -318,5 +374,10 @@ else
 fi
 
 info "${GREEN}${BOLD}install complete${RESET}"
-info "diagnose:  ${install_dir}/${bin_name} diagnose"
-info "menu:      ${install_dir}/${bin_name} menu"
+if clewdr_on_path_points_to_install "$install_dir" "$bin_name"; then
+    info "diagnose:  clewdr diagnose"
+    info "menu:      clewdr menu"
+else
+    info "diagnose:  ${install_dir}/${bin_name} diagnose"
+    info "menu:      ${install_dir}/${bin_name} menu"
+fi

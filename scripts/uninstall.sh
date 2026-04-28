@@ -15,12 +15,16 @@
 # Environment overrides:
 #   CLEWDR_INSTALL_DIR    install dir to clean up (default: auto-detect
 #                         /opt/clewdr or $HOME/clewdr).
+#   CLEWDR_BIN_LINK       PATH symlink to clean up if it points to this
+#                         install (default: /usr/local/bin/clewdr on
+#                         Linux/macOS, $PREFIX/bin/clewdr on Termux).
 
 set -euo pipefail
 
 PURGE=0
 INSTALL_DIR_OVERRIDE="${CLEWDR_INSTALL_DIR:-}"
 NO_SERVICE="${CLEWDR_NO_SERVICE:-0}"
+BIN_LINK_PATH="${CLEWDR_BIN_LINK:-}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -79,6 +83,15 @@ service_supported() {
     return 1
 }
 
+default_bin_link_path() {
+    if [[ -n "${PREFIX:-}" && "$PREFIX" == *com.termux* ]] \
+       || [[ -d /data/data/com.termux/files/usr ]]; then
+        echo "${PREFIX:-/data/data/com.termux/files/usr}/bin/clewdr"
+    else
+        echo "/usr/local/bin/clewdr"
+    fi
+}
+
 # Find the install dir. Honors the env override; otherwise probes the
 # two install.sh defaults in priority order. We deliberately don't
 # fall back to `which clewdr` — the binary on $PATH might be a
@@ -103,6 +116,10 @@ resolve_install_dir() {
 install_dir=$(resolve_install_dir)
 bin="${install_dir}/clewdr"
 [[ -x "$bin" ]] || err "no executable at $bin"
+
+if [[ -z "$BIN_LINK_PATH" ]]; then
+    BIN_LINK_PATH=$(default_bin_link_path)
+fi
 
 info "found install at ${BOLD}${install_dir}${RESET}"
 
@@ -156,6 +173,14 @@ fi
 rm -f "$bin"
 rm -f "${install_dir}/clewdr.exe"
 rm -f "${install_dir}/libc++_shared.so"
+
+if [[ -L "$BIN_LINK_PATH" ]]; then
+    link_target=$(readlink "$BIN_LINK_PATH" 2>/dev/null || true)
+    if [[ "$link_target" == "$bin" || "$link_target" == "${install_dir}/clewdr" ]]; then
+        rm -f "$BIN_LINK_PATH"
+        info "removed PATH link ${BIN_LINK_PATH}"
+    fi
+fi
 
 # Try to remove the install dir, but only if it's empty. If --purge
 # wasn't passed, clewdr.db / clewdr.toml / log/ are still in there —
