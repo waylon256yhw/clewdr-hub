@@ -8,6 +8,7 @@
 //! initialization so that subcommands never race with the `tokio::spawn`-ed
 //! config writeback in `ClewdrConfig::new()`.
 
+pub mod bundle;
 pub mod diagnose;
 pub mod export;
 pub mod import;
