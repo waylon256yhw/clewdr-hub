@@ -33,6 +33,14 @@ RELEASE_TAG="${CLEWDR_RELEASE_TAG:-latest}"
 INSTALL_DIR_OVERRIDE="${CLEWDR_INSTALL_DIR:-}"
 NO_SERVICE="${CLEWDR_NO_SERVICE:-0}"
 
+# Minimum host glibc that can run the GitHub `linux-*` build artifacts.
+# CI builds them on ubuntu-latest (glibc 2.39 at the time of writing);
+# anything older falls back to the static musllinux-* asset to avoid
+# `GLIBC_X.Y not found` at first invocation. Bump this in lockstep
+# with .github/workflows/build.yml runner upgrades. Operators on
+# unusual hosts (e.g. compatibility libcs) can override.
+REQUIRED_GLIBC="${CLEWDR_REQUIRED_GLIBC:-2.36}"
+
 # Color helpers; auto-disable when stdout isn't a TTY (curl|bash piping
 # to something that captures stdout).
 if [[ -t 1 ]]; then
@@ -47,6 +55,56 @@ warn() { echo "${YELLOW}${BOLD}warn:${RESET} $*" >&2; }
 
 require() {
     command -v "$1" >/dev/null 2>&1 || err "missing required tool: $1 (install it first, then re-run)"
+}
+
+# Pure comparison: returns 0 iff $1 >= $2 by MAJOR.MINOR. The minor
+# component compares as a plain integer (so 2.31 < 2.36 < 2.100), which
+# is what semver-like glibc release numbers want. An empty $1 (no
+# detected version) returns non-zero so the caller's musl fallback
+# kicks in — better safe than handing a broken dynamic binary to a
+# host whose libc we can't read.
+version_at_least() {
+    local have="$1" need="$2"
+    [[ -n "$have" ]] || return 1
+    local have_major=${have%%.*} need_major=${need%%.*}
+    local have_minor=${have#*.} need_minor=${need#*.}
+    have_minor=${have_minor%%.*}
+    need_minor=${need_minor%%.*}
+    if   (( have_major > need_major )); then return 0
+    elif (( have_major < need_major )); then return 1
+    else                                     (( have_minor >= need_minor ))
+    fi
+}
+
+# Best-effort glibc version probe. `getconf GNU_LIBC_VERSION` is the
+# preferred source; falls back to parsing `ldd --version`'s first line.
+# Echoes a MAJOR.MINOR string, or empty if neither source produced one.
+host_glibc_version() {
+    local v
+    v=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')
+    if [[ -z "$v" ]]; then
+        v=$(ldd --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    fi
+    echo "$v"
+}
+
+# Returns 0 iff the host glibc is >= $1. Wrapper that composes
+# host_glibc_version + version_at_least so the pure comparison is
+# unit-testable without process mocks.
+glibc_at_least() {
+    version_at_least "$(host_glibc_version)" "$1"
+}
+
+# Picks `linux` vs `musllinux` for a glibc-detected host (the musl
+# branch in detect_target() short-circuits before this is called).
+# Pure — covered by the helper smoke tests; bumping REQUIRED_GLIBC
+# changes which branch a given host lands in.
+pick_linux_libc() {
+    if glibc_at_least "$REQUIRED_GLIBC"; then
+        echo "linux"
+    else
+        echo "musllinux"
+    fi
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -69,14 +127,19 @@ detect_target() {
     else
         case "$uname_s" in
             Linux)
-                # libc detection. ldd's `--version` reports glibc on
-                # glibc systems and "musl libc" on musl. The grep pipe
-                # is best-effort; on weird hosts we fall back to "linux"
-                # (glibc), which is the more common build matrix entry.
+                # libc detection. ldd --version reports "musl libc" on
+                # musl, glibc otherwise. On glibc systems we ALSO need
+                # to check the version — the `linux-*` build artifacts
+                # are built on ubuntu-latest (currently glibc 2.39) and
+                # won't run on hosts older than REQUIRED_GLIBC. Older
+                # glibc hosts get routed to the static musllinux asset.
                 if ldd --version 2>&1 | grep -qiE 'musl'; then
                     os="musllinux"
                 else
-                    os="linux"
+                    os=$(pick_linux_libc)
+                    if [[ "$os" == "musllinux" ]]; then
+                        warn "host glibc looks older than ${REQUIRED_GLIBC}; falling back to static musllinux build"
+                    fi
                 fi
                 ;;
             Darwin) os="macos" ;;
@@ -113,6 +176,24 @@ resolve_install_dir() {
     case "$target" in
         android-*) echo "${HOME}/clewdr" ;;
         *)         echo "/opt/clewdr" ;;
+    esac
+}
+
+# Returns 0 iff `clewdr service install` has a backend on this host.
+# The verb supports only systemd (Linux) and Termux:Boot (Android);
+# macOS, BSDs, and stripped-down Linux containers without systemd
+# would fail with "no supported service manager found" and leave a
+# half-installed binary. Used to gate the auto-call at the end of
+# install.sh and the matching uninstall step.
+service_supported() {
+    local target=$1
+    case "$target" in
+        android-*) return 0 ;;                       # Termux:Boot
+        linux-*|musllinux-*)
+            [[ -d /run/systemd/system ]] && return 0 # systemd
+            return 1
+            ;;
+        *) return 1 ;;                               # macOS, windows, …
     esac
 }
 
@@ -202,10 +283,19 @@ info "installed: ${BOLD}${install_dir}/${bin_name}${RESET}"
 
 # Service registration. The binary handles env detection (systemd vs
 # Termux:Boot) and the privileged setup (useradd, /etc/systemd/, etc.),
-# so this script doesn't need any per-OS branching here.
+# so this script doesn't need any per-OS branching here — but we DO
+# need to skip the call entirely when the host has no supported
+# backend (macOS, sysvinit Linux, stripped containers). Otherwise the
+# verb errors out and `set -e` aborts the script after the binary's
+# already in place.
 if [[ "$NO_SERVICE" == "1" ]]; then
     warn "skipping service registration (CLEWDR_NO_SERVICE=1)"
     info "register later with: ${install_dir}/${bin_name} service install"
+elif ! service_supported "$target"; then
+    warn "no supported service backend detected (need systemd on Linux or Termux:Boot on Android)"
+    info "skipping service registration; the binary is installed but won't autostart on reboot"
+    info "manual start: ${install_dir}/${bin_name} serve"
+    info "register later (if you set up systemd / Termux:Boot): ${install_dir}/${bin_name} service install"
 else
     info "registering service..."
     "$install_dir/$bin_name" service install

@@ -49,6 +49,25 @@ err()  { echo "${RED}${BOLD}error:${RESET} $*" >&2; exit 1; }
 info() { echo "${GREEN}${BOLD}==>${RESET} $*"; }
 warn() { echo "${YELLOW}${BOLD}warn:${RESET} $*" >&2; }
 
+# Returns 0 iff `clewdr service uninstall` has a backend it can talk
+# to on this host. Mirror of the same gate in install.sh: the verb
+# only supports systemd and Termux:Boot, and on hosts without either
+# (macOS, sysvinit Linux, containers) it errors before doing anything,
+# which would `set -e` us out of the binary cleanup that should still
+# run. Kept verbatim instead of sourced — the two scripts are
+# delivered independently and small duplication is cheaper than
+# trying to share a library file across the curl|bash entry points.
+service_supported() {
+    if [[ -n "${PREFIX:-}" && "$PREFIX" == *com.termux* ]] \
+       || [[ -d /data/data/com.termux/files/usr ]]; then
+        return 0
+    fi
+    if [[ "$(uname -s)" == "Linux" ]] && [[ -d /run/systemd/system ]]; then
+        return 0
+    fi
+    return 1
+}
+
 # Find the install dir. Honors the env override; otherwise probes the
 # two install.sh defaults in priority order. We deliberately don't
 # fall back to `which clewdr` — the binary on $PATH might be a
@@ -80,12 +99,31 @@ info "found install at ${BOLD}${install_dir}${RESET}"
 # and (with --purge) the data dir. Forwarding --purge here means the
 # data confirmation prompt runs inside the verb, where it lives next
 # to the path constants the verb already knows.
-if [[ "$PURGE" == "1" ]]; then
-    info "calling: $bin service uninstall --purge"
-    "$bin" service uninstall --purge
+#
+# Skip the call when no service backend is available (macOS, no-
+# systemd Linux, CLEWDR_NO_SERVICE installs). Otherwise the verb
+# errors out before binary removal and `set -e` aborts cleanup
+# entirely. If --purge was requested in that case, warn the operator
+# that the data path can't be reached from bash without re-deriving
+# the binary's path-resolution logic — they're better off running
+# the binary directly or deleting by hand.
+if service_supported; then
+    if [[ "$PURGE" == "1" ]]; then
+        info "calling: $bin service uninstall --purge"
+        "$bin" service uninstall --purge
+    else
+        info "calling: $bin service uninstall"
+        "$bin" service uninstall
+    fi
 else
-    info "calling: $bin service uninstall"
-    "$bin" service uninstall
+    info "no supported service backend (no systemd, not Termux); skipping \`$bin service uninstall\`."
+    if [[ "$PURGE" == "1" ]]; then
+        warn "--purge requested but the service verb's purge path isn't available here."
+        warn "delete data manually if needed; common locations:"
+        warn "  - ${install_dir}/clewdr.{toml,db}"
+        warn "  - ${install_dir}/log/"
+        warn "  - \$HOME/.local/clewdr/log/  (Termux logs)"
+    fi
 fi
 
 # 2) Remove the binary itself + the libc++_shared.so we may have
