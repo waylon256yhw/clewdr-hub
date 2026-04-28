@@ -77,6 +77,83 @@ const TABLE_DELETE_ORDER_RESTORE: &[&str] = &[
 /// `api_keys` UPSERT churn doesn't leave orphan associations behind.
 const TABLES_WIPED_EVEN_IN_MERGE: &[&str] = &["api_key_account_bindings"];
 
+/// Per-table spec used by merge mode to translate cross-table FKs and
+/// avoid binding the bundle's synthetic primary key (which would collide
+/// with any local row that happens to share the same numeric id — the
+/// common case when two independently-seeded DBs both start allocating
+/// ids from 1).
+#[derive(Debug, Clone, Copy)]
+struct TableMergeSpec {
+    /// Synthetic PK column to drop from INSERT in merge mode. `None` for
+    /// tables without a synthetic id (the natural key is the PK).
+    id_column: Option<&'static str>,
+    /// Natural key columns that form the UPSERT conflict target.
+    natural_key: &'static [&'static str],
+    /// Foreign keys: (column name, parent table). Each gets translated
+    /// from the bundle's id space to the local id space via the running
+    /// id_maps before the row is inserted.
+    fks: &'static [(&'static str, &'static str)],
+}
+
+fn merge_spec(table: &str) -> TableMergeSpec {
+    match table {
+        "policies" => TableMergeSpec {
+            id_column: Some("id"),
+            natural_key: &["name"],
+            fks: &[],
+        },
+        "users" => TableMergeSpec {
+            id_column: Some("id"),
+            natural_key: &["username"],
+            fks: &[("policy_id", "policies")],
+        },
+        "proxies" => TableMergeSpec {
+            id_column: Some("id"),
+            natural_key: &["name"],
+            fks: &[],
+        },
+        "accounts" => TableMergeSpec {
+            id_column: Some("id"),
+            natural_key: &["name"],
+            fks: &[("proxy_id", "proxies")],
+        },
+        "api_keys" => TableMergeSpec {
+            id_column: Some("id"),
+            natural_key: &["lookup_key"],
+            fks: &[("user_id", "users")],
+        },
+        "api_key_account_bindings" => TableMergeSpec {
+            id_column: None,
+            natural_key: &["api_key_id", "account_id"],
+            fks: &[("api_key_id", "api_keys"), ("account_id", "accounts")],
+        },
+        "settings" => TableMergeSpec {
+            id_column: None,
+            natural_key: &["key"],
+            fks: &[],
+        },
+        "models" => TableMergeSpec {
+            id_column: None,
+            natural_key: &["model_id"],
+            fks: &[],
+        },
+        "model_pricing" => TableMergeSpec {
+            id_column: None,
+            natural_key: &["pricing_key"],
+            fks: &[],
+        },
+        _ => TableMergeSpec {
+            id_column: None,
+            natural_key: &[],
+            fks: &[],
+        },
+    }
+}
+
+/// `parent_table → (bundle_id → local_id)` populated as merge mode imports
+/// rows in FK-parent order. Children translate their FK columns through it.
+type IdMaps = std::collections::HashMap<&'static str, std::collections::HashMap<i64, i64>>;
+
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// UPSERT each row by its UNIQUE key. Preserves rows not in the bundle.
@@ -407,6 +484,10 @@ async fn apply_tables(
         false
     };
 
+    // Per-table id maps for merge mode FK translation. Always allocated;
+    // restore mode just doesn't populate or read it.
+    let mut id_maps: IdMaps = std::collections::HashMap::new();
+
     for table in TABLE_INSERT_ORDER {
         let Some(plan) = plans.get(*table) else {
             continue;
@@ -426,8 +507,33 @@ async fn apply_tables(
                 .deleted_first = res;
         }
 
+        let spec = merge_spec(table);
+
+        // Per-mode column list:
+        //   restore  → keep `id` so bundle ids land verbatim into freshly
+        //              wiped tables (FK refs across the bundle stay
+        //              consistent because every parent / child rows share
+        //              the bundle's id space).
+        //   merge    → drop `id` from the INSERT so an existing local row
+        //              with the same numeric id but a different natural
+        //              key doesn't UNIQUE-violate. SQLite either UPDATEs
+        //              the existing row in place (preserving its local id)
+        //              or auto-allocates a fresh one. The mapping is
+        //              captured below so child tables can translate.
+        let writable: Vec<String> = if args.mode == Mode::Merge
+            && let Some(id_col) = spec.id_column
+        {
+            plan.writable
+                .iter()
+                .filter(|c| c.as_str() != id_col)
+                .cloned()
+                .collect()
+        } else {
+            plan.writable.clone()
+        };
+
         let counts = summary.per_table.entry((*table).to_string()).or_default();
-        for row in rows {
+        for bundle_row in rows {
             // Admin protection: skip the bundle's admin row only when
             // there's a *local* admin worth preserving. On `--init` or
             // any DB without an admin, we must let the bundle's admin
@@ -436,39 +542,162 @@ async fn apply_tables(
             // violate at COMMIT.
             if *table == "users"
                 && preserve_local_admin
-                && matches!(row.get("username"), Some(CellValue::Text(s)) if s == "admin")
+                && matches!(bundle_row.get("username"), Some(CellValue::Text(s)) if s == "admin")
             {
                 counts.skipped_admin += 1;
+                // Even though we didn't write this row, we still need
+                // an id_map entry so any bundled api_keys row with
+                // user_id pointing at the bundle's admin can translate
+                // to the local admin id. Without this, FK translation
+                // would fail with "no matching row in parent table".
+                if args.mode == Mode::Merge
+                    && let Some(id_col) = spec.id_column
+                    && let Some(CellValue::Integer(bundle_id)) = bundle_row.get(id_col)
+                {
+                    let local_id =
+                        capture_local_id(conn, table, spec.natural_key, bundle_row).await?;
+                    if let Some(lid) = local_id {
+                        id_maps.entry(*table).or_default().insert(*bundle_id, lid);
+                    }
+                }
                 continue;
             }
             if *table == "settings"
-                && let Some(CellValue::Text(k)) = row.get("key")
+                && let Some(CellValue::Text(k)) = bundle_row.get("key")
                 && SETTINGS_KEYS_NEVER_EXPORTED.contains(&k.as_str())
             {
                 counts.skipped_blocked_settings += 1;
                 continue;
             }
 
-            execute_row_insert(conn, table, plan, row, args.mode).await?;
+            // Merge mode FK translation: each FK column in this row gets
+            // its bundle id rewritten to the matching local id captured
+            // when we processed the parent table earlier.
+            let row_to_insert: BTreeMap<String, CellValue> =
+                if args.mode == Mode::Merge && !spec.fks.is_empty() {
+                    let mut translated = bundle_row.clone();
+                    for (fk_col, parent_table) in spec.fks {
+                        translate_fk(&mut translated, fk_col, parent_table, &id_maps)?;
+                    }
+                    translated
+                } else {
+                    bundle_row.clone()
+                };
+
+            execute_row_insert(
+                conn,
+                table,
+                &writable,
+                spec.natural_key,
+                &row_to_insert,
+                args.mode,
+            )
+            .await?;
             counts.inserted += 1;
+
+            // Capture the local id post-UPSERT so descendant tables can
+            // translate their FKs through this entry.
+            if args.mode == Mode::Merge
+                && let Some(id_col) = spec.id_column
+                && let Some(CellValue::Integer(bundle_id)) = bundle_row.get(id_col)
+            {
+                let local_id =
+                    capture_local_id(conn, table, spec.natural_key, &row_to_insert).await?;
+                if let Some(lid) = local_id {
+                    id_maps.entry(*table).or_default().insert(*bundle_id, lid);
+                }
+            }
         }
     }
     Ok(())
 }
 
+/// Rewrite a foreign-key column on `row` from a bundle id to the local id
+/// captured when the parent table was imported. Nullable FKs (NULL or
+/// missing column) are left alone; an FK that has no matching parent
+/// entry is a fatal import error — we'd rather roll back the whole
+/// transaction than smuggle an orphaned row that COMMIT would reject
+/// anyway.
+fn translate_fk(
+    row: &mut BTreeMap<String, CellValue>,
+    fk_col: &str,
+    parent_table: &str,
+    id_maps: &IdMaps,
+) -> Result<(), ClewdrError> {
+    let bundle_id = match row.get(fk_col) {
+        Some(CellValue::Integer(i)) => *i,
+        // Nullable FKs and missing columns stay as-is.
+        None | Some(CellValue::Null) => return Ok(()),
+        _ => {
+            return Err(ClewdrError::ConflictMessage {
+                msg: format!(
+                    "FK column {fk_col} has non-integer value; cannot translate during merge"
+                ),
+            });
+        }
+    };
+    let local_id = id_maps
+        .get(parent_table)
+        .and_then(|m| m.get(&bundle_id))
+        .copied();
+    match local_id {
+        Some(lid) => {
+            row.insert(fk_col.to_string(), CellValue::Integer(lid));
+            Ok(())
+        }
+        None => Err(ClewdrError::ConflictMessage {
+            msg: format!(
+                "FK {fk_col} = {bundle_id} (bundle id) has no matching row in parent table {parent_table}; \
+                 bundle is internally inconsistent"
+            ),
+        }),
+    }
+}
+
+/// Look up the local row's `id` after a merge UPSERT, so child rows can
+/// have their FK column translated. Returns `None` for tables that don't
+/// have an `id` column (junction tables, `settings`, `models`,
+/// `model_pricing`) — none of those are FK targets, so no translation is
+/// needed downstream.
+async fn capture_local_id(
+    conn: &mut SqliteConnection,
+    table: &str,
+    natural_key: &[&str],
+    row: &BTreeMap<String, CellValue>,
+) -> Result<Option<i64>, ClewdrError> {
+    if natural_key.is_empty() {
+        return Ok(None);
+    }
+    use sqlx::Row as _;
+    let where_clause = natural_key
+        .iter()
+        .map(|c| format!("{c} = ?"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql = format!("SELECT id FROM {table} WHERE {where_clause}");
+    let mut q = sqlx::query(&sql);
+    for col in natural_key {
+        let val = row.get(*col).cloned().unwrap_or(CellValue::Null);
+        q = bind_cell(q, val);
+    }
+    let row_opt = q.fetch_optional(&mut *conn).await?;
+    Ok(row_opt.and_then(|r| r.try_get::<i64, _>("id").ok()))
+}
+
 async fn execute_row_insert(
     conn: &mut SqliteConnection,
     table: &str,
-    plan: &ColumnPlan,
+    writable: &[String],
+    natural_key: &[&str],
     row: &BTreeMap<String, CellValue>,
     mode: Mode,
 ) -> Result<(), ClewdrError> {
-    if plan.writable.is_empty() {
+    if writable.is_empty() {
         return Ok(());
     }
 
-    let cols = plan.writable.join(", ");
-    let placeholders = vec!["?"; plan.writable.len()].join(", ");
+    let cols = writable.join(", ");
+    let placeholders = vec!["?"; writable.len()].join(", ");
     let sql = match mode {
         Mode::Restore => {
             // Tables were wiped first — no conflict possible. Plain INSERT
@@ -476,35 +705,16 @@ async fn execute_row_insert(
             // bundle is internally inconsistent (duplicate natural keys).
             format!("INSERT INTO {table} ({cols}) VALUES ({placeholders})")
         }
-        Mode::Merge => build_merge_upsert_sql(table, &plan.writable),
+        Mode::Merge => build_merge_upsert_sql(table, writable, natural_key),
     };
 
     let mut q = sqlx::query(&sql);
-    for col in &plan.writable {
+    for col in writable {
         let cell = row.get(col).cloned().unwrap_or(CellValue::Null);
         q = bind_cell(q, cell);
     }
     q.execute(&mut *conn).await?;
     Ok(())
-}
-
-/// Per-table UNIQUE columns that we use as the UPSERT conflict target in
-/// merge mode. Picking the natural key (rather than the synthetic id) keeps
-/// merge semantics intuitive: "row with the same name / username / model_id
-/// gets updated in place; everything else is new."
-fn merge_conflict_target(table: &str) -> &'static [&'static str] {
-    match table {
-        "policies" => &["name"],
-        "users" => &["username"],
-        "proxies" => &["name"],
-        "accounts" => &["name"],
-        "api_keys" => &["lookup_key"],
-        "api_key_account_bindings" => &["api_key_id", "account_id"],
-        "settings" => &["key"],
-        "models" => &["model_id"],
-        "model_pricing" => &["pricing_key"],
-        _ => &[],
-    }
 }
 
 /// Build the `INSERT … ON CONFLICT(natural_key) DO UPDATE SET col=excluded.col …`
@@ -516,18 +726,17 @@ fn merge_conflict_target(table: &str) -> &'static [&'static str] {
 /// then drop local-only rows that don't conflict with the bundle (e.g. a
 /// local user's local-only api_keys when merging the user). True UPSERT
 /// keeps the same row id, so cascades never fire.
-fn build_merge_upsert_sql(table: &str, cols: &[String]) -> String {
+fn build_merge_upsert_sql(table: &str, cols: &[String], natural_key: &[&str]) -> String {
     let cols_list = cols.join(", ");
     let placeholders = vec!["?"; cols.len()].join(", ");
-    let target_cols = merge_conflict_target(table);
-    if target_cols.is_empty() {
+    if natural_key.is_empty() {
         // No declared conflict target — fall back to a permissive insert.
         return format!("INSERT OR IGNORE INTO {table} ({cols_list}) VALUES ({placeholders})");
     }
-    let target = target_cols.join(", ");
+    let target = natural_key.join(", ");
     let updates: Vec<String> = cols
         .iter()
-        .filter(|c| !target_cols.contains(&c.as_str()))
+        .filter(|c| !natural_key.contains(&c.as_str()))
         .filter(|c| c.as_str() != "id") // never reassign row id on update
         .map(|c| format!("{c} = excluded.{c}"))
         .collect();
@@ -1432,6 +1641,133 @@ mod tests {
             n_accounts, 0,
             "restore left local accounts behind because bundle's accounts was empty"
         );
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn merge_translates_overlapping_ids_across_independent_dbs() {
+        // The most common merge collision: two independently-seeded DBs
+        // whose admin/policies/etc. all start at id=1. Without ID
+        // translation, the bundle's row binds id=1 for the import, the
+        // local row already holds id=1 with a different natural key,
+        // and SQLite raises `UNIQUE constraint failed: <table>.id`
+        // before the natural-key UPSERT can do anything.
+        //
+        // After the fix, merge mode drops the synthetic id from INSERT
+        // and translates FK columns through `id_maps`, so child rows
+        // pointing at the bundle's id space land on the local row that
+        // matched on natural key.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("nope.toml");
+
+        // Source DB: admin (id=1, default policy), plus a custom policy
+        // 'src-policy' (id=2) and a non-admin user 'bob' (id=2,
+        // policy_id=2 → 'src-policy'). bob also has an api_key whose
+        // user_id=2.
+        let src_db = dir.path().join("src.db");
+        let pool = crate::db::init_pool(&src_db).await.unwrap();
+        crate::db::seed_admin(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO policies (name, max_concurrent, rpm_limit, weekly_budget_nanousd, monthly_budget_nanousd)
+             VALUES ('src-policy', 4, 20, 1000000, 5000000)",
+        )
+        .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO users (username, role, policy_id) VALUES ('bob', 'member', 2)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO api_keys (user_id, label, lookup_key, key_hash, plaintext_key)
+             VALUES (2, 'bob-key', 'sk-bob', X'BBBB', 'sk-bob-secret')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let bundle_path = dir.path().join("bundle.json");
+        let bundle = build_bundle(&src_db, &cfg_path, &export_args(bundle_path.clone()))
+            .await
+            .unwrap();
+
+        // Target DB: same id space, *different* content. admin id=1,
+        // 'tgt-policy' (id=2), 'carol' user (id=2, policy_id=2 →
+        // 'tgt-policy'). The deliberately overlapping ids are exactly
+        // the case that broke the previous implementation.
+        let tgt_db = dir.path().join("tgt.db");
+        let pool = crate::db::init_pool(&tgt_db).await.unwrap();
+        crate::db::seed_admin(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO policies (name, max_concurrent, rpm_limit, weekly_budget_nanousd, monthly_budget_nanousd)
+             VALUES ('tgt-policy', 6, 40, 2000000, 8000000)",
+        )
+        .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO users (username, role, policy_id) VALUES ('carol', 'member', 2)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        // Merge bundle into target.
+        let pool = crate::db::open_existing_pool(&tgt_db).await.unwrap();
+        apply_bundle(&pool, &bundle, &import_args(bundle_path, Mode::Merge))
+            .await
+            .unwrap();
+
+        // Both policies survive — no UNIQUE id collision blew up the import.
+        let policy_names: Vec<String> = sqlx::query_as("SELECT name FROM policies ORDER BY name")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(n,): (String,)| n)
+            .collect();
+        assert!(
+            policy_names.contains(&"src-policy".to_string())
+                && policy_names.contains(&"tgt-policy".to_string()),
+            "expected both policies to survive merge, got {policy_names:?}"
+        );
+
+        // Both users (bob and carol) coexist.
+        let user_names: Vec<String> =
+            sqlx::query_as("SELECT username FROM users ORDER BY username")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(n,): (String,)| n)
+                .collect();
+        assert_eq!(user_names, vec!["admin", "bob", "carol"]);
+
+        // bob's policy_id was translated through id_maps[policies] so it
+        // now points at the *local* id of `src-policy`, not the bundle's
+        // original id=2 (which clashed with `tgt-policy`).
+        let (bob_policy,): (String,) = sqlx::query_as(
+            "SELECT p.name FROM users u JOIN policies p ON p.id = u.policy_id WHERE u.username = 'bob'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(bob_policy, "src-policy");
+
+        // carol still references her local tgt-policy.
+        let (carol_policy,): (String,) = sqlx::query_as(
+            "SELECT p.name FROM users u JOIN policies p ON p.id = u.policy_id WHERE u.username = 'carol'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(carol_policy, "tgt-policy");
+
+        // bob's api_key.user_id was translated too: it lands on bob's
+        // local id, not on whichever id=2 row happened to be there.
+        let (key_owner,): (String,) = sqlx::query_as(
+            "SELECT u.username FROM api_keys k JOIN users u ON u.id = k.user_id WHERE k.label = 'bob-key'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(key_owner, "bob");
         pool.close().await;
     }
 
