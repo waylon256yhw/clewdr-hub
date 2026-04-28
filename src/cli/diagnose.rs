@@ -11,7 +11,7 @@
 //! that `ClewdrConfig::new()` spawns.
 
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -71,7 +71,7 @@ async fn run_all_checks() -> Vec<CheckResult> {
     let mut out = Vec::with_capacity(10);
     out.push(check_binary());
     out.push(check_platform());
-    out.push(check_config());
+    out.push(check_config(&cfg));
     out.push(check_database(&cfg).await);
     out.push(check_session(&cfg).await);
     out.push(check_port(&cfg).await);
@@ -166,11 +166,22 @@ impl DiagConfig {
     fn bind_address(&self) -> SocketAddr {
         SocketAddr::new(self.ip(), self.port())
     }
-    /// Address used by the local HTTP probe. Bind IP may be `0.0.0.0`, but
-    /// we always probe via loopback since that's where the running server
-    /// answers from the same host.
+    /// Address used by the local HTTP probe.
+    ///
+    /// For wildcard binds (`0.0.0.0` / `::`) we substitute the matching
+    /// loopback because the running server answers on every interface,
+    /// including loopback. For explicit binds (LAN address, `[::1]`) we
+    /// preserve the configured IP — otherwise a server on
+    /// `192.168.1.10:8484` or `[::1]:8484` would silently fail this probe
+    /// and get downgraded to `PORT_OCCUPIED_UNKNOWN` once the bind retry
+    /// also fails to reclaim the address.
     fn probe_address(&self) -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.port())
+        let probe_ip = match self.ip() {
+            IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            other => other,
+        };
+        SocketAddr::new(probe_ip, self.port())
     }
 }
 
@@ -232,7 +243,18 @@ fn check_platform() -> CheckResult {
     }
 }
 
-fn check_config() -> CheckResult {
+fn check_config(cfg: &DiagConfig) -> CheckResult {
+    if cfg.no_fs() {
+        // In `no_fs` mode the operator is configuring entirely through
+        // env vars (CLEWDR_*) — there's no on-disk clewdr.toml to look
+        // for. Emitting a WARN here would be a false positive for healthy
+        // HF Space deployments.
+        return CheckResult {
+            id: "config",
+            status: Status::Ok,
+            detail: "skipped — no_fs mode (env-driven config)".to_string(),
+        };
+    }
     let path = CONFIG_PATH.as_path();
     if !path.exists() {
         return CheckResult {
@@ -284,7 +306,7 @@ async fn check_database(cfg: &DiagConfig) -> CheckResult {
             ),
         };
     }
-    let pool = match crate::db::open_existing_pool(path).await {
+    let pool = match crate::db::open_readonly_pool(path).await {
         Ok(p) => p,
         Err(e) => {
             return CheckResult {
@@ -356,7 +378,7 @@ async fn check_session(cfg: &DiagConfig) -> CheckResult {
             detail: "skipped: database missing".to_string(),
         };
     }
-    let pool = match crate::db::open_existing_pool(path).await {
+    let pool = match crate::db::open_readonly_pool(path).await {
         Ok(p) => p,
         Err(e) => {
             return CheckResult {
@@ -719,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn diag_config_probe_uses_loopback_even_when_bind_is_wildcard() {
+    fn diag_config_probe_address_substitutes_wildcard_with_loopback_v4() {
         let cfg = DiagConfig {
             ip: Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
             port: Some(9000),
@@ -733,6 +755,56 @@ mod tests {
             cfg.probe_address(),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000)
         );
+    }
+
+    #[test]
+    fn diag_config_probe_address_substitutes_wildcard_with_loopback_v6() {
+        let cfg = DiagConfig {
+            ip: Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            port: Some(9000),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.probe_address(),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9000)
+        );
+    }
+
+    #[test]
+    fn diag_config_probe_address_preserves_explicit_v4() {
+        // A LAN-bound server (192.168.x.y) does not answer on loopback;
+        // probing 127.0.0.1 would falsely report PORT_OCCUPIED_UNKNOWN.
+        let lan = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+        let cfg = DiagConfig {
+            ip: Some(lan),
+            port: Some(8484),
+            ..Default::default()
+        };
+        assert_eq!(cfg.probe_address(), SocketAddr::new(lan, 8484));
+    }
+
+    #[test]
+    fn diag_config_probe_address_preserves_explicit_v6_loopback() {
+        // Bind to [::1] explicitly: do not "rewrite" to 127.0.0.1 — the
+        // server only answers on the v6 loopback in that case.
+        let v6_loop = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let cfg = DiagConfig {
+            ip: Some(v6_loop),
+            port: Some(8484),
+            ..Default::default()
+        };
+        assert_eq!(cfg.probe_address(), SocketAddr::new(v6_loop, 8484));
+    }
+
+    #[test]
+    fn check_config_skips_in_no_fs_mode() {
+        let cfg = DiagConfig {
+            no_fs: Some(true),
+            ..Default::default()
+        };
+        let r = check_config(&cfg);
+        assert_eq!(r.status, Status::Ok);
+        assert!(r.detail.contains("no_fs"));
     }
 
     #[tokio::test]

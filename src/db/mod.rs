@@ -23,6 +23,44 @@ use crate::error::ClewdrError;
 const ADMIN_PASSWORD_ENV: &str = "ADMIN_PASSWORD";
 const MAX_CONNECTIONS: u32 = 5;
 
+/// Opens an existing SQLite database in **read-only** mode without running
+/// any migrations.
+///
+/// Use this for verbs advertised as side-effect-free (`diagnose`, `status`,
+/// future `export-config` probes). It differs from
+/// [`open_existing_pool`] in three load-bearing ways:
+///
+/// 1. SQLite is opened with `mode=ro`, so any attempted write fails fast
+///    instead of silently advancing the WAL.
+/// 2. `sqlx::migrate!()` is **not** invoked. An older on-disk DB stays at
+///    its original schema; we'd rather have a stale schema for diagnostics
+///    than have a "read-only" verb mutate a backup file.
+/// 3. The pool is sized to one connection — diagnostics are sequential and
+///    we want the smallest possible footprint while a server may be
+///    attached to the same DB on a separate connection.
+///
+/// `:memory:` is supported for tests.
+pub async fn open_readonly_pool(db_path: &Path) -> Result<SqlitePool, ClewdrError> {
+    let is_memory = db_path.to_str().is_some_and(|s| s.contains(":memory:"));
+    if !is_memory && !db_path.exists() {
+        return Err(ClewdrError::DbNotFound {
+            path: db_path.to_path_buf(),
+        });
+    }
+
+    let options = SqliteConnectOptions::new()
+        .filename(db_path)
+        .read_only(true)
+        .create_if_missing(false)
+        .pragma("busy_timeout", "5000");
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    Ok(pool)
+}
+
 pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, ClewdrError> {
     let is_memory = db_path.to_str().is_some_and(|s| s.contains(":memory:"));
 
@@ -334,6 +372,66 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("query");
+    }
+
+    #[tokio::test]
+    async fn open_readonly_pool_rejects_writes_and_skips_migrations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ro.db");
+        // Seed via init_pool so the file has a valid schema.
+        {
+            let pool = init_pool(&path).await.expect("init_pool");
+            pool.close().await;
+        }
+
+        // Capture the migration count before opening read-only — open should
+        // not insert new migration rows.
+        let pre_count: i64 = {
+            let pool = open_existing_pool(&path).await.expect("open existing");
+            let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations")
+                .fetch_one(&pool)
+                .await
+                .expect("count migrations");
+            pool.close().await;
+            n
+        };
+
+        let pool = open_readonly_pool(&path).await.expect("open readonly");
+
+        // Reads work.
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(&pool)
+            .await
+            .expect("read migrations");
+        assert_eq!(n, pre_count);
+
+        // PRAGMA integrity_check is read-only — must work.
+        let (s,): (String,) = sqlx::query_as("PRAGMA integrity_check")
+            .fetch_one(&pool)
+            .await
+            .expect("integrity_check");
+        assert_eq!(s, "ok");
+
+        // Writes must be rejected by SQLite — proves the connection is RO.
+        let write_res = sqlx::query("CREATE TABLE diag_should_fail (x INTEGER)")
+            .execute(&pool)
+            .await;
+        assert!(
+            write_res.is_err(),
+            "open_readonly_pool let a write through: {write_res:?}"
+        );
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn open_readonly_pool_rejects_missing_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("nope.db");
+        match open_readonly_pool(&missing).await {
+            Err(ClewdrError::DbNotFound { path }) => assert_eq!(path, missing),
+            other => panic!("expected DbNotFound, got {other:?}"),
+        }
+        assert!(!missing.exists());
     }
 
     #[tokio::test]
