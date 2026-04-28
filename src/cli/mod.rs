@@ -9,6 +9,7 @@
 //! config writeback in `ClewdrConfig::new()`.
 
 pub mod bundle;
+pub mod crypto;
 pub mod diagnose;
 pub mod export;
 pub mod import;

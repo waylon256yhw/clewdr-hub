@@ -94,6 +94,7 @@ rand = { version = "0.10.0", features = ["std_rng"] }
 hmac = "0.12"
 rpassword = "7"
 semver = "1"
+aes-gcm = { version = "0.10", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 enable-ansi-support = "0.3"
@@ -115,7 +116,7 @@ embed-resource = ["dep:tower-serve-static", "dep:include_dir"]
 external-resource = ["tower-http/fs"]
 mimalloc = ["dep:mimalloc"]
 dhat-heap = ["dep:dhat"]
-# Encrypted export/import bundle (placeholder — wired up in commit #8).
-encrypt = []
+# Encrypted export/import bundle (Argon2id KDF + AES-256-GCM).
+encrypt = ["dep:aes-gcm"]
 # Interactive TUI menu (placeholder — wired up in commit #11).
 tui = []

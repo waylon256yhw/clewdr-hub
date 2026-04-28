@@ -37,6 +37,7 @@ use crate::{
         BUNDLE_VERSION, Bundle, CellValue, NEVER_EXPORTED, RUNTIME_TABLES,
         SETTINGS_KEYS_NEVER_EXPORTED, TableSchema, read_table_schema as read_db_schema,
     },
+    cli::crypto,
     config::{CONFIG_PATH, DB_PATH},
     error::ClewdrError,
 };
@@ -226,7 +227,7 @@ pub async fn run(args: Args) -> Result<(), ClewdrError> {
     }
 
     let raw = fs::read(&args.path)?;
-    let bundle = parse_bundle(&raw)?;
+    let bundle = parse_bundle(&raw, args.passphrase_stdin)?;
     check_version_compatibility(&bundle, args.force)?;
     detect_redacted_bundle(&bundle)?;
 
@@ -257,14 +258,23 @@ pub async fn run(args: Args) -> Result<(), ClewdrError> {
 // Bundle parsing + version compat
 // ──────────────────────────────────────────────────────────────────────────
 
-const ENCRYPTED_BUNDLE_MAGIC: &[u8] = b"CLWDR1\0";
-
-fn parse_bundle(raw: &[u8]) -> Result<Bundle, ClewdrError> {
-    if raw.starts_with(ENCRYPTED_BUNDLE_MAGIC) {
-        return Err(ClewdrError::BadRequest {
-            msg: "encrypted bundles are supported in a follow-up commit",
-        });
+/// Read a bundle (encrypted or plaintext) into the in-memory [`Bundle`].
+///
+/// The encrypted path matches on [`crypto::ENCRYPTED_BUNDLE_MAGIC`] and
+/// asks [`crypto::read_import_passphrase`] for the passphrase before
+/// handing the ciphertext to [`crypto::decrypt_bundle`]. The plaintext
+/// path runs `serde_json::from_slice` directly. Either way we end up
+/// validating `version` against [`BUNDLE_VERSION`] before returning.
+fn parse_bundle(raw: &[u8], passphrase_stdin: bool) -> Result<Bundle, ClewdrError> {
+    if raw.starts_with(crypto::ENCRYPTED_BUNDLE_MAGIC) {
+        let pwd = crypto::read_import_passphrase(passphrase_stdin)?;
+        let plaintext = crypto::decrypt_bundle(raw, &pwd)?;
+        return parse_plaintext_bundle(&plaintext);
     }
+    parse_plaintext_bundle(raw)
+}
+
+fn parse_plaintext_bundle(raw: &[u8]) -> Result<Bundle, ClewdrError> {
     let bundle: Bundle = serde_json::from_slice(raw)?;
     if bundle.version != BUNDLE_VERSION {
         return Err(ClewdrError::BadRequest {
@@ -1345,10 +1355,43 @@ mod tests {
     }
 
     #[test]
-    fn parse_bundle_rejects_encrypted_magic() {
-        let mut buf = ENCRYPTED_BUNDLE_MAGIC.to_vec();
+    fn parse_plaintext_bundle_rejects_encrypted_magic() {
+        // Feeding raw encrypted bytes to the plaintext parser must fail at
+        // serde_json — the magic byte sequence is not valid JSON.
+        let mut buf = crypto::ENCRYPTED_BUNDLE_MAGIC.to_vec();
         buf.extend_from_slice(&[0u8; 64]);
-        assert!(parse_bundle(&buf).is_err());
+        assert!(parse_plaintext_bundle(&buf).is_err());
+    }
+
+    #[cfg(feature = "encrypt")]
+    #[tokio::test]
+    async fn encrypted_bundle_round_trips_through_crypto_helpers() {
+        // End-to-end: build a real bundle, encrypt it with crypto::encrypt_bundle,
+        // then feed the ciphertext through crypto::decrypt_bundle +
+        // parse_plaintext_bundle and verify we get the same Bundle back.
+        // (parse_bundle's TTY/stdin path can't be exercised in `cargo test`
+        // — there's no stdin attached — so we drive the helpers directly.)
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("nope.toml");
+        let src_db = seeded_db(&dir).await;
+        let bundle_path = dir.path().join("bundle.json");
+        let bundle = build_bundle(&src_db, &cfg_path, &export_args(bundle_path.clone()))
+            .await
+            .unwrap();
+
+        let json = serde_json::to_vec(&bundle).unwrap();
+        let ciphertext = crypto::encrypt_bundle(&json, "round-trip-passphrase").unwrap();
+        assert!(ciphertext.starts_with(crypto::ENCRYPTED_BUNDLE_MAGIC));
+
+        let decrypted = crypto::decrypt_bundle(&ciphertext, "round-trip-passphrase").unwrap();
+        let restored = parse_plaintext_bundle(&decrypted).unwrap();
+        assert_eq!(restored.version, bundle.version);
+        assert_eq!(restored.clewdr_version, bundle.clewdr_version);
+        assert_eq!(restored.tables.len(), bundle.tables.len());
+
+        // Wrong passphrase: AEAD authentication failure surfaces as
+        // BadRequest, not as a JSON parse error.
+        assert!(crypto::decrypt_bundle(&ciphertext, "different-passphrase").is_err());
     }
 
     // ──────────────────────────────────────────────────────────────────

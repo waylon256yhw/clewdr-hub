@@ -1,8 +1,10 @@
 //! `clewdr export-config` — dump config + selected db tables to a portable bundle.
 //!
-//! Default output is a plaintext JSON bundle (encryption arrives in a later
-//! commit). Files are written with mode 0600 and an atomic rename so a
-//! crash mid-write doesn't leave a half-written secret on disk.
+//! Default output is an Argon2id-derived AES-256-GCM-encrypted bundle (see
+//! [`crate::cli::crypto`] for the wire format). `--no-encrypt` keeps the
+//! plaintext JSON form — written with mode 0600, atomic rename, and a
+//! stern stderr warning so the operator knows the file carries unwrapped
+//! cookies and OAuth tokens.
 //!
 //! What goes in the bundle is decided by [`crate::cli::bundle`] — that
 //! module owns the table list, the secret-column allowlist, and the
@@ -24,6 +26,7 @@ use crate::{
         drop_blocked_settings_rows, read_table_rows, read_table_schema, redact_secrets_in_place,
         secret_columns_for,
     },
+    cli::crypto,
     config::{CONFIG_PATH, DB_PATH},
     error::ClewdrError,
 };
@@ -67,53 +70,69 @@ pub async fn run(args: Args) -> Result<(), ClewdrError> {
         });
     }
 
-    // Encryption is implemented in a follow-up commit. Until that lands,
-    // every export goes out plaintext — but with stern warnings and
-    // 0600 file mode. The flag still parses so the CLI surface doesn't
-    // change between this commit and the encryption one.
-    let encryption_implemented = false;
-    if !encryption_implemented && !args.no_encrypt {
-        eprintln!(
-            "{}",
-            "note: encryption is not yet implemented; this bundle will be written in plaintext."
-                .yellow()
-        );
-        eprintln!(
-            "      Pass --no-encrypt to silence this hint, or wait for the encrypted-export commit."
-        );
-    }
-
     let db_path = DB_PATH.to_owned();
     let cfg_path = CONFIG_PATH.to_owned();
     let out_path = args.path.clone();
 
+    // Resolve the passphrase up front when encrypting. Doing this *before*
+    // building the bundle means a missing TTY / mismatched confirmation
+    // bails without doing the (read-locked) DB pass.
+    let passphrase = if args.no_encrypt {
+        None
+    } else {
+        Some(crypto::read_export_passphrase(args.passphrase_stdin)?)
+    };
+
     let bundle = build_bundle(&db_path, &cfg_path, &args).await?;
     let json = serde_json::to_vec_pretty(&bundle)?;
 
-    write_secret_file(&out_path, &json)?;
+    let payload = match passphrase.as_deref() {
+        Some(pwd) => crypto::encrypt_bundle(&json, pwd)?,
+        None => json,
+    };
+    let payload_len = payload.len();
+
+    write_secret_file(&out_path, &payload)?;
 
     let n_tables = bundle.tables.len();
     let n_rows: usize = bundle.tables.values().map(Vec::len).sum();
     eprintln!(
-        "{} wrote {} ({} bytes, {} table(s), {} row(s))",
+        "{} wrote {} ({} bytes, {} table(s), {} row(s), {})",
         "✓".green().bold(),
         out_path.display(),
-        json.len(),
+        payload_len,
         n_tables,
-        n_rows
+        n_rows,
+        if passphrase.is_some() {
+            "encrypted".green().to_string()
+        } else {
+            "plaintext".yellow().bold().to_string()
+        },
     );
 
-    if !args.no_secrets {
+    if args.no_encrypt {
+        if !args.no_secrets {
+            eprintln!(
+                "{}",
+                "WARNING: bundle contains session cookies, OAuth refresh tokens, and proxy credentials in plaintext."
+                    .yellow()
+                    .bold()
+            );
+            eprintln!(
+                "  File mode is 0600. Treat this file with the same care as a password vault export."
+            );
+            eprintln!(
+                "  Use --no-secrets to strip them, or drop --no-encrypt for AES-GCM encryption."
+            );
+        } else {
+            eprintln!(
+                "  Wrote plaintext JSON with secrets stripped (--no-secrets). File mode is 0600."
+            );
+        }
+    } else {
         eprintln!(
-            "{}",
-            "WARNING: bundle contains session cookies, OAuth refresh tokens, and proxy credentials in plaintext."
-                .yellow()
-                .bold()
+            "  Encrypted with Argon2id + AES-256-GCM. Keep the passphrase safe — without it the bundle is unrecoverable."
         );
-        eprintln!(
-            "  File mode is 0600. Treat this file with the same care as a password vault export."
-        );
-        eprintln!("  Use --no-secrets to strip them, or wait for the encrypted-export commit.");
     }
     Ok(())
 }
