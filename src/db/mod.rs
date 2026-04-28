@@ -284,12 +284,23 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("nope.db");
         let res = open_existing_pool(&missing).await;
-        match res {
-            Err(ClewdrError::DbNotFound { path }) => assert_eq!(path, missing),
+        match &res {
+            Err(ClewdrError::DbNotFound { path }) => assert_eq!(path, &missing),
             other => panic!("expected DbNotFound, got {other:?}"),
         }
         // The bad path must not have been created as a side effect.
         assert!(!missing.exists(), "open_existing_pool created {missing:?}");
+        // The user-facing message must not point at flags that don't apply
+        // to every CLI verb (e.g. --init only exists on import-config).
+        let rendered = res.unwrap_err().to_string();
+        assert!(
+            !rendered.contains("--init"),
+            "DbNotFound message should not suggest --init: {rendered}"
+        );
+        assert!(
+            rendered.contains("clewdr serve") || rendered.contains("--db"),
+            "DbNotFound message should suggest a generic recovery: {rendered}"
+        );
     }
 
     #[tokio::test]

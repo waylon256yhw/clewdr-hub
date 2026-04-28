@@ -175,7 +175,7 @@ pub enum ClewdrError {
     #[snafu(display("Not found: {}", msg))]
     NotFound { msg: &'static str },
     #[snafu(display(
-        "Database not found at {} — pass --init to create it, or run `clewdr serve` first",
+        "Database not found at {}. Check the --db path, or run `clewdr serve` first to create a fresh database at the default location.",
         path.display()
     ))]
     DbNotFound { path: std::path::PathBuf },
