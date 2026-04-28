@@ -20,7 +20,7 @@ import {
   useComputedColorScheme,
 } from "@mantine/core";
 import { Notifications } from "@mantine/notifications";
-import { useDisclosure } from "@mantine/hooks";
+import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { Routes, Route, Navigate, useLocation, Link } from "react-router";
 import { Component, Suspense, lazy, useEffect, useRef, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -132,17 +132,17 @@ const NAV_ITEMS = [
   { label: "运维", path: "/ops", icon: IconActivity },
 ];
 
-function ColorSchemeToggle() {
+function ColorSchemeToggle({ size = "lg", iconSize = 18 }: { size?: "md" | "lg"; iconSize?: number }) {
   const { setColorScheme } = useMantineColorScheme();
   const computed = useComputedColorScheme("light");
   return (
     <ActionIcon
       variant="default"
-      size="lg"
+      size={size}
       onClick={() => setColorScheme(computed === "light" ? "dark" : "light")}
       aria-label="切换主题"
     >
-      {computed === "light" ? <IconMoon size={18} /> : <IconSun size={18} />}
+      {computed === "light" ? <IconMoon size={iconSize} /> : <IconSun size={iconSize} />}
     </ActionIcon>
   );
 }
@@ -227,6 +227,10 @@ function AdminShell() {
   const { logout } = useAuth();
   useGlobalAdminEvents();
   const version = useFrontendVersionSync();
+  const compactHeader = useMediaQuery("(max-width: 36em)");
+  const headerActionSize = compactHeader ? "md" : "lg";
+  const headerIconSize = compactHeader ? 17 : 18;
+  const logoSize = compactHeader ? 26 : 28;
 
   return (
     <AppShell
@@ -235,32 +239,44 @@ function AdminShell() {
       padding="md"
     >
       <AppShell.Header>
-        <Group h="100%" px="md" justify="space-between">
-          <Group gap="xs">
+        <Group
+          h="100%"
+          px={compactHeader ? "xs" : "md"}
+          gap={compactHeader ? 6 : "md"}
+          justify="space-between"
+          wrap="nowrap"
+        >
+          <Group gap="xs" wrap="nowrap" style={{ minWidth: 0, flex: "1 1 auto", overflow: "hidden" }}>
             <Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
-            <img src="/logo.svg" alt="" width={28} height={28} />
-            <Title order={4}>clewdr-hub</Title>
+            <img src="/logo.svg" alt="" width={logoSize} height={logoSize} style={{ flexShrink: 0 }} />
+            <Title order={4} visibleFrom="xs">clewdr-hub</Title>
             {version && (
-              <Badge size="sm" radius="sm" variant="gradient" gradient={{ from: "cyan", to: "blue" }}>
+              <Badge
+                size="sm"
+                radius="sm"
+                variant="gradient"
+                gradient={{ from: "cyan", to: "blue" }}
+                style={{ flexShrink: 0 }}
+              >
                 {version}
               </Badge>
             )}
           </Group>
-          <Group gap="xs">
-            <ColorSchemeToggle />
+          <Group gap={compactHeader ? 4 : "xs"} wrap="nowrap" style={{ flex: "0 0 auto" }}>
+            <ColorSchemeToggle size={headerActionSize} iconSize={headerIconSize} />
             <ActionIcon
               component="a"
               href="https://github.com/waylon256yhw/clewdr-hub"
               target="_blank"
               rel="noreferrer"
               variant="default"
-              size="lg"
+              size={headerActionSize}
               aria-label="打开 GitHub 仓库"
             >
-              <IconBrandGithub size={18} />
+              <IconBrandGithub size={headerIconSize} />
             </ActionIcon>
-            <ActionIcon variant="default" size="lg" onClick={logout} aria-label="退出登录">
-              <IconLogout size={18} />
+            <ActionIcon variant="default" size={headerActionSize} onClick={logout} aria-label="退出登录">
+              <IconLogout size={headerIconSize} />
             </ActionIcon>
           </Group>
         </Group>
