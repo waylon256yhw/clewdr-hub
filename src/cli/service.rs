@@ -141,8 +141,8 @@ mod systemd {
     const SERVICE_GROUP: &str = "clewdr";
     const WORKING_DIR: &str = "/opt/clewdr";
     const LOG_DIR: &str = "/opt/clewdr/log";
-    const PURGE_DB_PATH: &str = "/opt/clewdr/clewdr.db";
-    const PURGE_CONFIG_PATH: &str = "/opt/clewdr/clewdr.toml";
+    const SERVICE_DB_PATH: &str = "/opt/clewdr/clewdr.db";
+    const SERVICE_CONFIG_PATH: &str = "/opt/clewdr/clewdr.toml";
     pub async fn install() -> Result<(), ClewdrError> {
         require_root("install systemd unit")?;
         ensure_user_exists()?;
@@ -190,8 +190,8 @@ mod systemd {
 
         if purge {
             super::purge_data(&[
-                Path::new(PURGE_DB_PATH),
-                Path::new(PURGE_CONFIG_PATH),
+                Path::new(SERVICE_DB_PATH),
+                Path::new(SERVICE_CONFIG_PATH),
                 Path::new(LOG_DIR),
             ])?;
         }
@@ -234,8 +234,8 @@ mod systemd {
             group = SERVICE_GROUP,
             workdir = WORKING_DIR,
             binary = binary.display(),
-            config = PURGE_CONFIG_PATH,
-            db = PURGE_DB_PATH,
+            config = SERVICE_CONFIG_PATH,
+            db = SERVICE_DB_PATH,
             log_dir = LOG_DIR,
         )
     }
@@ -244,12 +244,9 @@ mod systemd {
         if super::is_root() {
             return Ok(());
         }
-        Err(ClewdrError::BadRequest {
-            msg: Box::leak(
-                format!(
-                    "must run as root to {action} (try `sudo clewdr service install` / `... uninstall`)"
-                )
-                .into_boxed_str(),
+        Err(ClewdrError::BadRequestMessage {
+            msg: format!(
+                "must run as root to {action} (try `sudo clewdr service install` / `... uninstall`)"
             ),
         })
     }
@@ -316,18 +313,16 @@ mod systemd {
     fn run_systemctl(args: &[&str]) -> Result<(), ClewdrError> {
         let status = Command::new("systemctl").args(args).status()?;
         if !status.success() {
-            return Err(ClewdrError::BadRequest {
-                msg: Box::leak(
-                    format!("systemctl {} returned non-zero", args.join(" ")).into_boxed_str(),
-                ),
+            return Err(ClewdrError::BadRequestMessage {
+                msg: format!("systemctl {} returned non-zero", args.join(" ")),
             });
         }
         Ok(())
     }
 
     fn current_exe() -> Result<PathBuf, ClewdrError> {
-        env::current_exe().map_err(|e| ClewdrError::BadRequest {
-            msg: Box::leak(format!("cannot determine current binary path: {e}").into_boxed_str()),
+        env::current_exe().map_err(|e| ClewdrError::BadRequestMessage {
+            msg: format!("cannot determine current binary path: {e}"),
         })
     }
 }
@@ -345,18 +340,15 @@ mod termux {
         let home = home_dir()?;
         let boot_dir = home.join(".termux/boot");
         if !boot_dir.exists() {
-            return Err(ClewdrError::BadRequest {
-                msg: Box::leak(
-                    format!(
-                        "~/.termux/boot/ not found — install the Termux:Boot app from F-Droid: {F_DROID_HINT}"
-                    )
-                    .into_boxed_str(),
+            return Err(ClewdrError::BadRequestMessage {
+                msg: format!(
+                    "~/.termux/boot/ not found — install the Termux:Boot app from F-Droid: {F_DROID_HINT}"
                 ),
             });
         }
         let script_path = boot_dir.join("clewdr-hub");
-        let binary = env::current_exe().map_err(|e| ClewdrError::BadRequest {
-            msg: Box::leak(format!("cannot resolve current exe: {e}").into_boxed_str()),
+        let binary = env::current_exe().map_err(|e| ClewdrError::BadRequestMessage {
+            msg: format!("cannot resolve current exe: {e}"),
         })?;
         let log_dir = home.join(".local/clewdr/log");
         let contents = boot_script_contents(&binary, &log_dir);

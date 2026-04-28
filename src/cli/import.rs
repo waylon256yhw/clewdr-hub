@@ -6,8 +6,10 @@
 //!   rows that do conflict are replaced. The local admin row is preserved
 //!   unless `--overwrite-admin` is set.
 //! - `--mode restore --yes`: truncate every config-like table, then
-//!   re-insert from the bundle verbatim (including ids). The `--yes`
-//!   guard is mandatory because this destroys local data.
+//!   re-insert from the bundle. Bundle ids are kept verbatim unless the
+//!   local admin row is being preserved, in which case ids are translated
+//!   so foreign keys point at the preserved admin. The `--yes` guard is
+//!   mandatory because this destroys local data.
 //!
 //! Schema diff is permissive but explicit: extra bundle columns are
 //! warned and dropped; missing bundle columns let the DB default fire,
@@ -33,8 +35,8 @@ use sqlx::{SqliteConnection, SqlitePool};
 
 use crate::{
     cli::bundle::{
-        BUNDLE_VERSION, Bundle, CellValue, NEVER_EXPORTED, RUNTIME_TABLES,
-        SETTINGS_KEYS_NEVER_EXPORTED, TableSchema, read_table_schema as read_db_schema,
+        BUNDLE_VERSION, Bundle, CellValue, NEVER_EXPORTED, SETTINGS_KEYS_NEVER_EXPORTED,
+        TableSchema, read_table_schema as read_db_schema,
     },
     cli::crypto,
     config::{CONFIG_PATH, DB_PATH},
@@ -51,22 +53,28 @@ const TABLE_INSERT_ORDER: &[&str] = &[
     "proxies",
     "users",
     "accounts",
+    "account_runtime_state",
     "api_keys",
     "api_key_account_bindings",
     "settings",
     "models",
     "model_pricing",
+    "usage_rollups",
+    "usage_lifetime_totals",
 ];
 
 /// Tables wiped at the start of `--mode restore`. Reverse FK order so each
 /// child's rows are gone before its parent's, even though deferred FKs
 /// would also accept any delete order.
 const TABLE_DELETE_ORDER_RESTORE: &[&str] = &[
+    "usage_lifetime_totals",
+    "usage_rollups",
     "model_pricing",
     "models",
     "settings",
     "api_key_account_bindings",
     "api_keys",
+    "account_runtime_state",
     "accounts",
     "users",
     "proxies",
@@ -128,6 +136,11 @@ fn merge_spec(table: &str) -> TableMergeSpec {
             natural_key: &["api_key_id", "account_id"],
             fks: &[("api_key_id", "api_keys"), ("account_id", "accounts")],
         },
+        "account_runtime_state" => TableMergeSpec {
+            id_column: None,
+            natural_key: &["account_id"],
+            fks: &[("account_id", "accounts")],
+        },
         "settings" => TableMergeSpec {
             id_column: None,
             natural_key: &["key"],
@@ -142,6 +155,16 @@ fn merge_spec(table: &str) -> TableMergeSpec {
             id_column: Some("id"),
             natural_key: &["pricing_key"],
             fks: &[],
+        },
+        "usage_rollups" => TableMergeSpec {
+            id_column: Some("id"),
+            natural_key: &["user_id", "period_type", "period_start"],
+            fks: &[("user_id", "users")],
+        },
+        "usage_lifetime_totals" => TableMergeSpec {
+            id_column: None,
+            natural_key: &["user_id"],
+            fks: &[("user_id", "users")],
         },
         _ => TableMergeSpec {
             id_column: None,
@@ -277,8 +300,18 @@ fn parse_bundle(raw: &[u8], passphrase_stdin: bool) -> Result<Bundle, ClewdrErro
 fn parse_plaintext_bundle(raw: &[u8]) -> Result<Bundle, ClewdrError> {
     let bundle: Bundle = serde_json::from_slice(raw)?;
     if bundle.version != BUNDLE_VERSION {
-        return Err(ClewdrError::BadRequest {
-            msg: "unsupported bundle version",
+        return Err(ClewdrError::BadRequestMessage {
+            msg: if bundle.version > BUNDLE_VERSION {
+                format!(
+                    "unsupported bundle version {} (this clewdr reads version {}); upgrade clewdr to import this bundle",
+                    bundle.version, BUNDLE_VERSION
+                )
+            } else {
+                format!(
+                    "unsupported bundle version {} (this clewdr reads version {})",
+                    bundle.version, BUNDLE_VERSION
+                )
+            },
         });
     }
     Ok(bundle)
@@ -402,20 +435,14 @@ async fn apply_bundle(
         plans.insert((*table).to_string(), plan);
     }
 
-    // Reject runtime / never-exported tables in a bundle outright. They
-    // shouldn't be there, but if they are we don't want to silently drop
-    // them — operator should know their bundle has unexpected content.
+    // Reject never-exported tables in a bundle outright. Runtime tables
+    // are imported when present because `export-config --include-runtime`
+    // advertises a full round trip for account state and usage counters.
     for table in bundle.tables.keys() {
         if NEVER_EXPORTED.contains(&table.as_str()) {
             summary
                 .schema_warnings
                 .push(format!("ignored never-exported table in bundle: {table}"));
-        } else if RUNTIME_TABLES.contains(&table.as_str())
-            && !TABLE_INSERT_ORDER.contains(&table.as_str())
-        {
-            summary
-                .schema_warnings
-                .push(format!("ignored runtime table in bundle: {table}"));
         } else if !TABLE_INSERT_ORDER.contains(&table.as_str()) {
             summary
                 .schema_warnings
@@ -457,28 +484,11 @@ async fn apply_tables(
     plans: &BTreeMap<String, ColumnPlan>,
     summary: &mut ImportSummary,
 ) -> Result<(), ClewdrError> {
-    // Restore mode: wipe every table in TABLE_DELETE_ORDER_RESTORE,
-    // *regardless* of whether the bundle contains rows for it. Restore
-    // means "the live DB matches the bundle exactly"; a table missing
-    // from an older bundle should be left empty, not preserved with
-    // local rows.
-    if args.mode == Mode::Restore {
-        for table in TABLE_DELETE_ORDER_RESTORE {
-            let res = wipe_table(conn, table).await?;
-            summary
-                .per_table
-                .entry((*table).to_string())
-                .or_default()
-                .deleted_first = res;
-        }
-    }
-
-    // Cache local-admin presence once per import. The admin protection in
-    // merge mode only kicks in when there *is* a local admin to preserve;
-    // a fresh DB (or one that lost its admin somehow) needs to accept the
-    // bundle's admin or the resulting DB has no login + every bundled
-    // api_keys row FK-violates at COMMIT.
-    let preserve_local_admin = if args.mode == Mode::Merge && !args.overwrite_admin {
+    // Cache local-admin presence once per import. Admin protection applies
+    // in both merge and restore modes unless `--overwrite-admin` is set:
+    // restore is destructive, but it still must not replace the operator's
+    // local admin password/session state by default.
+    let preserve_local_admin = if !args.overwrite_admin {
         let row: Option<(i64,)> =
             sqlx::query_as("SELECT 1 FROM users WHERE username = 'admin' LIMIT 1")
                 .fetch_optional(&mut *conn)
@@ -488,9 +498,31 @@ async fn apply_tables(
         false
     };
 
-    // Per-table id maps for merge mode FK translation. Always allocated;
-    // restore mode just doesn't populate or read it.
+    // Restore mode: wipe every table in TABLE_DELETE_ORDER_RESTORE,
+    // *regardless* of whether the bundle contains rows for it. Restore
+    // means "the live DB matches the bundle exactly"; a table missing
+    // from an older bundle should be left empty, not preserved with
+    // local rows. The only exception is the local admin row (and its
+    // referenced policy) when admin preservation is active.
+    if args.mode == Mode::Restore {
+        for table in TABLE_DELETE_ORDER_RESTORE {
+            let res = wipe_table(conn, table, preserve_local_admin).await?;
+            summary
+                .per_table
+                .entry((*table).to_string())
+                .or_default()
+                .deleted_first = res;
+        }
+    }
+
+    // Per-table id maps for FK translation. Merge mode always translates
+    // synthetic ids. Restore mode normally writes bundle ids verbatim, but
+    // admin preservation keeps the local admin id/policy row alive; in
+    // that mode we also translate ids so the bundle's remaining rows can
+    // land without colliding with the preserved local rows.
     let mut id_maps: IdMaps = std::collections::HashMap::new();
+    let translate_preserved_admin = args.mode == Mode::Restore && preserve_local_admin;
+    let translate_all_ids = args.mode == Mode::Merge || translate_preserved_admin;
 
     for table in TABLE_INSERT_ORDER {
         let Some(plan) = plans.get(*table) else {
@@ -503,7 +535,7 @@ async fn apply_tables(
         // Junction tables we always wipe — even in merge mode — so api_keys
         // UPSERT churn doesn't leave orphan rows behind.
         if args.mode == Mode::Merge && TABLES_WIPED_EVEN_IN_MERGE.contains(table) {
-            let res = wipe_table(conn, table).await?;
+            let res = wipe_table(conn, table, false).await?;
             summary
                 .per_table
                 .entry((*table).to_string())
@@ -514,19 +546,13 @@ async fn apply_tables(
         let spec = merge_spec(table);
 
         // Per-mode column list:
-        //   restore  → keep `id` so bundle ids land verbatim into freshly
-        //              wiped tables (FK refs across the bundle stay
-        //              consistent because every parent / child rows share
-        //              the bundle's id space).
-        //   merge    → drop `id` from the INSERT so an existing local row
-        //              with the same numeric id but a different natural
-        //              key doesn't UNIQUE-violate. SQLite either UPDATEs
-        //              the existing row in place (preserving its local id)
-        //              or auto-allocates a fresh one. The mapping is
-        //              captured below so child tables can translate.
-        let writable: Vec<String> = if args.mode == Mode::Merge
-            && let Some(id_col) = spec.id_column
-        {
+        //   plain restore       → keep `id` so bundle ids land verbatim
+        //                         into freshly wiped tables.
+        //   merge/admin-restore → drop `id` so natural-key UPSERTs can
+        //                         preserve local ids where needed. The
+        //                         mapping is captured below so child
+        //                         tables can translate.
+        let writable: Vec<String> = if translate_all_ids && let Some(id_col) = spec.id_column {
             plan.writable
                 .iter()
                 .filter(|c| c.as_str() != id_col)
@@ -554,8 +580,7 @@ async fn apply_tables(
                 // user_id pointing at the bundle's admin can translate
                 // to the local admin id. Without this, FK translation
                 // would fail with "no matching row in parent table".
-                if args.mode == Mode::Merge
-                    && let Some(id_col) = spec.id_column
+                if let Some(id_col) = spec.id_column
                     && let Some(CellValue::Integer(bundle_id)) = bundle_row.get(id_col)
                 {
                     let local_id =
@@ -578,7 +603,7 @@ async fn apply_tables(
             // its bundle id rewritten to the matching local id captured
             // when we processed the parent table earlier.
             let row_to_insert: BTreeMap<String, CellValue> =
-                if args.mode == Mode::Merge && !spec.fks.is_empty() {
+                if translate_all_ids && !spec.fks.is_empty() {
                     let mut translated = bundle_row.clone();
                     for (fk_col, parent_table) in spec.fks {
                         translate_fk(&mut translated, fk_col, parent_table, &id_maps)?;
@@ -594,14 +619,18 @@ async fn apply_tables(
                 &writable,
                 spec.natural_key,
                 &row_to_insert,
-                args.mode,
+                if translate_all_ids {
+                    Mode::Merge
+                } else {
+                    args.mode
+                },
             )
             .await?;
             counts.inserted += 1;
 
             // Capture the local id post-UPSERT so descendant tables can
             // translate their FKs through this entry.
-            if args.mode == Mode::Merge
+            if translate_all_ids
                 && let Some(id_col) = spec.id_column
                 && let Some(CellValue::Integer(bundle_id)) = bundle_row.get(id_col)
             {
@@ -659,10 +688,9 @@ fn translate_fk(
 }
 
 /// Look up the local row's `id` after a merge UPSERT, so child rows can
-/// have their FK column translated. Returns `None` for tables that don't
-/// have an `id` column (junction tables, `settings`, `models`,
-/// `model_pricing`) — none of those are FK targets, so no translation is
-/// needed downstream.
+/// have their FK column translated. Tables without an `id` column return
+/// `None`; they are not FK targets in the import graph, so no downstream
+/// translation is needed.
 async fn capture_local_id(
     conn: &mut SqliteConnection,
     table: &str,
@@ -775,8 +803,16 @@ fn bind_cell<'q>(
 /// particular must survive a restore — it's intentionally excluded from
 /// the bundle so each host mints its own, and wiping it would break every
 /// active admin session and every signed cookie.
-async fn wipe_table(conn: &mut SqliteConnection, table: &str) -> Result<usize, ClewdrError> {
+async fn wipe_table(
+    conn: &mut SqliteConnection,
+    table: &str,
+    preserve_local_admin: bool,
+) -> Result<usize, ClewdrError> {
     if table == "settings" {
+        debug_assert!(
+            !SETTINGS_KEYS_NEVER_EXPORTED.is_empty(),
+            "settings restore relies on at least one preserved per-host key"
+        );
         let placeholders = vec!["?"; SETTINGS_KEYS_NEVER_EXPORTED.len()].join(", ");
         let sql = format!("DELETE FROM settings WHERE key NOT IN ({placeholders})");
         let mut q = sqlx::query(&sql);
@@ -784,6 +820,22 @@ async fn wipe_table(conn: &mut SqliteConnection, table: &str) -> Result<usize, C
             q = q.bind(*k);
         }
         let res = q.execute(&mut *conn).await?;
+        return Ok(res.rows_affected() as usize);
+    }
+    if preserve_local_admin && table == "users" {
+        let res = sqlx::query("DELETE FROM users WHERE username != 'admin'")
+            .execute(&mut *conn)
+            .await?;
+        return Ok(res.rows_affected() as usize);
+    }
+    if preserve_local_admin && table == "policies" {
+        let res = sqlx::query(
+            "DELETE FROM policies WHERE id NOT IN (
+                 SELECT policy_id FROM users WHERE username = 'admin'
+             )",
+        )
+        .execute(&mut *conn)
+        .await?;
         return Ok(res.rows_affected() as usize);
     }
     let res = sqlx::query(&format!("DELETE FROM {table}"))
@@ -861,6 +913,9 @@ impl ColumnPlan {
 // ──────────────────────────────────────────────────────────────────────────
 
 fn restore_config_toml(path: &Path, contents: &str) -> Result<(), ClewdrError> {
+    // This runs after the DB transaction commits. If the rename/write
+    // fails, the DB has already been restored; the timestamped .bak is the
+    // operator's recovery point for the previous config file.
     if path.exists() {
         let suffix = format!("toml.bak.{}", Utc::now().format("%Y%m%dT%H%M%SZ"));
         let backup = path.with_extension(suffix);
@@ -983,6 +1038,13 @@ mod tests {
             no_secrets: false,
             include_runtime: false,
             passphrase_stdin: false,
+        }
+    }
+
+    fn export_args_with_runtime(out: PathBuf) -> ExportArgs {
+        ExportArgs {
+            include_runtime: true,
+            ..export_args(out)
         }
     }
 
@@ -1137,6 +1199,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_preserves_admin_row_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("nope.toml");
+        let src_db = seeded_db(&dir).await;
+        let bundle_path = dir.path().join("bundle.json");
+        let bundle = build_bundle(&src_db, &cfg_path, &export_args(bundle_path.clone()))
+            .await
+            .unwrap();
+
+        let tgt_db = dir.path().join("tgt.db");
+        let pool = crate::db::init_pool(&tgt_db).await.unwrap();
+        crate::db::seed_admin(&pool).await.unwrap();
+        sqlx::query(
+            "UPDATE users SET password_hash = ?1, session_version = 42 WHERE username = 'admin'",
+        )
+        .bind("$argon2id$LOCAL_RESTORE_HASH")
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let pool = crate::db::open_existing_pool(&tgt_db).await.unwrap();
+        let summary = apply_bundle(&pool, &bundle, &import_args(bundle_path, Mode::Restore))
+            .await
+            .unwrap();
+
+        let (hash, session_version): (String, i64) = sqlx::query_as(
+            "SELECT password_hash, session_version FROM users WHERE username = 'admin'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(hash, "$argon2id$LOCAL_RESTORE_HASH");
+        assert_eq!(session_version, 42);
+        assert!(summary.per_table["users"].skipped_admin >= 1);
+        pool.close().await;
+    }
+
+    #[tokio::test]
     async fn overwrite_admin_replaces_admin_row() {
         let dir = tempfile::tempdir().unwrap();
         let cfg_path = dir.path().join("nope.toml");
@@ -1285,6 +1386,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_imports_runtime_tables_from_include_runtime_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("nope.toml");
+
+        let src_db = seeded_db(&dir).await;
+        let pool = crate::db::open_existing_pool(&src_db).await.unwrap();
+        sqlx::query(
+            "INSERT INTO account_runtime_state (account_id, reset_time) VALUES (1, 123456)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_rollups (
+                 user_id, period_type, period_start, period_end, request_count, cost_nanousd
+             ) VALUES (1, 'week', '2026-04-27T00:00:00Z', '2026-05-04T00:00:00Z', 7, 9001)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_lifetime_totals (user_id, request_count, cost_nanousd)
+             VALUES (1, 11, 12001)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let bundle_path = dir.path().join("runtime-bundle.json");
+        let bundle = build_bundle(
+            &src_db,
+            &cfg_path,
+            &export_args_with_runtime(bundle_path.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(bundle.tables.contains_key("account_runtime_state"));
+        assert!(bundle.tables.contains_key("usage_rollups"));
+        assert!(bundle.tables.contains_key("usage_lifetime_totals"));
+
+        let tgt_db = dir.path().join("tgt.db");
+        let pool = crate::db::init_pool(&tgt_db).await.unwrap();
+        crate::db::seed_admin(&pool).await.unwrap();
+        pool.close().await;
+
+        let pool = crate::db::open_existing_pool(&tgt_db).await.unwrap();
+        let mut args = import_args(bundle_path, Mode::Restore);
+        args.overwrite_admin = true;
+        let summary = apply_bundle(&pool, &bundle, &args).await.unwrap();
+
+        let (reset_time,): (i64,) =
+            sqlx::query_as("SELECT reset_time FROM account_runtime_state WHERE account_id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reset_time, 123456);
+
+        let (rollup_requests, rollup_cost): (i64, i64) = sqlx::query_as(
+            "SELECT request_count, cost_nanousd FROM usage_rollups
+             WHERE user_id = 1 AND period_type = 'week'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((rollup_requests, rollup_cost), (7, 9001));
+
+        let (lifetime_requests, lifetime_cost): (i64, i64) = sqlx::query_as(
+            "SELECT request_count, cost_nanousd FROM usage_lifetime_totals WHERE user_id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((lifetime_requests, lifetime_cost), (11, 12001));
+        assert_eq!(summary.per_table["account_runtime_state"].inserted, 1);
+        assert_eq!(summary.per_table["usage_rollups"].inserted, 1);
+        assert_eq!(summary.per_table["usage_lifetime_totals"].inserted, 1);
+        pool.close().await;
+    }
+
+    #[tokio::test]
     async fn dry_run_does_not_persist_changes() {
         let dir = tempfile::tempdir().unwrap();
         let cfg_path = dir.path().join("nope.toml");
@@ -1423,7 +1605,7 @@ mod tests {
                 path: bundle_path,
                 mode: Mode::Restore,
                 yes: true,
-                overwrite_admin: false,
+                overwrite_admin: true,
                 dry_run: false,
                 init: false,
                 force: false,

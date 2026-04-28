@@ -54,8 +54,8 @@ pub(crate) async fn run_with_path(args: Args, db_path: &Path) -> Result<(), Clew
     // even though this binary path is single-task).
     let hash = tokio::task::spawn_blocking(move || db::hash_password_public(&password))
         .await
-        .map_err(|e| ClewdrError::UnexpectedNone {
-            msg: Box::leak(format!("argon2 task panicked: {e}").into_boxed_str()),
+        .map_err(|e| ClewdrError::UnexpectedMessage {
+            msg: format!("argon2 task panicked: {e}"),
         })??;
 
     let pool = db::open_existing_pool(db_path).await?;
