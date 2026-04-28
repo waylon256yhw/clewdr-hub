@@ -151,12 +151,25 @@ async fn menu_reset_admin() -> Result<(), ClewdrError> {
         .with_default("admin")
         .prompt()
         .map_err(wrap_or_cancel)?;
-    // We deliberately pass `password: None` so cli::reset::run drives
-    // its own rpassword prompts (with confirmation). Re-prompting here
-    // would either duplicate that logic or create a path where the
-    // password is read in a less-secure way than the CLI verb's.
+    let password = Text::new("New admin password (visible):")
+        .prompt()
+        .map_err(wrap_or_cancel)?;
+    if password.is_empty() {
+        return Err(ClewdrError::BadRequest {
+            msg: "password cannot be empty",
+        });
+    }
+    let confirm = Text::new("Confirm new admin password (visible):")
+        .prompt()
+        .map_err(wrap_or_cancel)?;
+    if password != confirm {
+        return Err(ClewdrError::BadRequest {
+            msg: "passwords do not match",
+        });
+    }
+
     cli::reset::run(cli::reset::Args {
-        password: None,
+        password: Some(password),
         from_env: false,
         username,
     })
