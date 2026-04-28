@@ -97,16 +97,30 @@ async fn main() -> Result<(), ClewdrError> {
     // ---- Early CLI dispatch (must precede logging + CLEWDR_CONFIG) ----
     if let Some(cmd) = ARGS.command.clone() {
         if !matches!(cmd, Command::Serve) {
-            return clewdr_hub::cli::dispatch(cmd).await;
+            return verb_finish(clewdr_hub::cli::dispatch(cmd).await);
         }
     }
     #[cfg(feature = "portable")]
     if ARGS.update {
-        return clewdr_hub::cli::run_update().await;
+        return verb_finish(clewdr_hub::cli::run_update().await);
     }
 
     // ---- From here on it's the serve path; logging + CLEWDR_CONFIG are fair game ----
     serve().await
+}
+
+/// Convert a CLI verb's `Result` into a process-level outcome.
+///
+/// On success we just return `Ok(())` so `#[tokio::main]` exits 0. On error
+/// we print the [`ClewdrError`]'s `Display` form (which carries the carefully
+/// crafted user-facing text — DbNotFound, BadRequest, etc.) and exit 1
+/// directly, bypassing tokio's default `Debug`-formatted error printout.
+fn verb_finish(result: Result<(), ClewdrError>) -> Result<(), ClewdrError> {
+    if let Err(e) = result {
+        eprintln!("{} {e}", "Error:".red().bold());
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 async fn serve() -> Result<(), ClewdrError> {
