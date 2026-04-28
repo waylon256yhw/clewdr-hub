@@ -683,6 +683,7 @@ dependencies = [
  "rpassword",
  "rustls",
  "self-replace",
+ "semver",
  "serde",
  "serde_json",
  "serde_with",

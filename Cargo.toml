@@ -93,6 +93,7 @@ blake3 = "1.8.3"
 rand = { version = "0.10.0", features = ["std_rng"] }
 hmac = "0.12"
 rpassword = "7"
+semver = "1"
 
 [target.'cfg(windows)'.dependencies]
 enable-ansi-support = "0.3"
