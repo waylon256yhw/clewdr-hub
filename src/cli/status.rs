@@ -262,9 +262,13 @@ async fn http_probe(addr: SocketAddr) -> ProbeOutcome {
             return ProbeOutcome::Unreachable;
         }
     };
+    // Capture the *actual* status code up front so a 201/204/etc. body
+    // that happens to fall through to the foreign-shape branch below
+    // doesn't get reported as 200.
+    let status_code = resp.status().as_u16();
     if !resp.status().is_success() {
         return ProbeOutcome::ForeignHttp {
-            status: resp.status().as_u16(),
+            status: status_code,
         };
     }
     let body = resp.text().await.unwrap_or_default();
@@ -274,7 +278,9 @@ async fn http_probe(addr: SocketAddr) -> ProbeOutcome {
             version: trimmed.to_string(),
         }
     } else {
-        ProbeOutcome::ForeignHttp { status: 200 }
+        ProbeOutcome::ForeignHttp {
+            status: status_code,
+        }
     }
 }
 
@@ -330,22 +336,50 @@ fn detect_termux_boot() -> ServiceInfo {
 }
 
 async fn detect_systemd() -> Option<ServiceInfo> {
-    // `systemctl is-active <unit>`:
-    //   exit 0 + stdout "active"     → running
-    //   exit 3 + stdout "inactive"   → unit exists but stopped
-    //   exit 4 + stdout "inactive\n" → unit doesn't exist (Linux), or "unknown"
-    // We don't try to distinguish "no unit" from "inactive" because the
-    // shell-out cost is the same and the human output covers both.
+    // `systemctl show <unit> --property=LoadState,ActiveState --value` gives
+    // us two definitive answers in one call:
+    //   LoadState   = "loaded" / "not-found" / "masked" / "error"
+    //   ActiveState = "active" / "inactive" / "failed" / "activating" / ...
     //
-    // Uses std::process::Command (sync) rather than tokio::process to avoid
-    // pulling in the `process` tokio feature; the call returns in under
-    // 10ms on every system we care about.
+    // This is more discriminating than `is-active`:
+    //   * `is-active` returns "inactive" exit 3 for *both* a missing unit
+    //     and an installed-but-stopped unit, so we couldn't distinguish
+    //     "register me" from "start me".
+    //   * On hosts where systemd is present but the user can't reach the
+    //     bus (containers, chroots), `show` exits non-zero with empty
+    //     stdout — we treat that as "no info" and fall back to
+    //     NotRegistered instead of synthesising a bogus
+    //     `Systemd { active_state: "" }` row.
+    //
+    // Uses std::process::Command (sync) rather than tokio::process to
+    // avoid pulling in tokio's `process` feature; the call returns in
+    // under 10ms on every system we care about.
     let out = std::process::Command::new("systemctl")
-        .args(["is-active", SYSTEMD_UNIT])
+        .args([
+            "show",
+            SYSTEMD_UNIT,
+            "--property=LoadState,ActiveState",
+            "--value",
+            "--no-pager",
+        ])
         .output()
         .ok()?;
-    let active_state = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let active = out.status.success();
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut lines = stdout.lines();
+    let load_state = lines.next()?.trim().to_string();
+    let active_state = lines.next()?.trim().to_string();
+
+    if load_state != "loaded" {
+        // not-found / masked / error — the unit isn't usable as a clewdr
+        // service registration even if systemd itself is healthy.
+        return None;
+    }
+
+    // ActiveState values that count as "really running":
+    let active = matches!(active_state.as_str(), "active" | "reloading");
     Some(ServiceInfo::Systemd {
         unit: SYSTEMD_UNIT.to_string(),
         active_state,
@@ -359,7 +393,7 @@ async fn detect_systemd() -> Option<ServiceInfo> {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn pid_for_listener(cfg: &StatusConfig) -> Option<u32> {
-    proc_pid_for_port(cfg.port())
+    proc_pid_for_listener(cfg.ip(), cfg.port())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -368,18 +402,26 @@ fn pid_for_listener(_cfg: &StatusConfig) -> Option<u32> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn proc_pid_for_port(port: u16) -> Option<u32> {
+fn proc_pid_for_listener(want_ip: IpAddr, want_port: u16) -> Option<u32> {
     use std::{
         fs,
         io::{BufRead, BufReader},
     };
 
-    // Step 1: collect socket inodes that are LISTEN-ing on `port`.
+    // Step 1: pick the right /proc/net table for the configured family,
+    // then collect socket inodes that are LISTEN-ing on want_ip:want_port.
+    //
+    // Filtering by *both* address and port is load-bearing: if clewdr is
+    // bound to [::1]:8484 and an unrelated process is bound to
+    // 127.0.0.1:8484, looking at port alone would let us return the wrong
+    // PID even though the HTTP probe correctly identified ours.
+    let table = match want_ip {
+        IpAddr::V4(_) => "/proc/net/tcp",
+        IpAddr::V6(_) => "/proc/net/tcp6",
+    };
+
     let mut inodes: Vec<u64> = Vec::new();
-    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let Ok(f) = fs::File::open(table) else {
-            continue;
-        };
+    if let Ok(f) = fs::File::open(table) {
         for line in BufReader::new(f).lines().map_while(Result::ok).skip(1) {
             // sl  local_address rem_address st tx_q rx_q tr tm->when retrnsmt   uid timeout inode
             //  0  CD000000:21A4 ...        0A   ...                                         12345
@@ -388,13 +430,19 @@ fn proc_pid_for_port(port: u16) -> Option<u32> {
                 continue; // not LISTEN
             }
             let local = fields[1];
-            let Some((_addr, port_hex)) = local.split_once(':') else {
+            let Some((addr_hex, port_hex)) = local.rsplit_once(':') else {
                 continue;
             };
             let Ok(p) = u16::from_str_radix(port_hex, 16) else {
                 continue;
             };
-            if p != port {
+            if p != want_port {
+                continue;
+            }
+            let Some(local_ip) = parse_proc_net_addr(addr_hex) else {
+                continue;
+            };
+            if local_ip != want_ip {
                 continue;
             }
             if let Ok(inode) = fields[9].parse::<u64>() {
@@ -438,6 +486,45 @@ fn proc_pid_for_port(port: u16) -> Option<u32> {
         }
     }
     None
+}
+
+/// Parse the `local_address` hex column from `/proc/net/tcp{,6}`.
+///
+/// The kernel writes each 32-bit word in *host* byte order, hex-encoded.
+/// On the little-endian platforms we ship for (x86_64, aarch64, armv7),
+/// that means each 4-byte word is reversed relative to network order:
+///
+///   * IPv4: `"0100007F"` → `7F.00.00.01` → 127.0.0.1
+///   * IPv6: `"00000000000000000000000001000000"` → `::1`
+///
+/// On big-endian hosts we'd need `to_be_bytes` instead, but Linux/Android
+/// production targets are LE; we cfg on `target_endian` to keep the door
+/// open.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn parse_proc_net_addr(hex: &str) -> Option<IpAddr> {
+    fn word_bytes(word: u32) -> [u8; 4] {
+        if cfg!(target_endian = "little") {
+            word.to_le_bytes()
+        } else {
+            word.to_be_bytes()
+        }
+    }
+
+    match hex.len() {
+        8 => {
+            let word = u32::from_str_radix(hex, 16).ok()?;
+            Some(IpAddr::V4(Ipv4Addr::from(word_bytes(word))))
+        }
+        32 => {
+            let mut bytes = [0u8; 16];
+            for i in 0..4 {
+                let word = u32::from_str_radix(&hex[i * 8..(i + 1) * 8], 16).ok()?;
+                bytes[i * 4..(i + 1) * 4].copy_from_slice(&word_bytes(word));
+            }
+            Some(IpAddr::V6(Ipv6Addr::from(bytes)))
+        }
+        _ => None,
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -635,5 +722,50 @@ mod tests {
         let probe = ProbeOutcome::Refused;
         let svc = ServiceInfo::NotRegistered;
         assert_eq!(compute_state(&probe, &svc), State::Stopped);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn parse_proc_net_addr_decodes_v4() {
+        // 127.0.0.1 → "0100007F" (LE-per-word), [::1] → 16-byte form below.
+        assert_eq!(
+            parse_proc_net_addr("0100007F"),
+            Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+        );
+        // 0.0.0.0 wildcard
+        assert_eq!(
+            parse_proc_net_addr("00000000"),
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        );
+        // 192.168.1.10 → bytes [192, 168, 1, 10] → LE u32 word "0A01A8C0"
+        assert_eq!(
+            parse_proc_net_addr("0A01A8C0"),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)))
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn parse_proc_net_addr_decodes_v6() {
+        // [::1] is the only non-zero v6 address we care about for tests.
+        // The 16 bytes [0,0,...,0,1] become 4 LE words; the last word
+        // contains 0x00000001 (network order), reversed → "01000000".
+        assert_eq!(
+            parse_proc_net_addr("00000000000000000000000001000000"),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+        // [::] wildcard
+        assert_eq!(
+            parse_proc_net_addr("00000000000000000000000000000000"),
+            Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn parse_proc_net_addr_rejects_invalid_lengths() {
+        assert!(parse_proc_net_addr("").is_none());
+        assert!(parse_proc_net_addr("12").is_none());
+        assert!(parse_proc_net_addr("nothex!!").is_none());
     }
 }
