@@ -138,7 +138,7 @@ fn merge_spec(table: &str) -> TableMergeSpec {
             fks: &[],
         },
         "model_pricing" => TableMergeSpec {
-            id_column: None,
+            id_column: Some("id"),
             natural_key: &["pricing_key"],
             fks: &[],
         },
@@ -1768,6 +1768,88 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(key_owner, "bob");
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn merge_translates_overlapping_ids_for_model_pricing() {
+        // Same id-collision pattern as the policies/users test above, but
+        // exercises the `model_pricing` spec specifically. Without
+        // id_column = Some("id") on the merge spec, the bundle's id binds
+        // verbatim into the INSERT, and a local row with the same numeric
+        // id but a different pricing_key triggers
+        // `UNIQUE constraint failed: model_pricing.id` before the
+        // ON CONFLICT(pricing_key) UPSERT can run.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("nope.toml");
+
+        // Source DB: seeded pricing rows + one custom 'src-pricing' row.
+        // Locking down the id (the next free id past whatever the seed
+        // populated) keeps the collision deterministic across migration
+        // changes.
+        let src_db = dir.path().join("src.db");
+        let pool = crate::db::init_pool(&src_db).await.unwrap();
+        crate::db::seed_admin(&pool).await.unwrap();
+        let (next_pricing_id,): (i64,) =
+            sqlx::query_as("SELECT COALESCE(MAX(id), 0) + 1 FROM model_pricing")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO model_pricing (id, pricing_key, display_name,
+                                        input_nanousd_per_token, output_nanousd_per_token)
+             VALUES (?1, 'src-pricing', 'Source Pricing', 100, 200)",
+        )
+        .bind(next_pricing_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let bundle_path = dir.path().join("bundle.json");
+        let bundle = build_bundle(&src_db, &cfg_path, &export_args(bundle_path.clone()))
+            .await
+            .unwrap();
+
+        // Target DB: same seeded pricing rows + a *different* custom row
+        // pinned to the same id `next_pricing_id`. With the spec fix this
+        // merges cleanly; without it SQLite raises `UNIQUE constraint failed:
+        // model_pricing.id` before any UPSERT logic runs.
+        let tgt_db = dir.path().join("tgt.db");
+        let pool = crate::db::init_pool(&tgt_db).await.unwrap();
+        crate::db::seed_admin(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO model_pricing (id, pricing_key, display_name,
+                                        input_nanousd_per_token, output_nanousd_per_token)
+             VALUES (?1, 'tgt-pricing', 'Target Pricing', 300, 400)",
+        )
+        .bind(next_pricing_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let pool = crate::db::open_existing_pool(&tgt_db).await.unwrap();
+        apply_bundle(&pool, &bundle, &import_args(bundle_path, Mode::Merge))
+            .await
+            .expect("merge must not collide on model_pricing.id");
+
+        // Both rows survive the merge — the bundle's 'src-pricing' was
+        // inserted with a fresh local id, and 'tgt-pricing' was preserved
+        // at its original id.
+        let pricing_keys: Vec<String> =
+            sqlx::query_as("SELECT pricing_key FROM model_pricing ORDER BY pricing_key")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(k,): (String,)| k)
+                .collect();
+        assert!(
+            pricing_keys.contains(&"src-pricing".to_string())
+                && pricing_keys.contains(&"tgt-pricing".to_string()),
+            "expected both pricing rows to survive merge, got {pricing_keys:?}"
+        );
         pool.close().await;
     }
 
