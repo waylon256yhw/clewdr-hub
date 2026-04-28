@@ -15,7 +15,7 @@ use zip::ZipArchive;
 use crate::{
     config::CLEWDR_CONFIG,
     error::{ClewdrError, WreqSnafu},
-    services::version::parse_clewdr_version,
+    services::version::{is_newer_release, parse_clewdr_version},
 };
 
 const DEFAULT_REPO_OWNER: &str = "waylon256yhw";
@@ -126,13 +126,14 @@ impl ClewdrUpdater {
         let latest_version = release.tag_name.trim_start_matches('v');
         let current_version = env!("CARGO_PKG_VERSION");
 
-        // semver-aware: prerelease tags don't outrank matching stables,
-        // build metadata is ignored for ordering, anything malformed
-        // surfaces as ClewdrError::InvalidVersion with the offending
-        // string in the message.
+        // SemVer 2.0 precedence: prereleases don't outrank matching
+        // stables, *and* build metadata is ignored. Default `Ord` on
+        // semver::Version compares build metadata too, which would make
+        // a release like `v1.2.4+build.5` look "newer" than a running
+        // `1.2.4` and self-replace with the same binary on every check.
         let current_v = parse_clewdr_version(current_version)?;
         let latest_v = parse_clewdr_version(latest_version)?;
-        let update_available = latest_v > current_v;
+        let update_available = is_newer_release(&current_v, &latest_v);
 
         if !update_available {
             info!("Already at the latest version {}", current_version.green());
