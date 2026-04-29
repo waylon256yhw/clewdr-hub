@@ -6,8 +6,10 @@
 # clewdr.toml, and the log directory are *preserved* — the service
 # uninstall verb only deletes them when --purge is passed.
 #
-# Pass --purge here to forward it to the verb AND let the service-side
-# interactive 'yes' confirmation gate the data deletion.
+# Pass --purge here to delete data too. When a service backend is usable,
+# the binary's service verb performs the interactive 'yes' confirmation;
+# otherwise this script confirms and deletes the install.sh-managed local
+# paths itself.
 #
 # Usage:
 #   bash uninstall.sh [--purge]
@@ -62,6 +64,11 @@ err()  { echo "${RED}${BOLD}error:${RESET} $*" >&2; exit 1; }
 info() { echo "${GREEN}${BOLD}==>${RESET} $*"; }
 warn() { echo "${YELLOW}${BOLD}warn:${RESET} $*" >&2; }
 
+is_termux() {
+    [[ -n "${PREFIX:-}" && "$PREFIX" == *com.termux* ]] \
+        || [[ -d /data/data/com.termux/files/usr ]]
+}
+
 # Returns 0 iff `clewdr service uninstall` has a backend it can talk
 # to on this host AND the caller has the privileges it needs. Mirror
 # of the gate in install.sh — Termux:Boot needs no root, systemd
@@ -73,8 +80,7 @@ warn() { echo "${YELLOW}${BOLD}warn:${RESET} $*" >&2; }
 # is cheaper than trying to share a library file across the curl|bash
 # entry points.
 service_supported() {
-    if [[ -n "${PREFIX:-}" && "$PREFIX" == *com.termux* ]] \
-       || [[ -d /data/data/com.termux/files/usr ]]; then
+    if is_termux; then
         return 0
     fi
     if [[ "$(uname -s)" == "Linux" ]] && [[ -d /run/systemd/system ]] && (( EUID == 0 )); then
@@ -84,11 +90,42 @@ service_supported() {
 }
 
 default_bin_link_path() {
-    if [[ -n "${PREFIX:-}" && "$PREFIX" == *com.termux* ]] \
-       || [[ -d /data/data/com.termux/files/usr ]]; then
+    if is_termux; then
         echo "${PREFIX:-/data/data/com.termux/files/usr}/bin/clewdr"
     else
         echo "/usr/local/bin/clewdr"
+    fi
+}
+
+confirm_local_purge() {
+    warn "--purge 将删除本机 clewdr 数据："
+    warn "  - ${install_dir}/clewdr.toml"
+    warn "  - ${install_dir}/clewdr.db"
+    warn "  - ${install_dir}/log/"
+    if is_termux; then
+        warn "  - \$HOME/.local/clewdr/log/"
+    fi
+
+    if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
+        err "无法进行 --purge 二次确认；请在交互终端中重试，或去掉 --purge"
+    fi
+    printf "输入 'yes' 确认删除： " > /dev/tty
+    local answer=""
+    read -r answer < /dev/tty
+    [[ "$answer" == "yes" ]] || err "已取消删除（输入不是 'yes'）"
+}
+
+purge_local_data() {
+    [[ "$PURGE" == "1" ]] || return 0
+    [[ "$service_called" != "1" ]] || return 0
+
+    confirm_local_purge
+    rm -f "${install_dir}/clewdr.toml"
+    rm -f "${install_dir}/clewdr.db"
+    rm -rf "${install_dir}/log"
+    if is_termux; then
+        rm -rf "${HOME}/.local/clewdr/log"
+        rmdir "${HOME}/.local/clewdr" 2>/dev/null || true
     fi
 }
 
@@ -134,10 +171,9 @@ info "found install at ${BOLD}${install_dir}${RESET}"
 #   - or no service backend is available with current privileges
 #     (macOS, no-systemd Linux, non-root user on a systemd host).
 # Otherwise the verb errors out before binary removal and `set -e`
-# aborts cleanup entirely. If --purge was requested in that case,
-# warn the operator that the data path can't be reached from bash
-# without re-deriving the binary's path-resolution logic — they're
-# better off running the binary directly or deleting by hand.
+# aborts cleanup entirely. If --purge was requested while the verb was
+# skipped, purge_local_data below deletes the install.sh-managed local
+# data paths after its own TTY confirmation.
 service_called=0
 if [[ "$NO_SERVICE" == "1" ]]; then
     info "skipping \`$bin service uninstall\` (CLEWDR_NO_SERVICE / --no-service)"
@@ -155,13 +191,7 @@ else
     info "if you installed with sudo + systemd, re-run this script with sudo to tear the unit down too."
 fi
 
-if [[ "$PURGE" == "1" && "$service_called" != "1" ]]; then
-    warn "--purge requested but the service verb's purge path was skipped above."
-    warn "delete data manually if needed; common locations:"
-    warn "  - ${install_dir}/clewdr.{toml,db}"
-    warn "  - ${install_dir}/log/"
-    warn "  - \$HOME/.local/clewdr/log/  (Termux logs)"
-fi
+purge_local_data
 
 # 2) Remove the binary itself + the libc++_shared.so we may have
 # placed alongside it on Android. Same root-required rule as install.sh
