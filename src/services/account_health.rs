@@ -85,6 +85,10 @@ pub struct PoolAccountView<'a> {
     /// Whether the account is currently being probed. Orthogonal overlay —
     /// does not change the base state.
     pub probing: bool,
+    /// The pool has moved this account back to dispatchable and queued a
+    /// DB reactivation write. Lets health avoid treating the still-stale
+    /// DB terminal status as authoritative during that short window.
+    pub reactivated: bool,
     /// Transient probe error, cleared on probe success.
     pub last_probe_error: Option<&'a str>,
 }
@@ -201,6 +205,7 @@ pub struct PoolSnapshotView {
     pub invalid: HashMap<i64, Reason>,
     pub inflight: HashMap<i64, (u32, u32)>,
     pub probing: HashSet<i64>,
+    pub reactivated: HashSet<i64>,
     pub probe_errors: HashMap<i64, String>,
 }
 
@@ -250,24 +255,26 @@ fn compose_from_db(account: &AccountWithRuntime) -> AccountHealthState {
     }
 }
 
-/// Derive the base health state for one account.
-///
-/// Precedence: the pool's bucket membership wins. DB is consulted only
-/// when the account is not in any bucket (e.g., newly inserted row not yet
-/// reloaded) or to refine `InvalidKind` when the pool's view alone is
-/// ambiguous.
-///
-/// `now` is the UNIX timestamp used to filter expired cooldowns. An
-/// account in `exhausted` whose `reset_time <= now` is reported as
-/// `Active` — the pool's periodic `reset` tick will physically move it
-/// back to `valid` on its next turn, but the dispatcher and every read
-/// surface should already treat it as usable.
-pub fn compose_health(
+fn compose_terminal_from_db(account: &AccountWithRuntime) -> Option<AccountHealthState> {
+    match account.status.as_str() {
+        "auth_error" => Some(AccountHealthState::Invalid {
+            kind: InvalidKind::AuthError,
+            reason: parse_db_invalid_reason(account),
+        }),
+        "disabled" => Some(AccountHealthState::Invalid {
+            kind: InvalidKind::Disabled,
+            reason: parse_db_invalid_reason(account),
+        }),
+        _ => None,
+    }
+}
+
+fn compose_from_pool_or_db(
     account: &AccountWithRuntime,
-    view: PoolAccountView<'_>,
+    bucket: Option<PoolBucket<'_>>,
     now: i64,
-) -> AccountHealth {
-    let state = match view.bucket {
+) -> AccountHealthState {
+    match bucket {
         Some(PoolBucket::Valid) => AccountHealthState::Active,
         Some(PoolBucket::Exhausted { reset_time }) => {
             // Drop reset_time entries that have already expired — the
@@ -286,6 +293,41 @@ pub fn compose_health(
             reason: Some(reason.clone()),
         },
         None => compose_from_db(account),
+    }
+}
+
+/// Derive the base health state for one account.
+///
+/// Precedence: the pool's invalid bucket wins because it carries the most
+/// specific reason. Explicit DB terminal states (`auth_error` / `disabled`)
+/// then override stale valid/exhausted views unless the pool has already
+/// queued a reactivation for the row. Otherwise, the pool's bucket membership
+/// wins. DB is consulted when the account is not in any bucket (e.g., newly
+/// inserted row not yet reloaded) or to refine `InvalidKind` when the pool's
+/// view alone is ambiguous.
+///
+/// `now` is the UNIX timestamp used to filter expired cooldowns. An
+/// account in `exhausted` whose `reset_time <= now` is reported as
+/// `Active` — the pool's periodic `reset` tick will physically move it
+/// back to `valid` on its next turn, but the dispatcher and every read
+/// surface should already treat it as usable.
+pub fn compose_health(
+    account: &AccountWithRuntime,
+    view: PoolAccountView<'_>,
+    now: i64,
+) -> AccountHealth {
+    let state = match view.bucket {
+        Some(PoolBucket::Invalid { .. }) => compose_from_pool_or_db(account, view.bucket, now),
+        _ if !view.reactivated => {
+            // Explicit DB terminal states are produced by higher-confidence
+            // paths such as messages / test / OAuth refresh. Do not let a
+            // stale in-memory valid/exhausted bucket hide that verdict from
+            // read surfaces, but do preserve a pool Invalid reason when one
+            // exists.
+            compose_terminal_from_db(account)
+                .unwrap_or_else(|| compose_from_pool_or_db(account, view.bucket, now))
+        }
+        _ => compose_from_pool_or_db(account, view.bucket, now),
     };
 
     // Step 3.5 C4c: only surface `last_failure` when the account is
@@ -422,6 +464,7 @@ pub fn compose_health_snapshot(
             bucket,
             inflight: view.inflight.get(&id).copied(),
             probing: view.probing.contains(&id),
+            reactivated: view.reactivated.contains(&id),
             last_probe_error: view.probe_errors.get(&id).map(String::as_str),
         };
         per_account.insert(id, compose_health(account, account_view, now));
@@ -749,6 +792,60 @@ mod tests {
                 reason: Some(Reason::Disabled),
             }
         );
+    }
+
+    #[test]
+    fn db_terminal_status_overrides_stale_pool_valid_bucket() {
+        let a = with_invalid_reason(
+            account(1, "oauth", "disabled", None, true, None),
+            &Reason::Disabled,
+        );
+        let view = PoolAccountView {
+            bucket: Some(PoolBucket::Valid),
+            ..Default::default()
+        };
+        let h = compose_health(&a, view, now());
+        assert_eq!(
+            h.state,
+            AccountHealthState::Invalid {
+                kind: InvalidKind::Disabled,
+                reason: Some(Reason::Disabled),
+            }
+        );
+    }
+
+    #[test]
+    fn pool_invalid_reason_overrides_empty_db_terminal_reason() {
+        let a = account(1, "oauth", "auth_error", None, true, None);
+        let view = PoolAccountView {
+            bucket: Some(PoolBucket::Invalid {
+                reason: &Reason::Null,
+            }),
+            ..Default::default()
+        };
+        let h = compose_health(&a, view, now());
+        assert_eq!(
+            h.state,
+            AccountHealthState::Invalid {
+                kind: InvalidKind::AuthError,
+                reason: Some(Reason::Null),
+            }
+        );
+    }
+
+    #[test]
+    fn reactivated_pool_view_overrides_stale_db_terminal_status() {
+        let a = with_invalid_reason(
+            account(1, "oauth", "auth_error", None, true, None),
+            &Reason::Null,
+        );
+        let view = PoolAccountView {
+            bucket: Some(PoolBucket::Valid),
+            reactivated: true,
+            ..Default::default()
+        };
+        let h = compose_health(&a, view, now());
+        assert_eq!(h.state, AccountHealthState::Active);
     }
 
     #[test]

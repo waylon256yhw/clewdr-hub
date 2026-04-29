@@ -17,19 +17,27 @@ use crate::{
     config::{AccountSlot, CLAUDE_ENDPOINT, ClewdrCookie},
     db::accounts::{
         AccountWithRuntime, batch_upsert_runtime_states, find_account_by_organization_uuid,
-        get_account_by_id, load_all_accounts, update_account_metadata_unchecked,
+        get_account_by_id, load_all_accounts, set_account_auth_error, set_account_disabled,
+        set_account_last_failure, set_account_reset_time, update_account_metadata_unchecked,
         upsert_account_oauth,
     },
     db::proxies::{build_proxy_url, get_proxy_by_id},
     error::{
-        ClewdrError, WreqSnafu, display_account_invalid_reason, sanitize_account_error_message,
+        ClewdrError, WreqSnafu, claude_error_from_response_parts, display_account_invalid_reason,
+        sanitize_account_error_message,
     },
     oauth::{
         AdminOAuthStartResponse, exchange_admin_oauth_callback, refresh_oauth_token,
         start_admin_oauth_flow,
     },
-    services::account_health::AccountHealth,
     services::account_pool::AccountPoolHandle,
+    services::{
+        account_error::{
+            AccountFailureAction, AccountFailureContext, AccountFailureContextPersisted,
+            FailureSource, classify_account_failure,
+        },
+        account_health::AccountHealth,
+    },
     state::AppState,
     stealth::SharedStealthProfile,
 };
@@ -774,6 +782,65 @@ pub struct TestAccountResponse {
     pub http_status: Option<u16>,
 }
 
+fn test_response_error(status_u16: u16, response_body: &str) -> ClewdrError {
+    let code =
+        wreq::StatusCode::from_u16(status_u16).unwrap_or(wreq::StatusCode::INTERNAL_SERVER_ERROR);
+    claude_error_from_response_parts(code, None, response_body)
+}
+
+async fn persist_test_failure_verdict(
+    state: &AppState,
+    account_id: i64,
+    failure: &AccountFailureContext,
+    message: &str,
+) {
+    let Some(reason) = failure.normalized_reason.to_reason() else {
+        return;
+    };
+    match failure.action {
+        AccountFailureAction::TerminalDisabled => {
+            if let Err(err) =
+                set_account_disabled(&state.db, account_id, &reason.to_db_string()).await
+            {
+                tracing::warn!("Failed to set test-disabled account {account_id}: {err}");
+                return;
+            }
+        }
+        AccountFailureAction::TerminalAuth => {
+            if let Err(err) = set_account_auth_error(&state.db, account_id, message).await {
+                tracing::warn!("Failed to set test auth_error account {account_id}: {err}");
+                return;
+            }
+        }
+        AccountFailureAction::Cooldown { reset_time } => {
+            if let Err(err) = set_account_reset_time(&state.db, account_id, reset_time).await {
+                tracing::warn!("Failed to set test cooldown for account {account_id}: {err}");
+                return;
+            }
+            if let Err(err) = state.account_pool.reload_from_db().await {
+                tracing::warn!(
+                    "Failed to reload pool after test cooldown for account {account_id}: {err}"
+                );
+            }
+            return;
+        }
+        AccountFailureAction::TransientUpstream | AccountFailureAction::InternalError => return,
+    }
+
+    let persisted = AccountFailureContextPersisted::from(failure);
+    if let Err(err) = set_account_last_failure(&state.db, account_id, Some(&persisted)).await {
+        tracing::warn!("Failed to persist test failure for account {account_id}: {err}");
+    }
+    state.account_pool.invalidate(account_id, reason).await;
+}
+
+async fn clear_test_failure_verdict(state: &AppState, account_id: i64) {
+    if let Err(err) = set_account_last_failure(&state.db, account_id, None).await {
+        tracing::warn!("Failed to clear test failure for account {account_id}: {err}");
+    }
+    state.account_pool.clear_probe_error(account_id).await;
+}
+
 pub async fn test_account(
     State(state): State<AppState>,
     State(profile): State<SharedStealthProfile>,
@@ -859,14 +926,9 @@ pub async fn test_account(
                             // surfaces as `internal_error` while real
                             // refresh-token rejections (`invalid_grant`,
                             // 401/403) keep the auth_rejected verdict.
-                            let log_status =
-                                crate::services::account_error::classify_account_failure(
-                                    &e,
-                                    crate::services::account_error::FailureSource::Test,
-                                    Some("refresh"),
-                                )
-                                .action
-                                .to_log_status();
+                            let failure =
+                                classify_account_failure(&e, FailureSource::Test, Some("refresh"));
+                            let log_status = failure.action.to_log_status();
                             let ctx = BillingContext {
                                 db: state.db.clone(),
                                 user_id: None,
@@ -886,6 +948,7 @@ pub async fn test_account(
                                 Some(&error_msg),
                             )
                             .await;
+                            persist_test_failure_verdict(&state, id, &failure, &error_msg).await;
                             return Ok(Json(TestAccountResponse {
                                 success: false,
                                 latency_ms: (chrono::Utc::now() - started_at).num_milliseconds(),
@@ -982,37 +1045,27 @@ pub async fn test_account(
     };
 
     // 7. Log result
-    // Step 3.5 C3b: derive log status from the unified classifier so
-    // /test final-request failures share the verdict surface with
-    // messages / count_tokens / probe. Wrap the upstream HTTP status
-    // into a synthetic `ClaudeHttpError` (no body phrase) and route
-    // through `classify_account_failure` — the classifier covers the
-    // 401/403 -> auth_rejected and 5xx/4xx -> upstream_error mapping
-    // that this site previously open-coded.
+    // Step 3.5 C3b: derive log status from the same upstream-error parser
+    // and classifier used by /v1/messages, so /test preserves body phrases
+    // like "organization has been disabled" instead of reducing them to a
+    // bare HTTP status.
+    let failure = if success {
+        None
+    } else if let Some(status_u16) = http_status {
+        let synthetic = test_response_error(status_u16, &response_body);
+        Some(classify_account_failure(
+            &synthetic,
+            FailureSource::Test,
+            None,
+        ))
+    } else {
+        None
+    };
     let log_status = if success {
         "ok"
-    } else if let Some(status_u16) = http_status {
-        let code = wreq::StatusCode::from_u16(status_u16)
-            .unwrap_or(wreq::StatusCode::INTERNAL_SERVER_ERROR);
-        let synthetic = ClewdrError::ClaudeHttpError {
-            code,
-            inner: Box::new(crate::error::ClaudeErrorBody {
-                message: serde_json::json!(""),
-                r#type: "error".to_string(),
-                code: Some(status_u16),
-                ..Default::default()
-            }),
-        };
-        crate::services::account_error::classify_account_failure(
-            &synthetic,
-            crate::services::account_error::FailureSource::Test,
-            None,
-        )
-        .action
-        .to_log_status()
+    } else if let Some(failure) = &failure {
+        failure.action.to_log_status()
     } else {
-        // Transport-level error — no upstream response. Same surface
-        // as classifier's TransientUpstream / WreqError path.
         "upstream_error"
     };
     let ctx = BillingContext {
@@ -1034,6 +1087,11 @@ pub async fn test_account(
         error_msg.as_deref(),
     )
     .await;
+    if success {
+        clear_test_failure_verdict(&state, id).await;
+    } else if let (Some(failure), Some(message)) = (&failure, error_msg.as_deref()) {
+        persist_test_failure_verdict(&state, id, failure, message).await;
+    }
 
     Ok(Json(TestAccountResponse {
         success,
@@ -1046,6 +1104,7 @@ pub async fn test_account(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Reason;
 
     #[test]
     fn derives_cookie_when_only_cookie_submitted() {
@@ -1128,5 +1187,29 @@ mod tests {
     fn rejects_dual_credential_submission() {
         let err = derive_auth_source(None, true, true, None).unwrap_err();
         assert!(matches!(err, ClewdrError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn test_response_error_preserves_org_disabled_body_for_classifier() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"This organization has been disabled."}}"#;
+        let err = test_response_error(400, body);
+        let ctx = classify_account_failure(&err, FailureSource::Test, None);
+        assert_eq!(ctx.action, AccountFailureAction::TerminalDisabled);
+        assert_eq!(ctx.normalized_reason.to_reason(), Some(Reason::Disabled));
+    }
+
+    #[test]
+    fn test_response_error_preserves_rate_limit_reset_for_classifier() {
+        let reset_time = chrono::Utc::now().timestamp() + 3600;
+        let body = format!(
+            r#"{{"type":"error","error":{{"type":"rate_limit_error","message":"{{\"resetsAt\":{reset_time}}}"}}}}"#
+        );
+        let err = test_response_error(429, &body);
+        let ctx = classify_account_failure(&err, FailureSource::Test, None);
+        assert_eq!(ctx.action, AccountFailureAction::Cooldown { reset_time });
+        assert_eq!(
+            ctx.normalized_reason.to_reason(),
+            Some(Reason::TooManyRequest(reset_time))
+        );
     }
 }

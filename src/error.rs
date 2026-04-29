@@ -461,6 +461,99 @@ where
     fn check_claude(self) -> impl Future<Output = Result<Self, ClewdrError>>;
 }
 
+pub fn claude_error_from_response_parts(
+    status: StatusCode,
+    reset_header: Option<&str>,
+    text: &str,
+) -> ClewdrError {
+    if status == 302 {
+        let error = ClaudeErrorBody {
+            message: json!("Blocked, check your IP address"),
+            r#type: "error".to_string(),
+            code: Some(status.as_u16()),
+            ..Default::default()
+        };
+        return ClewdrError::ClaudeHttpError {
+            code: status,
+            inner: Box::new(error),
+        };
+    }
+
+    let Ok(err) = serde_json::from_str::<ClaudeError>(text) else {
+        let error = ClaudeErrorBody {
+            message: format!("Unknown error: {text}").into(),
+            r#type: "error_parse_error_body".to_string(),
+            code: Some(status.as_u16()),
+            ..Default::default()
+        };
+        return ClewdrError::ClaudeHttpError {
+            code: status,
+            inner: Box::new(error),
+        };
+    };
+
+    const OAUTH_PHRASE: &str =
+        "oauth authentication is currently not allowed for this organization";
+    let msg_lower = err
+        .error
+        .message
+        .as_str()
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| err.error.message.to_string().to_ascii_lowercase());
+    if status == 400 && msg_lower.contains("organization has been disabled") {
+        return Reason::Disabled.into();
+    }
+    if (status == 401 || status == 403) && msg_lower.contains(OAUTH_PHRASE) {
+        return Reason::Null.into();
+    }
+
+    let inner_error = err.error;
+    if status == 429 {
+        // Some Anthropic feature-gating errors also use 429; keep them as HTTP
+        // errors instead of cooling down the account as if it were rate-limited.
+        let msg_lower = inner_error
+            .message
+            .as_str()
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_else(|| inner_error.message.to_string().to_ascii_lowercase());
+        if msg_lower.contains("extra usage is required for long context requests") {
+            return ClewdrError::ClaudeHttpError {
+                code: status,
+                inner: Box::new(inner_error),
+            };
+        }
+
+        let ts = inner_error.message["resetsAt"]
+            .as_i64()
+            .or_else(|| reset_header.and_then(|h| h.parse::<i64>().ok()));
+        if let Some(ts) = ts {
+            if let Some(reset_time) = chrono::DateTime::from_timestamp(ts, 0) {
+                let now = chrono::Utc::now();
+                let diff = reset_time.to_utc() - now;
+                let mins = diff.num_minutes();
+                error!(
+                    "Rate limit exceeded, expires in {} hours",
+                    mins as f64 / 60.0
+                );
+                return ClewdrError::InvalidCookie {
+                    reason: Reason::TooManyRequest(ts),
+                };
+            }
+            return ClewdrError::TimestampError { timestamp: ts };
+        }
+
+        error!("Rate limit exceeded, but no reset time provided");
+        return ClewdrError::InvalidCookie {
+            reason: Reason::TooManyRequest(Utc::now().timestamp() + 18000),
+        };
+    }
+
+    ClewdrError::ClaudeHttpError {
+        code: status,
+        inner: Box::new(inner_error),
+    }
+}
+
 impl CheckClaudeErr for Response {
     /// Checks response from Claude Web API for errors
     /// Validates HTTP status codes and parses error messages from responses
@@ -479,21 +572,9 @@ impl CheckClaudeErr for Response {
         let reset_header = self
             .headers()
             .get("anthropic-ratelimit-unified-reset")
-            .cloned();
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_owned);
         debug!("Error response status: {}", status);
-        if status == 302 {
-            // blocked by cloudflare
-            let error = ClaudeErrorBody {
-                message: json!("Blocked, check your IP address"),
-                r#type: "error".to_string(),
-                code: Some(status.as_u16()),
-                ..Default::default()
-            };
-            return Err(ClewdrError::ClaudeHttpError {
-                code: status,
-                inner: Box::new(error),
-            });
-        }
         let text = match self.text().await {
             Ok(text) => text,
             Err(err) => {
@@ -509,79 +590,11 @@ impl CheckClaudeErr for Response {
                 });
             }
         };
-        let Ok(err) = serde_json::from_str::<ClaudeError>(&text) else {
-            let error = ClaudeErrorBody {
-                message: format!("Unknown error: {text}").into(),
-                r#type: "error_parse_error_body".to_string(),
-                code: Some(status.as_u16()),
-                ..Default::default()
-            };
-            return Err(ClewdrError::ClaudeHttpError {
-                code: status,
-                inner: Box::new(error),
-            });
-        };
-        const OAUTH_PHRASE: &str =
-            "oauth authentication is currently not allowed for this organization";
-        let msg_lower = err
-            .error
-            .message
-            .as_str()
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_else(|| err.error.message.to_string().to_ascii_lowercase());
-        if status == 400 && msg_lower.contains("organization has been disabled") {
-            // account disabled
-            return Err(Reason::Disabled.into());
-        }
-        if (status == 401 || status == 403) && msg_lower.contains(OAUTH_PHRASE) {
-            return Err(Reason::Null.into());
-        }
-        let inner_error = err.error;
-        // check if the error is a rate limit error
-        if status == 429 {
-            // Some Anthropic feature-gating errors also use 429; keep them as HTTP
-            // errors instead of cooling down the account as if it were rate-limited.
-            let msg_lower = inner_error
-                .message
-                .as_str()
-                .map(|s| s.to_ascii_lowercase())
-                .unwrap_or_else(|| inner_error.message.to_string().to_ascii_lowercase());
-            if msg_lower.contains("extra usage is required for long context requests") {
-                return Err(ClewdrError::ClaudeHttpError {
-                    code: status,
-                    inner: Box::new(inner_error),
-                });
-            }
-
-            // get the reset time from the error message
-            let ts = inner_error.message["resetsAt"]
-                .as_i64()
-                .or_else(|| reset_header.and_then(|h| h.to_str().ok()?.parse::<i64>().ok()));
-            if let Some(ts) = ts {
-                let reset_time = chrono::DateTime::from_timestamp(ts, 0)
-                    .ok_or(ClewdrError::TimestampError { timestamp: ts })?
-                    .to_utc();
-                let now = chrono::Utc::now();
-                let diff = reset_time - now;
-                let mins = diff.num_minutes();
-                error!(
-                    "Rate limit exceeded, expires in {} hours",
-                    mins as f64 / 60.0
-                );
-                return Err(ClewdrError::InvalidCookie {
-                    reason: Reason::TooManyRequest(ts),
-                });
-            } else {
-                error!("Rate limit exceeded, but no reset time provided");
-                return Err(ClewdrError::InvalidCookie {
-                    reason: Reason::TooManyRequest(Utc::now().timestamp() + 18000),
-                });
-            }
-        }
-        Err(ClewdrError::ClaudeHttpError {
-            code: status,
-            inner: Box::new(inner_error),
-        })
+        Err(claude_error_from_response_parts(
+            status,
+            reset_header.as_deref(),
+            &text,
+        ))
     }
 }
 

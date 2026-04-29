@@ -1035,6 +1035,7 @@ impl AccountPoolActor {
                 .collect(),
             inflight: state.inflight.clone(),
             probing: state.probing.clone(),
+            reactivated: state.reactivated.clone(),
             probe_errors: state.probe_errors.clone(),
         }
     }
