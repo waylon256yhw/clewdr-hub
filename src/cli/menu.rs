@@ -70,20 +70,20 @@ enum MenuAction {
 
 fn menu_entries() -> Vec<(&'static str, MenuAction)> {
     let mut entries: Vec<(&'static str, MenuAction)> = vec![
-        ("查看运行状态", MenuAction::Status),
-        ("运行诊断（只读健康检查）", MenuAction::Diagnose),
-        ("重置管理员密码", MenuAction::ResetAdmin),
-        ("导出配置备份包", MenuAction::ExportConfig),
-        ("导入配置备份包", MenuAction::ImportConfig),
-        (
-            "安装自启动服务（systemd / Termux:Boot）",
-            MenuAction::ServiceInstall,
-        ),
-        ("卸载自启动服务", MenuAction::ServiceUninstall),
+        ("1、查看状态", MenuAction::Status),
+        ("2、查看诊断", MenuAction::Diagnose),
+        ("3、重置密码", MenuAction::ResetAdmin),
+        ("4、导出配置", MenuAction::ExportConfig),
+        ("5、导入配置", MenuAction::ImportConfig),
+        ("6、安装服务", MenuAction::ServiceInstall),
+        ("7、卸载服务", MenuAction::ServiceUninstall),
     ];
     #[cfg(feature = "portable")]
-    entries.push(("检查更新", MenuAction::Update));
-    entries.push(("退出", MenuAction::Quit));
+    entries.push(("8、检查更新", MenuAction::Update));
+    #[cfg(feature = "portable")]
+    entries.push(("9、退出", MenuAction::Quit));
+    #[cfg(not(feature = "portable"))]
+    entries.push(("8、退出", MenuAction::Quit));
     entries
 }
 
@@ -471,6 +471,7 @@ mod tests {
     #[test]
     fn menu_entries_include_quit_and_main_verbs() {
         let entries = menu_entries();
+        let labels: Vec<&str> = entries.iter().map(|(label, _)| *label).collect();
         let actions: Vec<MenuAction> = entries.iter().map(|(_, a)| *a).collect();
         // Pin the menu surface — anyone removing one of these actions
         // should think twice about what verb they're hiding from
@@ -483,6 +484,21 @@ mod tests {
         assert!(actions.contains(&MenuAction::ServiceInstall));
         assert!(actions.contains(&MenuAction::ServiceUninstall));
         assert!(actions.contains(&MenuAction::Quit));
+        #[cfg(feature = "portable")]
+        assert_eq!(
+            labels,
+            vec![
+                "1、查看状态",
+                "2、查看诊断",
+                "3、重置密码",
+                "4、导出配置",
+                "5、导入配置",
+                "6、安装服务",
+                "7、卸载服务",
+                "8、检查更新",
+                "9、退出",
+            ]
+        );
         // Quit must be last so navigation order matches the user's
         // mental model ("escape hatch at the bottom").
         assert_eq!(entries.last().map(|(_, a)| *a), Some(MenuAction::Quit));
