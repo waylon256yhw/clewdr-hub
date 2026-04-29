@@ -374,6 +374,7 @@ fi
 # backend (macOS, sysvinit Linux, stripped containers). Otherwise the
 # verb errors out and `set -e` aborts the script after the binary's
 # already in place.
+service_state="skipped"   # one of: running | starting | failed | skipped | boot_registered
 if [[ "$NO_SERVICE" == "1" ]]; then
     warn "已跳过自启动注册（CLEWDR_NO_SERVICE=1）"
     info "后续注册：${clewdr_cmd} service install"
@@ -389,9 +390,95 @@ elif ! service_supported "$target"; then
     fi
 else
     info "注册自启动服务..."
-    "$install_dir/$bin_name" service install
+    if "$install_dir/$bin_name" service install; then
+        # Termux:Boot only writes a launcher script — the daemon does NOT
+        # start until reboot or a manual `sh ~/.termux/boot/clewdr-hub`.
+        # Don't probe (the listener won't be there) and don't say
+        # "starting".
+        if [[ "$target" == android-* ]]; then
+            service_state="boot_registered"
+        else
+            service_state="starting"
+        fi
+    else
+        service_state="failed"
+    fi
 fi
 
-info "${GREEN}${BOLD}安装完成${RESET}"
-info "诊断：${clewdr_cmd} diagnose"
-info "菜单：${clewdr_cmd} menu"
+# Probe whether the listener is actually answering. Default systemd unit
+# pins CLEWDR_PORT=8484, so this is correct for the install.sh path even
+# if the operator has a different port in clewdr.toml. Termux's
+# boot_registered path skips this — the daemon isn't running yet.
+if [[ "$service_state" == "starting" ]]; then
+    for _ in 1 2 3 4 5 6 7 8; do
+        if curl -fsS --max-time 1 "http://127.0.0.1:8484/api/version" >/dev/null 2>&1; then
+            service_state="running"
+            break
+        fi
+        sleep 1
+    done
+fi
+
+# Best-effort server IP for the access URL. hostname -I works on most
+# Linux distros; `ip` is a Debian/Ubuntu fallback. If neither is around
+# we just say <server-ip> so the user knows to fill it in.
+detect_server_ip() {
+    local ip=""
+    if command -v hostname >/dev/null 2>&1; then
+        ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+    fi
+    if [[ -z "$ip" ]] && command -v ip >/dev/null 2>&1; then
+        ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)
+    fi
+    [[ -n "$ip" ]] && echo "$ip" || echo "<server-ip>"
+}
+
+server_ip=$(detect_server_ip)
+
+echo
+case "$service_state" in
+    running)
+        echo "${GREEN}${BOLD}✓ 安装完成 — 服务已运行${RESET}"
+        ;;
+    starting)
+        echo "${YELLOW}${BOLD}⚠ 安装完成 — 服务启动中${RESET}"
+        echo "  8 秒内 ${BOLD}/api/version${RESET} 未响应；可能仍在初始化，也可能启动失败。"
+        echo "  排查：${BOLD}journalctl -u clewdr -n 50${RESET}"
+        ;;
+    boot_registered)
+        echo "${GREEN}${BOLD}✓ 安装完成 — Termux:Boot 已注册${RESET}"
+        echo "  现在启动：${BOLD}sh ~/.termux/boot/clewdr-hub${RESET}"
+        echo "  或重启 Termux 让它自动运行"
+        ;;
+    failed)
+        echo "${RED}${BOLD}✗ 二进制已部署 — 自启动注册失败${RESET}"
+        echo "  路径：${install_dir}/${bin_name}"
+        if [[ "$target" != android-* ]]; then
+            echo "  排查：${BOLD}journalctl -u clewdr -n 50${RESET}"
+        fi
+        echo "  重试：${BOLD}${clewdr_cmd} service install${RESET}"
+        ;;
+    skipped)
+        echo "${YELLOW}${BOLD}⚠ 安装完成 — 未启动${RESET}"
+        echo "  前台启动：${BOLD}${clewdr_cmd} serve${RESET}"
+        ;;
+esac
+
+echo
+case "$service_state" in
+    running|starting|boot_registered)
+        printf "  %-10s %s\n" "访问后台" "${BOLD}http://${server_ip}:8484${RESET}"
+        printf "  %-10s %s\n" "默认密码" "${BOLD}password${RESET}（首次登录强制改密）"
+        ;;
+esac
+printf "  %-10s %s\n" "管理菜单" "${BOLD}${clewdr_cmd} menu${RESET}"
+printf "  %-10s %s\n" "运行诊断" "${BOLD}${clewdr_cmd} diagnose${RESET}"
+case "$service_state" in
+    running|starting)
+        printf "  %-10s %s\n" "服务日志" "${BOLD}journalctl -u clewdr -f${RESET}"
+        ;;
+    boot_registered)
+        printf "  %-10s %s\n" "服务日志" "${BOLD}tail -f ~/.local/clewdr/log/clewdr.boot.log${RESET}"
+        ;;
+esac
+echo

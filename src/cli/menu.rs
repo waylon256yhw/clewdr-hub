@@ -294,9 +294,11 @@ async fn menu_service_install() -> Result<(), ClewdrError> {
 
 async fn menu_service_uninstall() -> Result<(), ClewdrError> {
     let (systemd, termux_boot) = prompt_service_target()?;
-    let purge = Confirm::new("--purge：是否同时删除 clewdr.db、clewdr.toml 和日志目录？")
+    let purge = Confirm::new("--purge：是否完全移除 clewdr？")
         .with_default(false)
-        .with_help_message("默认关闭；如果这里选择是，后续仍会要求输入 `yes` 二次确认。")
+        .with_help_message(
+            "Yes 会移除二进制、配置、数据库、systemd 单元 / Termux:Boot 脚本，并删除 PATH 链接。后续会要求输入 yes 二次确认。",
+        )
         .prompt()
         .map_err(wrap_or_cancel)?;
     cli::service::run(cli::service::ServiceCommand::Uninstall(

@@ -6,18 +6,21 @@
 //!
 //! - **systemd**: writes `/etc/systemd/system/clewdr.service`, ensures a
 //!   `clewdr` system user + `/opt/clewdr` workdir + `/opt/clewdr/log/`.
-//!   Requires root. Uninstall reverses systemd state but leaves the
-//!   user / workdir in place (other services may share them, and
-//!   removing a system user is irreversible).
+//!   Requires root. Plain uninstall reverses systemd state and leaves
+//!   data/binary/user in place; `--purge` does a complete teardown.
 //! - **Termux:Boot**: writes `~/.termux/boot/clewdr-hub` with a
 //!   non-blocking `nohup ... &` launcher. No root needed; assumes the
 //!   Termux:Boot app is installed (we can't install it for the user,
 //!   but we point at the F-Droid page if `~/.termux/boot/` is missing).
 //!
-//! `--purge` on uninstall additionally deletes the running config, db,
-//! and log directory after an interactive confirmation. Default is
-//! preserve. Non-TTY callers get a clear refusal so a script can't
-//! accidentally wipe data.
+//! `--purge` is a complete teardown: in addition to the data files, it
+//! removes the binary, PATH symlink, workdir, systemd drop-in dir,
+//! legacy logrotate config, and the `clewdr` system user + group
+//! (Termux mirror covers the boot script, install dir, and PATH link).
+//! After unlinking the running binary the verb finalizes and exits
+//! cleanly so the menu can't loop in a half-uninstalled state.
+//! Non-TTY callers get a clear refusal so a script can't accidentally
+//! wipe an install.
 
 use std::{
     env, fs,
@@ -61,8 +64,11 @@ pub struct UninstallArgs {
     #[arg(long, conflicts_with = "systemd")]
     pub termux_boot: bool,
 
-    /// Also delete `clewdr.db`, `clewdr.toml`, and the log directory.
-    /// Default is preserve. Requires an interactive TTY for confirmation.
+    /// Complete teardown: remove the binary, PATH symlink, workdir,
+    /// data files, systemd drop-in dir, legacy logrotate config, and
+    /// the `clewdr` system user + group. Termux mirror covers the
+    /// boot script, install dir, and PATH link. Default is preserve.
+    /// Requires an interactive TTY for confirmation.
     #[arg(long)]
     pub purge: bool,
 }
@@ -137,6 +143,8 @@ mod systemd {
     use super::*;
 
     const UNIT_PATH: &str = "/etc/systemd/system/clewdr.service";
+    const UNIT_DROP_IN_DIR: &str = "/etc/systemd/system/clewdr.service.d";
+    const LOGROTATE_PATH: &str = "/etc/logrotate.d/clewdr";
     const SERVICE_USER: &str = "clewdr";
     const SERVICE_GROUP: &str = "clewdr";
     const WORKING_DIR: &str = "/opt/clewdr";
@@ -167,34 +175,121 @@ mod systemd {
     pub async fn uninstall(purge: bool) -> Result<(), ClewdrError> {
         require_root("uninstall systemd unit")?;
 
-        // disable + stop is best-effort: systemctl returns non-zero
-        // when the unit isn't loaded, which is exactly the "already
-        // gone" case we want to tolerate. We still verify daemon-reload
-        // succeeds at the end since that's load-bearing for systemd
-        // forgetting the deleted unit.
-        let _ = run_systemctl(&["disable", "--now", SYSTEMD_UNIT_NAME]);
+        let unit_existed = Path::new(UNIT_PATH).exists();
 
-        if Path::new(UNIT_PATH).exists() {
+        // Always best-effort stop, even when the unit file is gone —
+        // systemd may still have it loaded (manual rm without
+        // daemon-reload, transient unit, etc.) and we don't want to
+        // wipe data while the daemon keeps running. Quiet because the
+        // "Unit not loaded" case is the expected no-op when there's
+        // truly nothing to disable.
+        let _ = run_systemctl_quiet(&["disable", "--now", SYSTEMD_UNIT_NAME]);
+
+        if unit_existed {
             fs::remove_file(UNIT_PATH)?;
+            run_systemctl(&["daemon-reload"])?;
+            eprintln!(
+                "{} clewdr.service disabled and unit file removed",
+                "✓".green().bold()
+            );
+        } else {
+            eprintln!("  no systemd unit at {} (already uninstalled?)", UNIT_PATH);
         }
-        run_systemctl(&["daemon-reload"])?;
 
-        eprintln!(
-            "{} clewdr.service disabled and unit file removed",
-            "✓".green().bold()
-        );
-        eprintln!(
-            "  System user '{SERVICE_USER}' + workdir '{WORKING_DIR}' left in place; \
-             remove manually if not used by other services."
-        );
-
-        if purge {
-            super::purge_data(&[
-                Path::new(SERVICE_DB_PATH),
-                Path::new(SERVICE_CONFIG_PATH),
-                Path::new(LOG_DIR),
-            ])?;
+        if !purge {
+            eprintln!("  数据、二进制、系统用户保留；如需完全移除请加 --purge。");
+            return Ok(());
         }
+
+        let binary = env::current_exe().ok();
+        let mut items: Vec<super::PurgeItem> = vec![
+            super::PurgeItem {
+                path: PathBuf::from(SERVICE_DB_PATH),
+                label: "data",
+            },
+            super::PurgeItem {
+                path: PathBuf::from(SERVICE_CONFIG_PATH),
+                label: "config",
+            },
+            super::PurgeItem {
+                path: PathBuf::from(LOG_DIR),
+                label: "logs",
+            },
+            // Drop-in overrides: anything someone added under
+            // /etc/systemd/system/clewdr.service.d/ (resource limits,
+            // env tweaks, etc). Owning the dir name "clewdr.service.d"
+            // makes this safe to recursively delete on purge.
+            super::PurgeItem {
+                path: PathBuf::from(UNIT_DROP_IN_DIR),
+                label: "systemd drop-ins",
+            },
+            // Legacy logrotate config from the old README ("manual
+            // systemd 持久化") that some operators copied into place by
+            // hand. Current install paths don't deploy it, but
+            // existing installs may carry it forward.
+            super::PurgeItem {
+                path: PathBuf::from(LOGROTATE_PATH),
+                label: "logrotate",
+            },
+        ];
+
+        // PATH symlink — only if it actually points at our binary, so
+        // we never trash a custom `clewdr` someone else dropped at
+        // /usr/local/bin/clewdr.
+        let symlink = Path::new("/usr/local/bin/clewdr");
+        if let Some(b) = &binary
+            && let Ok(target) = fs::read_link(symlink)
+        {
+            let resolved = fs::canonicalize(&target).ok();
+            let our = fs::canonicalize(b).ok();
+            if resolved.is_some() && resolved == our {
+                items.push(super::PurgeItem {
+                    path: symlink.to_path_buf(),
+                    label: "PATH link",
+                });
+            }
+        }
+
+        // Binary if it lives inside our managed workdir.
+        let binary_in_workdir = binary.as_ref().is_some_and(|b| b.starts_with(WORKING_DIR));
+        if binary_in_workdir && let Some(b) = &binary {
+            items.push(super::PurgeItem {
+                path: b.clone(),
+                label: "binary",
+            });
+        }
+
+        // Workdir last — we want everything inside it gone first so the
+        // recursive remove_dir_all has nothing surprising to walk into.
+        items.push(super::PurgeItem {
+            path: PathBuf::from(WORKING_DIR),
+            label: "workdir",
+        });
+
+        super::purge_all(items)?;
+
+        // Best-effort: drop the service user and matching group.
+        // userdel will refuse if any file still owns the uid (rare
+        // after we wiped the workdir) or if a process tied to it
+        // hasn't fully exited yet. groupdel as a separate call because
+        // some distros don't auto-remove the primary group.
+        let userdel_ok = Command::new("userdel")
+            .arg(SERVICE_USER)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if userdel_ok {
+            eprintln!("  removed system user {}", SERVICE_USER);
+        }
+        let _ = Command::new("groupdel")
+            .arg(SERVICE_GROUP)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        super::finalize_if_self_removed(&binary);
         Ok(())
     }
 
@@ -254,6 +349,8 @@ mod systemd {
     fn ensure_user_exists() -> Result<(), ClewdrError> {
         let exists = Command::new("getent")
             .args(["passwd", SERVICE_USER])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -320,6 +417,21 @@ mod systemd {
         Ok(())
     }
 
+    /// Best-effort systemctl call: silences both stdout and stderr so
+    /// "Unit not loaded" / "does not exist" / "no such unit" never leak
+    /// to the operator when we know the call is safe to fail (e.g.
+    /// `disable --now` on a unit we're about to delete anyway). Returns
+    /// success bool but most callers just ignore it.
+    fn run_systemctl_quiet(args: &[&str]) -> bool {
+        Command::new("systemctl")
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
     fn current_exe() -> Result<PathBuf, ClewdrError> {
         env::current_exe().map_err(|e| ClewdrError::BadRequestMessage {
             msg: format!("cannot determine current binary path: {e}"),
@@ -380,18 +492,71 @@ mod termux {
             "  if clewdr is still running, stop it manually (e.g. `pkill clewdr`) or restart Termux."
         );
 
-        if purge {
-            // For Termux we don't have a privileged install path, so the
-            // user's data lives wherever they unzipped the binary.
-            // Best-effort guesses match the install.sh layout the plan
-            // points at: $HOME/clewdr/ for binary + config + db,
-            // $HOME/.local/clewdr/log/ for logs (matching the boot script
-            // we just deleted).
-            let guess_db = home.join("clewdr/clewdr.db");
-            let guess_toml = home.join("clewdr/clewdr.toml");
-            let log_dir = home.join(".local/clewdr/log");
-            super::purge_data(&[&guess_db, &guess_toml, &log_dir])?;
+        if !purge {
+            eprintln!("  数据、二进制保留；如需完全移除请加 --purge。");
+            return Ok(());
         }
+
+        // Termux's install.sh layout puts everything under $HOME/clewdr/
+        // (binary + config + db) and ~/.local/clewdr/log/ for logs.
+        let install_dir = home.join("clewdr");
+        let log_dir = home.join(".local/clewdr/log");
+        let binary = env::current_exe().ok();
+
+        let mut items: Vec<super::PurgeItem> = vec![
+            super::PurgeItem {
+                path: install_dir.join("clewdr.db"),
+                label: "data",
+            },
+            super::PurgeItem {
+                path: install_dir.join("clewdr.toml"),
+                label: "config",
+            },
+            super::PurgeItem {
+                path: log_dir,
+                label: "logs",
+            },
+        ];
+
+        // PATH symlink at $PREFIX/bin/clewdr — only if it points at us.
+        if let Some(prefix) = env::var_os("PREFIX") {
+            let symlink = PathBuf::from(prefix).join("bin/clewdr");
+            if let Some(b) = &binary
+                && let Ok(target) = fs::read_link(&symlink)
+            {
+                let resolved = fs::canonicalize(&target).ok();
+                let our = fs::canonicalize(b).ok();
+                if resolved.is_some() && resolved == our {
+                    items.push(super::PurgeItem {
+                        path: symlink,
+                        label: "PATH link",
+                    });
+                }
+            }
+        }
+
+        let binary_in_install = binary.as_ref().is_some_and(|b| b.starts_with(&install_dir));
+        if binary_in_install && let Some(b) = &binary {
+            items.push(super::PurgeItem {
+                path: b.clone(),
+                label: "binary",
+            });
+        }
+
+        items.push(super::PurgeItem {
+            path: install_dir,
+            label: "install dir",
+        });
+
+        super::purge_all(items)?;
+
+        // Try to remove ~/.local/clewdr/ if it's now empty (we just
+        // wiped its only known child, the log dir). If something else
+        // is in there — operator-placed files — rmdir refuses and
+        // we leave it alone.
+        let _ = fs::remove_dir(home.join(".local/clewdr"));
+
+        super::finalize_if_self_removed(&binary);
         Ok(())
     }
 
@@ -463,25 +628,51 @@ fn is_root() -> bool {
         .unwrap_or(false)
 }
 
-/// Interactive `--purge` confirmation. Refuses on a non-TTY because a
-/// script accidentally piping `clewdr service uninstall --purge` should
-/// not be able to silently delete the operator's data.
-fn purge_data(paths: &[&Path]) -> Result<(), ClewdrError> {
-    let existing: Vec<&Path> = paths.iter().copied().filter(|p| p.exists()).collect();
+/// One entry in the `--purge` removal list. The label is shown next to
+/// the path so the operator can tell at a glance what each line means
+/// ("data" / "binary" / "PATH link" / "workdir" / …) before typing yes.
+struct PurgeItem {
+    path: PathBuf,
+    label: &'static str,
+}
+
+/// Show the full purge preview, ask `yes` to confirm, then delete each
+/// entry in order. Symlinks are unlinked themselves (not their targets);
+/// directories are removed recursively (`remove_dir_all`); files via
+/// `remove_file`. Caller is expected to have built `items` in an order
+/// safe to delete top-to-bottom — typically with the workdir LAST.
+fn purge_all(items: Vec<PurgeItem>) -> Result<(), ClewdrError> {
+    // symlink_metadata so a dangling/managed symlink still counts as
+    // "present" and gets cleaned, and the binary's data isn't followed
+    // when we just want to remove the link.
+    let existing: Vec<PurgeItem> = items
+        .into_iter()
+        .filter(|i| fs::symlink_metadata(&i.path).is_ok())
+        .collect();
     if existing.is_empty() {
-        eprintln!("  --purge: no clewdr.db / clewdr.toml / log dir found; nothing to delete.");
+        eprintln!("  --purge: nothing to remove (already gone).");
         return Ok(());
     }
 
+    let label_width = existing.iter().map(|i| i.label.len()).max().unwrap_or(0);
+
     eprintln!();
-    eprintln!("--purge will delete:");
-    let mut total: u64 = 0;
-    for path in &existing {
-        let bytes = path_size(path);
-        total += bytes;
-        eprintln!("  {} ({})", path.display(), human_bytes(bytes).dimmed());
+    eprintln!("--purge will remove:");
+    for item in &existing {
+        let hint = match fs::symlink_metadata(&item.path) {
+            Ok(m) if m.file_type().is_symlink() => "symlink".to_string(),
+            Ok(m) if m.is_file() => human_bytes(m.len()),
+            Ok(_) => human_bytes(path_size(&item.path)),
+            Err(_) => "?".to_string(),
+        };
+        eprintln!(
+            "  {:<width$}  {}  {}",
+            item.label,
+            item.path.display(),
+            format!("({hint})").dimmed(),
+            width = label_width,
+        );
     }
-    eprintln!("  total: {}", human_bytes(total).bold());
 
     if !std::io::stdin().is_terminal() {
         return Err(ClewdrError::BadRequest {
@@ -498,15 +689,59 @@ fn purge_data(paths: &[&Path]) -> Result<(), ClewdrError> {
         });
     }
 
-    for path in existing {
-        if path.is_dir() {
-            fs::remove_dir_all(path)?;
-        } else {
-            fs::remove_file(path)?;
+    let mut failures: Vec<PathBuf> = Vec::new();
+    for item in &existing {
+        let result = match fs::symlink_metadata(&item.path) {
+            Ok(m) if m.is_dir() => fs::remove_dir_all(&item.path),
+            // Files AND symlinks both go through remove_file, which on
+            // a symlink unlinks the link itself and never touches the
+            // target — exactly what we want for the PATH link.
+            Ok(_) => fs::remove_file(&item.path),
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(()) => eprintln!("  removed {}", item.path.display()),
+            Err(e) => {
+                eprintln!(
+                    "  {} failed to remove {}: {}",
+                    "!".yellow().bold(),
+                    item.path.display(),
+                    e
+                );
+                failures.push(item.path.clone());
+            }
         }
-        eprintln!("  removed {}", path.display());
+    }
+    // Surface partial-failure to the caller so it doesn't proceed to
+    // user/group removal or print a "✓ 已从本机移除" banner over a
+    // half-cleaned install. The operator can re-run --purge once
+    // they've fixed the cause (immutable bit, busy mount, ro fs, …).
+    if !failures.is_empty() {
+        return Err(ClewdrError::BadRequestMessage {
+            msg: format!(
+                "purge incomplete: {} item(s) failed to remove (see preceding lines for details)",
+                failures.len()
+            ),
+        });
     }
     Ok(())
+}
+
+/// If we just unlinked the running binary, the menu loop / shell would
+/// be staring at a half-uninstalled state — `clewdr` is no longer on
+/// disk but the in-memory process keeps going. Print a final summary
+/// and exit cleanly so neither the menu nor the verb caller continues.
+fn finalize_if_self_removed(binary: &Option<PathBuf>) {
+    let Some(b) = binary else { return };
+    if b.exists() {
+        return;
+    }
+    eprintln!();
+    eprintln!("{} clewdr 已从本机移除", "✓".green().bold());
+    use std::io::Write;
+    std::io::stderr().flush().ok();
+    std::io::stdout().flush().ok();
+    std::process::exit(0);
 }
 
 fn path_size(p: &Path) -> u64 {
