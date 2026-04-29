@@ -1,5 +1,5 @@
 use clewdr_hub::{
-    ARGS, Args, Command, FIG, IS_DEBUG,
+    Args, Command, FIG, IS_DEBUG,
     config::{CLEWDR_CONFIG, CONFIG_PATH, DB_PATH, LOG_DIR},
     error::ClewdrError,
     version_info_colored,
@@ -54,6 +54,32 @@ fn admin_panel_url(addr: SocketAddr) -> String {
     format!("http://{}:{}", host, addr.port())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_bare_invocation_gets_friendly_default() {
+        let args = Args::default();
+        assert!(should_show_interactive_default(&args, 1, true));
+    }
+
+    #[test]
+    fn non_tty_bare_invocation_keeps_serve_compatibility() {
+        let args = Args::default();
+        assert!(!should_show_interactive_default(&args, 1, false));
+    }
+
+    #[test]
+    fn argv_or_explicit_serve_keeps_serve_path() {
+        let mut args = Args::default();
+        assert!(!should_show_interactive_default(&args, 2, true));
+
+        args.command = Some(Command::Serve);
+        assert!(!should_show_interactive_default(&args, 1, true));
+    }
+}
+
 /// Application entry point.
 ///
 /// Order matters here:
@@ -62,7 +88,9 @@ fn admin_panel_url(addr: SocketAddr) -> String {
 ///    [`CLEWDR_CONFIG`] initialization, because touching `CLEWDR_CONFIG`
 ///    spawns an async writeback to `clewdr.toml` that would race with
 ///    `clewdr import-config`.
-/// 3. Only the bare-server path proceeds to logging + config + DB + axum.
+/// 3. In an interactive terminal, bare `clewdr` prints status/help instead
+///    of trying to start a second foreground server.
+/// 4. Only the serve path proceeds to logging + config + DB + axum.
 #[tokio::main]
 async fn main() -> Result<(), ClewdrError> {
     // Strict argv validation: surface unknown flags (typos, removed args) as a
@@ -71,7 +99,8 @@ async fn main() -> Result<(), ClewdrError> {
     // harnesses and other library consumers tolerate unrelated argv; the
     // binary itself wants the strict behaviour.
     use clap::Parser;
-    let _ = Args::parse();
+    let args = Args::parse();
+    let argc = std::env::args_os().len();
 
     // Ensure a crypto provider is installed before rustls usage (yup-oauth2 / hyper-rustls).
     #[cfg(target_os = "android")]
@@ -95,18 +124,51 @@ async fn main() -> Result<(), ClewdrError> {
     colored::control::set_override(stdout_is_tty);
 
     // ---- Early CLI dispatch (must precede logging + CLEWDR_CONFIG) ----
-    if let Some(cmd) = ARGS.command.clone() {
+    if let Some(cmd) = args.command.clone() {
         if !matches!(cmd, Command::Serve) {
             return verb_finish(clewdr_hub::cli::dispatch(cmd).await);
         }
     }
     #[cfg(feature = "portable")]
-    if ARGS.update {
+    if args.update {
         return verb_finish(clewdr_hub::cli::run_update().await);
+    }
+    if should_show_interactive_default(&args, argc, stdout_is_tty) {
+        return verb_finish(interactive_default().await);
     }
 
     // ---- From here on it's the serve path; logging + CLEWDR_CONFIG are fair game ----
     serve().await
+}
+
+fn should_show_interactive_default(args: &Args, argc: usize, stdout_is_tty: bool) -> bool {
+    if !stdout_is_tty || argc != 1 || args.command.is_some() {
+        return false;
+    }
+    #[cfg(feature = "portable")]
+    if args.update {
+        return false;
+    }
+    true
+}
+
+async fn interactive_default() -> Result<(), ClewdrError> {
+    println!("clewdr v{}", env!("CARGO_PKG_VERSION"));
+    println!("检测到交互式裸命令，未启动前台服务。");
+    println!();
+
+    clewdr_hub::cli::status::run(clewdr_hub::cli::status::Args { json: false }).await?;
+
+    println!();
+    println!("常用命令：");
+    #[cfg(feature = "tui")]
+    println!("  clewdr menu      打开操作菜单");
+    println!("  clewdr status    查看运行状态");
+    println!("  clewdr diagnose  诊断安装");
+    println!("  clewdr serve     前台启动服务");
+    println!();
+    println!("提示：安装脚本通常已注册后台服务；需要手动前台运行时再执行 `clewdr serve`。");
+    Ok(())
 }
 
 /// Convert a CLI verb's `Result` into a process-level outcome.

@@ -217,7 +217,7 @@ mod systemd {
              User={user}\n\
              Group={group}\n\
              WorkingDirectory={workdir}\n\
-             ExecStart={binary} --config {config} --db {db} --log-dir {log_dir}\n\
+             ExecStart={binary} serve --config {config} --db {db} --log-dir {log_dir}\n\
              Restart=on-failure\n\
              RestartSec=5\n\
              \n\
@@ -569,7 +569,7 @@ mod tests {
         // and unwritable by the service user (review #10 P1).
         assert!(
             unit.contains(
-                "ExecStart=/opt/clewdr/clewdr --config /opt/clewdr/clewdr.toml \
+                "ExecStart=/opt/clewdr/clewdr serve --config /opt/clewdr/clewdr.toml \
                  --db /opt/clewdr/clewdr.db --log-dir /opt/clewdr/log"
             ),
             "unit:\n{unit}"
@@ -596,7 +596,7 @@ mod tests {
         let unit = systemd::unit_file_contents(Path::new("/usr/local/bin/clewdr"));
         assert!(
             unit.contains(
-                "ExecStart=/usr/local/bin/clewdr --config /opt/clewdr/clewdr.toml \
+                "ExecStart=/usr/local/bin/clewdr serve --config /opt/clewdr/clewdr.toml \
                  --db /opt/clewdr/clewdr.db --log-dir /opt/clewdr/log"
             ),
             "unit:\n{unit}"

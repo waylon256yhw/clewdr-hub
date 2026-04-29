@@ -90,7 +90,7 @@ pub struct Args {
     pub command: Option<Command>,
 }
 
-/// Path-related flags shared by every subcommand and the bare `serve` entry.
+/// Path-related flags shared by every subcommand and the server entry.
 #[derive(clap::Args, Debug, Clone, Default)]
 pub struct GlobalOpts {
     /// load cookie from file (deprecated)
@@ -112,7 +112,7 @@ pub struct GlobalOpts {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
-    /// Run the HTTP server (default when no subcommand is given).
+    /// Run the HTTP server.
     Serve,
 
     /// Reset the admin user's password (requires existing database).
