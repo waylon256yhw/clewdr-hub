@@ -208,7 +208,10 @@ service_supported() {
     local target=$1
     case "$target" in
         android-*)
-            # Termux:Boot doesn't need root.
+            # Termux:Boot is an optional app; most fresh Termux installs
+            # don't have ~/.termux/boot yet. Treat it like systemd: only
+            # auto-register when the backend is already present.
+            [[ -d "${HOME}/.termux/boot" ]] || return 1
             return 0
             ;;
         linux-*|musllinux-*)
@@ -370,10 +373,17 @@ if [[ "$NO_SERVICE" == "1" ]]; then
     warn "skipping service registration (CLEWDR_NO_SERVICE=1)"
     info "register later with: ${install_dir}/${bin_name} service install"
 elif ! service_supported "$target"; then
-    warn "no supported service backend detected (need systemd on Linux or Termux:Boot on Android)"
-    info "skipping service registration; the binary is installed but won't autostart on reboot"
-    info "manual start: ${install_dir}/${bin_name} serve"
-    info "register later (if you set up systemd / Termux:Boot): ${install_dir}/${bin_name} service install"
+    if [[ "$target" == android-* ]]; then
+        warn "Termux:Boot backend not detected (~/.termux/boot missing)"
+        info "skipping service registration; the binary is installed but won't autostart on reboot"
+        info "manual start: ${install_dir}/${bin_name} serve"
+        info "register later: install Termux:Boot, open it once, then run ${install_dir}/${bin_name} service install"
+    else
+        warn "no supported service backend detected (need systemd on Linux or Termux:Boot on Android)"
+        info "skipping service registration; the binary is installed but won't autostart on reboot"
+        info "manual start: ${install_dir}/${bin_name} serve"
+        info "register later (if you set up systemd / Termux:Boot): ${install_dir}/${bin_name} service install"
+    fi
 else
     info "registering service..."
     "$install_dir/$bin_name" service install
