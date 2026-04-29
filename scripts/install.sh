@@ -224,6 +224,18 @@ service_supported() {
     esac
 }
 
+validate_install_dir() {
+    local install_dir=$1
+
+    if [[ ( -e "$install_dir" || -L "$install_dir" ) && ! -d "$install_dir" ]]; then
+        err "${install_dir} already exists but is not a directory; remove or rename it, then re-run the installer"
+    fi
+
+    if [[ "$install_dir" == /opt/* || "$install_dir" == /usr/* ]] && [[ $EUID -ne 0 ]]; then
+        err "writing to ${install_dir} requires root — re-run with sudo, or set CLEWDR_INSTALL_DIR=\$HOME/clewdr for a user-local install"
+    fi
+}
+
 install_path_link() {
     local target=$1 install_dir=$2 bin_name=$3
 
@@ -308,6 +320,7 @@ fi
 
 install_dir=$(resolve_install_dir "$target")
 info "install dir: ${BOLD}${install_dir}${RESET}"
+validate_install_dir "$install_dir"
 
 api_url=$(release_api_url)
 info "fetching release metadata from ${api_url}"
@@ -332,13 +345,6 @@ bin_name="clewdr"
 [[ "$target" == windows-* ]] && bin_name="clewdr.exe"
 [[ -f "$tmpdir/extracted/$bin_name" ]] \
     || err "extracted archive doesn't contain $bin_name (asset corrupted?)"
-
-# /opt and /usr need root. The systemd path will need root anyway for
-# `service install`, so failing here with a clear message is friendlier
-# than discovering it three steps later.
-if [[ "$install_dir" == /opt/* || "$install_dir" == /usr/* ]] && [[ $EUID -ne 0 ]]; then
-    err "writing to ${install_dir} requires root — re-run with sudo, or set CLEWDR_INSTALL_DIR=\$HOME/clewdr for a user-local install"
-fi
 
 mkdir -p "$install_dir"
 mv "$tmpdir/extracted/$bin_name" "$install_dir/$bin_name"
