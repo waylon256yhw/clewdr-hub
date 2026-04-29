@@ -29,7 +29,33 @@
 
 ## 部署
 
-### Docker Compose（推荐）
+### 一键安装（推荐）
+
+Linux / macOS / Termux 一条命令装好，自动注册开机自启：
+
+```bash
+curl -fL https://raw.githubusercontent.com/waylon256yhw/clewdr-hub/master/scripts/install.sh | bash
+```
+
+装完直接打开管理菜单：
+
+```bash
+clewdr menu
+```
+
+按编号选择 — 查看状态、改密码、导入导出配置都在里面。
+
+管理后台地址 `http://你的IP:8484`，默认密码 `password`，首次登录强制改密。
+
+#### Termux 用户
+
+要在关掉 Termux 后服务仍在线，先到 F-Droid 装一次 [Termux:Boot](https://f-droid.org/packages/com.termux.boot/) 并打开它，再执行：
+
+```bash
+clewdr service install
+```
+
+### Docker Compose
 
 ```bash
 mkdir clewdr-hub && cd clewdr-hub
@@ -37,40 +63,11 @@ curl -O https://raw.githubusercontent.com/waylon256yhw/clewdr-hub/master/docker-
 docker compose up -d
 ```
 
-管理后台：`http://your-ip:8484`，默认密码 `password`（首次登录强制改密）。
+管理后台：`http://your-ip:8484`，默认密码 `password`，首次登录强制改密。数据持久化在 Docker volume `clewdr-data` 中，`docker compose down` 不会丢数据。
 
-数据持久化在 Docker volume `clewdr-data` 中，`docker compose down` 不会丢数据。
+### 手动安装
 
-### 二进制
-
-```bash
-# 下载（Linux x86_64 示例，其他架构见 Releases）
-curl -fL https://github.com/waylon256yhw/clewdr-hub/releases/latest/download/clewdr-linux-x86_64.zip -o clewdr.zip
-unzip clewdr.zip && chmod +x clewdr
-./clewdr
-```
-
-DB 自动创建在同目录（`clewdr.db`），可用 `--db /path/to/db` 指定。
-
-#### systemd 持久化（推荐）
-
-```bash
-# 安装二进制
-sudo mkdir -p /opt/clewdr/log
-sudo cp clewdr /opt/clewdr/
-sudo useradd -r -s /sbin/nologin clewdr 2>/dev/null || true
-sudo chown -R clewdr:clewdr /opt/clewdr
-
-# 安装 service + 日志轮转
-sudo curl -fL https://raw.githubusercontent.com/waylon256yhw/clewdr-hub/master/deploy/clewdr.service \
-  -o /etc/systemd/system/clewdr.service
-sudo curl -fL https://raw.githubusercontent.com/waylon256yhw/clewdr-hub/master/deploy/clewdr.logrotate \
-  -o /etc/logrotate.d/clewdr
-sudo systemctl daemon-reload
-sudo systemctl enable --now clewdr
-```
-
-查看状态：`systemctl status clewdr`，日志：`journalctl -u clewdr -f` 或 `tail -f /opt/clewdr/log/*.log`。
+到 [Releases](https://github.com/waylon256yhw/clewdr-hub/releases/latest) 下载对应平台的 zip，解压加可执行权限即可。要开机自启可以接着跑 `clewdr service install`。
 
 ### 环境变量
 
@@ -79,6 +76,28 @@ sudo systemctl enable --now clewdr
 | `CLEWDR_IP` | `0.0.0.0` | 监听地址 |
 | `CLEWDR_PORT` | `8484` | 监听端口 |
 | `ADMIN_PASSWORD` | `password` | 管理员密码（首次登录强制修改） |
+
+## 日常管理
+
+```bash
+clewdr menu       # 交互式管理菜单
+clewdr            # 一眼看运行状态
+clewdr update     # 升级到最新版
+```
+
+`clewdr menu` 里能做：查看状态、查看诊断、重置密码、导入/导出配置、安装/卸载服务、检查更新。
+
+## 卸载
+
+```bash
+curl -fL https://raw.githubusercontent.com/waylon256yhw/clewdr-hub/master/scripts/uninstall.sh | bash
+```
+
+默认只删二进制和服务注册，保留你的配置和数据。要把配置和数据库也删掉：
+
+```bash
+curl -fL https://raw.githubusercontent.com/waylon256yhw/clewdr-hub/master/scripts/uninstall.sh | bash -s -- --purge
+```
 
 ## 使用
 
