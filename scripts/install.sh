@@ -361,6 +361,11 @@ fi
 
 info "installed: ${BOLD}${install_dir}/${bin_name}${RESET}"
 install_path_link "$target" "$install_dir" "$bin_name"
+if clewdr_on_path_points_to_install "$install_dir" "$bin_name"; then
+    clewdr_cmd="clewdr"
+else
+    clewdr_cmd="${install_dir}/${bin_name}"
+fi
 
 # Service registration. The binary handles env detection (systemd vs
 # Termux:Boot) and the privileged setup (useradd, /etc/systemd/, etc.),
@@ -370,30 +375,23 @@ install_path_link "$target" "$install_dir" "$bin_name"
 # verb errors out and `set -e` aborts the script after the binary's
 # already in place.
 if [[ "$NO_SERVICE" == "1" ]]; then
-    warn "skipping service registration (CLEWDR_NO_SERVICE=1)"
-    info "register later with: ${install_dir}/${bin_name} service install"
+    warn "已跳过自启动注册（CLEWDR_NO_SERVICE=1）"
+    info "后续注册：${clewdr_cmd} service install"
 elif ! service_supported "$target"; then
     if [[ "$target" == android-* ]]; then
-        warn "Termux:Boot backend not detected (~/.termux/boot missing)"
-        info "skipping service registration; the binary is installed but won't autostart on reboot"
-        info "manual start: ${install_dir}/${bin_name} serve"
-        info "register later: install Termux:Boot, open it once, then run ${install_dir}/${bin_name} service install"
+        warn "未检测到 Termux:Boot（缺少 ~/.termux/boot）"
+        info "已跳过自启动；前台启动：${clewdr_cmd} serve"
+        info "装好 Termux:Boot 并打开一次后，执行：${clewdr_cmd} service install"
     else
-        warn "no supported service backend detected (need systemd on Linux or Termux:Boot on Android)"
-        info "skipping service registration; the binary is installed but won't autostart on reboot"
-        info "manual start: ${install_dir}/${bin_name} serve"
-        info "register later (if you set up systemd / Termux:Boot): ${install_dir}/${bin_name} service install"
+        warn "未检测到可用自启动后端（Linux 需要 systemd，Termux 需要 Termux:Boot）"
+        info "已跳过自启动；前台启动：${clewdr_cmd} serve"
+        info "后续注册：${clewdr_cmd} service install"
     fi
 else
-    info "registering service..."
+    info "注册自启动服务..."
     "$install_dir/$bin_name" service install
 fi
 
-info "${GREEN}${BOLD}install complete${RESET}"
-if clewdr_on_path_points_to_install "$install_dir" "$bin_name"; then
-    info "diagnose:  clewdr diagnose"
-    info "menu:      clewdr menu"
-else
-    info "diagnose:  ${install_dir}/${bin_name} diagnose"
-    info "menu:      ${install_dir}/${bin_name} menu"
-fi
+info "${GREEN}${BOLD}安装完成${RESET}"
+info "诊断：${clewdr_cmd} diagnose"
+info "菜单：${clewdr_cmd} menu"
