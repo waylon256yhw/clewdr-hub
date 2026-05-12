@@ -952,7 +952,7 @@ fn print_summary(summary: &ImportSummary, bundle: &Bundle, dry_run: bool) {
 
     for table in TABLE_INSERT_ORDER {
         if let Some(c) = summary.per_table.get(*table) {
-            let parts = vec![
+            let parts = [
                 format!("inserted={}", c.inserted),
                 format!("skipped_admin={}", c.skipped_admin),
                 format!("skipped_blocked_settings={}", c.skipped_blocked_settings),

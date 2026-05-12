@@ -292,10 +292,10 @@ async fn detect_service() -> ServiceInfo {
     if is_termux() {
         return detect_termux_boot();
     }
-    if Path::new("/run/systemd/system").exists() {
-        if let Some(info) = detect_systemd().await {
-            return info;
-        }
+    if Path::new("/run/systemd/system").exists()
+        && let Some(info) = detect_systemd().await
+    {
+        return info;
     }
     ServiceInfo::NotRegistered
 }

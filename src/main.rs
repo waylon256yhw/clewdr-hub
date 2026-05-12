@@ -124,10 +124,10 @@ async fn main() -> Result<(), ClewdrError> {
     colored::control::set_override(stdout_is_tty);
 
     // ---- Early CLI dispatch (must precede logging + CLEWDR_CONFIG) ----
-    if let Some(cmd) = args.command.clone() {
-        if !matches!(cmd, Command::Serve) {
-            return verb_finish(clewdr_hub::cli::dispatch(cmd).await);
-        }
+    if let Some(cmd) = args.command.clone()
+        && !matches!(cmd, Command::Serve)
+    {
+        return verb_finish(clewdr_hub::cli::dispatch(cmd).await);
     }
     #[cfg(feature = "portable")]
     if args.update {

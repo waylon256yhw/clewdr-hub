@@ -358,7 +358,7 @@ fn prompt_service_target() -> Result<(bool, bool), ClewdrError> {
     .with_help_message("只有自动检测选错时才需要覆盖，例如 Termux chroot 内的 systemd。")
     .prompt()
     .map_err(wrap_or_cancel)?;
-    Ok(parse_service_target(&label))
+    Ok(parse_service_target(label))
 }
 
 /// Pure label → (systemd, termux_boot) mapping for the service-target
