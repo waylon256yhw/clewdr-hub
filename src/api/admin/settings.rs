@@ -173,18 +173,17 @@ async fn fetch_npm_versions() -> Result<Vec<String>, Box<dyn std::error::Error +
         .map(|obj| obj.keys().cloned().collect())
         .unwrap_or_default();
 
-    // Sort by semver descending, take latest 10
-    versions.sort_by_key(|v| std::cmp::Reverse(version_tuple(v)));
+    // Sort by semver descending, take latest 5. Anything that doesn't
+    // parse as semver sorts last (treated as 0.0.0).
+    versions.sort_by_key(|v| {
+        std::cmp::Reverse(
+            semver::Version::parse(v)
+                .ok()
+                .map(|ver| (ver.major, ver.minor, ver.patch))
+                .unwrap_or((0, 0, 0)),
+        )
+    });
     versions.truncate(5);
 
     Ok(versions)
-}
-
-fn version_tuple(v: &str) -> (u32, u32, u32) {
-    let parts: Vec<u32> = v.split('.').filter_map(|s| s.parse().ok()).collect();
-    (
-        parts.first().copied().unwrap_or(0),
-        parts.get(1).copied().unwrap_or(0),
-        parts.get(2).copied().unwrap_or(0),
-    )
 }
