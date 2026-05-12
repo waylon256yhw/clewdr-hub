@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 use sqlx::SqlitePool;
 use tracing::warn;
 
-use super::common::{Paginated, PaginationParams};
+use super::common::{Paginated, PaginationParams, normalize_optional};
 use crate::{
     billing::{BillingContext, RequestType, persist_probe_log},
     db::proxies::{
@@ -92,13 +92,6 @@ fn map_proxy(row: ProxyRow) -> ProxyResponse {
         created_at: row.created_at,
         updated_at: row.updated_at,
     }
-}
-
-fn normalize_optional(value: Option<String>) -> Option<String> {
-    value.and_then(|v| {
-        let trimmed = v.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
-    })
 }
 
 fn validate_protocol(protocol: &str) -> Result<(), ClewdrError> {

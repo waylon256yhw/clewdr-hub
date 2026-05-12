@@ -21,3 +21,12 @@ pub struct Paginated<T: Serialize> {
     pub offset: i64,
     pub limit: i64,
 }
+
+/// Trim whitespace and collapse empty strings to `None`. Used by admin
+/// endpoints that accept optional free-text fields.
+pub fn normalize_optional(value: Option<String>) -> Option<String> {
+    value.and_then(|v| {
+        let trimmed = v.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use sqlx::{Executor, Sqlite, SqlitePool};
 
-use super::common::PaginationParams;
+use super::common::{PaginationParams, normalize_optional};
 use crate::{
     billing::{BillingContext, RequestType, persist_probe_log},
     claude_code_state::{ClaudeCodeState, build_api_client},
@@ -197,13 +197,6 @@ pub struct UpdateAccountRequest {
 #[derive(Deserialize)]
 pub struct StartOAuthRequest {
     pub redirect_uri: Option<String>,
-}
-
-fn normalize_optional(value: Option<String>) -> Option<String> {
-    value.and_then(|v| {
-        let trimmed = v.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
-    })
 }
 
 // Parse a user-supplied cookie into its canonical inner form
