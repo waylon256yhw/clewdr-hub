@@ -457,7 +457,7 @@ async fn check_port(cfg: &DiagConfig) -> CheckResult {
         Ok(resp) if resp.status().is_success() => {
             let live_version = resp.text().await.ok().map(|s| s.trim().to_string());
             match live_version.as_deref() {
-                Some(v) if v.starts_with('v') && is_semver_ish(&v[1..]) => {
+                Some(v) if v.starts_with('v') && super::probe_common::is_semver_ish(&v[1..]) => {
                     let current = format!("v{}", env!("CARGO_PKG_VERSION"));
                     let detail = if v == current {
                         format!("RUNNING on {probe_addr} — {v} (matches binary)")
@@ -507,23 +507,6 @@ async fn check_port(cfg: &DiagConfig) -> CheckResult {
                 ),
             },
         },
-    }
-}
-
-fn is_semver_ish(s: &str) -> bool {
-    let mut parts = s.split('.');
-    let a = parts.next();
-    let b = parts.next();
-    let c = parts.next();
-    match (a, b, c) {
-        (Some(x), Some(y), Some(z)) => {
-            // Accept "1.2.3" and "1.2.3-pre" / "1.2.3+meta" prefixes.
-            let z_num: String = z.chars().take_while(|c| c.is_ascii_digit()).collect();
-            x.chars().all(|c| c.is_ascii_digit())
-                && y.chars().all(|c| c.is_ascii_digit())
-                && !z_num.is_empty()
-        }
-        _ => false,
     }
 }
 
@@ -721,24 +704,6 @@ fn check_data_size(cfg: &DiagConfig) -> CheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn semver_ish_accepts_normal_versions() {
-        assert!(is_semver_ish("1.2.3"));
-        assert!(is_semver_ish("0.0.1"));
-        assert!(is_semver_ish("12.34.56"));
-        assert!(is_semver_ish("1.2.3-pre"));
-        assert!(is_semver_ish("1.2.3+meta"));
-    }
-
-    #[test]
-    fn semver_ish_rejects_garbage() {
-        assert!(!is_semver_ish("hello"));
-        assert!(!is_semver_ish("1.2"));
-        assert!(!is_semver_ish("a.b.c"));
-        assert!(!is_semver_ish(""));
-        assert!(!is_semver_ish("v1.2.3")); // caller strips the leading "v"
-    }
 
     #[test]
     fn diag_config_defaults_to_loopback_8484() {

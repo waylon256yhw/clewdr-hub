@@ -273,7 +273,7 @@ async fn http_probe(addr: SocketAddr) -> ProbeOutcome {
     }
     let body = resp.text().await.unwrap_or_default();
     let trimmed = body.trim();
-    if trimmed.starts_with('v') && is_semver_ish(&trimmed[1..]) {
+    if trimmed.starts_with('v') && super::probe_common::is_semver_ish(&trimmed[1..]) {
         ProbeOutcome::Clewdr {
             version: trimmed.to_string(),
         }
@@ -281,20 +281,6 @@ async fn http_probe(addr: SocketAddr) -> ProbeOutcome {
         ProbeOutcome::ForeignHttp {
             status: status_code,
         }
-    }
-}
-
-fn is_semver_ish(s: &str) -> bool {
-    let mut parts = s.split('.');
-    let (a, b, c) = (parts.next(), parts.next(), parts.next());
-    match (a, b, c) {
-        (Some(x), Some(y), Some(z)) => {
-            let z_num: String = z.chars().take_while(|c| c.is_ascii_digit()).collect();
-            x.chars().all(|c| c.is_ascii_digit())
-                && y.chars().all(|c| c.is_ascii_digit())
-                && !z_num.is_empty()
-        }
-        _ => false,
     }
 }
 
@@ -649,16 +635,6 @@ mod tests {
 
     fn cfg_default() -> StatusConfig {
         StatusConfig::default()
-    }
-
-    #[test]
-    fn semver_ish_matches_api_version_format() {
-        // Mirrors what /api/version returns: `v1.2.3`, with the leading
-        // `v` stripped before this helper runs.
-        assert!(is_semver_ish("1.2.3"));
-        assert!(is_semver_ish("1.2.3-pre"));
-        assert!(!is_semver_ish("hello"));
-        assert!(!is_semver_ish("1.2"));
     }
 
     #[test]

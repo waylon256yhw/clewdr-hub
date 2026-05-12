@@ -15,6 +15,7 @@ pub mod export;
 pub mod import;
 #[cfg(feature = "tui")]
 pub mod menu;
+mod probe_common;
 pub mod reset;
 pub mod service;
 pub mod status;
