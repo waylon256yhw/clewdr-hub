@@ -8,6 +8,7 @@ use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 
 use super::common::{Paginated, PaginationParams};
+use crate::billing::{current_month_bounds, current_week_bounds};
 use crate::error::ClewdrError;
 use crate::services::user_limiter::UserLimiterMap;
 use crate::state::AdminEvent;
@@ -55,17 +56,11 @@ pub struct ResetUsageRequest {
     pub period: String,
 }
 
-fn current_week_start() -> String {
-    use chrono::{Datelike, Utc};
-    let now = Utc::now();
-    let weekday = now.weekday().num_days_from_monday();
-    let monday = now.date_naive() - chrono::Duration::days(weekday as i64);
-    monday.format("%Y-%m-%dT00:00:00Z").to_string()
-}
-
-fn current_month_start() -> String {
-    use chrono::Utc;
-    Utc::now().format("%Y-%m-01T00:00:00Z").to_string()
+fn current_period_starts() -> (String, String) {
+    let now = chrono::Utc::now();
+    let (week_start, _) = current_week_bounds(now);
+    let (month_start, _) = current_month_bounds(now);
+    (week_start, month_start)
 }
 
 fn user_list_query(week_start: &str, month_start: &str) -> String {
@@ -96,7 +91,8 @@ pub async fn list(
         .fetch_one(&db)
         .await?;
 
-    let base = user_list_query(&current_week_start(), &current_month_start());
+    let (week_start, month_start) = current_period_starts();
+    let base = user_list_query(&week_start, &month_start);
     let query = format!("{base} ORDER BY u.id LIMIT ?1 OFFSET ?2");
     let items: Vec<UserResponse> = sqlx::query_as(&query)
         .bind(limit)
@@ -167,7 +163,8 @@ pub async fn create(
     })?
     .last_insert_rowid();
 
-    let base = user_list_query(&current_week_start(), &current_month_start());
+    let (week_start, month_start) = current_period_starts();
+    let base = user_list_query(&week_start, &month_start);
     let query = format!("{base} WHERE u.id = ?1");
     let row: UserResponse = sqlx::query_as(&query).bind(id).fetch_one(&db).await?;
 
@@ -313,7 +310,8 @@ pub async fn update(
         limiter.remove(id).await;
     }
 
-    let base = user_list_query(&current_week_start(), &current_month_start());
+    let (week_start, month_start) = current_period_starts();
+    let base = user_list_query(&week_start, &month_start);
     let query = format!("{base} WHERE u.id = ?1");
     let row: UserResponse = sqlx::query_as(&query).bind(id).fetch_one(&db).await?;
 
@@ -382,8 +380,7 @@ pub async fn reset_usage(
         });
     }
 
-    let week_start = current_week_start();
-    let month_start = current_month_start();
+    let (week_start, month_start) = current_period_starts();
 
     match req.period.as_str() {
         "week" => {
