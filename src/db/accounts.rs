@@ -65,35 +65,6 @@ pub struct RuntimeStateRow {
     pub buckets: [UsageBreakdown; 5],
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct AccountPoolSummary {
-    pub valid: usize,
-    pub exhausted: usize,
-    pub invalid: usize,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct AccountStatusSummary {
-    pub active: i64,
-    pub cooling: i64,
-    pub error: i64,
-    pub disabled: i64,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct AccountAuthSourceSummary {
-    pub oauth: i64,
-    pub cookie: i64,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct AccountSummary {
-    pub total: i64,
-    pub pool: AccountPoolSummary,
-    pub statuses: AccountStatusSummary,
-    pub auth_sources: AccountAuthSourceSummary,
-}
-
 impl RuntimeStateRow {
     pub fn to_params(&self) -> RuntimeStateParams {
         RuntimeStateParams {
@@ -130,57 +101,6 @@ pub fn active_reset_time(account: &AccountWithRuntime) -> Option<i64> {
         .as_ref()
         .and_then(|runtime| runtime.reset_time)
         .filter(|ts| *ts > now)
-}
-
-pub fn is_temporarily_unavailable(account: &AccountWithRuntime) -> bool {
-    active_reset_time(account).is_some()
-}
-
-pub fn summarize_accounts(accounts: &[AccountWithRuntime]) -> AccountSummary {
-    let mut summary = AccountSummary {
-        total: accounts.len() as i64,
-        ..Default::default()
-    };
-
-    for account in accounts {
-        match account.auth_source.as_str() {
-            "oauth" => summary.auth_sources.oauth += 1,
-            "cookie" => summary.auth_sources.cookie += 1,
-            _ => {}
-        }
-
-        let pool_eligible = account.cookie_blob.as_ref().is_some_and(|v| !v.is_empty())
-            || (account.auth_source == "oauth" && account.oauth_token.is_some());
-
-        match account.status.as_str() {
-            "disabled" => {
-                summary.statuses.disabled += 1;
-                if pool_eligible {
-                    summary.pool.invalid += 1;
-                }
-            }
-            "auth_error" => {
-                summary.statuses.error += 1;
-                if pool_eligible {
-                    summary.pool.invalid += 1;
-                }
-            }
-            _ if is_temporarily_unavailable(account) => {
-                summary.statuses.cooling += 1;
-                if pool_eligible {
-                    summary.pool.exhausted += 1;
-                }
-            }
-            _ => {
-                summary.statuses.active += 1;
-                if pool_eligible {
-                    summary.pool.valid += 1;
-                }
-            }
-        }
-    }
-
-    summary
 }
 
 fn get_u64(row: &sqlx::sqlite::SqliteRow, col: &str) -> u64 {
@@ -976,19 +896,16 @@ where
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::time::Duration;
 
-    use chrono::Utc;
     use sqlx::Row;
 
     use super::{
-        AccountAuthSourceSummary, AccountIdentityConflict, AccountMetadataUpdate,
-        AccountPoolSummary, AccountStatusSummary, AccountSummary, AccountWithRuntime,
-        RuntimeStateRow, account_credential_matches_prefix, batch_upsert_runtime_states,
-        find_account_by_organization_uuid, load_all_accounts, summarize_accounts,
-        update_account_metadata, upsert_oauth_snapshot_runtime_fields,
+        AccountIdentityConflict, AccountMetadataUpdate, RuntimeStateRow,
+        account_credential_matches_prefix, batch_upsert_runtime_states,
+        find_account_by_organization_uuid, load_all_accounts, update_account_metadata,
+        upsert_oauth_snapshot_runtime_fields,
     };
-    use crate::config::{Organization, TokenInfo, UsageBreakdown};
+    use crate::config::UsageBreakdown;
     use crate::db::init_pool;
 
     fn runtime(reset_time: Option<i64>) -> RuntimeStateRow {
@@ -1012,93 +929,6 @@ mod tests {
             weekly_opus_utilization: None,
             buckets: std::array::from_fn(|_| UsageBreakdown::default()),
         }
-    }
-
-    fn account(
-        id: i64,
-        auth_source: &str,
-        status: &str,
-        cookie_blob: Option<&str>,
-        has_oauth: bool,
-        reset_time: Option<i64>,
-    ) -> AccountWithRuntime {
-        AccountWithRuntime {
-            id,
-            name: format!("acct-{id}"),
-            rr_order: id,
-            max_slots: 5,
-            proxy_id: None,
-            proxy_name: None,
-            proxy_url: None,
-            drain_first: false,
-            status: status.to_string(),
-            auth_source: auth_source.to_string(),
-            cookie_blob: cookie_blob.map(str::to_string),
-            oauth_token: has_oauth.then(|| TokenInfo {
-                access_token: "access".to_string(),
-                expires_in: Duration::from_secs(3600),
-                organization: Organization {
-                    uuid: "org".to_string(),
-                },
-                refresh_token: "refresh".to_string(),
-                expires_at: Utc::now() + chrono::Duration::hours(1),
-            }),
-            oauth_expires_at: None,
-            last_refresh_at: None,
-            last_error: None,
-            organization_uuid: Some("org".to_string()),
-            invalid_reason: None,
-            last_failure: None,
-            email: None,
-            account_type: None,
-            rate_limit_tier: None,
-            subscription_created_at: None,
-            billing_type: None,
-            created_at: None,
-            updated_at: None,
-            runtime: Some(runtime(reset_time)),
-        }
-    }
-
-    #[test]
-    fn summarize_accounts_unifies_pool_and_status_views() {
-        let now = Utc::now().timestamp();
-        let summary = summarize_accounts(&[
-            account(1, "oauth", "active", None, true, None),
-            account(
-                2,
-                "cookie",
-                "active",
-                Some("cookie=yes"),
-                false,
-                Some(now + 300),
-            ),
-            account(3, "cookie", "auth_error", Some("cookie=yes"), false, None),
-            account(4, "oauth", "disabled", None, true, None),
-            account(5, "oauth", "active", None, false, None),
-        ]);
-
-        assert_eq!(
-            summary,
-            AccountSummary {
-                total: 5,
-                pool: AccountPoolSummary {
-                    valid: 1,
-                    exhausted: 1,
-                    invalid: 2,
-                },
-                statuses: AccountStatusSummary {
-                    active: 2,
-                    cooling: 1,
-                    error: 1,
-                    disabled: 1,
-                },
-                auth_sources: AccountAuthSourceSummary {
-                    oauth: 3,
-                    cookie: 2,
-                },
-            }
-        );
     }
 
     #[tokio::test]

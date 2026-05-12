@@ -1,7 +1,6 @@
 //! Smoke tests for the CLI argument parser.
 //!
-//! These do not exercise verb implementations (most are `unimplemented!`);
-//! they verify that the [`clewdr_hub::Args`] / [`clewdr_hub::Command`] parser
+//! Verifies that the [`clewdr_hub::Args`] / [`clewdr_hub::Command`] parser
 //! handles back-compat flags, global path overrides, and subcommand routing
 //! the way the plan promises.
 

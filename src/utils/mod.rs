@@ -1,12 +1,8 @@
-use axum::body::Body;
 use colored::{ColoredString, Colorize};
 use tokio::spawn;
 use tracing::error;
 
-use crate::{
-    config::{CLEWDR_CONFIG, LOG_DIR},
-    error::ClewdrError,
-};
+use crate::config::{CLEWDR_CONFIG, LOG_DIR};
 
 /// Helper function to format a boolean value as "Enabled" or "Disabled"
 pub fn enabled(flag: bool) -> ColoredString {
@@ -51,23 +47,4 @@ pub fn print_out_text(text: String, file_name: &str) {
             error!("Failed to write log file {}: {}", path.display(), e);
         }
     });
-}
-
-/// Timezone for the API
-pub const TIME_ZONE: &str = "America/New_York";
-
-pub fn forward_response(in_: wreq::Response) -> Result<http::Response<Body>, ClewdrError> {
-    let status = in_.status();
-    let header = in_.headers().to_owned();
-    let stream = in_.bytes_stream();
-    let mut res = http::Response::builder().status(status);
-
-    let headers = res.headers_mut().unwrap();
-    for (key, value) in header {
-        if let Some(key) = key {
-            headers.insert(key, value);
-        }
-    }
-
-    Ok(res.body(Body::from_stream(stream))?)
 }

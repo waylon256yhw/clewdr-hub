@@ -47,7 +47,6 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
-itertools = "0.14"
 async-trait = "0.1"
 toml = "1"
 eventsource-stream = "0.2"
@@ -57,26 +56,20 @@ zip = { version = "8", optional = true, default-features = false, features = [
     "deflate",
 ] }
 tempfile = "3"
-axum-auth = "0.8"
 tiktoken-rs = "0.9"
-passwords = "3"
 tower-http = { version = "0.6", features = [
     "compression-zstd",
     "cors",
     "trace",
 ] }
 include_dir = { version = "0.7", optional = true }
-tower-serve-static = { version = "0.1", optional = true }
 figment = { version = "0.10", features = ["env", "toml"] }
 arc-swap = "1"
 url = { version = "2", features = ["serde"] }
 strum = { version = "0.27", features = ["derive"] }
 moka = { version = "0.12", features = ["sync"] }
 tower = "0.5"
-bytes = "1"
-trie-rs = "0.4"
 async-stream = "0.3"
-struct_iterable = "0.1"
 console-subscriber = { version = "0.5", optional = true }
 http = "1"
 snafu = { version = "0.8", features = ["futures", "rust_1_81"] }
@@ -113,7 +106,7 @@ default = ["portable", "external-resource", "tui", "encrypt"]
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]
 portable = ["dep:zip", "dep:self-replace"]
 xdg = ["dep:etcetera"]
-embed-resource = ["dep:tower-serve-static", "dep:include_dir"]
+embed-resource = ["dep:include_dir"]
 external-resource = ["tower-http/fs"]
 mimalloc = ["dep:mimalloc"]
 dhat-heap = ["dep:dhat"]
