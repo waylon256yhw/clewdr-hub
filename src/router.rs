@@ -28,6 +28,7 @@ impl RouterBuilder {
         let pool_handle = AccountPoolHandle::start(db_pool.clone(), event_tx.clone())
             .await
             .expect("Failed to start AccountPoolActor");
+        crate::services::oauth_keepalive::start(db_pool.clone(), pool_handle.clone());
         let claude_providers = crate::providers::claude::build_providers(
             pool_handle.clone(),
             db_pool.clone(),

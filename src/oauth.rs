@@ -565,6 +565,33 @@ pub async fn refresh_oauth_token(
     Ok(result)
 }
 
+/// Refresh only the OAuth credential bytes.
+///
+/// Anthropic rotates refresh tokens at the token endpoint. Callers that treat
+/// profile/usage as optional follow-up work should use this helper so the new
+/// refresh token can be persisted before any later snapshot request fails.
+pub async fn refresh_oauth_token_only(
+    token: &TokenInfo,
+    proxy_url: Option<&str>,
+) -> Result<TokenInfo, ClewdrError> {
+    let raw = refresh_oauth_access_token(&token.refresh_token, proxy_url).await?;
+    let access_token =
+        token_response_access_token(&raw, "OAuth refresh response missing access_token")?;
+    let organization_uuid = raw
+        .organization
+        .uuid
+        .clone()
+        .or(raw.organization_uuid.clone())
+        .unwrap_or_else(|| token.organization.uuid.clone());
+    Ok(TokenInfo::from_parts(
+        access_token,
+        raw.refresh_token
+            .unwrap_or_else(|| token.refresh_token.clone()),
+        Duration::from_secs(raw.expires_in.unwrap_or_default()),
+        organization_uuid,
+    ))
+}
+
 /// Like [`refresh_oauth_token`] but also returns the raw profile and usage JSON bodies,
 /// so manually-triggered probes can persist them for debugging.
 pub async fn refresh_oauth_token_with_raw(
