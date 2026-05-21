@@ -1,8 +1,10 @@
 use axum::response::IntoResponse;
 
 mod request;
+mod response;
 
 pub use request::{OpenAIChatPreprocess, OpenAIRequestError, translate_request};
+pub use response::{anthropic_type_to_oai, to_openai_non_stream, translate_upstream_error_body};
 
 use axum::Json;
 use http::StatusCode;
