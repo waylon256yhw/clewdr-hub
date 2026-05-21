@@ -18,6 +18,7 @@
 
 - **零依赖部署**：单个静态链接二进制，前端编译嵌入，SQLite WAL 自动建库
 - **透明代理**：直接转发 `/v1/messages`，不注入系统提示词；仅为兼容 Anthropic 模型行为做最小参数归一化
+- **OpenAI 兼容入口**：`POST /v1/chat/completions` + `/v1/models?format=` 协商，零改造对接 OpenAI SDK 客户端，复用同一套鉴权 / 配额 / 限流 / 计费链路
 - **轻量伪装**：可配置 CLI/SDK 版本号和请求头，过上游客户端检测
 - **多账号调度**：cookie 池 + round-robin + 亲和性缓存 + per-account 并发槽（`max_slots`），支持标记账号「优先消耗」用于限量试用账号
 - **多代理管理**：可维护多个备用代理，支持账号级绑定，适合不同账号走不同出口
@@ -118,6 +119,46 @@ export ANTHROPIC_API_KEY=sk-...    # 从后台创建
 
 这是有意的兼容性取舍：对这个项目的目标场景，保留 `temperature` 作为主要采样旋钮已经足够，同时可以减少不同客户端和不同 Claude 模型之间的参数兼容问题。
 
+### OpenAI 兼容端点
+
+`POST /v1/chat/completions` 接受标准 OpenAI Chat Completions 请求体，内部翻译成 Anthropic Messages 调用同一套上游链路。鉴权、配额、限流、计费、日志都和 `/v1/messages` 共享，所以 `RequestType` 仍记为 `messages`、`/api/admin/logs` 不需要新过滤项。
+
+最小客户端示例（`openai-python`）：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://your-host:8484/v1", api_key="sk-...")
+resp = client.chat.completions.create(
+    model="claude-sonnet-4-6",
+    messages=[{"role": "user", "content": "Hi"}],
+)
+print(resp.choices[0].message.content)
+```
+
+实现要点：
+
+- **支持字段**：`messages`（含 `developer` 角色，自动并入 `system`）、`stream` + `stream_options.include_usage`、`tools` / `tool_choice`（含 `required` → Anthropic `any`，`none` 自动剥除工具）、`response_format`（`text` / `json_object` 静默接受，`json_schema` 映射到 `output_format`）、`reasoning_effort`（`low/medium/high`）、`max_tokens` / `max_completion_tokens`、`stop` 字符串或数组（自动截到 4 条）、`temperature`、`user`、字符串型 `metadata`。
+- **多模态**：`image_url` 内容部分支持 `data:image/{jpeg|png|gif|webp};base64,...` 数据 URL 和 `http(s)://` URL；其它 MIME / scheme 直接 400。
+- **思考链**：上游 `thinking` 内容块默认映射到 OpenAI/DeepSeek 约定的 `message.reasoning_content`；客户端发送 `x-include-reasoning: false`（或 `0` / `no`）可关闭。
+- **流式**：响应是 `text/event-stream`，每个 chunk 是 `chat.completion.chunk`。开启 `stream_options.include_usage` 后，`[DONE]` 之前会单独发一个 `choices=[], usage={...}` chunk（含 `prompt_tokens_details.cached_tokens`）。
+- **Usage 归并**：`prompt_tokens = input + cache_creation + cache_read`，`cache_read` 单独经 `prompt_tokens_details.cached_tokens` 透出。
+- **静默忽略**：`frequency_penalty` / `presence_penalty` / `logit_bias` / `seed` / `service_tier` / `store` / `top_logprobs`、非 string 的 `metadata` 字段、未识别字段；接收但不映射到上游。
+- **硬性拒绝**：`n > 1` 与 `logprobs: true` 显式 400（语义无法在 Anthropic 上等价实现，避免静默偏差）。
+- **错误体**：所有错误（鉴权失败、配额超限、上游池空、上游 4xx/5xx）都按 `{ "error": { "message", "type", "code", "param" } }` 返回；状态码与 `/v1/messages` 同一信号保持一致。
+- **CORS**：preflight 接受 `openai-beta` / `openai-organization` / `openai-project` 三个浏览器侧客户端常用 header。
+
+### `/v1/models` 格式协商
+
+| 查询字符串 | 形态 | 用途 |
+| -- | -- | -- |
+| 缺省 / `?format=` | 兼容超集（同时含 Anthropic `display_name/created_at/type/has_more/first_id/last_id` 和 OpenAI `object/created/owned_by`） | 老客户端无感升级，默认行为 |
+| `?format=openai` | 严格 OpenAI：顶层 `object="list"`，`data[].object="model"`，`created` 是 Unix 秒，`owned_by="anthropic"` | OpenAI SDK / LiteLLM / one-api 风中转 |
+| `?format=anthropic` | 当前 Anthropic 形态（无 `object` / `created` / `owned_by`） | 严格按 Anthropic models API 解析的客户端 |
+| 其他值 | 400 `invalid_request_error` | 阻止拼写错误静默走默认 |
+
+同一个查询字符串也作用于 `GET /v1/models/{id}` 单条接口。
+
 ### Anthropic 1M Context 说明
 
 - 本项目不再支持 legacy `-1M` 伪模型名，请直接使用 Anthropic 官方标准模型名
@@ -183,7 +224,7 @@ fork 自 [clewdr](https://github.com/Xerxes-2/clewdr)，保留其核心代理能
 
 **新增**：用户/策略/RBAC、API Key 认证（blake3）、账号池并发槽调度、请求日志与费用追踪、运维统计与日志下钻、管理后台（7 页）、SSE 实时事件、审计字段
 
-**移除**：OpenAI 兼容端点（`/v1/chat/completions`）、`/code/v1/*` 路由。需要 OpenAI 格式请用原版。
+**移除**：`/code/v1/*` 路由。OpenAI 兼容入口已通过 `/v1/chat/completions` 完整重做，详见上方"OpenAI 兼容端点"一节。
 
 ## 致谢
 
