@@ -29,9 +29,8 @@ use crate::{
     stealth,
     types::{
         claude::{
-            ContentBlock, CreateMessageParams, CustomTool, ImageSource, ImageUrl, Message,
-            MessageContent, Metadata, OutputConfig, OutputEffort, OutputFormat, Role, Tool,
-            ToolChoice,
+            ContentBlock, CreateMessageParams, CustomTool, ImageSource, Message, MessageContent,
+            Metadata, OutputConfig, OutputEffort, OutputFormat, Role, Tool, ToolChoice,
         },
         openai::{
             ChatCompletionRequest, ChatContent, ChatMessage, ChatToolChoice, ContentPart,
@@ -252,12 +251,22 @@ fn push_system_entries(systems: &mut Vec<Value>, content: ChatContent) {
 
 fn user_content_to_blocks(content: ChatContent) -> Result<Vec<ContentBlock>, OpenAIRequestError> {
     Ok(match content {
-        ChatContent::Text(text) => vec![ContentBlock::text(text)],
+        ChatContent::Text(text) => {
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![ContentBlock::text(text)]
+            }
+        }
         ChatContent::Parts(parts) => {
             let mut out = Vec::with_capacity(parts.len());
             for part in parts {
                 match part {
-                    ContentPart::Text { text } => out.push(ContentBlock::text(text)),
+                    ContentPart::Text { text } => {
+                        if !text.is_empty() {
+                            out.push(ContentBlock::text(text));
+                        }
+                    }
                     ContentPart::ImageUrl { image_url } => {
                         out.push(image_url_to_block(&image_url.url)?);
                     }
@@ -322,10 +331,11 @@ fn image_url_to_block(url: &str) -> Result<ContentBlock, OpenAIRequestError> {
         });
     }
     if url.starts_with("http://") || url.starts_with("https://") {
-        return Ok(ContentBlock::ImageUrl {
-            image_url: ImageUrl {
+        return Ok(ContentBlock::Image {
+            source: ImageSource::Url {
                 url: url.to_string(),
             },
+            cache_control: None,
         });
     }
     Err(OpenAIRequestError {
@@ -598,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn translates_image_url_https_passthrough() {
+    fn translates_image_url_https_to_image_with_url_source() {
         let req = req_from_json(json!({
             "model": "claude-sonnet-4-6",
             "messages": [{"role": "user", "content": [
@@ -611,11 +621,50 @@ mod tests {
             panic!("expected blocks")
         };
         match &content[0] {
-            ContentBlock::ImageUrl { image_url } => {
-                assert_eq!(image_url.url, "https://example.com/a.png");
-            }
-            _ => panic!("expected image_url"),
+            ContentBlock::Image { source, .. } => match source {
+                ImageSource::Url { url } => assert_eq!(url, "https://example.com/a.png"),
+                _ => panic!("expected ImageSource::Url for https URLs"),
+            },
+            _ => panic!("expected Image block for https image_url"),
         }
+    }
+
+    #[test]
+    fn empty_user_text_string_is_dropped() {
+        let req = req_from_json(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {"role": "user", "content": ""},
+                {"role": "user", "content": "real"}
+            ]
+        }));
+        let (body, _) = translate_request(req).unwrap();
+        // The empty user message is skipped entirely; only the real
+        // message survives.
+        assert_eq!(body.messages.len(), 1);
+        match &body.messages[0].content {
+            MessageContent::Text { content } => assert_eq!(content, "real"),
+            _ => panic!("expected text"),
+        }
+    }
+
+    #[test]
+    fn empty_text_parts_are_filtered_while_image_parts_survive() {
+        let req = req_from_json(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": ""},
+                {"type": "image_url", "image_url": {"url": "https://example.com/b.png"}},
+                {"type": "text", "text": ""}
+            ]}]
+        }));
+        let (body, _) = translate_request(req).unwrap();
+        assert_eq!(body.messages.len(), 1);
+        let MessageContent::Blocks { content } = &body.messages[0].content else {
+            panic!("expected blocks")
+        };
+        assert_eq!(content.len(), 1);
+        assert!(matches!(content[0], ContentBlock::Image { .. }));
     }
 
     #[test]
