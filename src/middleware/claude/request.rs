@@ -522,10 +522,15 @@ where
             strip_ephemeral_scope_from_system(system);
         }
 
-        // Inject metadata.user_id if missing (for non-CLI clients like 2API)
-        inject_metadata_user_id(&mut body, auth_user.as_ref());
-
+        // Compute the affinity hash from the pre-injection request so two
+        // requests from the same client share an affinity slot. Injecting a
+        // generated `metadata.user_id` first would make every anonymous
+        // request hash uniquely and defeat caching.
         let context = build_claude_context(&body, auth_user.as_ref(), anthropic_beta);
+
+        // Inject metadata.user_id if missing (for non-CLI clients like 2API).
+        // The context above intentionally observes the pre-injection state.
+        inject_metadata_user_id(&mut body, auth_user.as_ref());
 
         Ok(Self(body, context))
     }
@@ -695,6 +700,62 @@ mod tests {
             request_affinity_hash(&haiku, None),
             request_affinity_hash(&opus, None)
         );
+    }
+
+    #[test]
+    fn build_context_runs_before_inject_metadata_user_id() {
+        // Regression: build_claude_context must observe the pre-injection
+        // body so request_affinity_hash falls back to the stable
+        // cache-control system hash. If a generated metadata.user_id
+        // (which contains a random `_session_<uuid>`) leaks into the
+        // affinity hash, every anonymous request would hash uniquely
+        // and the per-account affinity cache would be defeated.
+        //
+        // Simulate the injection by setting metadata.user_id directly so
+        // the test does not depend on the global stealth profile (which
+        // is only initialized in the live binary).
+        fn fresh_body() -> CreateMessageParams {
+            CreateMessageParams {
+                model: "claude-sonnet-4-6".to_string(),
+                messages: vec![Message::new_text(Role::User, "hi")],
+                system: Some(json!([
+                    {
+                        "type": "text",
+                        "text": "stable prompt",
+                        "cache_control": { "type": "ephemeral" }
+                    }
+                ])),
+                ..Default::default()
+            }
+        }
+        fn inject_synthetic_session(body: &mut CreateMessageParams, uuid: &str) {
+            let metadata = body.metadata.get_or_insert_with(Default::default);
+            metadata.fields.insert(
+                "user_id".to_string(),
+                format!("user_hex_account__session_{uuid}"),
+            );
+        }
+
+        // Pre-injection: two identical bodies must agree on affinity.
+        let pre1 = fresh_body();
+        let pre2 = fresh_body();
+        let pre_hash1 = build_claude_context(&pre1, None, None).system_prompt_hash;
+        let pre_hash2 = build_claude_context(&pre2, None, None).system_prompt_hash;
+        assert!(pre_hash1.is_some());
+        assert_eq!(pre_hash1, pre_hash2);
+
+        // Post-injection: two bodies with *different* synthetic session
+        // uuids hash to different affinity slots. This is the exact
+        // regression direction we are guarding against — building the
+        // context after inject_metadata_user_id would land here.
+        let mut post1 = fresh_body();
+        inject_synthetic_session(&mut post1, "11111111-1111-1111-1111-111111111111");
+        let mut post2 = fresh_body();
+        inject_synthetic_session(&mut post2, "22222222-2222-2222-2222-222222222222");
+        let post_hash1 = build_claude_context(&post1, None, None).system_prompt_hash;
+        let post_hash2 = build_claude_context(&post2, None, None).system_prompt_hash;
+        assert!(post_hash1.is_some());
+        assert_ne!(post_hash1, post_hash2);
     }
 
     #[test]

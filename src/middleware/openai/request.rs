@@ -487,9 +487,12 @@ where
             strip_ephemeral_scope_from_system(system);
         }
 
-        inject_metadata_user_id(&mut body, auth_user.as_ref());
-
+        // Build context before inject_metadata_user_id so the affinity hash
+        // observes the pre-injection state — see ClaudeCodePreprocess for
+        // the matching ordering on the Anthropic path.
         let context = build_claude_context(&body, auth_user.as_ref(), None);
+
+        inject_metadata_user_id(&mut body, auth_user.as_ref());
 
         Ok(Self {
             params: body,
