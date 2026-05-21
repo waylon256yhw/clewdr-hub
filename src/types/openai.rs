@@ -134,7 +134,7 @@ pub enum ChatMessage {
         name: Option<String>,
     },
     Tool {
-        content: String,
+        content: ChatContent,
         tool_call_id: String,
     },
 }
@@ -176,6 +176,15 @@ pub struct FunctionDef {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parameters: Option<Value>,
+    /// OpenAI structured-output strict flag. Forwarded to Anthropic
+    /// `CustomTool.strict` so JSON-schema-validated function calls keep
+    /// strict-mode semantics across the proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+    /// Preserve future / vendor-specific function fields instead of
+    /// silently dropping them at the wire boundary.
+    #[serde(default, flatten, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

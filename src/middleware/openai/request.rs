@@ -133,9 +133,10 @@ pub fn translate_request(
                 content,
                 tool_call_id,
             } => {
+                let text = flatten_tool_content(content);
                 let block = ContentBlock::ToolResult {
                     tool_use_id: tool_call_id,
-                    content: Value::String(content),
+                    content: Value::String(text),
                     cache_control: None,
                     is_error: None,
                 };
@@ -388,12 +389,30 @@ fn translate_tools(tools: Vec<ToolDef>) -> Vec<Tool> {
                 cache_control: None,
                 defer_loading: None,
                 input_examples: None,
-                strict: None,
+                strict: def.function.strict,
                 type_: None,
                 extra: Default::default(),
             })
         })
         .collect()
+}
+
+/// Flatten OpenAI tool message content (string or text parts) into a single
+/// string. OpenAI's API only allows text content in tool role messages; image
+/// parts are silently dropped here because Anthropic `ToolResult.content`
+/// accepts plain text best.
+fn flatten_tool_content(content: ChatContent) -> String {
+    match content {
+        ChatContent::Text(s) => s,
+        ChatContent::Parts(parts) => parts
+            .into_iter()
+            .filter_map(|p| match p {
+                ContentPart::Text { text } => Some(text),
+                ContentPart::ImageUrl { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+    }
 }
 
 fn translate_tool_choice(choice: ChatToolChoice) -> Result<Option<ToolChoice>, OpenAIRequestError> {
@@ -758,6 +777,51 @@ mod tests {
         match body.tool_choice.unwrap() {
             ToolChoice::Tool { name, .. } => assert_eq!(name, "search"),
             _ => panic!("expected tool_choice::Tool"),
+        }
+    }
+
+    #[test]
+    fn tool_message_accepts_array_of_text_parts() {
+        let req = req_from_json(json!({
+            "model": "x",
+            "messages": [
+                {"role": "tool", "content": [
+                    {"type": "text", "text": "result-a"},
+                    {"type": "text", "text": "result-b"}
+                ], "tool_call_id": "call_1"}
+            ]
+        }));
+        let (body, _) = translate_request(req).unwrap();
+        let MessageContent::Blocks { content } = &body.messages[0].content else {
+            panic!("expected blocks")
+        };
+        match &content[0] {
+            ContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content, &Value::String("result-aresult-b".to_string()));
+            }
+            _ => panic!("expected tool_result"),
+        }
+    }
+
+    #[test]
+    fn function_strict_flag_is_forwarded() {
+        let req = req_from_json(json!({
+            "model": "x",
+            "messages": [],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "calc",
+                    "strict": true,
+                    "parameters": {"type": "object"}
+                }
+            }]
+        }));
+        let (body, _) = translate_request(req).unwrap();
+        let tools = body.tools.expect("tools array present");
+        match &tools[0] {
+            Tool::Custom(t) => assert_eq!(t.strict, Some(true)),
+            _ => panic!("expected Tool::Custom"),
         }
     }
 
