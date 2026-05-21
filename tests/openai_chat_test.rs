@@ -545,7 +545,7 @@ async fn chat_completions_cors_preflight_allows_openai_headers() {
                 ("access-control-request-method", "POST"),
                 (
                     "access-control-request-headers",
-                    "authorization, openai-beta, openai-organization, openai-project",
+                    "authorization, openai-beta, openai-organization, openai-project, x-include-reasoning",
                 ),
             ],
         )
@@ -559,6 +559,9 @@ async fn chat_completions_cors_preflight_allows_openai_headers() {
     assert!(allow_headers.contains("openai-beta"));
     assert!(allow_headers.contains("openai-organization"));
     assert!(allow_headers.contains("openai-project"));
+    // The documented x-include-reasoning toggle must survive preflight so
+    // browser clients can disable reasoning content emission.
+    assert!(allow_headers.contains("x-include-reasoning"));
 }
 
 #[tokio::test]

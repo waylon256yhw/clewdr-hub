@@ -266,6 +266,7 @@ impl RouterBuilder {
                 AUTHORIZATION,
                 CONTENT_TYPE,
                 HeaderName::from_static("x-api-key"),
+                HeaderName::from_static("x-include-reasoning"),
                 HeaderName::from_static("openai-beta"),
                 HeaderName::from_static("openai-organization"),
                 HeaderName::from_static("openai-project"),
