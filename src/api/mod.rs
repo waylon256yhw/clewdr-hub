@@ -5,5 +5,7 @@ pub(crate) mod common;
 pub mod health;
 mod misc;
 pub mod models;
+mod openai_chat;
 pub use claude_code::{api_claude_code, api_claude_code_count_tokens};
 pub use misc::api_version;
+pub use openai_chat::api_openai_chat_completions;

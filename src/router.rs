@@ -60,6 +60,7 @@ impl RouterBuilder {
     pub fn with_default_setup(self) -> Self {
         self.route_public_endpoints()
             .route_claude_code_endpoints()
+            .route_openai_chat_endpoints()
             .route_admin_endpoints()
             .setup_static_serving()
             .with_tower_trace()
@@ -83,6 +84,18 @@ impl RouterBuilder {
                 "/v1/messages/count_tokens",
                 post(api_claude_code_count_tokens),
             )
+            .layer(CompressionLayer::new())
+            .route_layer(from_extractor_with_state::<RequireFlexibleAuth, _>(
+                self.state.clone(),
+            ))
+            .with_state(self.state.clone());
+        self.inner = self.inner.merge(router);
+        self
+    }
+
+    fn route_openai_chat_endpoints(mut self) -> Self {
+        let router = Router::new()
+            .route("/v1/chat/completions", post(api_openai_chat_completions))
             .layer(CompressionLayer::new())
             .route_layer(from_extractor_with_state::<RequireFlexibleAuth, _>(
                 self.state.clone(),

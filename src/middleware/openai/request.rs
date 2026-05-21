@@ -450,6 +450,7 @@ pub struct OpenAIChatPreprocess {
     pub params: CreateMessageParams,
     pub context: ClaudeContext,
     pub include_reasoning: bool,
+    pub include_usage: bool,
 }
 
 impl<S> FromRequest<S> for OpenAIChatPreprocess
@@ -462,6 +463,11 @@ where
         let auth_user = req.extensions().get::<AuthenticatedUser>().cloned();
         let include_reasoning = parse_include_reasoning(req.headers());
         let Json(oai) = Json::<ChatCompletionRequest>::from_request(req, &()).await?;
+        let include_usage = oai
+            .stream_options
+            .as_ref()
+            .and_then(|s| s.include_usage)
+            .unwrap_or(false);
         let (mut body, _stream) = translate_request(oai)?;
 
         drop_empty_system(&mut body);
@@ -489,6 +495,7 @@ where
             params: body,
             context,
             include_reasoning,
+            include_usage,
         })
     }
 }
