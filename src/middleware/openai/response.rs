@@ -94,9 +94,14 @@ pub fn translate_upstream_error_body(bytes: &[u8]) -> OpenAIErrorBody {
 pub fn anthropic_type_to_oai(t: &str) -> &'static str {
     match t {
         "rate_limited" | "overloaded_error" | "rate_limit_error" => "rate_limit_exceeded",
-        "authentication_error" | "permission_error" => "invalid_request_error",
+        // Preserve the auth/permission categorization rather than
+        // collapsing to invalid_request_error: HTTP status alone is not
+        // enough for clients to distinguish a malformed request from
+        // failed credentials.
+        "authentication_error" => "authentication_error",
+        "permission_error" => "permission_error",
         "invalid_request_error" => "invalid_request_error",
-        "not_found_error" => "invalid_request_error",
+        "not_found_error" => "not_found_error",
         _ => "api_error",
     }
 }
@@ -292,6 +297,31 @@ mod tests {
     }
 
     #[test]
+    fn tool_only_response_serializes_content_as_null() {
+        // OpenAI-compatible strict SDKs expect `content: null` to be
+        // present (not omitted) when the assistant turn was a pure
+        // tool call. Regression for response.rs initially using
+        // skip_serializing_if on AssistantMessage.content.
+        let resp = make_response(
+            vec![ContentBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "calc".to_string(),
+                input: json!({}),
+                cache_control: None,
+                caller: None,
+            }],
+            Some(StopReason::ToolUse),
+            None,
+        );
+        let chat = build_chat_completion(resp, true);
+        let serialized = serde_json::to_value(&chat).unwrap();
+        let message = &serialized["choices"][0]["message"];
+        assert!(message.as_object().unwrap().contains_key("content"));
+        assert!(message["content"].is_null());
+        assert!(message["tool_calls"].is_array());
+    }
+
+    #[test]
     fn tool_calls_override_endturn_finish_reason() {
         let resp = make_response(
             vec![ContentBlock::ToolUse {
@@ -471,16 +501,17 @@ mod tests {
         );
         assert_eq!(
             anthropic_type_to_oai("authentication_error"),
-            "invalid_request_error"
+            "authentication_error"
         );
         assert_eq!(
             anthropic_type_to_oai("permission_error"),
-            "invalid_request_error"
+            "permission_error"
         );
         assert_eq!(
             anthropic_type_to_oai("invalid_request_error"),
             "invalid_request_error"
         );
+        assert_eq!(anthropic_type_to_oai("not_found_error"), "not_found_error");
         assert_eq!(anthropic_type_to_oai("something_else"), "api_error");
     }
 }

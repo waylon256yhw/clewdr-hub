@@ -267,7 +267,9 @@ pub struct Choice {
 #[derive(Debug, Clone, Serialize)]
 pub struct AssistantMessage {
     pub role: &'static str,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Always serialized. When the assistant turn was a pure tool call
+    /// (no text), this is `null` so strict OpenAI SDK / schema
+    /// validators still deserialize the response.
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
