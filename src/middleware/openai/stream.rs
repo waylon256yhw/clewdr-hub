@@ -19,7 +19,7 @@ use serde_json::json;
 use crate::{
     middleware::openai::response::translate_upstream_error_body,
     types::{
-        claude::{ContentBlock, ContentBlockDelta, StopReason, StreamEvent},
+        claude::{ContentBlock, ContentBlockDelta, StreamEvent},
         openai::{
             ChatCompletionChunk, Delta, DeltaFunction, DeltaToolCall, OpenAIErrorBody,
             PromptTokensDetails, StreamChoice, UsageOut,
@@ -433,7 +433,7 @@ pub fn to_openai_stream(
 mod tests {
     use super::*;
     use crate::types::claude::{
-        MessageDeltaContent, MessageStartContent, Role, StreamError, StreamUsage, Usage,
+        MessageDeltaContent, MessageStartContent, Role, StopReason, StreamError, StreamUsage, Usage,
     };
 
     fn collect_chunks(payloads: &[StreamPayload]) -> Vec<&ChatCompletionChunk> {
