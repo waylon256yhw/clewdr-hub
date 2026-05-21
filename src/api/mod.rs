@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod auth;
 mod claude_code;
+pub(crate) mod common;
 pub mod health;
 mod misc;
 pub mod models;
