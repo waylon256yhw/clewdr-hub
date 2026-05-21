@@ -308,7 +308,7 @@ impl StreamState {
                 out.push(StreamPayload::Error {
                     error: OpenAIErrorBody {
                         message: error.message,
-                        kind: "upstream_error".to_string(),
+                        kind: super::response::anthropic_type_to_oai(&error.type_).to_string(),
                         code: None,
                         param: None,
                     },
@@ -738,11 +738,36 @@ mod tests {
             .expect("error payload should be present");
         match err {
             StreamPayload::Error { error } => {
-                assert_eq!(error.kind, "upstream_error");
+                // Structured upstream error types are translated to the
+                // OAI-compatible category, not the generic
+                // "upstream_error" placeholder.
+                assert_eq!(error.kind, "rate_limit_exceeded");
                 assert_eq!(error.message, "upstream overloaded");
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn upstream_auth_error_event_preserves_authentication_kind() {
+        let events = vec![
+            message_start("claude-sonnet-4-6", None),
+            StreamEvent::Error {
+                error: StreamError {
+                    type_: "authentication_error".to_string(),
+                    message: "bad creds".to_string(),
+                },
+            },
+        ];
+        let payloads = drive(events, true, false);
+        let err = payloads
+            .iter()
+            .find_map(|p| match p {
+                StreamPayload::Error { error } => Some(error),
+                _ => None,
+            })
+            .expect("error payload should be present");
+        assert_eq!(err.kind, "authentication_error");
     }
 
     #[test]
