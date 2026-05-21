@@ -10,7 +10,7 @@ use tower_http::{compression::CompressionLayer, cors::CorsLayer};
 
 use crate::{
     api::*,
-    middleware::{RequireAdminAuth, RequireFlexibleAuth},
+    middleware::{RequireAdminAuth, RequireFlexibleAuth, RequireFlexibleAuthOpenAI},
     services::{account_pool::AccountPoolHandle, user_limiter::UserLimiterMap},
     state::{AdminEvent, AppState, AuthState},
     stealth,
@@ -97,7 +97,7 @@ impl RouterBuilder {
         let router = Router::new()
             .route("/v1/chat/completions", post(api_openai_chat_completions))
             .layer(CompressionLayer::new())
-            .route_layer(from_extractor_with_state::<RequireFlexibleAuth, _>(
+            .route_layer(from_extractor_with_state::<RequireFlexibleAuthOpenAI, _>(
                 self.state.clone(),
             ))
             .with_state(self.state.clone());

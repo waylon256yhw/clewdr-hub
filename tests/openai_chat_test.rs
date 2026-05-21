@@ -182,6 +182,33 @@ async fn chat_completions_requires_auth() {
         )
         .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // The auth rejection must serialize in the OpenAI envelope, not the
+    // Anthropic shape that ClewdrError emits by default. Regression for
+    // the auth route layer leaking the Anthropic-shape error body.
+    let body = response_json(response).await;
+    assert!(body["error"].is_object());
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(body["error"]["message"].is_string());
+}
+
+#[tokio::test]
+async fn chat_completions_invalid_api_key_returns_oai_shape() {
+    let app = setup_app(PolicyConfig::default()).await;
+    let replacement = if app.api_key.ends_with('x') { 'y' } else { 'x' };
+    let invalid_key = format!("{}{replacement}", &app.api_key[..app.api_key.len() - 1]);
+    let response = app
+        .request(
+            Method::POST,
+            "/v1/chat/completions",
+            Some(basic_chat_body()),
+            Some(("x-api-key", invalid_key.as_str())),
+            &[],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(body["error"]["message"].is_string());
 }
 
 #[tokio::test]

@@ -1,13 +1,16 @@
 use axum::extract::FromRef;
 use axum::extract::FromRequestParts;
+use axum::http::StatusCode;
 use axum::http::request::Parts;
 use tracing::warn;
 
 use crate::db::api_key::parse_api_key;
 use crate::db::queries::authenticate_api_key;
 use crate::error::ClewdrError;
+use crate::middleware::openai::OpenAIRequestError;
 use crate::session;
 use crate::state::AuthState;
+use crate::types::openai::OpenAIErrorBody;
 
 fn extract_key_from_headers(parts: &Parts) -> Option<String> {
     if let Some(key) = parts.headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
@@ -74,6 +77,38 @@ where
         }
 
         Err(ClewdrError::InvalidAuth)
+    }
+}
+
+/// `RequireFlexibleAuth` variant whose rejection serializes in the OpenAI
+/// error envelope. Used by the `/v1/chat/completions` route so missing or
+/// invalid API keys do not leak the Anthropic-shape error body that
+/// [`ClewdrError`]'s default `IntoResponse` would emit.
+pub struct RequireFlexibleAuthOpenAI;
+
+impl<S> FromRequestParts<S> for RequireFlexibleAuthOpenAI
+where
+    AuthState: FromRef<S>,
+    S: Sync + Send,
+{
+    type Rejection = OpenAIRequestError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match RequireFlexibleAuth::from_request_parts(parts, state).await {
+            Ok(_) => Ok(Self),
+            Err(err) => Err(OpenAIRequestError {
+                status: StatusCode::UNAUTHORIZED,
+                body: OpenAIErrorBody {
+                    message: err.to_string(),
+                    // OpenAI historically emits invalid_request_error for both
+                    // missing and incorrect API keys at the auth boundary;
+                    // client SDKs key off this value.
+                    kind: "invalid_request_error".to_string(),
+                    code: None,
+                    param: None,
+                },
+            }),
+        }
     }
 }
 
