@@ -24,7 +24,7 @@ use crate::{
 };
 
 const CLAUDE_CODE_ENTRYPOINT_ENV: &str = "CLAUDE_CODE_ENTRYPOINT";
-fn prepend_system_blocks(body: &mut CreateMessageParams, blocks: Vec<ContentBlock>) {
+pub(crate) fn prepend_system_blocks(body: &mut CreateMessageParams, blocks: Vec<ContentBlock>) {
     if blocks.is_empty() {
         return;
     }
@@ -67,7 +67,7 @@ fn sample_js_code_unit(text: &str, idx: usize) -> String {
         .unwrap_or_else(|| "0".to_string())
 }
 
-fn claude_code_billing_header(messages: &[Message], profile: &StealthProfile) -> String {
+pub(crate) fn claude_code_billing_header(messages: &[Message], profile: &StealthProfile) -> String {
     let first_text = first_user_message_text(messages);
     let sampled = [4, 7, 20]
         .into_iter()
@@ -122,7 +122,7 @@ fn strip_leading_billing_header(text: &str) -> Option<String> {
     }
 }
 
-fn strip_billing_headers_from_system(body: &mut CreateMessageParams) {
+pub(crate) fn strip_billing_headers_from_system(body: &mut CreateMessageParams) {
     let Some(system) = body.system.take() else {
         return;
     };
@@ -152,7 +152,7 @@ fn strip_billing_headers_from_system(body: &mut CreateMessageParams) {
     body.system = stripped;
 }
 
-fn drop_empty_system(body: &mut CreateMessageParams) {
+pub(crate) fn drop_empty_system(body: &mut CreateMessageParams) {
     let Some(system) = body.system.take() else {
         return;
     };
@@ -177,7 +177,7 @@ fn drop_empty_system(body: &mut CreateMessageParams) {
     body.system = (!is_empty).then_some(system);
 }
 
-fn strip_ephemeral_scope_from_system(system: &mut Value) {
+pub(crate) fn strip_ephemeral_scope_from_system(system: &mut Value) {
     let Some(items) = system.as_array_mut() else {
         return;
     };
@@ -205,7 +205,7 @@ fn strip_ephemeral_scope_from_system(system: &mut Value) {
     }
 }
 
-fn extract_anthropic_beta_header(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn extract_anthropic_beta_header(headers: &HeaderMap) -> Option<String> {
     let mut parts = Vec::new();
     for value in headers.get_all("anthropic-beta") {
         if let Ok(raw) = value.to_str() {
@@ -227,7 +227,7 @@ fn extract_anthropic_beta_header(headers: &HeaderMap) -> Option<String> {
 
 /// Inject `metadata.user_id` if missing (for non-CLI clients).
 /// Format: `user_{64hex}_account_{org_uuid}_session_{random_uuid}`
-fn inject_metadata_user_id(
+pub(crate) fn inject_metadata_user_id(
     body: &mut CreateMessageParams,
     auth_user: Option<&crate::db::models::AuthenticatedUser>,
 ) {
@@ -299,7 +299,7 @@ fn claude_code_session_affinity_hash(
     Some(hasher.finish())
 }
 
-fn request_affinity_hash(
+pub(crate) fn request_affinity_hash(
     body: &CreateMessageParams,
     auth_user: Option<&crate::db::models::AuthenticatedUser>,
 ) -> Option<u64> {
@@ -330,7 +330,7 @@ fn request_affinity_hash(
 /// page; when enabled it overwrites `output_config.effort` on supported Opus
 /// requests and leaves other models untouched. Older Opus versions receive a
 /// compatible fallback when the configured effort level is no longer supported.
-fn normalize_sampling_params(body: &mut CreateMessageParams, profile: &StealthProfile) {
+pub(crate) fn normalize_sampling_params(body: &mut CreateMessageParams, profile: &StealthProfile) {
     let thinking_active = matches!(
         body.thinking,
         Some(Thinking::Adaptive { .. }) | Some(Thinking::Enabled { .. })
@@ -437,6 +437,48 @@ static TEST_MESSAGE_CLAUDE: LazyLock<Message> =
 
 static TEST_MESSAGE_TEXT: LazyLock<Message> = LazyLock::new(|| Message::new_text(Role::User, "Hi"));
 
+/// Build a [`ClaudeContext`] from a fully-normalized request body.
+///
+/// Callers must have already applied the request-shaping pipeline
+/// (`drop_empty_system`, `normalize_sampling_params`,
+/// `strip_billing_headers_from_system`, `prepend_system_blocks`,
+/// `strip_ephemeral_scope_from_system`, `inject_metadata_user_id`) so that the
+/// affinity hash and token count reflect the final upstream payload.
+pub(crate) fn build_claude_context(
+    body: &CreateMessageParams,
+    auth_user: Option<&crate::db::models::AuthenticatedUser>,
+    anthropic_beta: Option<String>,
+) -> ClaudeContext {
+    let stream = body.stream.unwrap_or_default();
+    let system_prompt_hash = request_affinity_hash(body, auth_user);
+    let input_tokens = body.count_tokens();
+
+    ClaudeContext {
+        stream,
+        system_prompt_hash,
+        anthropic_beta,
+        usage: Usage {
+            input_tokens,
+            output_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        },
+        user_id: auth_user.map(|u| u.user_id),
+        api_key_id: auth_user.and_then(|u| u.api_key_id),
+        max_concurrent: auth_user.map(|u| u.max_concurrent),
+        rpm_limit: auth_user.map(|u| u.rpm_limit),
+        model_raw: body.model.clone(),
+        request_id: uuid::Uuid::new_v4().to_string(),
+        started_at: chrono::Utc::now(),
+        weekly_budget_nanousd: auth_user.map(|u| u.weekly_budget_nanousd),
+        monthly_budget_nanousd: auth_user.map(|u| u.monthly_budget_nanousd),
+        bound_account_ids: auth_user
+            .map(|u| u.bound_account_ids.clone())
+            .unwrap_or_default(),
+        selected_account_id: Default::default(),
+    }
+}
+
 pub struct ClaudeCodePreprocess(pub CreateMessageParams, pub ClaudeContext);
 
 impl<S> FromRequest<S> for ClaudeCodePreprocess
@@ -468,8 +510,6 @@ where
             return Err(ClewdrError::TestMessage);
         }
 
-        let stream = body.stream.unwrap_or_default();
-
         strip_billing_headers_from_system(&mut body);
 
         let system_prefixes = vec![ContentBlock::text(claude_code_billing_header(
@@ -482,38 +522,10 @@ where
             strip_ephemeral_scope_from_system(system);
         }
 
-        let system_prompt_hash = request_affinity_hash(&body, auth_user.as_ref());
-
-        let input_tokens = body.count_tokens();
-
         // Inject metadata.user_id if missing (for non-CLI clients like 2API)
         inject_metadata_user_id(&mut body, auth_user.as_ref());
 
-        let context = ClaudeContext {
-            stream,
-            system_prompt_hash,
-            anthropic_beta,
-            usage: Usage {
-                input_tokens,
-                output_tokens: 0,
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: None,
-            },
-            user_id: auth_user.as_ref().map(|u| u.user_id),
-            api_key_id: auth_user.as_ref().and_then(|u| u.api_key_id),
-            max_concurrent: auth_user.as_ref().map(|u| u.max_concurrent),
-            rpm_limit: auth_user.as_ref().map(|u| u.rpm_limit),
-            model_raw: body.model.clone(),
-            request_id: uuid::Uuid::new_v4().to_string(),
-            started_at: chrono::Utc::now(),
-            weekly_budget_nanousd: auth_user.as_ref().map(|u| u.weekly_budget_nanousd),
-            monthly_budget_nanousd: auth_user.as_ref().map(|u| u.monthly_budget_nanousd),
-            bound_account_ids: auth_user
-                .as_ref()
-                .map(|u| u.bound_account_ids.clone())
-                .unwrap_or_default(),
-            selected_account_id: Default::default(),
-        };
+        let context = build_claude_context(&body, auth_user.as_ref(), anthropic_beta);
 
         Ok(Self(body, context))
     }
