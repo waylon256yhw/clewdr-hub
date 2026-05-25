@@ -75,6 +75,20 @@ pub fn normalize_api_key_base_url(raw: &str) -> Result<url::Url, ClewdrError> {
         msg: format!("api_key base_url is not a valid URL: {e}"),
     })?;
 
+    // Restrict to HTTP(S). Without this, `ftp://x/v1`, `file:///etc`,
+    // `mailto:foo`, etc. would parse cleanly and be accepted by admin
+    // create/update + /test validation, only to fail later when wreq
+    // tries to POST. Reject at the validation chokepoint with a clear
+    // message instead.
+    match url.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(ClewdrError::BadRequestMessage {
+                msg: format!("api_key base_url must use http or https scheme, got '{other}'"),
+            });
+        }
+    }
+
     let path = url.path().to_string();
     let stripped = path
         .strip_suffix("/v1/")
@@ -581,5 +595,46 @@ mod tests {
         let err =
             normalize_api_key_base_url("not a url at all").expect_err("invalid URL should error");
         assert!(matches!(err, ClewdrError::BadRequestMessage { .. }));
+    }
+
+    /// Step 5 follow-up: only HTTP / HTTPS schemes are valid for an
+    /// Anthropic-shape upstream. Without this guard `ftp://x/v1`,
+    /// `mailto:foo`, `file:///etc/passwd` etc. parse cleanly via
+    /// `Url::parse` and would be accepted by admin create/update +
+    /// /test, only to surface as a confusing `wreq` error at send
+    /// time. Reject at the chokepoint with a clear message.
+    #[test]
+    fn normalize_api_key_base_url_rejects_non_http_schemes() {
+        for raw in [
+            "ftp://example.com/v1",
+            "file:///etc/passwd",
+            "mailto:foo@bar.com",
+            "ws://example.com",
+            "data:text/plain,hello",
+            "javascript:alert(1)",
+        ] {
+            let err = normalize_api_key_base_url(raw)
+                .expect_err(&format!("non-http(s) scheme should error: {raw}"));
+            match err {
+                ClewdrError::BadRequestMessage { msg } => {
+                    assert!(
+                        msg.contains("http") && msg.contains("scheme"),
+                        "error message should mention scheme requirement; got: {msg}"
+                    );
+                }
+                other => panic!("expected BadRequestMessage, got: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_api_key_base_url_accepts_http_and_https() {
+        // Both schemes pass through unchanged (no upgrade — admin's
+        // choice is preserved so they can hit an internal HTTP proxy
+        // if they want).
+        let http = normalize_api_key_base_url("http://internal.example/").unwrap();
+        assert_eq!(http.scheme(), "http");
+        let https = normalize_api_key_base_url("https://api.anthropic.com/").unwrap();
+        assert_eq!(https.scheme(), "https");
     }
 }
