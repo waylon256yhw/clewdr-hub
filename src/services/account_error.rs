@@ -19,7 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::Reason;
+use crate::config::{AuthMethod, Reason};
 use crate::error::ClewdrError;
 
 /// Scheduler-side action for an account on a single failure event.
@@ -335,10 +335,23 @@ fn classify_whatever_message(
 /// Classify a single account-related failure event into a
 /// scheduler action + display-side normalized reason + diagnostic
 /// context.
+///
+/// `auth_method` lets the classifier consult the slot kind so it can
+/// downgrade verdicts that don't apply to a given account type. The
+/// only such rule today: ApiKey accounts (pay-as-you-go, PRD
+/// Decision 2) have no quota window and no cooldown semantics, so a
+/// `Cooldown` verdict for an ApiKey slot is downgraded to
+/// `TransientUpstream` here — once, at the single classification
+/// chokepoint — instead of leaking into every retry-loop site that
+/// would otherwise have to mirror the demotion (or worse: silently
+/// write a cooldown entry into the pool runtime). Pass `None` from
+/// any site that does not yet have a slot in hand; the verdict is
+/// the same as before for cookie / OAuth slots.
 pub fn classify_account_failure(
     err: &ClewdrError,
     source: FailureSource,
     stage: Option<&'static str>,
+    auth_method: Option<AuthMethod>,
 ) -> AccountFailureContext {
     let raw_message = err.to_string();
 
@@ -454,6 +467,24 @@ pub fn classify_account_failure(
         ),
     };
 
+    // PRD Decision 2: ApiKey accounts are pay-as-you-go and have no
+    // quota window or cooldown semantics. A `Cooldown` verdict for an
+    // ApiKey slot is meaningless and, if surfaced, would write a
+    // cooldown entry into the pool runtime that parks the account
+    // until the reset timestamp. Downgrade once at the classifier
+    // chokepoint so every site reaches the same answer.
+    //
+    // `normalized_reason` is intentionally NOT changed (caller still
+    // sees the RateLimited/Restricted normalized reason for logging /
+    // observability — only the scheduler `action` is downgraded).
+    let action = if auth_method == Some(AuthMethod::ApiKey)
+        && matches!(action, AccountFailureAction::Cooldown { .. })
+    {
+        AccountFailureAction::TransientUpstream
+    } else {
+        action
+    };
+
     AccountFailureContext {
         action,
         normalized_reason,
@@ -472,7 +503,7 @@ mod tests {
     use wreq::StatusCode;
 
     fn classify(err: ClewdrError, source: FailureSource) -> AccountFailureContext {
-        classify_account_failure(&err, source, None)
+        classify_account_failure(&err, source, None, None)
     }
 
     fn classify_stage(
@@ -480,7 +511,11 @@ mod tests {
         source: FailureSource,
         stage: &'static str,
     ) -> AccountFailureContext {
-        classify_account_failure(&err, source, Some(stage))
+        classify_account_failure(&err, source, Some(stage), None)
+    }
+
+    fn classify_api_key(err: ClewdrError, source: FailureSource) -> AccountFailureContext {
+        classify_account_failure(&err, source, None, Some(AuthMethod::ApiKey))
     }
 
     fn http_error(status: u16, message: &str) -> ClewdrError {
@@ -567,6 +602,68 @@ mod tests {
             Some(Reason::TooManyRequest(ts))
         );
         assert_eq!(ctx.upstream_http_status, Some(429));
+    }
+
+    /// Step 5 C9: ApiKey accounts (PRD Decision 2) have no quota
+    /// window or cooldown semantics, so passing
+    /// `Some(AuthMethod::ApiKey)` to the classifier must downgrade
+    /// every Cooldown verdict to TransientUpstream — at the single
+    /// chokepoint, so every classification site reaches the same
+    /// answer without site-local mirror logic.
+    #[test]
+    fn api_key_auth_method_downgrades_cooldown_to_transient_upstream() {
+        let ts = 1_700_000_000_i64;
+        // 429 → Cooldown for cookie/oauth (None auth_method).
+        let cookie_verdict = classify(
+            ClewdrError::InvalidCookie {
+                reason: Reason::TooManyRequest(ts),
+            },
+            FailureSource::Messages,
+        );
+        assert_eq!(
+            cookie_verdict.action,
+            AccountFailureAction::Cooldown { reset_time: ts }
+        );
+
+        // Same error, ApiKey slot → TransientUpstream.
+        let api_key_verdict = classify_api_key(
+            ClewdrError::InvalidCookie {
+                reason: Reason::TooManyRequest(ts),
+            },
+            FailureSource::Messages,
+        );
+        assert_eq!(
+            api_key_verdict.action,
+            AccountFailureAction::TransientUpstream
+        );
+        // normalized_reason is intentionally NOT changed — callers
+        // still see RateLimited for logging / observability.
+        assert_eq!(
+            api_key_verdict.normalized_reason,
+            AccountNormalizedReason::RateLimited { reset_time: ts }
+        );
+
+        // Restricted (the second cooldown shape) also downgrades.
+        let restricted_ts = 1_800_000_000_i64;
+        let restricted_verdict = classify_api_key(
+            ClewdrError::InvalidCookie {
+                reason: Reason::Restricted(restricted_ts),
+            },
+            FailureSource::Messages,
+        );
+        assert_eq!(
+            restricted_verdict.action,
+            AccountFailureAction::TransientUpstream
+        );
+
+        // Non-cooldown verdicts pass through unchanged.
+        let banned_verdict = classify_api_key(
+            ClewdrError::InvalidCookie {
+                reason: Reason::Banned,
+            },
+            FailureSource::Messages,
+        );
+        assert_eq!(banned_verdict.action, AccountFailureAction::TerminalAuth);
     }
 
     #[test]

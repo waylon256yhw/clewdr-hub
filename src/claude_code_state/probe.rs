@@ -52,7 +52,7 @@ fn classify_probe_persisted(
     source: FailureSource,
     stage: &'static str,
 ) -> AccountFailureContextPersisted {
-    let ctx = classify_account_failure(err, source, Some(stage));
+    let ctx = classify_account_failure(err, source, Some(stage), None);
     AccountFailureContextPersisted::from(&ctx)
 }
 
@@ -238,7 +238,7 @@ impl ProbeFailure {
     /// unified classifier so cookie-probe / oauth-probe failures share
     /// the scheduler-action verdict with messages / count_tokens / test.
     fn from_err(source: FailureSource, stage: &'static str, err: &ClewdrError) -> Self {
-        let context = classify_account_failure(err, source, Some(stage));
+        let context = classify_account_failure(err, source, Some(stage), None);
         Self {
             stage,
             message: err.to_string(),
@@ -984,7 +984,7 @@ async fn probe_oauth_upstream_failure(
     // internal `set_account_auth_error` decision and for the
     // ProbeFailure surfaced to the probe row. `auth` is preserved as
     // a name for readability — it is exactly `TerminalAuth`.
-    let context = classify_account_failure(&err, FailureSource::ProbeOauth, Some("refresh"));
+    let context = classify_account_failure(&err, FailureSource::ProbeOauth, Some("refresh"), None);
     let auth = matches!(context.action, AccountFailureAction::TerminalAuth);
     let still_current =
         match account_credential_matches_prefix(db, account_id, "oauth", expected_prefix).await {

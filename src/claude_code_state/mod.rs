@@ -437,7 +437,7 @@ pub(crate) fn is_oauth_auth_failure(err: &ClewdrError) -> bool {
     // and `Whatever` messages with `invalid_grant` / refresh-token /
     // `status 401|403` phrases.
     matches!(
-        classify_account_failure(err, FailureSource::Messages, None).action,
+        classify_account_failure(err, FailureSource::Messages, None, None).action,
         AccountFailureAction::TerminalAuth
     )
 }

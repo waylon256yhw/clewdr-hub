@@ -1200,7 +1200,7 @@ mod tests {
         let err = crate::error::ClewdrError::InvalidCookie {
             reason: Reason::Disabled,
         };
-        let ctx = classify_account_failure(&err, FailureSource::Messages, None);
+        let ctx = classify_account_failure(&err, FailureSource::Messages, None, None);
         let persisted = AccountFailureContextPersisted::from(&ctx);
 
         // Invalid bucket → last_failure surfaces.
@@ -1288,7 +1288,7 @@ mod tests {
         let err = crate::error::ClewdrError::InvalidCookie {
             reason: Reason::TooManyRequest(123),
         };
-        let ctx = classify_account_failure(&err, FailureSource::Messages, None);
+        let ctx = classify_account_failure(&err, FailureSource::Messages, None, None);
         let persisted = AccountFailureContextPersisted::from(&ctx);
         let some = AccountHealth {
             state: AccountHealthState::Invalid {

@@ -919,8 +919,12 @@ pub async fn test_account(
                             // surfaces as `internal_error` while real
                             // refresh-token rejections (`invalid_grant`,
                             // 401/403) keep the auth_rejected verdict.
-                            let failure =
-                                classify_account_failure(&e, FailureSource::Test, Some("refresh"));
+                            let failure = classify_account_failure(
+                                &e,
+                                FailureSource::Test,
+                                Some("refresh"),
+                                None,
+                            );
                             let log_status = failure.action.to_log_status();
                             let ctx = BillingContext {
                                 db: state.db.clone(),
@@ -1049,6 +1053,7 @@ pub async fn test_account(
         Some(classify_account_failure(
             &synthetic,
             FailureSource::Test,
+            None,
             None,
         ))
     } else {
@@ -1186,7 +1191,7 @@ mod tests {
     fn test_response_error_preserves_org_disabled_body_for_classifier() {
         let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"This organization has been disabled."}}"#;
         let err = test_response_error(400, body);
-        let ctx = classify_account_failure(&err, FailureSource::Test, None);
+        let ctx = classify_account_failure(&err, FailureSource::Test, None, None);
         assert_eq!(ctx.action, AccountFailureAction::TerminalDisabled);
         assert_eq!(ctx.normalized_reason.to_reason(), Some(Reason::Disabled));
     }
@@ -1198,7 +1203,7 @@ mod tests {
             r#"{{"type":"error","error":{{"type":"rate_limit_error","message":"{{\"resetsAt\":{reset_time}}}"}}}}"#
         );
         let err = test_response_error(429, &body);
-        let ctx = classify_account_failure(&err, FailureSource::Test, None);
+        let ctx = classify_account_failure(&err, FailureSource::Test, None, None);
         assert_eq!(ctx.action, AccountFailureAction::Cooldown { reset_time });
         assert_eq!(
             ctx.normalized_reason.to_reason(),

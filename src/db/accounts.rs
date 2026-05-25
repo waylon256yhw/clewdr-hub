@@ -1910,7 +1910,7 @@ mod tests {
             reason: Reason::TooManyRequest(1_700_000_000),
         };
         let ctx: AccountFailureContext =
-            classify_account_failure(&err, FailureSource::Messages, None);
+            classify_account_failure(&err, FailureSource::Messages, None, None);
         let persisted = AccountFailureContextPersisted::from(&ctx);
 
         super::set_account_last_failure(&pool, 1, Some(&persisted))
@@ -1980,7 +1980,7 @@ mod tests {
         let err = crate::error::ClewdrError::InvalidCookie {
             reason: Reason::Disabled,
         };
-        let ctx = classify_account_failure(&err, FailureSource::Messages, None);
+        let ctx = classify_account_failure(&err, FailureSource::Messages, None, None);
         let persisted = AccountFailureContextPersisted::from(&ctx);
         super::set_account_last_failure(&pool, 1, Some(&persisted))
             .await

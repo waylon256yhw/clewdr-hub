@@ -30,7 +30,7 @@ pub fn error_to_log_status(err: &ClewdrError) -> (&'static str, u16) {
     // Account-side failures: route through the unified classifier so
     // every entry point (messages / count_tokens / test / probe /
     // refresh) reports the same status for the same upstream signal.
-    let ctx = classify_account_failure(err, FailureSource::Messages, None);
+    let ctx = classify_account_failure(err, FailureSource::Messages, None, None);
     let status = ctx.action.to_log_status();
     let http_status = match ctx.action {
         AccountFailureAction::TerminalAuth | AccountFailureAction::TerminalDisabled => {

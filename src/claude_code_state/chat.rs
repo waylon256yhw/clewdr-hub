@@ -230,7 +230,7 @@ impl ClaudeCodeState {
     /// branch — `FreeTier` keeps a separate path even though it also maps
     /// to `AccountFailureAction::TerminalDisabled`.
     fn is_oauth_disabled_failure(err: &ClewdrError) -> bool {
-        let ctx = classify_account_failure(err, FailureSource::Messages, None);
+        let ctx = classify_account_failure(err, FailureSource::Messages, None, None);
         matches!(
             ctx.normalized_reason,
             AccountNormalizedReason::OrganizationDisabled
@@ -242,7 +242,7 @@ impl ClaudeCodeState {
     /// any classifier path that produces `AccountFailureAction::Cooldown`
     /// reports its `reset_time` here.
     fn oauth_cooldown_until(err: &ClewdrError) -> Option<i64> {
-        match classify_account_failure(err, FailureSource::Messages, None).action {
+        match classify_account_failure(err, FailureSource::Messages, None, None).action {
             AccountFailureAction::Cooldown { reset_time } => Some(reset_time),
             _ => None,
         }
@@ -254,7 +254,7 @@ impl ClaudeCodeState {
     /// the pool's invalidate / collect API. Transient and internal
     /// classes return `None` so callers do not change account state.
     fn oauth_pool_reason(err: &ClewdrError) -> Option<Reason> {
-        let ctx = classify_account_failure(err, FailureSource::Messages, None);
+        let ctx = classify_account_failure(err, FailureSource::Messages, None, None);
         match ctx.action {
             AccountFailureAction::TerminalAuth
             | AccountFailureAction::TerminalDisabled
@@ -299,7 +299,7 @@ impl ClaudeCodeState {
         err: &ClewdrError,
         source: FailureSource,
     ) -> AccountFailureContextPersisted {
-        let ctx = classify_account_failure(err, source, None);
+        let ctx = classify_account_failure(err, source, None, None);
         AccountFailureContextPersisted::from(&ctx)
     }
 
@@ -656,22 +656,19 @@ impl ClaudeCodeState {
                             state.cookie.as_ref().unwrap().credential_label().green(),
                             e
                         );
-                        // Classify through the unified pipeline, then
-                        // demote Cooldown→TransientUpstream locally —
-                        // PRD Decision 2: ApiKey has no quota window
-                        // and no cooldown semantics, so 429 must not
-                        // park the account. C9 lifts the demotion into
-                        // the classifier's 4th `auth_method` param so
-                        // every classification site shares it; until
-                        // then this site-local mapping suffices.
-                        let verdict = classify_account_failure(&e, FailureSource::Messages, None);
-                        let action = match verdict.action {
-                            AccountFailureAction::Cooldown { .. } => {
-                                AccountFailureAction::TransientUpstream
-                            }
-                            other => other,
-                        };
-                        match action {
+                        // Classify through the unified pipeline. The
+                        // classifier's 4th `auth_method` param handles
+                        // the Cooldown→TransientUpstream demotion for
+                        // ApiKey at the single chokepoint (PRD
+                        // Decision 2: no cooldown semantics on
+                        // pay-as-you-go).
+                        let verdict = classify_account_failure(
+                            &e,
+                            FailureSource::Messages,
+                            None,
+                            Some(AuthMethod::ApiKey),
+                        );
+                        match verdict.action {
                             AccountFailureAction::TerminalAuth
                             | AccountFailureAction::TerminalDisabled => {
                                 if let Some(aid) = account_id {
@@ -694,7 +691,10 @@ impl ClaudeCodeState {
                                 continue;
                             }
                             AccountFailureAction::Cooldown { .. } => {
-                                unreachable!("Cooldown demoted to TransientUpstream above");
+                                // Unreachable: classifier demoted to
+                                // TransientUpstream because we passed
+                                // Some(AuthMethod::ApiKey).
+                                unreachable!("classifier should have demoted Cooldown for ApiKey");
                             }
                             AccountFailureAction::InternalError => {
                                 // Classifier signaled "do not change
@@ -1074,19 +1074,16 @@ impl ClaudeCodeState {
                             e
                         );
                         // Mirror of try_chat's ApiKey error arm — see
-                        // the equivalent comment there. The single
-                        // shape difference is FailureSource::CountTokens
-                        // so AccountHealth reports the right entry
-                        // point.
-                        let verdict =
-                            classify_account_failure(&e, FailureSource::CountTokens, None);
-                        let action = match verdict.action {
-                            AccountFailureAction::Cooldown { .. } => {
-                                AccountFailureAction::TransientUpstream
-                            }
-                            other => other,
-                        };
-                        match action {
+                        // the equivalent comment there. Differences:
+                        // FailureSource::CountTokens so AccountHealth
+                        // reports the right entry point.
+                        let verdict = classify_account_failure(
+                            &e,
+                            FailureSource::CountTokens,
+                            None,
+                            Some(AuthMethod::ApiKey),
+                        );
+                        match verdict.action {
                             AccountFailureAction::TerminalAuth
                             | AccountFailureAction::TerminalDisabled => {
                                 if let Some(aid) = account_id {
@@ -1106,7 +1103,7 @@ impl ClaudeCodeState {
                                 continue;
                             }
                             AccountFailureAction::Cooldown { .. } => {
-                                unreachable!("Cooldown demoted to TransientUpstream above");
+                                unreachable!("classifier should have demoted Cooldown for ApiKey");
                             }
                             AccountFailureAction::InternalError => {
                                 return Err(e);

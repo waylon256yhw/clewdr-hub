@@ -319,7 +319,8 @@ async fn persist_failure(
     err: ClewdrError,
 ) {
     let msg = err.to_string();
-    let context = classify_account_failure(&err, FailureSource::OauthRefresh, Some("refresh"));
+    let context =
+        classify_account_failure(&err, FailureSource::OauthRefresh, Some("refresh"), None);
     warn!("[oauth-keepalive] account {account_id}: {msg}");
 
     if !matches!(

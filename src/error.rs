@@ -267,7 +267,7 @@ impl IntoResponse for ClewdrError {
         // only persisted in the admin-domain `AccountHealth.last_failure`.
         if matches!(&self, ClewdrError::InvalidCookie { .. }) {
             use crate::services::account_error::{FailureSource, classify_account_failure};
-            let ctx = classify_account_failure(&self, FailureSource::Messages, None);
+            let ctx = classify_account_failure(&self, FailureSource::Messages, None, None);
             let inner = ClaudeErrorBody {
                 message: json!(self.to_string()),
                 r#type: ctx.normalized_reason.as_type_str().to_string(),
