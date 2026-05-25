@@ -15,7 +15,7 @@ use wreq_util::Emulation;
 
 use crate::{
     billing::BillingContext,
-    config::{AccountSlot, AuthMethod, CLAUDE_ENDPOINT, Reason, TokenInfo},
+    config::{AccountSlot, ApiKeyExtraHeaders, AuthMethod, CLAUDE_ENDPOINT, Reason, TokenInfo},
     error::{ClewdrError, WreqSnafu},
     services::account_pool::{AccountPoolHandle, CredentialFingerprint},
     stealth::SharedStealthProfile,
@@ -113,6 +113,16 @@ pub struct ClaudeCodeState {
     pub stealth_profile: SharedStealthProfile,
     pub bound_account_ids: Vec<i64>,
     pub selected_account_id: Option<std::sync::Arc<std::sync::Mutex<Option<i64>>>>,
+    /// API-key credential, populated iff the dispatched slot has
+    /// `auth_method == AuthMethod::ApiKey`. Travels via `x-api-key` on
+    /// every send (see C7 `execute_claude_request`). `None` for
+    /// Cookie/OAuth so accidental reuse on a subscription path produces
+    /// a missing-header 4xx rather than leaking a stale key.
+    pub api_key: Option<String>,
+    /// Optional per-account headers (e.g. `anthropic-workspace-id`)
+    /// attached on every ApiKey send after the reserved-name filter.
+    /// `None` for non-ApiKey slots.
+    pub api_key_extra_headers: Option<ApiKeyExtraHeaders>,
 }
 
 impl ClaudeCodeState {
@@ -140,6 +150,8 @@ impl ClaudeCodeState {
             stealth_profile,
             bound_account_ids: Vec::new(),
             selected_account_id: None,
+            api_key: None,
+            api_key_extra_headers: None,
         }
     }
 
@@ -167,7 +179,7 @@ impl ClaudeCodeState {
         let mut state = Self::new(account_pool_handle, stealth_profile);
         let auth_method = slot.auth_method;
         state.proxy_url = slot.proxy_url.clone();
-        state.cookie = Some(slot);
+        state.proxy = proxy_from_url(state.proxy_url.as_deref());
 
         state.cookie_header_value = match auth_method {
             AuthMethod::Cookie => {
@@ -176,32 +188,62 @@ impl ClaudeCodeState {
                 // was populated by `AccountSlot::new()` when the loader
                 // built it. Surface the inconsistency as an error rather
                 // than panicking if invariant breaks.
-                let cookie_value = state
+                let cookie_value = slot
                     .cookie
                     .as_ref()
-                    .and_then(|slot| slot.cookie.as_ref())
                     .ok_or(ClewdrError::UnexpectedNone {
                         msg: "Cookie kind invariant: slot.cookie missing on Cookie account",
                     })?
                     .to_string();
                 HeaderValue::from_str(cookie_value.as_str())?
             }
-            AuthMethod::OAuth => HeaderValue::from_static(""),
-            // ApiKey: no Cookie header. Auth flows via x-api-key in the
-            // send path (C7); cookie_header_value stays empty so the
-            // build_request filter at L189 skips attaching it.
-            AuthMethod::ApiKey => HeaderValue::from_static(""),
+            // OAuth / ApiKey: same empty sentinel; `build_request` (L189)
+            // skips the COOKIE attach when empty, and ApiKey auth flows
+            // via `x-api-key` in C7's send arm instead.
+            AuthMethod::OAuth | AuthMethod::ApiKey => HeaderValue::from_static(""),
         };
-        state.proxy = proxy_from_url(state.proxy_url.as_deref());
-        let mut client = wreq::Client::builder()
-            .cookie_store(true)
-            .emulation(Emulation::Chrome136);
-        if let Some(ref proxy) = state.proxy {
-            client = client.proxy(proxy.to_owned());
+
+        // Per-auth_method endpoint + wreq client + api_key plumbing.
+        // Cookie/OAuth keep the subscription-shaped client (Chrome TLS
+        // emulation + cookie store) and the default Anthropic endpoint.
+        // ApiKey overrides the endpoint from the slot's normalized
+        // base_url and uses a plain client — Chrome emulation is
+        // anti-detection for the subscription reverse-proxy path and is
+        // both meaningless and potentially trip-wire for strict
+        // corporate proxies on direct-API calls; the cookie store is
+        // similarly redundant since ApiKey never attaches Cookie.
+        let mut client_builder = wreq::Client::builder();
+        match auth_method {
+            AuthMethod::Cookie | AuthMethod::OAuth => {
+                state.endpoint = crate::config::ENDPOINT_URL.to_owned();
+                client_builder = client_builder
+                    .cookie_store(true)
+                    .emulation(Emulation::Chrome136);
+            }
+            AuthMethod::ApiKey => {
+                let raw_base =
+                    slot.api_key_base_url
+                        .as_deref()
+                        .ok_or(ClewdrError::UnexpectedNone {
+                            msg: "ApiKey kind invariant: slot.api_key_base_url missing",
+                        })?;
+                // Re-normalize defensively: admin write-time validation
+                // (C10) is the primary guard, but a manual DB edit could
+                // skip it, and `.join("v1/messages")` silently produces
+                // wrong URLs if the trailing-slash invariant breaks.
+                state.endpoint = normalize_api_key_base_url(raw_base)?;
+                state.api_key = slot.api_key_secret.as_ref().map(|s| s.as_str().to_string());
+                state.api_key_extra_headers = slot.api_key_extra_headers.clone();
+            }
         }
-        state.client = client.build().context(WreqSnafu {
+        if let Some(ref proxy) = state.proxy {
+            client_builder = client_builder.proxy(proxy.to_owned());
+        }
+        state.client = client_builder.build().context(WreqSnafu {
             msg: "Failed to build client for credential",
         })?;
+
+        state.cookie = Some(slot);
         Ok(state)
     }
 
@@ -287,21 +329,49 @@ impl ClaudeCodeState {
                     .to_string();
                 HeaderValue::from_str(cookie_value.as_str())?
             }
-            AuthMethod::OAuth => HeaderValue::from_static(""),
-            // ApiKey: same empty sentinel as OAuth. C6 will additionally
-            // override self.endpoint from slot.api_key_base_url here.
-            AuthMethod::ApiKey => HeaderValue::from_static(""),
+            // OAuth / ApiKey: empty sentinel; see `from_credential` for
+            // the rationale (mirror the constructor exactly so both
+            // entry points produce identically-shaped state).
+            AuthMethod::OAuth | AuthMethod::ApiKey => HeaderValue::from_static(""),
         };
         self.proxy_url = res.proxy_url.clone();
         self.proxy = proxy_from_url(self.proxy_url.as_deref());
-        self.endpoint = crate::config::ENDPOINT_URL.to_owned();
-        let mut client = wreq::Client::builder()
-            .cookie_store(true)
-            .emulation(Emulation::Chrome136);
-        if let Some(ref proxy) = self.proxy {
-            client = client.proxy(proxy.to_owned());
+
+        // Per-auth_method endpoint + wreq client + api_key plumbing.
+        // Mirror of the dispatch in `from_credential` so the hot-path
+        // re-acquire (every retry inside try_chat / try_count_tokens)
+        // ends up with the exact same client shape as a fresh
+        // constructor. Resetting `api_key` / `api_key_extra_headers` on
+        // the non-ApiKey arm is load-bearing: this method runs on every
+        // retry, and a previous ApiKey acquisition followed by a
+        // Cookie/OAuth slot would otherwise leak the prior key onto
+        // a subscription send.
+        let mut client_builder = wreq::Client::builder();
+        match res.auth_method {
+            AuthMethod::Cookie | AuthMethod::OAuth => {
+                self.endpoint = crate::config::ENDPOINT_URL.to_owned();
+                self.api_key = None;
+                self.api_key_extra_headers = None;
+                client_builder = client_builder
+                    .cookie_store(true)
+                    .emulation(Emulation::Chrome136);
+            }
+            AuthMethod::ApiKey => {
+                let raw_base =
+                    res.api_key_base_url
+                        .as_deref()
+                        .ok_or(ClewdrError::UnexpectedNone {
+                            msg: "ApiKey kind invariant: dispatched api_key slot missing base_url",
+                        })?;
+                self.endpoint = normalize_api_key_base_url(raw_base)?;
+                self.api_key = res.api_key_secret.as_ref().map(|s| s.as_str().to_string());
+                self.api_key_extra_headers = res.api_key_extra_headers.clone();
+            }
         }
-        self.client = client.build().context(WreqSnafu {
+        if let Some(ref proxy) = self.proxy {
+            client_builder = client_builder.proxy(proxy.to_owned());
+        }
+        self.client = client_builder.build().context(WreqSnafu {
             msg: "Failed to build client with new cookie",
         })?;
         if let Some(selected_account_id) = &self.selected_account_id
@@ -319,6 +389,19 @@ impl ClaudeCodeState {
     }
 
     pub fn check_token(&self) -> TokenStatus {
+        // ApiKey accounts authenticate via `x-api-key` per send; they
+        // have no expiring bearer token, so the OAuth/cookie token
+        // ladder below does not apply. Without this short-circuit
+        // ApiKey slots fall through to `TokenStatus::None`, and the
+        // try_chat / try_count_tokens caller would then attempt cookie
+        // OAuth exchange against the api-key base URL — load-bearing.
+        if self
+            .cookie
+            .as_ref()
+            .is_some_and(|s| s.auth_method == AuthMethod::ApiKey)
+        {
+            return TokenStatus::Valid;
+        }
         if let Some(token_info) = &self.oauth_token {
             if token_info.is_expired() {
                 return TokenStatus::Expired;
