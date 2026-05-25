@@ -52,10 +52,15 @@ const CREDENTIAL_FINGERPRINT_LEN: usize = 20;
 /// fingerprint must survive `refresh_token`-stable rotations or every
 /// request that overlaps a refresh would falsely trip the guard. Admin
 /// reconnect rotates both, so the fingerprint correctly flips.
+///
+/// ApiKey uses the api_key secret prefix. Admin rotation of the key
+/// itself is the only event that should invalidate runtime — there is
+/// no transparent rotation in the api-key model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialFingerprint {
     Cookie(String),
     OAuth(String),
+    ApiKey(String),
 }
 
 impl CredentialFingerprint {
@@ -69,15 +74,21 @@ impl CredentialFingerprint {
         CredentialFingerprint::OAuth(s[..cap].to_string())
     }
 
+    fn api_key_prefix(s: &str) -> Self {
+        let cap = CREDENTIAL_FINGERPRINT_LEN.min(s.len());
+        CredentialFingerprint::ApiKey(s[..cap].to_string())
+    }
+
     pub fn from_oauth_refresh_token(refresh_token: &str) -> Self {
         Self::oauth_prefix(refresh_token)
     }
 
     /// Build a fingerprint from a request-time `AccountSlot`. Returns None
     /// when the slot has no usable credential identifier (an OAuth slot
-    /// with `token = None` — should not happen in practice, but treated
-    /// as "no fingerprint" so the caller's guard becomes a pass-through
-    /// rather than a false rejection).
+    /// with `token = None`, or an ApiKey slot with `api_key_secret = None`
+    /// — should not happen in practice, but treated as "no fingerprint"
+    /// so the caller's guard becomes a pass-through rather than a false
+    /// rejection).
     pub fn from_slot(slot: &AccountSlot) -> Option<Self> {
         match slot.auth_method {
             // Use the inner cookie blob (`Deref<Target = str>`), not
@@ -94,6 +105,10 @@ impl CredentialFingerprint {
                 .token
                 .as_ref()
                 .map(|t| Self::oauth_prefix(&t.refresh_token)),
+            AuthMethod::ApiKey => slot
+                .api_key_secret
+                .as_ref()
+                .map(|s| Self::api_key_prefix(s.as_str())),
         }
     }
 }
@@ -897,6 +912,15 @@ impl AccountPoolActor {
                         slot.token = Some(token);
                     }
                     probe_cookie(account_id, slot, handle, profile, db, log_sink).await;
+                }
+                // ApiKey accounts are pay-as-you-go and do not expose
+                // subscription quota windows or OAuth profile metadata,
+                // so the probe machinery (which is subscription-shaped)
+                // does not apply. Clear the probing flag and return so
+                // the spawn does not leave the account stuck in
+                // `probing=true`.
+                AuthMethod::ApiKey => {
+                    let _ = handle.clear_probing(account_id).await;
                 }
             }
         });

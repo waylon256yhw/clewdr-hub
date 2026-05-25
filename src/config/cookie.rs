@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fmt::{Debug, Display},
     ops::Deref,
     str::FromStr,
@@ -26,28 +27,106 @@ pub enum ModelFamily {
 
 /// Authentication method for an account.
 ///
-/// Step 4 introduces this as the canonical kind discriminator for an
-/// `AccountSlot`. Pre-Step-4 code derived "is this OAuth?" from the
-/// presence of a placeholder cookie (`is_oauth_placeholder_slot`); that
-/// implicit shape is being retired across PR #6/#7/#8. Loader fills this
-/// from the DB column `accounts.auth_source`.
+/// Step 4 introduced this as the canonical kind discriminator for an
+/// `AccountSlot`. Step 5 adds `ApiKey` for pay-as-you-go Anthropic-compatible
+/// endpoints (official `api.anthropic.com` or custom endpoints such as AWS).
+/// Loader fills this from the DB column `accounts.auth_source`.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
     #[default]
     Cookie,
+    #[serde(rename = "oauth")]
     OAuth,
+    ApiKey,
 }
 
 impl AuthMethod {
     /// Map the persisted `accounts.auth_source` string to a typed kind.
-    /// Unknown values fall back to `Cookie` (defensive — Step 1 already
-    /// constrained the column to `cookie | oauth`).
+    /// Unknown values fall back to `Cookie` (defensive — the column CHECK
+    /// constrains it to `cookie | oauth | api_key`).
     pub fn from_auth_source(s: &str) -> Self {
         match s {
             "oauth" => AuthMethod::OAuth,
+            "api_key" => AuthMethod::ApiKey,
             _ => AuthMethod::Cookie,
         }
+    }
+}
+
+/// Secret string with a masked `Debug` impl. Used for the API key value
+/// inside `AccountSlot` so accidental log / tracing output cannot leak
+/// the credential. Deserialize is `transparent` so DB-loaded TEXT rows
+/// land here directly; the type intentionally does **not** derive
+/// `Serialize` — the only `AccountSlot` field that holds one carries
+/// `#[serde(skip_serializing)]`, and other call sites should not be
+/// emitting secret bytes either.
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct ApiKeySecret(String);
+
+impl Debug for ApiKeySecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            f.write_str("ApiKeySecret(<empty>)")
+        } else {
+            f.write_str("ApiKeySecret(***)")
+        }
+    }
+}
+
+impl ApiKeySecret {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Per-account extra HTTP headers for API-key accounts (e.g.
+/// `anthropic-workspace-id`). Header **keys** are debug-visible (they
+/// are useful for diagnostics and not sensitive on their own); header
+/// **values** are masked in `Debug` output and skipped by the
+/// `AccountSlot` `Serialize` path because they may contain secrets per
+/// PRD §Security. Deserialize is transparent so the DB JSON column
+/// loads directly into this map.
+#[derive(Clone, Default, Deserialize)]
+#[serde(transparent)]
+pub struct ApiKeyExtraHeaders(BTreeMap<String, String>);
+
+impl Debug for ApiKeyExtraHeaders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.keys().map(|k| (k, "***")))
+            .finish()
+    }
+}
+
+impl ApiKeyExtraHeaders {
+    pub fn new(m: BTreeMap<String, String>) -> Self {
+        Self(m)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.0.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn as_map(&self) -> &BTreeMap<String, String> {
+        &self.0
     }
 }
 
@@ -182,6 +261,28 @@ pub struct AccountSlot {
     pub weekly_sonnet_utilization: Option<f64>,
     #[serde(default)]
     pub weekly_opus_utilization: Option<f64>,
+
+    // ---------- ApiKey credential fields (Step 5) ----------
+    // Populated iff `auth_method == ApiKey`. `base_url` is the upstream
+    // origin (e.g. `https://api.anthropic.com/`, already normalized by
+    // `normalize_api_key_base_url` at insert / acquire time); `secret`
+    // is the literal API key; `extra_headers` is a per-account KV map
+    // merged into outbound requests (values are secrets).
+    //
+    // Both secret-bearing fields carry `#[serde(skip_serializing)]` so
+    // any future caller that serializes an `AccountSlot` (status dumps,
+    // snapshots, etc.) cannot accidentally leak the credential. The
+    // wrappers' `Debug` impls mask values, so derived `Debug` on
+    // `AccountSlot` is safe for tracing.
+    //
+    // All three carry `#[serde(default)]` so deserializing pre-Step-5
+    // snapshots (no api_key columns) does not fail.
+    #[serde(default)]
+    pub api_key_base_url: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub api_key_secret: Option<ApiKeySecret>,
+    #[serde(default, skip_serializing)]
+    pub api_key_extra_headers: Option<ApiKeyExtraHeaders>,
 }
 
 // `AccountSlot` deliberately does not implement `PartialEq` / `Eq` /
@@ -239,6 +340,9 @@ impl AccountSlot {
             weekly_utilization: None,
             weekly_sonnet_utilization: None,
             weekly_opus_utilization: None,
+            api_key_base_url: None,
+            api_key_secret: None,
+            api_key_extra_headers: None,
         })
     }
 
@@ -279,6 +383,28 @@ impl AccountSlot {
         }
     }
 
+    /// Construct an ApiKey slot directly from `(account_id, base_url,
+    /// secret, extra_headers)`. Used by the loader (`do_reload`) for
+    /// `auth_source = 'api_key'` rows. `base_url` is expected to be
+    /// already normalized via `normalize_api_key_base_url`; this
+    /// constructor does not re-validate.
+    pub fn api_key(
+        account_id: i64,
+        base_url: String,
+        secret: ApiKeySecret,
+        extra_headers: Option<ApiKeyExtraHeaders>,
+    ) -> Self {
+        Self {
+            cookie: None,
+            auth_method: AuthMethod::ApiKey,
+            account_id: Some(account_id),
+            api_key_base_url: Some(base_url),
+            api_key_secret: Some(secret),
+            api_key_extra_headers: extra_headers,
+            ..Self::default()
+        }
+    }
+
     pub fn add_token(&mut self, token: TokenInfo) {
         self.token = Some(token);
     }
@@ -299,6 +425,10 @@ impl AccountSlot {
             AuthMethod::OAuth => match self.account_id {
                 Some(id) => format!("oauth#{id}"),
                 None => "oauth#?".to_string(),
+            },
+            AuthMethod::ApiKey => match self.account_id {
+                Some(id) => format!("apikey#{id}"),
+                None => "apikey#?".to_string(),
             },
         }
     }
@@ -686,12 +816,14 @@ mod tests {
     fn auth_method_from_auth_source_strings() {
         assert_eq!(AuthMethod::from_auth_source("cookie"), AuthMethod::Cookie);
         assert_eq!(AuthMethod::from_auth_source("oauth"), AuthMethod::OAuth);
+        assert_eq!(AuthMethod::from_auth_source("api_key"), AuthMethod::ApiKey);
         // Unknown / legacy "hybrid" / empty all fall back to Cookie so a
         // mis-typed DB value can't accidentally route a slot through the
-        // OAuth send-path.
+        // OAuth or ApiKey send-path.
         assert_eq!(AuthMethod::from_auth_source(""), AuthMethod::Cookie);
         assert_eq!(AuthMethod::from_auth_source("hybrid"), AuthMethod::Cookie);
         assert_eq!(AuthMethod::from_auth_source("OAuth"), AuthMethod::Cookie);
+        assert_eq!(AuthMethod::from_auth_source("apikey"), AuthMethod::Cookie);
     }
 
     #[test]
@@ -700,10 +832,14 @@ mod tests {
         // any future cross-process snapshot exchange clean.
         let cookie_json = serde_json::to_string(&AuthMethod::Cookie).unwrap();
         let oauth_json = serde_json::to_string(&AuthMethod::OAuth).unwrap();
+        let apikey_json = serde_json::to_string(&AuthMethod::ApiKey).unwrap();
         assert_eq!(cookie_json, "\"cookie\"");
         assert_eq!(oauth_json, "\"oauth\"");
+        assert_eq!(apikey_json, "\"api_key\"");
         let parsed: AuthMethod = serde_json::from_str("\"oauth\"").unwrap();
         assert_eq!(parsed, AuthMethod::OAuth);
+        let parsed: AuthMethod = serde_json::from_str("\"api_key\"").unwrap();
+        assert_eq!(parsed, AuthMethod::ApiKey);
     }
 
     #[test]
@@ -755,5 +891,122 @@ mod tests {
             ..AccountSlot::default()
         };
         assert_eq!(oauth_no_id.credential_label(), "oauth#?");
+    }
+
+    /// Step 5: API-key slot built via `AccountSlot::api_key`. Label is
+    /// `apikey#{id}`, no cookie/oauth fields populated.
+    #[test]
+    fn api_key_slot_constructor_and_label() {
+        let slot = AccountSlot::api_key(
+            7,
+            "https://api.anthropic.com/".to_string(),
+            ApiKeySecret::new("sk-ant-test-xyz"),
+            None,
+        );
+        assert_eq!(slot.auth_method, AuthMethod::ApiKey);
+        assert_eq!(slot.account_id, Some(7));
+        assert_eq!(
+            slot.api_key_base_url.as_deref(),
+            Some("https://api.anthropic.com/")
+        );
+        assert_eq!(
+            slot.api_key_secret.as_ref().map(|s| s.as_str()),
+            Some("sk-ant-test-xyz")
+        );
+        assert!(slot.api_key_extra_headers.is_none());
+        assert!(slot.cookie.is_none());
+        assert!(slot.token.is_none());
+        assert_eq!(slot.credential_label(), "apikey#7");
+
+        let no_id = AccountSlot {
+            auth_method: AuthMethod::ApiKey,
+            account_id: None,
+            ..AccountSlot::default()
+        };
+        assert_eq!(no_id.credential_label(), "apikey#?");
+    }
+
+    /// `ApiKeySecret`'s `Debug` impl must NEVER leak the inner string.
+    /// This is the last line of defense if a tracing span / error path
+    /// drops a `?slot` or `{:?}` formatter onto an api-key slot.
+    #[test]
+    fn api_key_secret_debug_is_masked() {
+        let s = ApiKeySecret::new("sk-ant-supersecret-1234567890");
+        let dbg = format!("{:?}", s);
+        assert_eq!(dbg, "ApiKeySecret(***)");
+        assert!(!dbg.contains("sk-ant"));
+        assert!(!dbg.contains("supersecret"));
+
+        let empty = ApiKeySecret::new("");
+        assert_eq!(format!("{:?}", empty), "ApiKeySecret(<empty>)");
+    }
+
+    /// Extra-header values are secrets per PRD §Security. Keys remain
+    /// visible (diagnostically useful, not sensitive on their own).
+    #[test]
+    fn api_key_extra_headers_debug_masks_values() {
+        let mut map = BTreeMap::new();
+        map.insert(
+            "anthropic-workspace-id".to_string(),
+            "wrkspc_supersecret_xyz".to_string(),
+        );
+        map.insert(
+            "x-custom-token".to_string(),
+            "another_secret_value".to_string(),
+        );
+        let h = ApiKeyExtraHeaders::new(map);
+        let dbg = format!("{:?}", h);
+        // Keys present
+        assert!(dbg.contains("anthropic-workspace-id"));
+        assert!(dbg.contains("x-custom-token"));
+        // Values masked
+        assert!(!dbg.contains("wrkspc_supersecret_xyz"));
+        assert!(!dbg.contains("another_secret_value"));
+        assert!(dbg.contains("***"));
+    }
+
+    /// `AccountSlot::Serialize` must NEVER emit `api_key_secret` or
+    /// `api_key_extra_headers`. Both are explicitly marked
+    /// `#[serde(skip_serializing)]` and this test pins that behavior.
+    #[test]
+    fn account_slot_serialize_omits_api_key_secrets() {
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "anthropic-workspace-id".to_string(),
+            "wrkspc_should_not_appear".to_string(),
+        );
+        let slot = AccountSlot::api_key(
+            3,
+            "https://api.anthropic.com/".to_string(),
+            ApiKeySecret::new("sk-ant-should-not-appear"),
+            Some(ApiKeyExtraHeaders::new(headers)),
+        );
+        let json = serde_json::to_string(&slot).expect("AccountSlot serializes");
+        // base_url is fine to expose (it's not secret) — make sure the
+        // serialization still emits the non-secret api_key field so the
+        // skip is targeted, not blanket.
+        assert!(json.contains("api_key_base_url"));
+        assert!(json.contains("https://api.anthropic.com/"));
+        // Secrets must NOT appear.
+        assert!(!json.contains("sk-ant-should-not-appear"));
+        assert!(!json.contains("wrkspc_should_not_appear"));
+        assert!(!json.contains("api_key_secret"));
+        assert!(!json.contains("api_key_extra_headers"));
+    }
+
+    /// Round-trip a pre-Step-5 snapshot (no api_key_* fields in JSON):
+    /// `#[serde(default)]` must yield `None` for all three new fields.
+    #[test]
+    fn account_slot_deserialize_tolerates_missing_api_key_fields() {
+        let json = r#"{
+            "cookie": null,
+            "auth_method": "oauth",
+            "account_id": 11
+        }"#;
+        let slot: AccountSlot = serde_json::from_str(json).expect("legacy snapshot");
+        assert_eq!(slot.auth_method, AuthMethod::OAuth);
+        assert!(slot.api_key_base_url.is_none());
+        assert!(slot.api_key_secret.is_none());
+        assert!(slot.api_key_extra_headers.is_none());
     }
 }

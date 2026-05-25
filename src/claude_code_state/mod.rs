@@ -140,6 +140,10 @@ impl ClaudeCodeState {
                 HeaderValue::from_str(cookie_value.as_str())?
             }
             AuthMethod::OAuth => HeaderValue::from_static(""),
+            // ApiKey: no Cookie header. Auth flows via x-api-key in the
+            // send path (C7); cookie_header_value stays empty so the
+            // build_request filter at L189 skips attaching it.
+            AuthMethod::ApiKey => HeaderValue::from_static(""),
         };
         state.proxy = proxy_from_url(state.proxy_url.as_deref());
         let mut client = wreq::Client::builder()
@@ -237,6 +241,9 @@ impl ClaudeCodeState {
                 HeaderValue::from_str(cookie_value.as_str())?
             }
             AuthMethod::OAuth => HeaderValue::from_static(""),
+            // ApiKey: same empty sentinel as OAuth. C6 will additionally
+            // override self.endpoint from slot.api_key_base_url here.
+            AuthMethod::ApiKey => HeaderValue::from_static(""),
         };
         self.proxy_url = res.proxy_url.clone();
         self.proxy = proxy_from_url(self.proxy_url.as_deref());
