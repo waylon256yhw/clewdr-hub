@@ -45,6 +45,64 @@ const CLAUDE_BETA_BASE: &str = "oauth-2025-04-20";
 const CLAUDE_BETA_CONTEXT_1M_TOKEN: &str = "context-1m-2025-08-07";
 const CLAUDE_API_VERSION: &str = "2023-06-01";
 
+/// Header names that MUST NOT come from per-account extra_headers on
+/// an ApiKey send: either we set them ourselves (`x-api-key`,
+/// `anthropic-version`, `anthropic-beta`, `content-type`) or they
+/// reintroduce subscription-shaped behavior the ApiKey dispatch is
+/// designed to remove (`user-agent` would silently restore the CC
+/// stealth UA we deliberately omit) or they belong to the transport
+/// layer (`host`, `content-length`, `accept-encoding`) and overriding
+/// them breaks the request.
+///
+/// Admin write-time validation (C10) is the primary guardrail; this
+/// send-time filter is defense in depth for the case of a manual DB
+/// edit that bypasses validation.
+const API_KEY_RESERVED_EXTRA_HEADERS: &[&str] = &[
+    "x-api-key",
+    "authorization",
+    "anthropic-version",
+    "anthropic-beta",
+    "user-agent",
+    "host",
+    "content-length",
+    "content-type",
+    "accept-encoding",
+];
+
+fn is_reserved_api_key_extra_header(name: &str) -> bool {
+    API_KEY_RESERVED_EXTRA_HEADERS
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(name))
+}
+
+/// Compose the `anthropic-beta` header for an ApiKey send.
+///
+/// Unlike `merge_anthropic_beta_header` (the subscription path), this
+/// does NOT prepend `CLAUDE_BETA_BASE` (`oauth-2025-04-20`) — that
+/// token is meaningful only on the OAuth subscription endpoint and
+/// upstream API key services either ignore or reject it. We also do
+/// NOT filter `CLAUDE_BETA_CONTEXT_1M_TOKEN`; the 1M-token context
+/// beta is a legitimate request-level capability the caller is
+/// entitled to opt into on direct-API.
+///
+/// Returns `None` if the caller-supplied string is empty or contained
+/// only the stripped `oauth-2025-04-20` token. Caller must omit the
+/// `anthropic-beta` header entirely in that case — sending an empty
+/// value is worse than not sending it.
+fn api_key_beta_header(extra: Option<&str>) -> Option<String> {
+    let cleaned: Vec<&str> = extra
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case(CLAUDE_BETA_BASE))
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.join(","))
+    }
+}
+
 struct SelectedSlotState {
     handle: AccountPoolHandle,
     account_id: Option<i64>,
@@ -593,11 +651,86 @@ impl ClaudeCodeState {
             .await
     }
 
+    /// Send a request to an ApiKey account's normalized base URL.
+    /// Used by both `execute_claude_request` (`v1/messages`) and
+    /// `execute_claude_count_tokens_request` (`v1/messages/count_tokens`)
+    /// — the two paths are byte-identical apart from the URL segment
+    /// and the error-context string, so they share this helper rather
+    /// than duplicating the auth-header / body-strip / extra-header
+    /// dance per call site.
+    ///
+    /// Body clone is unavoidable: callers hand us `&CreateMessageParams`
+    /// (the cookie/OAuth send paths only read the body), and we must
+    /// mutate the `system` block to strip the CC billing header that
+    /// the extractor (`<ClaudeCodePreprocess as FromRequest>::from_request`
+    /// in `middleware/claude/request.rs`) prepends before account
+    /// dispatch is aware of the slot's auth_method. Direct-API
+    /// upstreams reject (or worse, log) that block as a spurious
+    /// system prompt.
+    ///
+    /// Header set (intentionally minimal vs the subscription path):
+    ///   - `x-api-key`: from `self.api_key` (populated at acquire time).
+    ///   - `anthropic-version`: required by the API.
+    ///   - `anthropic-beta`: from `api_key_beta_header(...)`, omitted
+    ///     if empty (an empty value is worse than no header).
+    ///   - Per-account extras after the reserved-name filter.
+    /// Notably absent: `User-Agent` (Chrome stealth UA is anti-detection
+    /// for subscription reverse-proxy, meaningless on direct API and
+    /// trip-wire for strict corporate proxies); `Authorization` (auth
+    /// flows via `x-api-key`, not bearer).
+    async fn execute_api_key_request(
+        &self,
+        path: &str,
+        body: &CreateMessageParams,
+        error_context: &'static str,
+    ) -> Result<wreq::Response, ClewdrError> {
+        let mut url = self.endpoint.join(path).expect("Url parse error");
+        url.set_query(Some("beta=true"));
+
+        let mut body = body.clone();
+        crate::middleware::claude::strip_billing_headers_from_system(&mut body);
+
+        let mut req = self
+            .client
+            .post(url.to_string())
+            .header("x-api-key", self.api_key.as_deref().unwrap_or(""))
+            .header("anthropic-version", CLAUDE_API_VERSION);
+
+        if let Some(beta) = api_key_beta_header(self.anthropic_beta_header.as_deref()) {
+            req = req.header("anthropic-beta", beta);
+        }
+
+        if let Some(extras) = self.api_key_extra_headers.as_ref() {
+            for (k, v) in extras.iter() {
+                if is_reserved_api_key_extra_header(k) {
+                    continue;
+                }
+                req = req.header(k.as_str(), v.as_str());
+            }
+        }
+
+        req.json(&body)
+            .send()
+            .await
+            .context(WreqSnafu { msg: error_context })?
+            .check_claude()
+            .await
+    }
+
     async fn execute_claude_request(
         &mut self,
         access_token: &str,
         body: &CreateMessageParams,
     ) -> Result<wreq::Response, ClewdrError> {
+        if self
+            .cookie
+            .as_ref()
+            .is_some_and(|s| s.auth_method == AuthMethod::ApiKey)
+        {
+            return self
+                .execute_api_key_request("v1/messages", body, "Failed to send chat message")
+                .await;
+        }
         let profile = self.stealth_profile.load();
         let beta_header = Self::merge_anthropic_beta_header(self.anthropic_beta_header.as_deref());
         let mut url = self.endpoint.join("v1/messages").expect("Url parse error");
@@ -1372,6 +1505,19 @@ impl ClaudeCodeState {
         access_token: &str,
         body: &CreateMessageParams,
     ) -> Result<wreq::Response, ClewdrError> {
+        if self
+            .cookie
+            .as_ref()
+            .is_some_and(|s| s.auth_method == AuthMethod::ApiKey)
+        {
+            return self
+                .execute_api_key_request(
+                    "v1/messages/count_tokens",
+                    body,
+                    "Failed to call Claude count_tokens",
+                )
+                .await;
+        }
         let profile = self.stealth_profile.load();
         let beta_header = Self::merge_anthropic_beta_header(self.anthropic_beta_header.as_deref());
         let mut url = self
@@ -1816,5 +1962,93 @@ mod tests {
             messages.normalized_reason_type,
             count.normalized_reason_type
         );
+    }
+
+    /// Step 5 C7: the ApiKey beta-header composer drops the OAuth
+    /// subscription base (`oauth-2025-04-20`) but, unlike the
+    /// subscription path's `merge_anthropic_beta_header`, must NOT
+    /// filter `context-1m-2025-08-07` — that token is a legitimate
+    /// request-level capability the client is entitled to opt into
+    /// on direct-API.
+    #[test]
+    fn api_key_beta_header_strips_oauth_base_keeps_others() {
+        use super::api_key_beta_header;
+
+        // Pure oauth base → header omitted (None) so caller does not
+        // emit an empty `anthropic-beta:` line.
+        assert_eq!(api_key_beta_header(Some("oauth-2025-04-20")), None);
+        assert_eq!(api_key_beta_header(Some("OAUTH-2025-04-20")), None);
+        assert_eq!(api_key_beta_header(None), None);
+        assert_eq!(api_key_beta_header(Some("")), None);
+        assert_eq!(api_key_beta_header(Some("  ,  ,")), None);
+
+        // The 1M context beta survives — regression guard against
+        // re-using the subscription-path merge that silently strips it.
+        assert_eq!(
+            api_key_beta_header(Some("context-1m-2025-08-07")).as_deref(),
+            Some("context-1m-2025-08-07"),
+        );
+
+        // Mixed: oauth base dropped, others preserved in order with
+        // whitespace normalized.
+        assert_eq!(
+            api_key_beta_header(Some(
+                "oauth-2025-04-20, context-1m-2025-08-07, fine-grained-tool-streaming-2025-05-14"
+            ))
+            .as_deref(),
+            Some("context-1m-2025-08-07,fine-grained-tool-streaming-2025-05-14"),
+        );
+
+        // Empty tokens dropped between commas.
+        assert_eq!(
+            api_key_beta_header(Some("context-1m-2025-08-07,, ,prompt-caching-2024-07-31"))
+                .as_deref(),
+            Some("context-1m-2025-08-07,prompt-caching-2024-07-31"),
+        );
+    }
+
+    /// Step 5 C7: send-time reserved-name filter is case-insensitive
+    /// and covers every header the ApiKey dispatch sets itself or the
+    /// transport layer owns. Defense in depth — the admin write-time
+    /// validator (C10) is the primary guard, but a manual DB edit
+    /// could slip past it and we must not let extra_headers re-inject
+    /// e.g. `User-Agent` (which would silently restore the CC stealth
+    /// UA the ApiKey path deliberately omits).
+    #[test]
+    fn reserved_api_key_extra_header_filter_is_case_insensitive() {
+        use super::is_reserved_api_key_extra_header;
+        for name in [
+            "x-api-key",
+            "X-API-KEY",
+            "x-Api-Key",
+            "authorization",
+            "Authorization",
+            "anthropic-version",
+            "anthropic-beta",
+            "user-agent",
+            "USER-AGENT",
+            "host",
+            "content-length",
+            "content-type",
+            "accept-encoding",
+        ] {
+            assert!(
+                is_reserved_api_key_extra_header(name),
+                "{name} should be reserved",
+            );
+        }
+        for name in [
+            "anthropic-workspace-id",
+            "x-request-id",
+            "x-custom",
+            "accept",
+            "cache-control",
+            "",
+        ] {
+            assert!(
+                !is_reserved_api_key_extra_header(name),
+                "{name} should NOT be reserved",
+            );
+        }
     }
 }
