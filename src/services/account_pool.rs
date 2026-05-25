@@ -1185,7 +1185,10 @@ impl AccountPoolActor {
                 // (account_id, auth_method, reason) — no credential bytes.
                 // Skip rows with no credential at all so we don't surface
                 // a phantom invalid entry for a half-deleted account.
-                if row.cookie_blob.is_none() && row.oauth_token.is_none() {
+                if row.cookie_blob.is_none()
+                    && row.oauth_token.is_none()
+                    && row.api_key_secret.is_none()
+                {
                     continue;
                 }
                 let reason = row
@@ -1204,21 +1207,65 @@ impl AccountPoolActor {
             // Step 4 / C8 onward: OAuth-only rows go through
             // `AccountSlot::oauth(...)` directly (no placeholder-cookie
             // synthesis); cookie rows continue through `AccountSlot::new`
-            // which parses the blob. The common tail below stamps the
-            // remaining row metadata onto either kind.
-            let mut cs = match (row.cookie_blob.as_deref(), row.oauth_token.as_ref()) {
-                (Some(cookie_str), _) => match AccountSlot::new(cookie_str, None) {
-                    Ok(cs) => cs,
-                    Err(e) => {
-                        warn!("Invalid cookie for account '{}': {e}", row.name);
+            // which parses the blob. Step 5: ApiKey rows go through
+            // `AccountSlot::api_key(...)` reading the api_key_* columns.
+            // The common tail below stamps the remaining row metadata
+            // onto either kind.
+            let row_kind = AuthMethod::from_auth_source(&row.auth_source);
+            let mut cs = match row_kind {
+                AuthMethod::ApiKey => {
+                    let (Some(base_url), Some(secret)) =
+                        (row.api_key_base_url.clone(), row.api_key_secret.clone())
+                    else {
+                        warn!(
+                            "ApiKey row '{}' missing base_url or secret; skipping",
+                            row.name
+                        );
                         continue;
+                    };
+                    let extra_headers = match row.api_key_extra_headers.as_deref() {
+                        None | Some("") => None,
+                        Some(raw) => match serde_json::from_str::<
+                            std::collections::BTreeMap<String, String>,
+                        >(raw)
+                        {
+                            Ok(map) if !map.is_empty() => {
+                                Some(crate::config::ApiKeyExtraHeaders::new(map))
+                            }
+                            Ok(_) => None,
+                            Err(e) => {
+                                warn!(
+                                    "ApiKey row '{}' has unparseable extra_headers JSON; \
+                                     dropping extras: {e}",
+                                    row.name
+                                );
+                                None
+                            }
+                        },
+                    };
+                    AccountSlot::api_key(
+                        row.id,
+                        base_url,
+                        crate::config::ApiKeySecret::new(secret),
+                        extra_headers,
+                    )
+                }
+                AuthMethod::Cookie | AuthMethod::OAuth => {
+                    match (row.cookie_blob.as_deref(), row.oauth_token.as_ref()) {
+                        (Some(cookie_str), _) => match AccountSlot::new(cookie_str, None) {
+                            Ok(cs) => cs,
+                            Err(e) => {
+                                warn!("Invalid cookie for account '{}': {e}", row.name);
+                                continue;
+                            }
+                        },
+                        (None, Some(token)) => AccountSlot::oauth(row.id, token.clone()),
+                        (None, None) => continue,
                     }
-                },
-                (None, Some(token)) => AccountSlot::oauth(row.id, token.clone()),
-                (None, None) => continue,
+                }
             };
             cs.account_id = Some(row.id);
-            cs.auth_method = AuthMethod::from_auth_source(&row.auth_source);
+            cs.auth_method = row_kind;
             cs.proxy_url = row.proxy_url.clone();
             cs.email = row.email.clone();
             cs.account_type = row.account_type.clone();
@@ -1246,7 +1293,6 @@ impl AccountPoolActor {
             // normal refresh is preserved — runtime/probing must survive.
             if let Some(mem) = mem_cookies.remove(&row.id) {
                 let mem_kind = mem.auth_method;
-                let row_kind = AuthMethod::from_auth_source(&row.auth_source);
                 let same_kind = mem_kind == row_kind;
                 let cookie_content_swap =
                     same_kind && row_kind == AuthMethod::Cookie && mem.cookie != cs.cookie;
@@ -1282,7 +1328,10 @@ impl AccountPoolActor {
         // Rebuild inflight map: preserve current counts, update max_slots from DB
         let mut new_inflight = HashMap::new();
         for row in &accounts {
-            if row.cookie_blob.is_none() && row.oauth_token.is_none() {
+            if row.cookie_blob.is_none()
+                && row.oauth_token.is_none()
+                && row.api_key_secret.is_none()
+            {
                 continue;
             }
             let current = state.inflight.get(&row.id).map_or(0, |(cur, _)| *cur);
@@ -2985,6 +3034,9 @@ mod tests {
             rate_limit_tier: None,
             subscription_created_at: None,
             billing_type: None,
+            api_key_base_url: None,
+            api_key_secret: None,
+            api_key_extra_headers: None,
             created_at: None,
             updated_at: None,
             runtime: Some(runtime),
@@ -3066,6 +3118,9 @@ mod tests {
             rate_limit_tier: None,
             subscription_created_at: None,
             billing_type: None,
+            api_key_base_url: None,
+            api_key_secret: None,
+            api_key_extra_headers: None,
             created_at: None,
             updated_at: None,
             runtime: Some(runtime),
@@ -3109,6 +3164,9 @@ mod tests {
             rate_limit_tier: None,
             subscription_created_at: None,
             billing_type: None,
+            api_key_base_url: None,
+            api_key_secret: None,
+            api_key_extra_headers: None,
             created_at: None,
             updated_at: None,
             runtime: None,
@@ -3181,6 +3239,9 @@ mod tests {
             rate_limit_tier: None,
             subscription_created_at: None,
             billing_type: None,
+            api_key_base_url: None,
+            api_key_secret: None,
+            api_key_extra_headers: None,
             created_at: None,
             updated_at: None,
             runtime: Some(db_runtime),

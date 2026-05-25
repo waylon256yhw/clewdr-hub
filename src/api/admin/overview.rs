@@ -69,6 +69,7 @@ pub struct AccountStatusOverview {
 pub struct AccountAuthSourceOverview {
     pub oauth: i64,
     pub cookie: i64,
+    pub api_key: i64,
 }
 
 #[derive(Serialize)]
@@ -153,7 +154,11 @@ pub async fn overview(
             .fetch_one(&db)
             .await?;
 
-    let AuthSourceCounts { oauth, cookie } = summary.auth_sources;
+    let AuthSourceCounts {
+        oauth,
+        cookie,
+        api_key,
+    } = summary.auth_sources;
     Ok(Json(OverviewResponse {
         version: crate::VERSION_INFO.clone(),
         server_time: now.to_rfc3339(),
@@ -172,7 +177,11 @@ pub async fn overview(
         accounts: AccountOverview {
             total: summary.total,
             statuses,
-            auth_sources: AccountAuthSourceOverview { oauth, cookie },
+            auth_sources: AccountAuthSourceOverview {
+                oauth,
+                cookie,
+                api_key,
+            },
         },
         policies: policy_count,
         requests_1h,

@@ -176,6 +176,7 @@ pub struct ProbeSummary {
 pub struct AuthSourceCounts {
     pub oauth: i64,
     pub cookie: i64,
+    pub api_key: i64,
 }
 
 /// Wire type returned by [`compose_health_snapshot`].
@@ -377,6 +378,7 @@ pub fn summarize(
         match account.auth_source.as_str() {
             "oauth" => auth_sources.oauth += 1,
             "cookie" => auth_sources.cookie += 1,
+            "api_key" => auth_sources.api_key += 1,
             _ => {}
         }
 
@@ -588,6 +590,9 @@ mod tests {
             rate_limit_tier: None,
             subscription_created_at: None,
             billing_type: None,
+            api_key_base_url: None,
+            api_key_secret: None,
+            api_key_extra_headers: None,
             created_at: None,
             updated_at: None,
             runtime: Some(runtime(reset_time)),
