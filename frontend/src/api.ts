@@ -90,7 +90,7 @@ export interface OverviewResponse {
   accounts: {
     total: number;
     statuses: { active: number; cooling: number; error: number; disabled: number };
-    auth_sources: { oauth: number; cookie: number };
+    auth_sources: { oauth: number; cookie: number; api_key: number };
   };
   policies: number;
   requests_1h: number;
@@ -194,9 +194,18 @@ export interface Account {
   proxy_name: string | null;
   drain_first: boolean;
   status: string;
-  auth_source: "cookie" | "oauth";
+  auth_source: "cookie" | "oauth" | "api_key";
   has_cookie: boolean;
   has_oauth: boolean;
+  /** True iff `auth_source = 'api_key'` and the row has both base_url and secret. */
+  has_api_key: boolean;
+  /** Admin-supplied base URL; safe to echo. Only populated for ApiKey rows. */
+  api_key_base_url?: string | null;
+  /**
+   * Header KEYS only — values are secrets per PRD §Security and never leave
+   * the DB. Frontend renders this as a "headers attached" affordance.
+   */
+  api_key_extra_header_keys?: string[] | null;
   oauth_expires_at: string | null;
   last_refresh_at: string | null;
   last_error: string | null;
@@ -438,10 +447,14 @@ export const createAccount = (data: {
   max_slots?: number;
   proxy_id?: number;
   drain_first?: boolean;
-  auth_source?: "cookie" | "oauth";
+  auth_source?: "cookie" | "oauth" | "api_key";
   cookie_blob?: string;
   oauth_callback_input?: string;
   oauth_state?: string;
+  /** ApiKey credential fields. Required together when auth_source = "api_key". */
+  api_key_base_url?: string;
+  api_key_secret?: string;
+  api_key_extra_headers?: Record<string, string>;
 }) => apiFetch<Account>("/api/admin/accounts", { method: "POST", body: data });
 export const updateAccount = (id: number, data: Record<string, unknown>) =>
   apiFetch<Account>(`/api/admin/accounts/${id}`, { method: "PUT", body: data });

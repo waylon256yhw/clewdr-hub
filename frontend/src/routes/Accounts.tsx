@@ -9,6 +9,7 @@ import {
   Modal,
   TextInput,
   NumberInput,
+  PasswordInput,
   Textarea,
   Stack,
   Text,
@@ -23,9 +24,9 @@ import {
   Tooltip,
   Tabs,
 } from "@mantine/core";
-import { useForm } from "@mantine/form";
+import { useForm, type UseFormReturnType } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
-import { IconPlus, IconEdit, IconTrash, IconRefresh, IconLink, IconFlask, IconStarFilled } from "@tabler/icons-react";
+import { IconPlus, IconEdit, IconTrash, IconRefresh, IconLink, IconFlask, IconStarFilled, IconX } from "@tabler/icons-react";
 import {
   listAccounts,
   listProxies,
@@ -237,6 +238,7 @@ function authSourceLabel(source: Account["auth_source"]): string {
   switch (source) {
     case "oauth": return "OAuth";
     case "cookie": return "Cookie";
+    case "api_key": return "API Key";
     default: return source;
   }
 }
@@ -543,6 +545,141 @@ interface FormValues {
   drain_first: boolean;
   cookie_blob: string;
   oauth_callback_input: string;
+  /** ApiKey base URL. Empty when not editing api_key. */
+  api_key_base_url: string;
+  /** ApiKey secret (raw). Never echoed back from server — empty on edit means "keep existing". */
+  api_key_secret: string;
+  /**
+   * Editable list of {key, value} pairs for ApiKey extra headers.
+   * Values must be entered fresh on every edit since the server only
+   * returns key names (header values are secrets). Empty rows are
+   * dropped on submit; an empty list submitted as `Some({})` explicitly
+   * clears server-side extras.
+   */
+  api_key_extra_headers: Array<{ key: string; value: string }>;
+}
+
+/**
+ * Step 5 / C12 — ApiKey credential editor.
+ *
+ * Three sub-controls:
+ *   1. Base URL — admin-supplied, safe to echo. Defaults to
+ *      `https://api.anthropic.com/` on create. Re-normalized server-side
+ *      via `normalize_api_key_base_url` so trailing-slash / `/v1` variants
+ *      all collapse to the canonical shape.
+ *   2. Secret — password input. On edit it stays empty by default and
+ *      "leave empty to keep" semantics apply (mirror of the cookie /
+ *      OAuth credential-replacement flow).
+ *   3. Extra headers — KV widget. Header VALUES are server-side secrets
+ *      and never come back from the API, so the editor only renders
+ *      *keys* the row already has (as a dimmed text affordance) and
+ *      requires fresh entry to replace. An empty list submitted as
+ *      `Some({})` explicitly clears server-side extras.
+ *
+ * The reserved-name set (`x-api-key`, `authorization`, etc.) is
+ * validated server-side at write time and surfaced as a 400 — the
+ * editor doesn't pre-block input so the error message is the single
+ * source of truth.
+ */
+function ApiKeyTabPanel({
+  form,
+  editing,
+}: {
+  form: UseFormReturnType<FormValues>;
+  editing: Account | null;
+}) {
+  const existingKeys = editing?.api_key_extra_header_keys ?? [];
+  const rows = form.getValues().api_key_extra_headers;
+  return (
+    <Stack>
+      <Text size="sm" c="dimmed">
+        直连 Anthropic 兼容端点。基础 URL 可填 <code>https://api.anthropic.com/</code> 或自定义反代地址；
+        服务端会规范化 URL 并把 <code>/v1/messages</code> 拼到其后。
+      </Text>
+      <TextInput
+        label="基础 URL"
+        placeholder="https://api.anthropic.com/"
+        required={!editing}
+        key={form.key("api_key_base_url")}
+        {...form.getInputProps("api_key_base_url")}
+      />
+      <PasswordInput
+        label={editing ? "API 密钥（留空保留原值）" : "API 密钥"}
+        placeholder="sk-ant-..."
+        required={!editing}
+        key={form.key("api_key_secret")}
+        {...form.getInputProps("api_key_secret")}
+      />
+      <Stack gap={6}>
+        <Group justify="space-between" align="center">
+          <Text size="sm" fw={500}>
+            额外请求头（可选）
+          </Text>
+          <Button
+            type="button"
+            size="xs"
+            variant="light"
+            leftSection={<IconPlus size={14} />}
+            onClick={() =>
+              form.setFieldValue("api_key_extra_headers", [
+                ...form.getValues().api_key_extra_headers,
+                { key: "", value: "" },
+              ])
+            }
+          >
+            添加
+          </Button>
+        </Group>
+        {existingKeys.length > 0 && rows.length === 0 && (
+          <Text size="xs" c="dimmed">
+            当前已配置头：{existingKeys.join(", ")}（值为机密、不会返回；如需替换请重新填写整张表）
+          </Text>
+        )}
+        <Text size="xs" c="dimmed">
+          示例：<code>anthropic-workspace-id</code> 用于 AWS Bedrock 兼容代理；保留头（如
+          <code>x-api-key</code>、<code>authorization</code>、<code>anthropic-version</code>、
+          <code>user-agent</code>）会被服务端拒绝。
+        </Text>
+        {rows.map((row, idx) => (
+          <Group key={idx} gap="xs" align="flex-end" wrap="nowrap">
+            <TextInput
+              flex={1}
+              placeholder="header name"
+              value={row.key}
+              onChange={(e) => {
+                const next = [...form.getValues().api_key_extra_headers];
+                next[idx] = { ...next[idx], key: e.currentTarget.value };
+                form.setFieldValue("api_key_extra_headers", next);
+              }}
+            />
+            <TextInput
+              flex={2}
+              placeholder="value"
+              value={row.value}
+              onChange={(e) => {
+                const next = [...form.getValues().api_key_extra_headers];
+                next[idx] = { ...next[idx], value: e.currentTarget.value };
+                form.setFieldValue("api_key_extra_headers", next);
+              }}
+            />
+            <ActionIcon
+              variant="subtle"
+              color="red"
+              aria-label="移除该行"
+              onClick={() => {
+                const next = form
+                  .getValues()
+                  .api_key_extra_headers.filter((_, i) => i !== idx);
+                form.setFieldValue("api_key_extra_headers", next);
+              }}
+            >
+              <IconX size={14} />
+            </ActionIcon>
+          </Group>
+        ))}
+      </Stack>
+    </Stack>
+  );
 }
 
 function AccountFormModal({
@@ -557,7 +694,13 @@ function AccountFormModal({
   proxies: Proxy[];
 }) {
   const queryClient = useQueryClient();
-  const [tab, setTab] = useState<"oauth" | "cookie">(editing?.auth_source === "cookie" ? "cookie" : "oauth");
+  const [tab, setTab] = useState<"oauth" | "cookie" | "api_key">(
+    editing?.auth_source === "cookie"
+      ? "cookie"
+      : editing?.auth_source === "api_key"
+        ? "api_key"
+        : "oauth",
+  );
   const [authUrl, setAuthUrl] = useState("");
   const [oauthState, setOauthState] = useState("");
   const form = useForm<FormValues>({
@@ -570,11 +713,23 @@ function AccountFormModal({
       drain_first: editing?.drain_first ?? false,
       cookie_blob: "",
       oauth_callback_input: "",
+      // Echo back what we know from the server (base_url is admin-supplied
+      // metadata so it's safe). Secret + header values are never returned;
+      // editor must re-enter them to change.
+      api_key_base_url: editing?.api_key_base_url ?? "",
+      api_key_secret: "",
+      api_key_extra_headers: [],
     },
   });
 
   useEffect(() => {
-    setTab(editing?.auth_source === "cookie" ? "cookie" : "oauth");
+    setTab(
+      editing?.auth_source === "cookie"
+        ? "cookie"
+        : editing?.auth_source === "api_key"
+          ? "api_key"
+          : "oauth",
+    );
     setAuthUrl("");
     setOauthState("");
     form.setValues({
@@ -585,6 +740,9 @@ function AccountFormModal({
       drain_first: editing?.drain_first ?? false,
       cookie_blob: "",
       oauth_callback_input: "",
+      api_key_base_url: editing?.api_key_base_url ?? "",
+      api_key_secret: "",
+      api_key_extra_headers: [],
     });
   }, [editing]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -611,9 +769,32 @@ function AccountFormModal({
       const cookieBlob = tab === "cookie" ? values.cookie_blob.trim() : "";
       const oauthInput = tab === "oauth" ? values.oauth_callback_input.trim() : "";
       const scopedOauthState = tab === "oauth" ? oauthState : "";
+
+      // ApiKey payload normalization. Drop pair rows where the key is
+      // blank — those are placeholders from the "add row" button. A
+      // pair with empty value but non-empty key is still kept so the
+      // backend can return a clear "header value required" error.
+      const apiKeyBaseUrl = tab === "api_key" ? values.api_key_base_url.trim() : "";
+      const apiKeySecret = tab === "api_key" ? values.api_key_secret.trim() : "";
+      const apiKeyExtraHeadersObj: Record<string, string> | undefined =
+        tab === "api_key"
+          ? Object.fromEntries(
+              values.api_key_extra_headers
+                .map((r) => [r.key.trim(), r.value] as const)
+                .filter(([k]) => k.length > 0),
+            )
+          : undefined;
+
       if (!name) throw new ApiError(400, "名称必填");
       if (!editing && tab === "cookie" && !cookieBlob) throw new ApiError(400, "新账号必须提供 Cookie");
       if (!editing && tab === "oauth" && !oauthInput) throw new ApiError(400, "请粘贴 Callback URL 或 Code");
+      if (!editing && tab === "api_key" && !apiKeyBaseUrl) throw new ApiError(400, "新账号必须提供 API 基础 URL");
+      if (!editing && tab === "api_key" && !apiKeySecret) throw new ApiError(400, "新账号必须提供 API 密钥");
+      // On edit within the api_key tab we let the user submit without
+      // re-entering the secret (empty = keep existing, mirror of the
+      // cookie/oauth flow). Switching INTO api_key from a different
+      // auth_source requires both base_url and secret, surfaced by the
+      // backend as a 400.
 
       if (editing) {
         const body: Record<string, unknown> = {};
@@ -624,6 +805,21 @@ function AccountFormModal({
         if (cookieBlob) body.cookie_blob = cookieBlob;
         if (oauthInput) body.oauth_callback_input = oauthInput;
         if (scopedOauthState) body.oauth_state = scopedOauthState;
+        if (tab === "api_key") {
+          // Send the api_key fields only on the api_key tab so the
+          // backend's "submit exactly one credential kind" guard fires
+          // correctly when the user switches credential kinds.
+          if (apiKeyBaseUrl && apiKeyBaseUrl !== (editing.api_key_base_url ?? "")) {
+            body.api_key_base_url = apiKeyBaseUrl;
+          }
+          if (apiKeySecret) body.api_key_secret = apiKeySecret;
+          if (apiKeyExtraHeadersObj !== undefined) {
+            // Empty object is meaningful — it explicitly clears the
+            // server-side extras (tri-state contract). Send it even
+            // when the user just deleted all rows.
+            body.api_key_extra_headers = apiKeyExtraHeadersObj;
+          }
+        }
         return updateAccount(editing.id, body);
       }
       return createAccount({
@@ -635,6 +831,12 @@ function AccountFormModal({
         cookie_blob: cookieBlob || undefined,
         oauth_callback_input: oauthInput || undefined,
         oauth_state: scopedOauthState || undefined,
+        api_key_base_url: apiKeyBaseUrl || undefined,
+        api_key_secret: apiKeySecret || undefined,
+        api_key_extra_headers:
+          apiKeyExtraHeadersObj && Object.keys(apiKeyExtraHeadersObj).length > 0
+            ? apiKeyExtraHeadersObj
+            : undefined,
       });
     },
     onSuccess: () => {
@@ -677,20 +879,29 @@ function AccountFormModal({
           <Tabs
             value={tab}
             onChange={(value) => {
-              const nextTab = (value as "oauth" | "cookie") ?? "oauth";
+              const nextTab = (value as "oauth" | "cookie" | "api_key") ?? "oauth";
               setTab(nextTab);
-              if (nextTab === "cookie") {
+              // Clear the OTHER credential kinds' field state when
+              // switching tabs so a half-typed cookie doesn't leak
+              // into an api_key submission.
+              if (nextTab !== "oauth") {
                 form.setFieldValue("oauth_callback_input", "");
                 setAuthUrl("");
                 setOauthState("");
-              } else {
+              }
+              if (nextTab !== "cookie") {
                 form.setFieldValue("cookie_blob", "");
+              }
+              if (nextTab !== "api_key") {
+                form.setFieldValue("api_key_secret", "");
+                form.setFieldValue("api_key_extra_headers", []);
               }
             }}
           >
             <Tabs.List>
               <Tabs.Tab value="oauth">OAuth Token</Tabs.Tab>
               <Tabs.Tab value="cookie">Cookie</Tabs.Tab>
+              <Tabs.Tab value="api_key">API Key</Tabs.Tab>
             </Tabs.List>
             <Tabs.Panel value="oauth" pt="md">
               <Stack>
@@ -742,6 +953,9 @@ function AccountFormModal({
                 key={form.key("cookie_blob")}
                 {...form.getInputProps("cookie_blob")}
               />
+            </Tabs.Panel>
+            <Tabs.Panel value="api_key" pt="md">
+              <ApiKeyTabPanel form={form} editing={editing} />
             </Tabs.Panel>
           </Tabs>
           <Group justify="flex-end">

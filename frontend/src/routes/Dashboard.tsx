@@ -86,6 +86,7 @@ export default function Dashboard() {
         <Group gap="xs">
           <Badge color="blue" variant="light">{data.accounts.auth_sources.oauth} OAuth</Badge>
           <Badge color="dark" variant="outline">{data.accounts.auth_sources.cookie} Cookie</Badge>
+          <Badge color="teal" variant="light">{data.accounts.auth_sources.api_key} API Key</Badge>
         </Group>
       ),
     },
