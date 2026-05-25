@@ -44,7 +44,7 @@ import {
   type Proxy,
   type UsageWindow,
 } from "../api";
-import { formatEpochSeconds } from "../lib/format";
+import { formatCost, formatEpochSeconds } from "../lib/format";
 
 /**
  * Step 3.5 C5-2: stable color hint for an
@@ -533,19 +533,20 @@ function AccountCard({
 
       {isApiKey ? (
         <Stack gap={4}>
+          <Group justify="space-between" gap="xs">
+            <Text size="xs" fw={500}>累计消耗</Text>
+            <Text size="xs" fw={600}>{formatCost(account.total_cost_nanousd)}</Text>
+          </Group>
           {account.api_key_base_url && (
             <Text size="xs" c="dimmed" lineClamp={1}>
               Base URL: {account.api_key_base_url}
             </Text>
           )}
           {extraHeaderRows.length > 0 && (
-            <Stack gap={2}>
-              {extraHeaderRows.map(({ key, value }) => (
-                <Text key={key} size="xs" c="dimmed" lineClamp={1}>
-                  {key}: {value}
-                </Text>
-              ))}
-            </Stack>
+            <Group justify="space-between" gap="xs">
+              <Text size="xs" fw={500}>额外请求头</Text>
+              <Text size="xs" c="dimmed">{extraHeaderRows.length} 项</Text>
+            </Group>
           )}
         </Stack>
       ) : (
@@ -615,6 +616,19 @@ function ApiKeyTabPanel({
   markExtrasDirty: () => void;
 }) {
   const rows = form.getValues().api_key_extra_headers;
+  // Sealed view by default when editing an account that already has
+  // headers. Click "编辑" or add a row to drop into the inline KV editor.
+  const [unlocked, setUnlocked] = useState(
+    () => apiKeyExtraHeaderRows(editing).length === 0,
+  );
+  const addRow = () => {
+    form.setFieldValue("api_key_extra_headers", [
+      ...form.getValues().api_key_extra_headers,
+      { key: "", value: "" },
+    ]);
+    markExtrasDirty();
+    setUnlocked(true);
+  };
   return (
     <Stack>
       <TextInput
@@ -636,63 +650,89 @@ function ApiKeyTabPanel({
           <Text size="sm" fw={500}>
             额外请求头（可选）
           </Text>
-          <Button
-            type="button"
-            size="xs"
-            variant="light"
-            leftSection={<IconPlus size={14} />}
-            onClick={() => {
-              form.setFieldValue("api_key_extra_headers", [
-                ...form.getValues().api_key_extra_headers,
-                { key: "", value: "" },
-              ]);
-              markExtrasDirty();
-            }}
-          >
-            添加
-          </Button>
-        </Group>
-        <Text size="xs" c="dimmed">可选；留空表示不附加额外请求头。</Text>
-        {rows.map((row, idx) => (
-          <Group key={idx} gap="xs" align="flex-end" wrap="nowrap">
-            <TextInput
-              flex={1}
-              placeholder="header name"
-              value={row.key}
-              onChange={(e) => {
-                const next = [...form.getValues().api_key_extra_headers];
-                next[idx] = { ...next[idx], key: e.currentTarget.value };
-                form.setFieldValue("api_key_extra_headers", next);
-                markExtrasDirty();
-              }}
-            />
-            <TextInput
-              flex={2}
-              placeholder="value"
-              value={row.value}
-              onChange={(e) => {
-                const next = [...form.getValues().api_key_extra_headers];
-                next[idx] = { ...next[idx], value: e.currentTarget.value };
-                form.setFieldValue("api_key_extra_headers", next);
-                markExtrasDirty();
-              }}
-            />
-            <ActionIcon
-              variant="subtle"
-              color="red"
-              aria-label="移除该行"
-              onClick={() => {
-                const next = form
-                  .getValues()
-                  .api_key_extra_headers.filter((_, i) => i !== idx);
-                form.setFieldValue("api_key_extra_headers", next);
-                markExtrasDirty();
-              }}
+          {unlocked ? (
+            <Button
+              type="button"
+              size="xs"
+              variant="light"
+              leftSection={<IconPlus size={14} />}
+              onClick={addRow}
             >
-              <IconX size={14} />
-            </ActionIcon>
-          </Group>
-        ))}
+              添加
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              size="xs"
+              variant="subtle"
+              leftSection={<IconEdit size={14} />}
+              onClick={() => setUnlocked(true)}
+            >
+              编辑
+            </Button>
+          )}
+        </Group>
+        {unlocked ? (
+          <>
+            <Text size="xs" c="dimmed">可选；留空表示不附加额外请求头。</Text>
+            {rows.map((row, idx) => (
+              <Group key={idx} gap="xs" align="flex-end" wrap="nowrap">
+                <TextInput
+                  flex={1}
+                  placeholder="header name"
+                  value={row.key}
+                  onChange={(e) => {
+                    const next = [...form.getValues().api_key_extra_headers];
+                    next[idx] = { ...next[idx], key: e.currentTarget.value };
+                    form.setFieldValue("api_key_extra_headers", next);
+                    markExtrasDirty();
+                  }}
+                />
+                <TextInput
+                  flex={2}
+                  placeholder="value"
+                  value={row.value}
+                  onChange={(e) => {
+                    const next = [...form.getValues().api_key_extra_headers];
+                    next[idx] = { ...next[idx], value: e.currentTarget.value };
+                    form.setFieldValue("api_key_extra_headers", next);
+                    markExtrasDirty();
+                  }}
+                />
+                <ActionIcon
+                  variant="subtle"
+                  color="red"
+                  aria-label="移除该行"
+                  onClick={() => {
+                    const next = form
+                      .getValues()
+                      .api_key_extra_headers.filter((_, i) => i !== idx);
+                    form.setFieldValue("api_key_extra_headers", next);
+                    markExtrasDirty();
+                  }}
+                >
+                  <IconX size={14} />
+                </ActionIcon>
+              </Group>
+            ))}
+          </>
+        ) : (
+          <Stack gap={4}>
+            {rows.map((row, idx) => (
+              <Text
+                key={idx}
+                size="xs"
+                c="dimmed"
+                style={{
+                  fontFamily: "var(--mantine-font-family-monospace)",
+                  wordBreak: "break-all",
+                }}
+              >
+                {row.key}: {row.value}
+              </Text>
+            ))}
+          </Stack>
+        )}
       </Stack>
     </Stack>
   );
@@ -1126,7 +1166,7 @@ export default function Accounts() {
       {accounts.length === 0 ? (
         <Text c="dimmed">暂无账号，点击上方按钮添加。</Text>
       ) : (
-        <SimpleGrid cols={{ base: 1, md: 2, xl: 3 }}>
+        <SimpleGrid cols={{ base: 1, md: 2, xl: 3 }} style={{ alignItems: "start" }}>
           {accounts.map((a) => (
             <AccountCard
               key={a.id}

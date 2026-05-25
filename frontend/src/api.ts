@@ -203,6 +203,8 @@ export interface Account {
   api_key_base_url?: string | null;
   /** Admin-configured extra headers attached to ApiKey sends. */
   api_key_extra_headers?: Record<string, string> | null;
+  /** All-time billable Messages spend attributed to this account. */
+  total_cost_nanousd: number;
   oauth_expires_at: string | null;
   last_refresh_at: string | null;
   last_error: string | null;

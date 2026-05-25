@@ -43,6 +43,8 @@ pub struct AccountWithRuntime {
     /// `BTreeMap<String,String>` by the loader (`do_reload`) when
     /// constructing an `AccountSlot::api_key`.
     pub api_key_extra_headers: Option<String>,
+    /// All-time billable Messages spend attributed to this account.
+    pub total_cost_nanousd: i64,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub runtime: Option<RuntimeStateRow>,
@@ -146,6 +148,7 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
             a.last_failure_json,
             a.email, a.account_type, a.rate_limit_tier, a.subscription_created_at, a.billing_type,
             a.api_key_base_url, a.api_key_secret, a.api_key_extra_headers,
+            COALESCE(cost.total_cost_nanousd, 0) AS total_cost_nanousd,
             a.created_at, a.updated_at,
             a.drain_first,
             rs.account_id AS rs_marker,
@@ -188,6 +191,12 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
         FROM accounts a
         LEFT JOIN proxies p ON p.id = a.proxy_id
         LEFT JOIN account_runtime_state rs ON a.id = rs.account_id
+        LEFT JOIN (
+            SELECT account_id, COALESCE(SUM(cost_nanousd), 0) AS total_cost_nanousd
+            FROM request_logs
+            WHERE account_id IS NOT NULL AND request_type = 'messages'
+            GROUP BY account_id
+        ) cost ON cost.account_id = a.id
         ORDER BY a.rr_order ASC"#,
     )
     .fetch_all(pool)
@@ -297,6 +306,7 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
             api_key_base_url: row.get("api_key_base_url"),
             api_key_secret: row.get("api_key_secret"),
             api_key_extra_headers: row.get("api_key_extra_headers"),
+            total_cost_nanousd: row.get("total_cost_nanousd"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
             runtime,
@@ -1545,6 +1555,42 @@ mod tests {
         assert_eq!(runtime.supports_claude_1m_sonnet, Some(true));
         assert_eq!(runtime.buckets[0].total_input_tokens, 123);
         assert_eq!(runtime.buckets[4].total_output_tokens, 456);
+    }
+
+    #[tokio::test]
+    async fn load_all_accounts_aggregates_billable_message_cost_by_account() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        insert_cookie_account(&pool, 1, "a", 1).await;
+        insert_cookie_account(&pool, 2, "b", 2).await;
+
+        for (request_id, account_id, request_type, cost) in [
+            ("msg-1", 1, "messages", 100),
+            ("msg-2", 1, "messages", 250),
+            ("test-1", 1, "test", 999),
+            ("msg-3", 2, "messages", 500),
+        ] {
+            sqlx::query(
+                "INSERT INTO request_logs (
+                    request_id, request_type, account_id, model_raw,
+                    started_at, status, cost_nanousd
+                ) VALUES (?1, ?2, ?3, 'claude-sonnet-4-6', '2026-05-25T00:00:00Z', 'ok', ?4)",
+            )
+            .bind(request_id)
+            .bind(request_type)
+            .bind(account_id)
+            .bind(cost)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let accounts = load_all_accounts(&pool).await.unwrap();
+        let by_id: std::collections::HashMap<i64, i64> = accounts
+            .iter()
+            .map(|account| (account.id, account.total_cost_nanousd))
+            .collect();
+        assert_eq!(by_id.get(&1), Some(&350));
+        assert_eq!(by_id.get(&2), Some(&500));
     }
 
     /// Mirrors the consolidated single-statement oauth-row-to-cookie replacement

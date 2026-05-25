@@ -95,6 +95,8 @@ pub struct AccountResponse {
     /// secret itself, so the admin API echoes them for edit forms.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_extra_headers: Option<BTreeMap<String, String>>,
+    /// All-time billable Messages spend attributed to this account.
+    pub total_cost_nanousd: i64,
     pub oauth_expires_at: Option<String>,
     pub last_refresh_at: Option<String>,
     pub last_error: Option<String>,
@@ -177,6 +179,7 @@ fn map_account(row: &AccountWithRuntime, health: Option<AccountHealth>) -> Accou
             .as_deref()
             .and_then(|s| serde_json::from_str::<BTreeMap<String, String>>(s).ok())
             .filter(|headers| !headers.is_empty()),
+        total_cost_nanousd: row.total_cost_nanousd,
         oauth_expires_at: row.oauth_expires_at.clone(),
         last_refresh_at: row.last_refresh_at.clone(),
         last_error: row

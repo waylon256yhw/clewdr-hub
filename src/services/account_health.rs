@@ -605,6 +605,7 @@ mod tests {
             api_key_base_url: None,
             api_key_secret: None,
             api_key_extra_headers: None,
+            total_cost_nanousd: 0,
             created_at: None,
             updated_at: None,
             runtime: Some(runtime(reset_time)),
