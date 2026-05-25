@@ -46,6 +46,53 @@ pub(crate) fn build_api_client(proxy_url: Option<&str>) -> wreq::Client {
     })
 }
 
+/// Normalize a user-supplied API-key base URL so `.join("v1/messages")`
+/// (and `.join("v1/messages/count_tokens")`) reliably produces
+/// `{origin}/v1/messages`. SQLite stores whatever the admin typed, so
+/// this helper has to absorb four common shapes:
+///
+///   `https://api.anthropic.com`        → `https://api.anthropic.com/`
+///   `https://api.anthropic.com/`       → `https://api.anthropic.com/`
+///   `https://api.anthropic.com/v1`     → `https://api.anthropic.com/`
+///   `https://api.anthropic.com/v1/`    → `https://api.anthropic.com/`
+///
+/// Only the literal trailing `v1` segment is stripped — a custom mount
+/// path like `https://proxy.example/anthropic/` is preserved so the
+/// final URL becomes `https://proxy.example/anthropic/v1/messages`.
+///
+/// The trailing-slash invariant is load-bearing for `url::Url::join`:
+/// without it the join replaces the final path segment rather than
+/// appending, which silently produces wrong upstream URLs.
+pub fn normalize_api_key_base_url(raw: &str) -> Result<url::Url, ClewdrError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ClewdrError::BadRequestMessage {
+            msg: "api_key base_url is empty".into(),
+        });
+    }
+    let mut url = url::Url::parse(trimmed).map_err(|e| ClewdrError::BadRequestMessage {
+        msg: format!("api_key base_url is not a valid URL: {e}"),
+    })?;
+
+    let path = url.path().to_string();
+    let stripped = path
+        .strip_suffix("/v1/")
+        .or_else(|| path.strip_suffix("/v1"))
+        .map(str::to_string)
+        .unwrap_or(path);
+
+    let final_path = if stripped.is_empty() {
+        "/".to_string()
+    } else if stripped.ends_with('/') {
+        stripped
+    } else {
+        format!("{stripped}/")
+    };
+
+    url.set_path(&final_path);
+    Ok(url)
+}
+
 #[derive(Clone)]
 pub struct ClaudeCodeState {
     pub account_pool_handle: AccountPoolHandle,
@@ -317,7 +364,7 @@ pub enum TokenStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::is_oauth_auth_failure;
+    use super::{is_oauth_auth_failure, normalize_api_key_base_url};
     use crate::{
         config::Reason,
         error::{ClaudeErrorBody, ClewdrError},
@@ -371,5 +418,81 @@ mod tests {
             message: "unrelated local failure".to_string(),
             source: None,
         }));
+    }
+
+    /// All four common admin-entered shapes of the anthropic base URL
+    /// must, after `normalize_api_key_base_url` + `.join("v1/messages")`,
+    /// land at the same upstream path. This is the single load-bearing
+    /// invariant of the helper — break it and every ApiKey send 404s.
+    #[test]
+    fn normalize_api_key_base_url_canonicalizes_anthropic_shapes() {
+        let expected = "https://api.anthropic.com/v1/messages";
+        for raw in [
+            "https://api.anthropic.com",
+            "https://api.anthropic.com/",
+            "https://api.anthropic.com/v1",
+            "https://api.anthropic.com/v1/",
+        ] {
+            let normalized =
+                normalize_api_key_base_url(raw).expect("anthropic base url should normalize");
+            let joined = normalized.join("v1/messages").expect("join should succeed");
+            assert_eq!(joined.as_str(), expected, "input: {raw}");
+        }
+    }
+
+    /// Same invariant applied to the count_tokens sibling route — guards
+    /// against a regression where the trailing-slash logic only worked
+    /// against the one path the helper was written against.
+    #[test]
+    fn normalize_api_key_base_url_supports_count_tokens_join() {
+        let normalized = normalize_api_key_base_url("https://api.anthropic.com/v1")
+            .expect("v1-suffix base url should normalize");
+        let joined = normalized
+            .join("v1/messages/count_tokens")
+            .expect("join should succeed");
+        assert_eq!(
+            joined.as_str(),
+            "https://api.anthropic.com/v1/messages/count_tokens",
+        );
+    }
+
+    /// A user pointing at an internal anthropic-compatible proxy mounted
+    /// at `/anthropic/` must keep that prefix — only the literal trailing
+    /// `/v1` segment is stripped, never a user-supplied mount path.
+    #[test]
+    fn normalize_api_key_base_url_preserves_custom_mount_path() {
+        let normalized = normalize_api_key_base_url("https://proxy.example/anthropic/")
+            .expect("custom mount should normalize");
+        let joined = normalized.join("v1/messages").expect("join should succeed");
+        assert_eq!(
+            joined.as_str(),
+            "https://proxy.example/anthropic/v1/messages",
+        );
+    }
+
+    #[test]
+    fn normalize_api_key_base_url_trims_whitespace() {
+        let normalized = normalize_api_key_base_url("  https://api.anthropic.com/v1/  ")
+            .expect("whitespace-padded base url should normalize");
+        assert_eq!(
+            normalized.join("v1/messages").unwrap().as_str(),
+            "https://api.anthropic.com/v1/messages",
+        );
+    }
+
+    #[test]
+    fn normalize_api_key_base_url_rejects_empty() {
+        for raw in ["", "   ", "\t\n"] {
+            let err = normalize_api_key_base_url(raw)
+                .expect_err("empty/whitespace base url should error");
+            assert!(matches!(err, ClewdrError::BadRequestMessage { .. }));
+        }
+    }
+
+    #[test]
+    fn normalize_api_key_base_url_rejects_non_url() {
+        let err =
+            normalize_api_key_base_url("not a url at all").expect_err("invalid URL should error");
+        assert!(matches!(err, ClewdrError::BadRequestMessage { .. }));
     }
 }
