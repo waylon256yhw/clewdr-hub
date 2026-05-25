@@ -959,7 +959,17 @@ impl ClaudeCodeState {
             // this guard only protects the account-pool inflight slot.
             let mut slot_guard =
                 SelectedSlotGuard::new(state.account_pool_handle.clone(), account_id, None);
-            let cookie_disallows = matches!(cookie.count_tokens_allowed, Some(false));
+            // `count_tokens_allowed` is subscription-runtime metadata
+            // (per-cookie permission gate). ApiKey accounts always
+            // allow upstream count_tokens; the field should be None on
+            // a freshly-loaded ApiKey slot but a stale `Some(false)`
+            // left over from a previous cookie/oauth life (e.g. on
+            // bundle-import paths that pre-date the loader's runtime
+            // skip for ApiKey) would otherwise route this request to
+            // the local estimator instead of the upstream endpoint.
+            // Skip the gate explicitly for ApiKey.
+            let cookie_disallows =
+                !is_api_key_slot && matches!(cookie.count_tokens_allowed, Some(false));
             if cookie_disallows {
                 slot_guard.finish().await;
                 state.persist_count_tokens_allowed(false).await;

@@ -941,6 +941,29 @@ pub async fn update(
         .bind(id)
         .execute(&mut *tx)
         .await?;
+
+        // When switching INTO api_key from cookie/oauth, drop the
+        // stale subscription runtime row. ApiKey has no quota window /
+        // cooldown / count_tokens_allowed gate (PRD Decision 2), so a
+        // leftover row from the previous credential life would produce
+        // wrong behavior: a stale `reset_time` would park the slot in
+        // `exhausted`, a stale `count_tokens_allowed = false` would
+        // route count_tokens to the local estimator, and stale weekly
+        // utilization buckets would surface as misleading dashboard
+        // numbers. The loader carries the same guard as defense in
+        // depth (see account_pool.rs cold-restart branch); this is the
+        // proactive admin-side cleanup so the DB never carries
+        // misleading data for an ApiKey account.
+        //
+        // Within-api_key updates don't need this (runtime stays empty
+        // throughout an ApiKey account's life), so gate on the
+        // switch-in flag.
+        if switching_into_api_key {
+            sqlx::query("DELETE FROM account_runtime_state WHERE account_id = ?1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
     }
     if let Some(ref org) = req.organization_uuid {
         sqlx::query(

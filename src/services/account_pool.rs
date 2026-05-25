@@ -1302,7 +1302,25 @@ impl AccountPoolActor {
                 } else {
                     replaced_ids.push(row.id);
                 }
-            } else if let Some(ref runtime) = row.runtime {
+            } else if row_kind != AuthMethod::ApiKey
+                && let Some(ref runtime) = row.runtime
+            {
+                // Cold-restart (or bundle-import) path: mem is empty
+                // and we'd otherwise apply the stale row.runtime
+                // verbatim. For ApiKey accounts that runtime is
+                // structurally meaningless — pay-as-you-go has no
+                // quota window / cooldown semantics (PRD Decision 2)
+                // — and is actively harmful when the row was
+                // previously cookie/oauth and got switched to
+                // api_key: a stale `reset_time` would park the slot
+                // in `exhausted`, and a stale `count_tokens_allowed
+                // = false` would route count_tokens to the local
+                // estimator instead of the upstream count_tokens
+                // endpoint. Admin update DELETEs the runtime row on
+                // switch-in (admin/accounts.rs) as the primary
+                // cleanup; this guard is the loader-side defense for
+                // bundle-import / manual-DB-edit paths that bypass
+                // that cleanup.
                 let params = runtime.to_params();
                 cs.apply_runtime_state(&params);
                 let normalized_reset = active_reset_time(row);
@@ -2701,6 +2719,106 @@ mod tests {
             !state.probing.contains(&51),
             "cookie content swap must clear probing"
         );
+    }
+
+    /// Step 5 follow-up: cold-restart with a stale `account_runtime_state`
+    /// row from a previous cookie/oauth life of this account_id must not
+    /// pollute an ApiKey slot. PRD Decision 2 puts ApiKey accounts
+    /// outside the quota window / cooldown machinery, so a stale
+    /// `reset_time` would otherwise park the slot in `exhausted` and
+    /// `count_tokens_allowed = false` would route count_tokens to the
+    /// local estimator.
+    ///
+    /// Admin update DELETEs the runtime row on switch-in (see
+    /// admin/accounts.rs) as the primary cleanup; this loader-side
+    /// guard catches bundle-import / manual-DB-edit paths that
+    /// bypass it.
+    #[tokio::test]
+    async fn reload_does_not_apply_stale_runtime_to_api_key_slot() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        // Insert an api_key account row (cookie/oauth columns NULL, both
+        // api_key_* columns non-NULL — required by the schema mutex CHECK).
+        sqlx::query(
+            "INSERT INTO accounts (
+                id, name, rr_order, max_slots, status, auth_source,
+                api_key_base_url, api_key_secret,
+                organization_uuid, drain_first
+            ) VALUES (?1, ?2, ?1, 5, 'active', 'api_key', ?3, ?4, NULL, 0)",
+        )
+        .bind(70_i64)
+        .bind("acc-70")
+        .bind("https://api.anthropic.com/")
+        .bind("sk-ant-test-stale-runtime-regression")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Stale runtime row: future reset_time + count_tokens_allowed=false.
+        // This is the shape of a row that used to belong to a cookie/oauth
+        // account before the admin switched it to api_key without (or
+        // before this guard) cleaning up account_runtime_state.
+        let future_reset = chrono::Utc::now().timestamp() + 3600;
+        sqlx::query(
+            "INSERT INTO account_runtime_state (account_id, reset_time, count_tokens_allowed)
+             VALUES (?1, ?2, 0)",
+        )
+        .bind(70_i64)
+        .bind(future_reset)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut state = empty_state(pool);
+        // Cold restart: nothing in mem_cookies. Without the loader guard,
+        // do_reload's else-if branch would apply the stale runtime to the
+        // ApiKey slot.
+        AccountPoolActor::do_reload(&mut state).await;
+
+        // ApiKey slot must end up in `valid` (NOT in `exhausted`) with
+        // None runtime fields.
+        assert!(
+            !state.exhausted.contains_key(&70),
+            "ApiKey slot must not be bucketed into exhausted by stale reset_time"
+        );
+        let slot = state
+            .valid
+            .iter()
+            .find(|c| c.account_id == Some(70))
+            .expect("ApiKey slot must appear in valid after cold reload");
+        assert_eq!(slot.auth_method, AuthMethod::ApiKey);
+        assert_eq!(
+            slot.reset_time, None,
+            "stale reset_time must not propagate to ApiKey"
+        );
+        assert_eq!(
+            slot.count_tokens_allowed, None,
+            "stale count_tokens_allowed must not propagate — try_count_tokens \
+             would otherwise route to the local estimator instead of the \
+             upstream count_tokens endpoint"
+        );
+    }
+
+    /// Companion regression: the loader guard is ApiKey-specific. A
+    /// cookie account with the same stale-runtime DB shape must STILL
+    /// have its runtime applied on cold restart, otherwise we'd
+    /// regress existing cookie behavior.
+    #[tokio::test]
+    async fn reload_still_applies_runtime_to_cookie_slot_on_cold_start() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        let cookie_blob = cookie_blob_for(b'q');
+        insert_cookie_account_row(&pool, 71, &cookie_blob).await;
+        let future_reset = chrono::Utc::now().timestamp() + 3600;
+        set_runtime_reset(&pool, 71, future_reset).await;
+
+        let mut state = empty_state(pool);
+        AccountPoolActor::do_reload(&mut state).await;
+
+        assert!(
+            state.exhausted.contains_key(&71),
+            "cookie account with future reset_time must be bucketed exhausted"
+        );
+        let slot = state.exhausted.get(&71).unwrap();
+        assert_eq!(slot.reset_time, Some(future_reset));
     }
 
     async fn insert_cookie_account_row(pool: &sqlx::SqlitePool, id: i64, cookie_blob: &str) {
