@@ -32,6 +32,17 @@ pub struct AccountWithRuntime {
     pub rate_limit_tier: Option<String>,
     pub subscription_created_at: Option<String>,
     pub billing_type: Option<String>,
+    /// Step 5: ApiKey credential fields. Populated iff `auth_source == "api_key"`.
+    /// Note these carry secret data in plain `String` form (matching the
+    /// existing `cookie_blob` / `TokenInfo` precedent in this struct).
+    /// Downstream code wraps them in `ApiKeySecret` / `ApiKeyExtraHeaders`
+    /// before they leave the DB layer.
+    pub api_key_base_url: Option<String>,
+    pub api_key_secret: Option<String>,
+    /// Raw JSON string from the DB column; parsed into a
+    /// `BTreeMap<String,String>` by the loader (`do_reload`) when
+    /// constructing an `AccountSlot::api_key`.
+    pub api_key_extra_headers: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub runtime: Option<RuntimeStateRow>,
@@ -134,6 +145,7 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
             a.organization_uuid, a.last_refresh_at, a.last_error, a.invalid_reason,
             a.last_failure_json,
             a.email, a.account_type, a.rate_limit_tier, a.subscription_created_at, a.billing_type,
+            a.api_key_base_url, a.api_key_secret, a.api_key_extra_headers,
             a.created_at, a.updated_at,
             a.drain_first,
             rs.account_id AS rs_marker,
@@ -282,6 +294,9 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
             rate_limit_tier: row.get("rate_limit_tier"),
             subscription_created_at: row.get("subscription_created_at"),
             billing_type: row.get("billing_type"),
+            api_key_base_url: row.get("api_key_base_url"),
+            api_key_secret: row.get("api_key_secret"),
+            api_key_extra_headers: row.get("api_key_extra_headers"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
             runtime,
