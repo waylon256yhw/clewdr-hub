@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use axum::{
@@ -13,8 +14,11 @@ use sqlx::{Executor, Sqlite, SqlitePool};
 use super::common::{PaginationParams, normalize_optional};
 use crate::{
     billing::{BillingContext, RequestType, persist_probe_log},
-    claude_code_state::{ClaudeCodeState, build_api_client},
-    config::{AccountSlot, CLAUDE_ENDPOINT, ClewdrCookie},
+    claude_code_state::{
+        ClaudeCodeState, build_api_client, is_reserved_api_key_extra_header,
+        normalize_api_key_base_url,
+    },
+    config::{AccountSlot, AuthMethod, CLAUDE_ENDPOINT, ClewdrCookie},
     db::accounts::{
         AccountWithRuntime, batch_upsert_runtime_states, find_account_by_organization_uuid,
         get_account_by_id, load_all_accounts, set_account_auth_error, set_account_disabled,
@@ -79,6 +83,18 @@ pub struct AccountResponse {
     pub auth_source: String,
     pub has_cookie: bool,
     pub has_oauth: bool,
+    /// True iff the row's `auth_source = 'api_key'` and the row has both
+    /// `api_key_base_url` and `api_key_secret` populated. The secret
+    /// itself is NEVER echoed back.
+    pub has_api_key: bool,
+    /// Normalized base URL. Safe to echo (admin entered it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_base_url: Option<String>,
+    /// Per-account extra header KEYS only — values are secrets per PRD
+    /// §Security and never leave the DB. Frontend renders this for the
+    /// "headers attached" affordance without exposing values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_extra_header_keys: Option<Vec<String>>,
     pub oauth_expires_at: Option<String>,
     pub last_refresh_at: Option<String>,
     pub last_error: Option<String>,
@@ -143,6 +159,27 @@ fn map_account(row: &AccountWithRuntime, health: Option<AccountHealth>) -> Accou
         auth_source: row.auth_source.clone(),
         has_cookie: row.cookie_blob.as_ref().is_some_and(|v| !v.is_empty()),
         has_oauth: row.oauth_token.is_some(),
+        has_api_key: row.auth_source == "api_key"
+            && row
+                .api_key_base_url
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+            && row.api_key_secret.as_deref().is_some_and(|s| !s.is_empty()),
+        api_key_base_url: if row.auth_source == "api_key" {
+            row.api_key_base_url.clone()
+        } else {
+            None
+        },
+        // Header VALUES are secrets; expose KEYS only so the UI can show
+        // "Workspace ID, Custom-Header" without leaking the values.
+        // Parse defensively: a malformed JSON column shouldn't 500 the
+        // accounts list — surface as "no extra headers" instead.
+        api_key_extra_header_keys: row
+            .api_key_extra_headers
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<BTreeMap<String, String>>(s).ok())
+            .map(|m| m.into_keys().collect())
+            .filter(|keys: &Vec<String>| !keys.is_empty()),
         oauth_expires_at: row.oauth_expires_at.clone(),
         last_refresh_at: row.last_refresh_at.clone(),
         last_error: row
@@ -177,6 +214,18 @@ pub struct CreateAccountRequest {
     pub oauth_callback_input: Option<String>,
     pub oauth_state: Option<String>,
     pub organization_uuid: Option<String>,
+    /// ApiKey credential — base URL (e.g. `https://api.anthropic.com/`),
+    /// API key, and optional extra HTTP headers attached to every send.
+    /// All three are stored denormalized in the `accounts` row.
+    #[serde(default)]
+    pub api_key_base_url: Option<String>,
+    #[serde(default)]
+    pub api_key_secret: Option<String>,
+    /// `Some({})` is explicit "no headers"; `None` is "not provided".
+    /// On create both behave the same — there is no existing value to
+    /// preserve. On update they differ (see UpdateAccountRequest).
+    #[serde(default)]
+    pub api_key_extra_headers: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize)]
@@ -192,6 +241,20 @@ pub struct UpdateAccountRequest {
     pub oauth_callback_input: Option<String>,
     pub oauth_state: Option<String>,
     pub organization_uuid: Option<String>,
+    /// On update, semantics mirror cookie/oauth: empty / omitted means
+    /// "keep existing"; a non-empty value replaces. Switching INTO
+    /// `api_key` from cookie/oauth requires both `base_url` and
+    /// `secret` to be present (a `Some("")` is treated as omitted).
+    #[serde(default)]
+    pub api_key_base_url: Option<String>,
+    #[serde(default)]
+    pub api_key_secret: Option<String>,
+    /// Tri-state:
+    ///   - `None` / omitted → keep existing headers
+    ///   - `Some({})` → explicit clear (NULL the column)
+    ///   - `Some(map)` non-empty → replace existing headers
+    #[serde(default)]
+    pub api_key_extra_headers: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize)]
@@ -256,36 +319,83 @@ fn derive_auth_source(
     requested: Option<&str>,
     submitted_cookie: bool,
     submitted_oauth: bool,
+    submitted_api_key: bool,
     existing: Option<&str>,
 ) -> Result<&'static str, ClewdrError> {
-    let derived: &'static str = match (submitted_cookie, submitted_oauth) {
-        (true, true) => {
-            return Err(ClewdrError::BadRequest {
-                msg: "Submit exactly one of cookie or OAuth callback input",
-            });
-        }
-        (true, false) => "cookie",
-        (false, true) => "oauth",
-        (false, false) => match existing {
+    let submitted_count = submitted_cookie as u8 + submitted_oauth as u8 + submitted_api_key as u8;
+    if submitted_count > 1 {
+        return Err(ClewdrError::BadRequest {
+            msg: "Submit exactly one credential kind: cookie, OAuth callback, or API key",
+        });
+    }
+    let derived: &'static str = if submitted_cookie {
+        "cookie"
+    } else if submitted_oauth {
+        "oauth"
+    } else if submitted_api_key {
+        "api_key"
+    } else {
+        match existing {
             Some("cookie") => "cookie",
             Some("oauth") => "oauth",
+            Some("api_key") => "api_key",
             _ => {
                 return Err(ClewdrError::BadRequest {
-                    msg: "Either cookie or OAuth callback input is required",
+                    msg: "Either cookie, OAuth callback, or API key is required",
                 });
             }
-        },
+        }
     };
 
     match requested {
         None => Ok(derived),
         Some(r) if r == derived => Ok(derived),
-        Some("cookie" | "oauth") => Err(ClewdrError::BadRequest {
+        Some("cookie" | "oauth" | "api_key") => Err(ClewdrError::BadRequest {
             msg: "Requested auth_source does not match provided credentials",
         }),
         Some(_) => Err(ClewdrError::BadRequest {
             msg: "Invalid auth_source",
         }),
+    }
+}
+
+/// Validate a caller-supplied `api_key_extra_headers` map against the
+/// reserved-name list shared with the send-side filter
+/// (`is_reserved_api_key_extra_header`). Empty keys are also rejected
+/// — they cannot map to a valid HTTP header.
+///
+/// This is the primary user-facing guard; the send-time filter in
+/// `chat::execute_api_key_request` repeats the check as defense in
+/// depth for the case of a manual DB edit that bypasses validation.
+fn validate_api_key_extra_headers(map: &BTreeMap<String, String>) -> Result<(), ClewdrError> {
+    for key in map.keys() {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            return Err(ClewdrError::BadRequest {
+                msg: "api_key_extra_headers contains an empty key",
+            });
+        }
+        if is_reserved_api_key_extra_header(trimmed) {
+            return Err(ClewdrError::BadRequestMessage {
+                msg: format!(
+                    "api_key_extra_headers key '{trimmed}' is reserved (would shadow a header the ApiKey dispatch sets itself or the transport owns)"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Serialize an extra-headers map to the JSON string we store in the
+/// `accounts.api_key_extra_headers` column. Returns `None` for an
+/// empty map (column should be NULL, not `"{}"`, so the loader and
+/// the `ApiKeyExtraHeaders::is_empty` check agree).
+fn extra_headers_to_db(map: &BTreeMap<String, String>) -> Option<String> {
+    if map.is_empty() {
+        None
+    } else {
+        // serde_json::to_string on BTreeMap<String,String> is infallible.
+        Some(serde_json::to_string(map).expect("BTreeMap serialization is infallible"))
     }
 }
 
@@ -333,12 +443,36 @@ pub async fn create(
     let cookie_blob = normalize_cookie_blob(req.cookie_blob)?;
     let oauth_state = normalize_optional(req.oauth_state);
     let oauth_callback_input = normalize_optional(req.oauth_callback_input);
-    // Reject dual submission before spending the one-time OAuth callback
-    // code — the DB CHECK would also catch it, but a clear 400 is friendlier
-    // and avoids a wasted Anthropic round-trip.
-    if cookie_blob.is_some() && oauth_callback_input.is_some() {
+
+    // ApiKey inputs: normalize the base URL and validate extra-header
+    // names BEFORE any DB work or OAuth round-trip, so a clean 400
+    // surfaces fast on bad input. Empty / whitespace-only base_url and
+    // secret are treated as "not submitted" (same convention as
+    // cookie_blob via normalize_optional).
+    let raw_api_key_base_url = normalize_optional(req.api_key_base_url);
+    let raw_api_key_secret = normalize_optional(req.api_key_secret);
+    let api_key_extra_headers_payload = req.api_key_extra_headers;
+    let submitting_api_key = raw_api_key_base_url.is_some()
+        || raw_api_key_secret.is_some()
+        || api_key_extra_headers_payload.is_some();
+
+    let api_key_base_url_normalized: Option<String> = match raw_api_key_base_url.as_deref() {
+        Some(raw) => Some(normalize_api_key_base_url(raw)?.as_str().to_string()),
+        None => None,
+    };
+    if let Some(ref map) = api_key_extra_headers_payload {
+        validate_api_key_extra_headers(map)?;
+    }
+    let api_key_extra_headers_json: Option<String> = api_key_extra_headers_payload
+        .as_ref()
+        .and_then(extra_headers_to_db);
+
+    let submitted_count = cookie_blob.is_some() as u8
+        + oauth_callback_input.is_some() as u8
+        + submitting_api_key as u8;
+    if submitted_count > 1 {
         return Err(ClewdrError::BadRequest {
-            msg: "Submit exactly one of cookie or OAuth callback input",
+            msg: "Submit exactly one credential kind: cookie, OAuth callback, or API key",
         });
     }
     let oauth = match oauth_callback_input {
@@ -356,8 +490,25 @@ pub async fn create(
         req.auth_source.as_deref(),
         cookie_blob.is_some(),
         oauth.is_some(),
+        submitting_api_key,
         None,
     )?;
+
+    // For api_key, both base_url and secret are mandatory on create
+    // (the schema mutex CHECK would reject a partial row anyway, but
+    // surface it as a clean 400 instead of a SQLite constraint error).
+    if auth_source == "api_key" {
+        if api_key_base_url_normalized.is_none() {
+            return Err(ClewdrError::BadRequest {
+                msg: "api_key_base_url is required for api_key accounts",
+            });
+        }
+        if raw_api_key_secret.is_none() {
+            return Err(ClewdrError::BadRequest {
+                msg: "api_key_secret is required for api_key accounts",
+            });
+        }
+    }
 
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
 
@@ -393,8 +544,9 @@ pub async fn create(
             oauth_access_token, oauth_refresh_token, oauth_expires_at,
             organization_uuid, last_refresh_at, last_error, email, account_type,
             rate_limit_tier, subscription_created_at, billing_type,
-            drain_first
-        ) VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17)",
+            drain_first,
+            api_key_base_url, api_key_secret, api_key_extra_headers
+        ) VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
     )
     .bind(&req.name)
     .bind(rr_order)
@@ -434,6 +586,9 @@ pub async fn create(
             .and_then(|v| v.snapshot.billing_type.as_deref()),
     )
     .bind(req.drain_first.unwrap_or(false) as i64)
+    .bind(api_key_base_url_normalized.as_deref())
+    .bind(raw_api_key_secret.as_deref())
+    .bind(api_key_extra_headers_json.as_deref())
     .execute(&mut *tx)
     .await
     .map_err(|e| {
@@ -496,9 +651,32 @@ pub async fn update(
     let new_cookie_blob = normalize_cookie_blob(req.cookie_blob.clone())?;
     let oauth_state = normalize_optional(req.oauth_state.clone());
     let oauth_callback_input = normalize_optional(req.oauth_callback_input.clone());
-    if new_cookie_blob.is_some() && oauth_callback_input.is_some() {
+
+    // ApiKey inputs: same fast-fail validation as create(). On update,
+    // empty / missing fields mean "keep existing" within an api_key→
+    // api_key update; switching INTO api_key from cookie/oauth requires
+    // both base_url + secret to be present (checked below).
+    let raw_new_api_key_base_url = normalize_optional(req.api_key_base_url.clone());
+    let raw_new_api_key_secret = normalize_optional(req.api_key_secret.clone());
+    let api_key_extra_headers_payload = req.api_key_extra_headers.clone();
+    let new_api_key_base_url_normalized: Option<String> = match raw_new_api_key_base_url.as_deref()
+    {
+        Some(raw) => Some(normalize_api_key_base_url(raw)?.as_str().to_string()),
+        None => None,
+    };
+    if let Some(ref map) = api_key_extra_headers_payload {
+        validate_api_key_extra_headers(map)?;
+    }
+    let submitting_api_key = raw_new_api_key_base_url.is_some()
+        || raw_new_api_key_secret.is_some()
+        || api_key_extra_headers_payload.is_some();
+
+    let submitted_count = new_cookie_blob.is_some() as u8
+        + oauth_callback_input.is_some() as u8
+        + submitting_api_key as u8;
+    if submitted_count > 1 {
         return Err(ClewdrError::BadRequest {
-            msg: "Submit exactly one of cookie or OAuth callback input",
+            msg: "Submit exactly one credential kind: cookie, OAuth callback, or API key",
         });
     }
     let oauth = match oauth_callback_input {
@@ -516,6 +694,7 @@ pub async fn update(
         req.auth_source.as_deref(),
         new_cookie_blob.is_some(),
         oauth.is_some(),
+        submitting_api_key,
         Some(existing.auth_source.as_str()),
     )?;
 
@@ -616,10 +795,13 @@ pub async fn update(
             });
         }
         // Single-statement credential replacement: cookie_blob, auth_source,
-        // and cleared oauth fields are written together so the row-level
-        // credential-mutex CHECK is only evaluated against the final state.
-        // Piecewise updates (write cookie first, then clear oauth, then switch
-        // auth_source) would trip the CHECK mid-transaction.
+        // and cleared oauth / api_key fields are written together so the
+        // row-level credential-mutex CHECK is only evaluated against the
+        // final state. Piecewise updates (write cookie first, then clear
+        // oauth, then switch auth_source) would trip the CHECK
+        // mid-transaction. Step 5 / C10: also NULL the api_key_*
+        // columns so switching api_key → cookie clears the prior
+        // credential and the mutex CHECK accepts the row.
         sqlx::query(
             "UPDATE accounts
              SET cookie_blob = ?1,
@@ -633,6 +815,9 @@ pub async fn update(
                  rate_limit_tier = NULL,
                  subscription_created_at = NULL,
                  billing_type = NULL,
+                 api_key_base_url = NULL,
+                 api_key_secret = NULL,
+                 api_key_extra_headers = NULL,
                  auth_source = 'cookie',
                  status = 'active',
                  invalid_reason = NULL,
@@ -648,7 +833,8 @@ pub async fn update(
     } else if let Some(ref oauth_data) = oauth {
         // Mirror of the cookie branch: all credential + auth_source columns
         // move together in a single UPDATE so the mutex CHECK sees only the
-        // consistent post-write state.
+        // consistent post-write state. C10: NULL api_key_* for the same
+        // reason as the cookie branch above.
         sqlx::query(
             "UPDATE accounts
              SET cookie_blob = NULL,
@@ -657,6 +843,9 @@ pub async fn update(
                  oauth_expires_at = ?3,
                  last_refresh_at = ?4,
                  organization_uuid = ?5,
+                 api_key_base_url = NULL,
+                 api_key_secret = NULL,
+                 api_key_extra_headers = NULL,
                  auth_source = 'oauth',
                  status = 'active',
                  last_error = NULL,
@@ -670,6 +859,85 @@ pub async fn update(
         .bind(oauth_data.token.expires_at.to_rfc3339())
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(oauth_data.snapshot.organization_uuid.as_str())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    } else if submitting_api_key {
+        // ApiKey branch. Two sub-cases:
+        //   - Switching INTO api_key from cookie/oauth: both base_url
+        //     and secret MUST be present (the schema mutex CHECK would
+        //     reject a partial row anyway; surface a clean 400 here).
+        //   - Updating WITHIN api_key: any subset of (base_url, secret,
+        //     extra_headers) may be present; missing fields keep the
+        //     existing value (mirror cookie/oauth empty-means-keep
+        //     semantics at L606, L648).
+        //
+        // extra_headers tri-state on the request side:
+        //   - None / omitted → keep existing JSON column unchanged
+        //   - Some({}) → explicit clear (NULL the column)
+        //   - Some(map) non-empty → replace with serialized JSON
+        let switching_into_api_key = existing.auth_source != "api_key";
+
+        let final_base_url: String = match (
+            new_api_key_base_url_normalized.as_deref(),
+            existing.api_key_base_url.as_deref(),
+            switching_into_api_key,
+        ) {
+            (Some(v), _, _) => v.to_string(),
+            (None, Some(existing_url), false) => existing_url.to_string(),
+            _ => {
+                return Err(ClewdrError::BadRequest {
+                    msg: "api_key_base_url is required when switching to api_key",
+                });
+            }
+        };
+
+        let final_secret: String = match (
+            raw_new_api_key_secret.as_deref(),
+            existing.api_key_secret.as_deref(),
+            switching_into_api_key,
+        ) {
+            (Some(v), _, _) => v.to_string(),
+            (None, Some(existing_secret), false) => existing_secret.to_string(),
+            _ => {
+                return Err(ClewdrError::BadRequest {
+                    msg: "api_key_secret is required when switching to api_key",
+                });
+            }
+        };
+
+        let final_extra_headers_sql: Option<String> = match api_key_extra_headers_payload {
+            None => existing.api_key_extra_headers.clone(),
+            Some(map) => extra_headers_to_db(&map),
+        };
+
+        sqlx::query(
+            "UPDATE accounts
+             SET cookie_blob = NULL,
+                 oauth_access_token = NULL,
+                 oauth_refresh_token = NULL,
+                 oauth_expires_at = NULL,
+                 last_refresh_at = NULL,
+                 organization_uuid = NULL,
+                 email = NULL,
+                 account_type = NULL,
+                 rate_limit_tier = NULL,
+                 subscription_created_at = NULL,
+                 billing_type = NULL,
+                 api_key_base_url = ?1,
+                 api_key_secret = ?2,
+                 api_key_extra_headers = ?3,
+                 auth_source = 'api_key',
+                 status = 'active',
+                 invalid_reason = NULL,
+                 last_error = NULL,
+                 last_failure_json = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?4",
+        )
+        .bind(final_base_url)
+        .bind(final_secret)
+        .bind(final_extra_headers_sql)
         .bind(id)
         .execute(&mut *tx)
         .await?;
@@ -742,6 +1010,11 @@ pub async fn probe_all(
         .into_iter()
         .filter(|a| match a.auth_source.as_str() {
             "oauth" => a.status != "disabled" && a.oauth_token.is_some(),
+            // ApiKey accounts have no subscription quota window and no
+            // OAuth profile to refresh; the probe machinery is
+            // subscription-shaped and not applicable. Explicit arm
+            // makes the intent clear vs leaning on the cookie default.
+            "api_key" => false,
             _ => a.cookie_blob.is_some(),
         })
         .map(|a| a.id)
@@ -834,6 +1107,139 @@ async fn clear_test_failure_verdict(state: &AppState, account_id: i64) {
     state.account_pool.clear_probe_error(account_id).await;
 }
 
+/// `/test` flow for `auth_source = 'api_key'` slots. The cookie /
+/// OAuth branch carries a long token-refresh ladder that ApiKey does
+/// not need; rather than weave conditional logic through 240 lines of
+/// existing code, the ApiKey case lives here as a self-contained
+/// branch that mirrors the same shape: send → classify → log →
+/// persist verdict → return `TestAccountResponse`.
+async fn test_account_api_key(
+    state: AppState,
+    id: i64,
+    account: AccountWithRuntime,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Json<TestAccountResponse>, ClewdrError> {
+    let base_url = account
+        .api_key_base_url
+        .as_deref()
+        .ok_or(ClewdrError::BadRequest {
+            msg: "api_key account missing base_url",
+        })?;
+    let secret = account
+        .api_key_secret
+        .as_deref()
+        .ok_or(ClewdrError::BadRequest {
+            msg: "api_key account missing secret",
+        })?;
+    // Defensive re-normalization: admin write-time validation ran when
+    // the row was inserted, but a manual DB edit could skip it.
+    let normalized = normalize_api_key_base_url(base_url)?;
+    let url = normalized
+        .join("v1/messages")
+        .expect("normalized base url joins cleanly");
+    let mut url_with_query = url;
+    url_with_query.set_query(Some("beta=true"));
+    let request_url = url_with_query.to_string();
+
+    let extras: BTreeMap<String, String> = account
+        .api_key_extra_headers
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<BTreeMap<String, String>>(s).ok())
+        .unwrap_or_default();
+
+    let body = serde_json::json!({
+        "model": TEST_ACCOUNT_MODEL,
+        "max_tokens": 10,
+        "messages": [{"role": "user", "content": "reply with ok only"}],
+        "stream": false,
+    });
+
+    let client = build_api_client(account.proxy_url.as_deref());
+    let mut req = client
+        .post(&request_url)
+        .header("x-api-key", secret)
+        .header("anthropic-version", "2023-06-01");
+    for (k, v) in extras.iter() {
+        if is_reserved_api_key_extra_header(k) {
+            continue;
+        }
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let result = req.json(&body).send().await.context(WreqSnafu {
+        msg: "test request failed",
+    });
+    let latency_ms = (chrono::Utc::now() - started_at).num_milliseconds();
+
+    let (success, http_status, error_msg, response_body) = match result {
+        Ok(resp) => {
+            let status_code = resp.status().as_u16();
+            let body_text = resp.text().await.unwrap_or_default();
+            if (200..300).contains(&status_code) {
+                (true, Some(status_code), None, body_text)
+            } else {
+                (false, Some(status_code), Some(body_text.clone()), body_text)
+            }
+        }
+        Err(e) => (false, None, Some(e.to_string()), String::new()),
+    };
+
+    // Classify with `Some(AuthMethod::ApiKey)` so 429 → TransientUpstream
+    // (Cooldown is downgraded at the classifier chokepoint per C9).
+    // `persist_test_failure_verdict` then sees TransientUpstream and
+    // returns without mutating account state — correct for ApiKey.
+    let failure = if success {
+        None
+    } else if let Some(status_u16) = http_status {
+        let synthetic = test_response_error(status_u16, &response_body);
+        Some(classify_account_failure(
+            &synthetic,
+            FailureSource::Test,
+            None,
+            Some(AuthMethod::ApiKey),
+        ))
+    } else {
+        None
+    };
+    let log_status = if success {
+        "ok"
+    } else if let Some(failure) = &failure {
+        failure.action.to_log_status()
+    } else {
+        "upstream_error"
+    };
+    let ctx = BillingContext {
+        db: state.db.clone(),
+        user_id: None,
+        api_key_id: None,
+        account_id: Some(id),
+        model_raw: TEST_ACCOUNT_MODEL.to_string(),
+        request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
+        started_at,
+        event_tx: state.event_tx.clone(),
+    };
+    persist_probe_log(
+        &ctx,
+        RequestType::Test,
+        log_status,
+        http_status,
+        &response_body,
+        error_msg.as_deref(),
+    )
+    .await;
+    if success {
+        clear_test_failure_verdict(&state, id).await;
+    } else if let (Some(failure), Some(message)) = (&failure, error_msg.as_deref()) {
+        persist_test_failure_verdict(&state, id, failure, message).await;
+    }
+
+    Ok(Json(TestAccountResponse {
+        success,
+        latency_ms,
+        error: error_msg,
+        http_status,
+    }))
+}
+
 pub async fn test_account(
     State(state): State<AppState>,
     State(profile): State<SharedStealthProfile>,
@@ -853,6 +1259,23 @@ pub async fn test_account(
     }
 
     let started_at = chrono::Utc::now();
+
+    // ApiKey accounts have no bearer-token ladder — skip the OAuth /
+    // cookie token-fetch entirely and send directly with `x-api-key` +
+    // extra headers (after the reserved-name filter, defense in depth
+    // against the same admin-side validator that already ran at write
+    // time). The response-handling tail (classify + log + verdict) is
+    // intentionally near-duplicate of the OAuth/cookie path below, with
+    // the one difference that the classifier is told this is an ApiKey
+    // slot so 429 → TransientUpstream (PRD Decision 2) instead of
+    // Cooldown — which means `persist_test_failure_verdict`'s
+    // TransientUpstream / InternalError arms are no-ops for ApiKey,
+    // which is exactly the desired "pay-as-you-go has no cooldown"
+    // behavior.
+    if account.auth_source == "api_key" {
+        return test_account_api_key(state, id, account, started_at).await;
+    }
+
     let access_token = match account.oauth_token.clone() {
         Some(token) => {
             if token.is_expired() {
@@ -1107,11 +1530,11 @@ mod tests {
     #[test]
     fn derives_cookie_when_only_cookie_submitted() {
         assert_eq!(
-            derive_auth_source(None, true, false, None).unwrap(),
+            derive_auth_source(None, true, false, false, None).unwrap(),
             "cookie"
         );
         assert_eq!(
-            derive_auth_source(None, true, false, Some("oauth")).unwrap(),
+            derive_auth_source(None, true, false, false, Some("oauth")).unwrap(),
             "cookie"
         );
     }
@@ -1119,30 +1542,51 @@ mod tests {
     #[test]
     fn derives_oauth_when_only_oauth_submitted() {
         assert_eq!(
-            derive_auth_source(None, false, true, None).unwrap(),
+            derive_auth_source(None, false, true, false, None).unwrap(),
             "oauth"
         );
         assert_eq!(
-            derive_auth_source(None, false, true, Some("cookie")).unwrap(),
+            derive_auth_source(None, false, true, false, Some("cookie")).unwrap(),
             "oauth"
+        );
+    }
+
+    #[test]
+    fn derives_api_key_when_only_api_key_submitted() {
+        assert_eq!(
+            derive_auth_source(None, false, false, true, None).unwrap(),
+            "api_key"
+        );
+        // Switching from cookie/oauth → api_key: the submitted credential wins.
+        assert_eq!(
+            derive_auth_source(None, false, false, true, Some("cookie")).unwrap(),
+            "api_key"
+        );
+        assert_eq!(
+            derive_auth_source(None, false, false, true, Some("oauth")).unwrap(),
+            "api_key"
         );
     }
 
     #[test]
     fn preserves_existing_when_nothing_submitted() {
         assert_eq!(
-            derive_auth_source(None, false, false, Some("cookie")).unwrap(),
+            derive_auth_source(None, false, false, false, Some("cookie")).unwrap(),
             "cookie"
         );
         assert_eq!(
-            derive_auth_source(None, false, false, Some("oauth")).unwrap(),
+            derive_auth_source(None, false, false, false, Some("oauth")).unwrap(),
             "oauth"
+        );
+        assert_eq!(
+            derive_auth_source(None, false, false, false, Some("api_key")).unwrap(),
+            "api_key"
         );
     }
 
     #[test]
     fn errors_when_nothing_submitted_and_no_existing() {
-        let err = derive_auth_source(None, false, false, None).unwrap_err();
+        let err = derive_auth_source(None, false, false, false, None).unwrap_err();
         assert!(matches!(err, ClewdrError::BadRequest { .. }));
     }
 
@@ -1151,25 +1595,32 @@ mod tests {
         // Post-C3 migration no hybrid rows should remain, but the derivation
         // is defensive: if one slips through, updating without new credentials
         // must fail rather than silently preserve an invalid value.
-        let err = derive_auth_source(None, false, false, Some("hybrid")).unwrap_err();
+        let err = derive_auth_source(None, false, false, false, Some("hybrid")).unwrap_err();
         assert!(matches!(err, ClewdrError::BadRequest { .. }));
     }
 
     #[test]
     fn accepts_requested_that_matches_derived() {
         assert_eq!(
-            derive_auth_source(Some("cookie"), true, false, None).unwrap(),
+            derive_auth_source(Some("cookie"), true, false, false, None).unwrap(),
             "cookie"
         );
         assert_eq!(
-            derive_auth_source(Some("oauth"), false, true, None).unwrap(),
+            derive_auth_source(Some("oauth"), false, true, false, None).unwrap(),
             "oauth"
+        );
+        assert_eq!(
+            derive_auth_source(Some("api_key"), false, false, true, None).unwrap(),
+            "api_key"
         );
     }
 
     #[test]
     fn errors_on_requested_mismatch() {
-        let err = derive_auth_source(Some("oauth"), true, false, None).unwrap_err();
+        let err = derive_auth_source(Some("oauth"), true, false, false, None).unwrap_err();
+        assert!(matches!(err, ClewdrError::BadRequest { .. }));
+        // Requesting api_key while submitting cookie is also a mismatch.
+        let err = derive_auth_source(Some("api_key"), true, false, false, None).unwrap_err();
         assert!(matches!(err, ClewdrError::BadRequest { .. }));
     }
 
@@ -1177,14 +1628,88 @@ mod tests {
     fn rejects_legacy_hybrid_request() {
         // Requesting auth_source="hybrid" with a single valid credential must
         // fail at the requested-vs-derived mismatch check.
-        let err = derive_auth_source(Some("hybrid"), true, false, None).unwrap_err();
+        let err = derive_auth_source(Some("hybrid"), true, false, false, None).unwrap_err();
         assert!(matches!(err, ClewdrError::BadRequest { .. }));
     }
 
     #[test]
     fn rejects_dual_credential_submission() {
-        let err = derive_auth_source(None, true, true, None).unwrap_err();
+        let err = derive_auth_source(None, true, true, false, None).unwrap_err();
         assert!(matches!(err, ClewdrError::BadRequest { .. }));
+        // cookie + api_key
+        let err = derive_auth_source(None, true, false, true, None).unwrap_err();
+        assert!(matches!(err, ClewdrError::BadRequest { .. }));
+        // oauth + api_key
+        let err = derive_auth_source(None, false, true, true, None).unwrap_err();
+        assert!(matches!(err, ClewdrError::BadRequest { .. }));
+        // All three.
+        let err = derive_auth_source(None, true, true, true, None).unwrap_err();
+        assert!(matches!(err, ClewdrError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn validate_api_key_extra_headers_accepts_safe_keys() {
+        let mut map = BTreeMap::new();
+        map.insert("anthropic-workspace-id".to_string(), "ws-123".to_string());
+        map.insert("x-custom-header".to_string(), "value".to_string());
+        assert!(validate_api_key_extra_headers(&map).is_ok());
+        // Empty map is fine (caller treats it as "no extras").
+        let empty = BTreeMap::new();
+        assert!(validate_api_key_extra_headers(&empty).is_ok());
+    }
+
+    #[test]
+    fn validate_api_key_extra_headers_rejects_reserved_keys() {
+        // Case-insensitive: the send-side filter is the source of truth.
+        for reserved in [
+            "x-api-key",
+            "X-API-KEY",
+            "Authorization",
+            "anthropic-version",
+            "anthropic-beta",
+            "user-agent",
+            "USER-AGENT",
+            "host",
+            "content-length",
+            "content-type",
+            "accept-encoding",
+        ] {
+            let mut map = BTreeMap::new();
+            map.insert(reserved.to_string(), "v".to_string());
+            let err = validate_api_key_extra_headers(&map).unwrap_err();
+            assert!(matches!(
+                err,
+                ClewdrError::BadRequestMessage { .. } | ClewdrError::BadRequest { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn validate_api_key_extra_headers_rejects_empty_key() {
+        let mut map = BTreeMap::new();
+        map.insert("".to_string(), "v".to_string());
+        let err = validate_api_key_extra_headers(&map).unwrap_err();
+        assert!(matches!(err, ClewdrError::BadRequest { .. }));
+
+        let mut map = BTreeMap::new();
+        map.insert("   ".to_string(), "v".to_string());
+        let err = validate_api_key_extra_headers(&map).unwrap_err();
+        assert!(matches!(err, ClewdrError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn extra_headers_to_db_returns_none_for_empty() {
+        assert_eq!(extra_headers_to_db(&BTreeMap::new()), None);
+    }
+
+    #[test]
+    fn extra_headers_to_db_serializes_btree_map_stably() {
+        let mut map = BTreeMap::new();
+        map.insert("z".to_string(), "1".to_string());
+        map.insert("a".to_string(), "2".to_string());
+        let serialized = extra_headers_to_db(&map).expect("non-empty map serializes");
+        // BTreeMap iteration is key-sorted, so the JSON output is stable.
+        assert_eq!(serialized, r#"{"a":"2","z":"1"}"#);
     }
 
     #[test]

@@ -2,6 +2,7 @@ mod chat;
 mod exchange;
 mod organization;
 pub mod probe;
+pub(crate) use chat::is_reserved_api_key_extra_header;
 use std::sync::LazyLock;
 
 use http::{

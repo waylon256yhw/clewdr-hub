@@ -69,7 +69,7 @@ const API_KEY_RESERVED_EXTRA_HEADERS: &[&str] = &[
     "accept-encoding",
 ];
 
-fn is_reserved_api_key_extra_header(name: &str) -> bool {
+pub(crate) fn is_reserved_api_key_extra_header(name: &str) -> bool {
     API_KEY_RESERVED_EXTRA_HEADERS
         .iter()
         .any(|reserved| reserved.eq_ignore_ascii_case(name))
