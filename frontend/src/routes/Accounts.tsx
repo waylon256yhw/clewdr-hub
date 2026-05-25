@@ -332,6 +332,10 @@ function WindowRow({ label, window }: { label: string; window: UsageWindow | nul
   );
 }
 
+function apiKeyExtraHeaderRows(account: Account | null): Array<{ key: string; value: string }> {
+  return Object.entries(account?.api_key_extra_headers ?? {}).map(([key, value]) => ({ key, value }));
+}
+
 function AccountCard({
   account,
   probing,
@@ -346,6 +350,8 @@ function AccountCard({
   onDelete: () => void;
 }) {
   const rt = account.runtime;
+  const isApiKey = account.auth_source === "api_key";
+  const extraHeaderRows = apiKeyExtraHeaderRows(account);
   const displayStatus = resolveDisplayStatus(account);
   const isProbing = account.health?.probing ?? probing;
   const effectiveProbeError = account.health?.last_probe_error ?? probeError;
@@ -415,7 +421,7 @@ function AccountCard({
         <Badge color={accountStatusColor(displayStatus)} variant="light" size="sm">
           {displayStatus}
         </Badge>
-        {isProbing && <Badge color="blue" variant="light" size="sm">probing</Badge>}
+        {isProbing && !isApiKey && <Badge color="blue" variant="light" size="sm">probing</Badge>}
         <Badge color="dark" variant="outline" size="sm">{authSourceLabel(account.auth_source)}</Badge>
         {(() => {
           const label = planTierLabel(account.rate_limit_tier, account.account_type);
@@ -474,7 +480,7 @@ function AccountCard({
         <Text size="xs" c="dimmed" mb="xs" lineClamp={1}>{account.email}</Text>
       )}
 
-      {account.subscription_created_at && (() => {
+      {account.subscription_created_at && !isApiKey && (() => {
         const days = daysUntilRenewal(account.subscription_created_at);
         if (days === null) return null;
         const startLabel = formatSubscriptionDate(account.subscription_created_at);
@@ -495,7 +501,7 @@ function AccountCard({
         );
       })()}
 
-      {probeCheckedAt && (
+      {probeCheckedAt && !isApiKey && (
         <Text size="xs" c="dimmed" mb="xs">探测更新时间: {probeCheckedAt}</Text>
       )}
 
@@ -515,7 +521,7 @@ function AccountCard({
           <Text size="xs" c="red" mb="xs">{account.invalid_reason}</Text>
         )}
 
-      {effectiveProbeError && (
+      {effectiveProbeError && !isApiKey && (
         <Text size="xs" c="orange" mb="xs">探测错误: {effectiveProbeError}</Text>
       )}
 
@@ -525,14 +531,35 @@ function AccountCard({
           <Text size="xs" c="orange" mb="xs">OAuth: {account.last_error}</Text>
         )}
 
-      <Divider my="xs" />
+      {isApiKey ? (
+        <Stack gap={4}>
+          {account.api_key_base_url && (
+            <Text size="xs" c="dimmed" lineClamp={1}>
+              Base URL: {account.api_key_base_url}
+            </Text>
+          )}
+          {extraHeaderRows.length > 0 && (
+            <Stack gap={2}>
+              {extraHeaderRows.map(({ key, value }) => (
+                <Text key={key} size="xs" c="dimmed" lineClamp={1}>
+                  {key}: {value}
+                </Text>
+              ))}
+            </Stack>
+          )}
+        </Stack>
+      ) : (
+        <>
+          <Divider my="xs" />
 
-      <Stack gap="xs">
-        <WindowRow label="5h 会话" window={rt?.session} />
-        <WindowRow label="7d 总量" window={rt?.weekly} />
-        <WindowRow label="7d Sonnet" window={rt?.weekly_sonnet} />
-        <WindowRow label="7d Opus" window={rt?.weekly_opus} />
-      </Stack>
+          <Stack gap="xs">
+            <WindowRow label="5h 会话" window={rt?.session} />
+            <WindowRow label="7d 总量" window={rt?.weekly} />
+            <WindowRow label="7d Sonnet" window={rt?.weekly_sonnet} />
+            <WindowRow label="7d Opus" window={rt?.weekly_opus} />
+          </Stack>
+        </>
+      )}
     </Paper>
   );
 }
@@ -551,10 +578,8 @@ interface FormValues {
   api_key_secret: string;
   /**
    * Editable list of {key, value} pairs for ApiKey extra headers.
-   * Values must be entered fresh on every edit since the server only
-   * returns key names (header values are secrets). Empty rows are
-   * dropped on submit; an empty list submitted as `Some({})` explicitly
-   * clears server-side extras.
+   * Empty rows are dropped on submit; an empty list submitted as
+   * `Some({})` explicitly clears server-side extras.
    */
   api_key_extra_headers: Array<{ key: string; value: string }>;
 }
@@ -570,11 +595,9 @@ interface FormValues {
  *   2. Secret — password input. On edit it stays empty by default and
  *      "leave empty to keep" semantics apply (mirror of the cookie /
  *      OAuth credential-replacement flow).
- *   3. Extra headers — KV widget. Header VALUES are server-side secrets
- *      and never come back from the API, so the editor only renders
- *      *keys* the row already has (as a dimmed text affordance) and
- *      requires fresh entry to replace. An empty list submitted as
- *      `Some({})` explicitly clears server-side extras.
+ *   3. Extra headers — KV widget. Empty rows are dropped on submit; an
+ *      empty list submitted as `Some({})` explicitly clears server-side
+ *      extras.
  *
  * The reserved-name set (`x-api-key`, `authorization`, etc.) is
  * validated server-side at write time and surfaced as a 400 — the
@@ -588,25 +611,12 @@ function ApiKeyTabPanel({
 }: {
   form: UseFormReturnType<FormValues>;
   editing: Account | null;
-  /**
-   * Called whenever the editor mutates the extra-headers KV list
-   * (add row / remove row / edit a cell). The parent uses this flag
-   * to decide whether to include `api_key_extra_headers` in the
-   * UPDATE payload — without it, every save of an ApiKey account
-   * would wipe its server-side extras because the initial form
-   * value is `[]` and the backend reads `Some({})` as explicit
-   * clear. Create / switch-into-api_key paths always send.
-   */
+  /** Marks the KV list as changed so edit submit can send replace/clear. */
   markExtrasDirty: () => void;
 }) {
-  const existingKeys = editing?.api_key_extra_header_keys ?? [];
   const rows = form.getValues().api_key_extra_headers;
   return (
     <Stack>
-      <Text size="sm" c="dimmed">
-        直连 Anthropic 兼容端点。基础 URL 可填 <code>https://api.anthropic.com/</code> 或自定义反代地址；
-        服务端会规范化 URL 并把 <code>/v1/messages</code> 拼到其后。
-      </Text>
       <TextInput
         label="基础 URL"
         placeholder="https://api.anthropic.com/"
@@ -642,16 +652,7 @@ function ApiKeyTabPanel({
             添加
           </Button>
         </Group>
-        {existingKeys.length > 0 && rows.length === 0 && (
-          <Text size="xs" c="dimmed">
-            当前已配置头：{existingKeys.join(", ")}（值为机密、不会返回；保存时本字段会保留不变。如需替换请重新填写整张表，如需清空请点"添加"后立即保存空表）
-          </Text>
-        )}
-        <Text size="xs" c="dimmed">
-          示例：<code>anthropic-workspace-id</code> 用于 AWS Bedrock 兼容代理；保留头（如
-          <code>x-api-key</code>、<code>authorization</code>、<code>anthropic-version</code>、
-          <code>user-agent</code>）会被服务端拒绝。
-        </Text>
+        <Text size="xs" c="dimmed">可选；留空表示不附加额外请求头。</Text>
         {rows.map((row, idx) => (
           <Group key={idx} gap="xs" align="flex-end" wrap="nowrap">
             <TextInput
@@ -718,15 +719,9 @@ function AccountFormModal({
   );
   const [authUrl, setAuthUrl] = useState("");
   const [oauthState, setOauthState] = useState("");
-  // Tracks whether the editor touched the extra_headers KV list at all
-  // (add row / remove row / edit any cell). The backend's tri-state
-  // contract treats `Some({})` as explicit clear and `None` as keep,
-  // so on edit mode we MUST omit the field by default — otherwise
-  // every save of an ApiKey account would wipe its extras, since the
-  // editor initializes the rows list to empty (header values are
-  // secrets and never come back from the server, so we can't
-  // pre-populate). Create / switch-into-api_key paths always send
-  // the field, so a freshly-set list of headers reaches the server.
+  // The backend's update contract is tri-state:
+  // omitted = keep, {} = clear, map = replace. Track whether the
+  // admin touched the KV list so ordinary edits don't rewrite it.
   const [extraHeadersDirty, setExtraHeadersDirty] = useState(false);
   const form = useForm<FormValues>({
     mode: "uncontrolled",
@@ -738,12 +733,9 @@ function AccountFormModal({
       drain_first: editing?.drain_first ?? false,
       cookie_blob: "",
       oauth_callback_input: "",
-      // Echo back what we know from the server (base_url is admin-supplied
-      // metadata so it's safe). Secret + header values are never returned;
-      // editor must re-enter them to change.
       api_key_base_url: editing?.api_key_base_url ?? "",
       api_key_secret: "",
-      api_key_extra_headers: [],
+      api_key_extra_headers: apiKeyExtraHeaderRows(editing),
     },
   });
 
@@ -768,7 +760,7 @@ function AccountFormModal({
       oauth_callback_input: "",
       api_key_base_url: editing?.api_key_base_url ?? "",
       api_key_secret: "",
-      api_key_extra_headers: [],
+      api_key_extra_headers: apiKeyExtraHeaderRows(editing),
     });
   }, [editing]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -839,16 +831,8 @@ function AccountFormModal({
             body.api_key_base_url = apiKeyBaseUrl;
           }
           if (apiKeySecret) body.api_key_secret = apiKeySecret;
-          // Tri-state contract: None = keep existing, Some({}) = clear,
-          // Some(map) = replace. The KV widget initializes to [] on
-          // edit (header values are secrets and never come back from
-          // the server, so we can't pre-populate). Without the dirty
-          // gate, every save would send {} and wipe server-side
-          // extras — including saves where the admin only touched
-          // the name / proxy / drain_first. Only forward the field if
-          // the user actually touched the KV widget on this open;
-          // create / switch-into-api_key paths always send via the
-          // create-branch below.
+          // Only forward this tri-state field after the KV editor was
+          // touched; otherwise ordinary edits should preserve headers.
           if (extraHeadersDirty && apiKeyExtraHeadersObj !== undefined) {
             body.api_key_extra_headers = apiKeyExtraHeadersObj;
           }
@@ -1105,7 +1089,7 @@ export default function Accounts() {
   const accounts = data?.items ?? [];
   const proxies = proxiesData?.items ?? [];
   const probingIds = new Set(
-    accounts.filter((a) => a.health?.probing).map((a) => a.id),
+    accounts.filter((a) => a.auth_source !== "api_key" && a.health?.probing).map((a) => a.id),
   );
 
   const openCreate = () => {

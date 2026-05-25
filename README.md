@@ -20,7 +20,7 @@
 - **透明代理**：直接转发 `/v1/messages`，不注入系统提示词；仅为兼容 Anthropic 模型行为做最小参数归一化
 - **OpenAI 兼容入口**：`POST /v1/chat/completions` + `/v1/models?format=` 协商，零改造对接 OpenAI SDK 客户端，复用同一套鉴权 / 配额 / 限流 / 计费链路
 - **轻量伪装**：可配置 CLI/SDK 版本号和请求头，过上游客户端检测
-- **多账号调度**：cookie 池 + round-robin + 亲和性缓存 + per-account 并发槽（`max_slots`），支持标记账号「优先消耗」用于限量试用账号
+- **多账号调度**：Cookie / OAuth / Custom Anthropic API Key 账号池 + round-robin + 亲和性缓存 + per-account 并发槽（`max_slots`），支持标记账号「优先消耗」用于限量试用账号
 - **多代理管理**：可维护多个备用代理，支持账号级绑定，适合不同账号走不同出口
 - **团队隔离**：用户 → 策略 → API Key，并发/RPM/周预算/月预算多重限额
 - **Per-Key 绑定**：把特定 key 锁定到指定账号，隔离资源
@@ -107,7 +107,24 @@ export ANTHROPIC_BASE_URL=http://your-ip:8484
 export ANTHROPIC_API_KEY=sk-...    # 从后台创建
 ```
 
-流程：**后台登录 →（可选）先到代理页添加备用代理 → 账号池添加 Cookie / 绑定代理 → 创建 API Key → 客户端配置上面两行**。单人到这里就够了。
+流程：**后台登录 →（可选）先到代理页添加备用代理 → 账号池添加 Cookie / OAuth / API Key 账号并按需绑定代理 → 创建 API Key → 客户端配置上面两行**。单人到这里就够了。
+
+### 账号池与 Custom Anthropic API Key
+
+账号池支持三类上游账号：
+
+- **Cookie / OAuth**：面向 Claude Pro / Max 订阅账号，后台会探测账号类型、用量窗口和重置时间。
+- **API Key**：面向官方 Anthropic API key 或兼容 Anthropic Messages API 的自定义端点，例如需要 `ANTHROPIC_BASE_URL`、`ANTHROPIC_API_KEY` 和额外请求头的内部 / 云厂商代理。
+
+添加 API Key 账号时填写：
+
+- **基础 URL**：例如 `https://api.anthropic.com/` 或自定义 Anthropic-compatible endpoint；服务端会规范化后拼接 `/v1/messages`、`/v1/messages/count_tokens`。
+- **API 密钥**：通过 `x-api-key` 发送；编辑账号时留空表示保留原值。
+- **额外请求头**：用于工作区、租户或自定义路由信息，例如 `anthropic-workspace-id`。这些值会在管理员账号编辑页回显，方便维护；导出 `--no-secrets` 和运行日志仍会避免泄露 API key 与 header 值。
+
+API Key 账号不会显示 5h / 7d 订阅用量窗口，也不会参与全量订阅探测。请求日志、用户配额、计费统计、OpenAI 兼容入口仍走同一套链路。
+
+`优先消耗` 适合把临时额度、试用额度或希望先用掉的账号放在调度前面。不要给所有账号都打开，否则等同于没有优先级；也不要把高价值主力账号误标为优先消耗。
 
 ### 请求参数兼容策略
 
@@ -163,8 +180,7 @@ print(resp.choices[0].message.content)
 
 - 本项目不再支持 legacy `-1M` 伪模型名，请直接使用 Anthropic 官方标准模型名
 - 本项目不会主动添加 `context-1m-2025-08-07`，也会忽略客户端传入的这个 legacy beta header
-- 截至 `2026-04-09`，`claude-opus-4-6` 与 `claude-sonnet-4-6` 的 1M context 已是原生能力；`claude-opus-4-5` 仍为 `200k`
-- Anthropic 已宣布 `claude-sonnet-4` / `claude-sonnet-4-5` 依赖 `context-1m-2025-08-07` 的过渡 1M beta 将在 `2026-04-30` 退场；本项目不再为这条历史兼容路径做适配
+- 依赖 `context-1m-2025-08-07` 的过渡 1M beta 已在 `2026-04-30` 后退出支持范围；需要 1M context 时请使用已经原生支持该能力的官方模型名
 
 ### 团队扩展
 
@@ -183,7 +199,7 @@ print(resp.choices[0].message.content)
 |------|------|
 | **总览** | 账号/用户/Key 数量，请求量，当前伪装版本 |
 | **运维** | 累计请求/Token/金额，模型分布，用户用量趋势与日志下钻 |
-| **账号池** | 添加/管理 Cookie，给账号绑定代理，查看用量窗口和重置倒计时 |
+| **账号池** | 添加/管理 Cookie / OAuth / Custom Anthropic API Key 账号，给账号绑定代理，查看订阅账号用量窗口和重置倒计时 |
 | **代理** | 维护多个备用代理，测试基础连通性/延迟/出口 IP/地区 |
 | **用户** | 成员 CRUD + 策略管理（并发/RPM/预算） |
 | **API Keys** | 创建/绑定/管理 Key |

@@ -90,11 +90,11 @@ pub struct AccountResponse {
     /// Normalized base URL. Safe to echo (admin entered it).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_base_url: Option<String>,
-    /// Per-account extra header KEYS only — values are secrets per PRD
-    /// §Security and never leave the DB. Frontend renders this for the
-    /// "headers attached" affordance without exposing values.
+    /// Per-account extra headers attached to every ApiKey send.
+    /// These are admin-configured routing headers, not the ApiKey
+    /// secret itself, so the admin API echoes them for edit forms.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key_extra_header_keys: Option<Vec<String>>,
+    pub api_key_extra_headers: Option<BTreeMap<String, String>>,
     pub oauth_expires_at: Option<String>,
     pub last_refresh_at: Option<String>,
     pub last_error: Option<String>,
@@ -170,16 +170,13 @@ fn map_account(row: &AccountWithRuntime, health: Option<AccountHealth>) -> Accou
         } else {
             None
         },
-        // Header VALUES are secrets; expose KEYS only so the UI can show
-        // "Workspace ID, Custom-Header" without leaking the values.
         // Parse defensively: a malformed JSON column shouldn't 500 the
         // accounts list — surface as "no extra headers" instead.
-        api_key_extra_header_keys: row
+        api_key_extra_headers: row
             .api_key_extra_headers
             .as_deref()
             .and_then(|s| serde_json::from_str::<BTreeMap<String, String>>(s).ok())
-            .map(|m| m.into_keys().collect())
-            .filter(|keys: &Vec<String>| !keys.is_empty()),
+            .filter(|headers| !headers.is_empty()),
         oauth_expires_at: row.oauth_expires_at.clone(),
         last_refresh_at: row.last_refresh_at.clone(),
         last_error: row

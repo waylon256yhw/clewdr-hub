@@ -201,11 +201,8 @@ export interface Account {
   has_api_key: boolean;
   /** Admin-supplied base URL; safe to echo. Only populated for ApiKey rows. */
   api_key_base_url?: string | null;
-  /**
-   * Header KEYS only — values are secrets per PRD §Security and never leave
-   * the DB. Frontend renders this as a "headers attached" affordance.
-   */
-  api_key_extra_header_keys?: string[] | null;
+  /** Admin-configured extra headers attached to ApiKey sends. */
+  api_key_extra_headers?: Record<string, string> | null;
   oauth_expires_at: string | null;
   last_refresh_at: string | null;
   last_error: string | null;
