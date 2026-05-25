@@ -584,9 +584,20 @@ interface FormValues {
 function ApiKeyTabPanel({
   form,
   editing,
+  markExtrasDirty,
 }: {
   form: UseFormReturnType<FormValues>;
   editing: Account | null;
+  /**
+   * Called whenever the editor mutates the extra-headers KV list
+   * (add row / remove row / edit a cell). The parent uses this flag
+   * to decide whether to include `api_key_extra_headers` in the
+   * UPDATE payload — without it, every save of an ApiKey account
+   * would wipe its server-side extras because the initial form
+   * value is `[]` and the backend reads `Some({})` as explicit
+   * clear. Create / switch-into-api_key paths always send.
+   */
+  markExtrasDirty: () => void;
 }) {
   const existingKeys = editing?.api_key_extra_header_keys ?? [];
   const rows = form.getValues().api_key_extra_headers;
@@ -620,19 +631,20 @@ function ApiKeyTabPanel({
             size="xs"
             variant="light"
             leftSection={<IconPlus size={14} />}
-            onClick={() =>
+            onClick={() => {
               form.setFieldValue("api_key_extra_headers", [
                 ...form.getValues().api_key_extra_headers,
                 { key: "", value: "" },
-              ])
-            }
+              ]);
+              markExtrasDirty();
+            }}
           >
             添加
           </Button>
         </Group>
         {existingKeys.length > 0 && rows.length === 0 && (
           <Text size="xs" c="dimmed">
-            当前已配置头：{existingKeys.join(", ")}（值为机密、不会返回；如需替换请重新填写整张表）
+            当前已配置头：{existingKeys.join(", ")}（值为机密、不会返回；保存时本字段会保留不变。如需替换请重新填写整张表，如需清空请点"添加"后立即保存空表）
           </Text>
         )}
         <Text size="xs" c="dimmed">
@@ -650,6 +662,7 @@ function ApiKeyTabPanel({
                 const next = [...form.getValues().api_key_extra_headers];
                 next[idx] = { ...next[idx], key: e.currentTarget.value };
                 form.setFieldValue("api_key_extra_headers", next);
+                markExtrasDirty();
               }}
             />
             <TextInput
@@ -660,6 +673,7 @@ function ApiKeyTabPanel({
                 const next = [...form.getValues().api_key_extra_headers];
                 next[idx] = { ...next[idx], value: e.currentTarget.value };
                 form.setFieldValue("api_key_extra_headers", next);
+                markExtrasDirty();
               }}
             />
             <ActionIcon
@@ -671,6 +685,7 @@ function ApiKeyTabPanel({
                   .getValues()
                   .api_key_extra_headers.filter((_, i) => i !== idx);
                 form.setFieldValue("api_key_extra_headers", next);
+                markExtrasDirty();
               }}
             >
               <IconX size={14} />
@@ -703,6 +718,16 @@ function AccountFormModal({
   );
   const [authUrl, setAuthUrl] = useState("");
   const [oauthState, setOauthState] = useState("");
+  // Tracks whether the editor touched the extra_headers KV list at all
+  // (add row / remove row / edit any cell). The backend's tri-state
+  // contract treats `Some({})` as explicit clear and `None` as keep,
+  // so on edit mode we MUST omit the field by default — otherwise
+  // every save of an ApiKey account would wipe its extras, since the
+  // editor initializes the rows list to empty (header values are
+  // secrets and never come back from the server, so we can't
+  // pre-populate). Create / switch-into-api_key paths always send
+  // the field, so a freshly-set list of headers reaches the server.
+  const [extraHeadersDirty, setExtraHeadersDirty] = useState(false);
   const form = useForm<FormValues>({
     mode: "uncontrolled",
     initialValues: {
@@ -732,6 +757,7 @@ function AccountFormModal({
     );
     setAuthUrl("");
     setOauthState("");
+    setExtraHeadersDirty(false);
     form.setValues({
       name: editing?.name ?? "",
       rr_order: editing?.rr_order ?? 0,
@@ -813,10 +839,17 @@ function AccountFormModal({
             body.api_key_base_url = apiKeyBaseUrl;
           }
           if (apiKeySecret) body.api_key_secret = apiKeySecret;
-          if (apiKeyExtraHeadersObj !== undefined) {
-            // Empty object is meaningful — it explicitly clears the
-            // server-side extras (tri-state contract). Send it even
-            // when the user just deleted all rows.
+          // Tri-state contract: None = keep existing, Some({}) = clear,
+          // Some(map) = replace. The KV widget initializes to [] on
+          // edit (header values are secrets and never come back from
+          // the server, so we can't pre-populate). Without the dirty
+          // gate, every save would send {} and wipe server-side
+          // extras — including saves where the admin only touched
+          // the name / proxy / drain_first. Only forward the field if
+          // the user actually touched the KV widget on this open;
+          // create / switch-into-api_key paths always send via the
+          // create-branch below.
+          if (extraHeadersDirty && apiKeyExtraHeadersObj !== undefined) {
             body.api_key_extra_headers = apiKeyExtraHeadersObj;
           }
         }
@@ -895,6 +928,7 @@ function AccountFormModal({
               if (nextTab !== "api_key") {
                 form.setFieldValue("api_key_secret", "");
                 form.setFieldValue("api_key_extra_headers", []);
+                setExtraHeadersDirty(false);
               }
             }}
           >
@@ -955,7 +989,11 @@ function AccountFormModal({
               />
             </Tabs.Panel>
             <Tabs.Panel value="api_key" pt="md">
-              <ApiKeyTabPanel form={form} editing={editing} />
+              <ApiKeyTabPanel
+                form={form}
+                editing={editing}
+                markExtrasDirty={() => setExtraHeadersDirty(true)}
+              />
             </Tabs.Panel>
           </Tabs>
           <Group justify="flex-end">
