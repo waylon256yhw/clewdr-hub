@@ -393,6 +393,30 @@ impl ClaudeCodeState {
             .await;
     }
 
+    /// Mark an ApiKey account disabled after an upstream terminal-disabled
+    /// verdict. This mirrors the OAuth disabled transition but keeps the
+    /// ApiKey credential columns intact for an admin to inspect or rotate.
+    async fn mark_api_key_account_disabled(
+        &mut self,
+        account_id: i64,
+        reason: Reason,
+        persisted: AccountFailureContextPersisted,
+    ) {
+        let Some(db) = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()) else {
+            return;
+        };
+        if let Err(db_err) = set_account_disabled(&db, account_id, &reason.to_db_string()).await {
+            warn!("Failed to set ApiKey account {account_id} disabled: {db_err}");
+            return;
+        }
+        if let Err(db_err) = set_account_last_failure(&db, account_id, Some(&persisted)).await {
+            warn!("Failed to persist ApiKey last_failure for account {account_id}: {db_err}");
+        }
+        self.account_pool_handle
+            .invalidate(account_id, reason)
+            .await;
+    }
+
     async fn persist_oauth_refresh(&mut self, account_id: i64) -> Result<(), ClewdrError> {
         let Some(fallback) = self.oauth_token.clone() else {
             return Ok(());
@@ -669,8 +693,7 @@ impl ClaudeCodeState {
                             Some(AuthMethod::ApiKey),
                         );
                         match verdict.action {
-                            AccountFailureAction::TerminalAuth
-                            | AccountFailureAction::TerminalDisabled => {
+                            AccountFailureAction::TerminalAuth => {
                                 if let Some(aid) = account_id {
                                     let persisted = AccountFailureContextPersisted::from(&verdict);
                                     state
@@ -679,6 +702,19 @@ impl ClaudeCodeState {
                                             e.to_string(),
                                             persisted,
                                         )
+                                        .await;
+                                }
+                                return Err(e);
+                            }
+                            AccountFailureAction::TerminalDisabled => {
+                                if let Some(aid) = account_id {
+                                    let reason = verdict
+                                        .normalized_reason
+                                        .to_reason()
+                                        .unwrap_or(Reason::Disabled);
+                                    let persisted = AccountFailureContextPersisted::from(&verdict);
+                                    state
+                                        .mark_api_key_account_disabled(aid, reason, persisted)
                                         .await;
                                 }
                                 return Err(e);
@@ -1094,8 +1130,7 @@ impl ClaudeCodeState {
                             Some(AuthMethod::ApiKey),
                         );
                         match verdict.action {
-                            AccountFailureAction::TerminalAuth
-                            | AccountFailureAction::TerminalDisabled => {
+                            AccountFailureAction::TerminalAuth => {
                                 if let Some(aid) = account_id {
                                     let persisted = AccountFailureContextPersisted::from(&verdict);
                                     state
@@ -1104,6 +1139,19 @@ impl ClaudeCodeState {
                                             e.to_string(),
                                             persisted,
                                         )
+                                        .await;
+                                }
+                                return Err(e);
+                            }
+                            AccountFailureAction::TerminalDisabled => {
+                                if let Some(aid) = account_id {
+                                    let reason = verdict
+                                        .normalized_reason
+                                        .to_reason()
+                                        .unwrap_or(Reason::Disabled);
+                                    let persisted = AccountFailureContextPersisted::from(&verdict);
+                                    state
+                                        .mark_api_key_account_disabled(aid, reason, persisted)
                                         .await;
                                 }
                                 return Err(e);

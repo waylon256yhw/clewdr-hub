@@ -211,8 +211,20 @@ pub struct PoolSnapshotView {
 }
 
 fn has_credential(account: &AccountWithRuntime) -> bool {
-    account.cookie_blob.as_ref().is_some_and(|v| !v.is_empty())
-        || (account.auth_source == "oauth" && account.oauth_token.is_some())
+    match account.auth_source.as_str() {
+        "api_key" => {
+            account
+                .api_key_base_url
+                .as_deref()
+                .is_some_and(|v| !v.is_empty())
+                && account
+                    .api_key_secret
+                    .as_deref()
+                    .is_some_and(|v| !v.is_empty())
+        }
+        "oauth" => account.oauth_token.is_some(),
+        _ => account.cookie_blob.as_ref().is_some_and(|v| !v.is_empty()),
+    }
 }
 
 fn parse_db_invalid_reason(account: &AccountWithRuntime) -> Option<Reason> {
@@ -625,6 +637,23 @@ mod tests {
         let a = account(1, "oauth", "active", None, true, None);
         let h = compose_health(&a, PoolAccountView::default(), now());
         assert_eq!(h.state, AccountHealthState::Active);
+    }
+
+    #[test]
+    fn api_key_account_is_active_when_base_url_and_secret_present() {
+        let mut a = account(1, "api_key", "active", None, false, None);
+        a.api_key_base_url = Some("https://api.anthropic.com/".to_string());
+        a.api_key_secret = Some("sk-ant-test".to_string());
+        let h = compose_health(&a, PoolAccountView::default(), now());
+        assert_eq!(h.state, AccountHealthState::Active);
+    }
+
+    #[test]
+    fn api_key_account_without_secret_is_unconfigured() {
+        let mut a = account(1, "api_key", "active", None, false, None);
+        a.api_key_base_url = Some("https://api.anthropic.com/".to_string());
+        let h = compose_health(&a, PoolAccountView::default(), now());
+        assert_eq!(h.state, AccountHealthState::Unconfigured);
     }
 
     #[test]
