@@ -290,7 +290,20 @@ fn read_cell(row: &sqlx::sqlite::SqliteRow, name: &str) -> Result<CellValue, Cle
 ///   authenticate — the operator must rotate keys after restore.
 pub fn secret_columns_for(table: &str) -> &'static [&'static str] {
     match table {
-        "accounts" => &["cookie_blob", "oauth_access_token", "oauth_refresh_token"],
+        "accounts" => &[
+            "cookie_blob",
+            "oauth_access_token",
+            "oauth_refresh_token",
+            // Step 5 / C11: ApiKey credentials are secrets too.
+            // `api_key_secret` is the bearer-equivalent; the
+            // `api_key_extra_headers` JSON column carries per-account
+            // header values (e.g. `anthropic-workspace-id`) that PRD
+            // §Security classifies as secret. `api_key_base_url` is
+            // admin-supplied metadata and stays in the bundle so the
+            // operator can rebuild the account after rotating keys.
+            "api_key_secret",
+            "api_key_extra_headers",
+        ],
         "api_keys" => &["plaintext_key", "key_hash"],
         "proxies" => &["password"],
         "users" => &["password_hash"],
@@ -426,6 +439,16 @@ mod tests {
                 "oauth_refresh_token".to_string(),
                 CellValue::Blob(vec![0xAA]),
             );
+            // Step 5 / C11: ApiKey-shaped secrets also fall under
+            // accounts redaction.
+            row.insert(
+                "api_key_secret".to_string(),
+                CellValue::Text("sk-ant-test".to_string()),
+            );
+            row.insert(
+                "api_key_extra_headers".to_string(),
+                CellValue::Text(r#"{"anthropic-workspace-id":"ws-secret"}"#.to_string()),
+            );
         }
         vec![row]
     }
@@ -438,9 +461,11 @@ mod tests {
         // Non-secret columns untouched
         assert_eq!(row["id"], CellValue::Integer(1));
         assert_eq!(row["name"], CellValue::Text("acct".to_string()));
-        // Secret columns nulled
+        // Secret columns nulled (cookie + oauth + api_key shapes)
         assert_eq!(row["cookie_blob"], CellValue::Null);
         assert_eq!(row["oauth_refresh_token"], CellValue::Null);
+        assert_eq!(row["api_key_secret"], CellValue::Null);
+        assert_eq!(row["api_key_extra_headers"], CellValue::Null);
     }
 
     #[test]

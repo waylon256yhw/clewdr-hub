@@ -374,6 +374,25 @@ fn detect_redacted_bundle(bundle: &Bundle) -> Result<(), ClewdrError> {
                               Re-export without --no-secrets.",
                     });
                 }
+                // Step 5 / C11: ApiKey rows need both base_url AND
+                // secret. `api_key_base_url` is admin-supplied and
+                // NOT redacted (it's metadata, not a credential), so
+                // a `--no-secrets` bundle will have base_url present
+                // but secret NULL. The mutex CHECK on the destination
+                // schema would reject the partial row at INSERT time
+                // anyway; catching it here gives the operator a clear
+                // message pointing at the right fix instead of a raw
+                // SQLite constraint violation.
+                "api_key"
+                    if null_or_missing("api_key_secret") || null_or_missing("api_key_base_url") =>
+                {
+                    return Err(ClewdrError::BadRequest {
+                        msg: "bundle has accounts row with api_key auth but api_key_secret or \
+                              api_key_base_url is NULL — this bundle was produced with --no-secrets \
+                              and cannot be imported. Re-export without --no-secrets, or recreate \
+                              the api_key account after a partial restore.",
+                    });
+                }
                 _ => {}
             }
         }
@@ -1785,6 +1804,85 @@ mod tests {
         // The actual contract:
         assert!(detect_redacted_bundle(&bundle).is_err());
         pool.close().await;
+    }
+
+    /// Step 5 / C11: a `--no-secrets` bundle that contains an api_key
+    /// account must be refused with an explicit error pointing at the
+    /// right fix, not silently imported as a half-credential row that
+    /// the schema mutex CHECK would then reject at INSERT time.
+    #[test]
+    fn detect_redacted_bundle_rejects_api_key_row_with_null_secret() {
+        use crate::cli::bundle::CellValue;
+
+        let mut row: std::collections::BTreeMap<String, CellValue> =
+            std::collections::BTreeMap::new();
+        row.insert("id".to_string(), CellValue::Integer(1));
+        row.insert("name".to_string(), CellValue::Text("acct".to_string()));
+        row.insert(
+            "auth_source".to_string(),
+            CellValue::Text("api_key".to_string()),
+        );
+        row.insert(
+            "api_key_base_url".to_string(),
+            CellValue::Text("https://api.anthropic.com/".to_string()),
+        );
+        // Secret nulled (simulating --no-secrets).
+        row.insert("api_key_secret".to_string(), CellValue::Null);
+
+        let bundle = Bundle {
+            version: 1,
+            produced_at: "2026-05-25T00:00:00Z".to_string(),
+            clewdr_version: env!("CARGO_PKG_VERSION").to_string(),
+            schema: std::collections::BTreeMap::new(),
+            config_toml: String::new(),
+            tables: std::collections::BTreeMap::from([("accounts".to_string(), vec![row])]),
+            skipped: Vec::new(),
+        };
+
+        let err = detect_redacted_bundle(&bundle).unwrap_err();
+        assert!(matches!(err, ClewdrError::BadRequest { .. }));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("api_key"),
+            "error message should mention api_key, got: {msg}"
+        );
+    }
+
+    /// Companion: a complete api_key row (both base_url AND secret
+    /// present) must pass the redaction check so legitimate full
+    /// bundles continue to import.
+    #[test]
+    fn detect_redacted_bundle_accepts_complete_api_key_row() {
+        use crate::cli::bundle::CellValue;
+
+        let mut row: std::collections::BTreeMap<String, CellValue> =
+            std::collections::BTreeMap::new();
+        row.insert("id".to_string(), CellValue::Integer(1));
+        row.insert("name".to_string(), CellValue::Text("acct".to_string()));
+        row.insert(
+            "auth_source".to_string(),
+            CellValue::Text("api_key".to_string()),
+        );
+        row.insert(
+            "api_key_base_url".to_string(),
+            CellValue::Text("https://api.anthropic.com/".to_string()),
+        );
+        row.insert(
+            "api_key_secret".to_string(),
+            CellValue::Text("sk-ant-test".to_string()),
+        );
+
+        let bundle = Bundle {
+            version: 1,
+            produced_at: "2026-05-25T00:00:00Z".to_string(),
+            clewdr_version: env!("CARGO_PKG_VERSION").to_string(),
+            schema: std::collections::BTreeMap::new(),
+            config_toml: String::new(),
+            tables: std::collections::BTreeMap::from([("accounts".to_string(), vec![row])]),
+            skipped: Vec::new(),
+        };
+
+        assert!(detect_redacted_bundle(&bundle).is_ok());
     }
 
     #[tokio::test]
