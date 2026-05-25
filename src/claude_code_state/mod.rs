@@ -389,17 +389,22 @@ impl ClaudeCodeState {
     }
 
     pub fn check_token(&self) -> TokenStatus {
-        // NB: no ApiKey short-circuit here. Returning `Valid` for ApiKey
-        // is tempting (it has no expiring bearer to refresh) but the
-        // try_chat / try_count_tokens access-token extraction sites
-        // (chat.rs::send_chat preamble, chat.rs::perform_count_tokens
-        // preamble) unconditionally read the bearer out of
-        // `oauth_token`/`cookie.token` after a Valid verdict, and an
-        // ApiKey slot has neither — yielding `UnexpectedNone("No access
-        // token found in cookie")`. C8 lands the retry-loop ApiKey
-        // bypass that skips the entire token ladder *and* the bearer
-        // extraction in one site, at which point this short-circuit
-        // can come back without leaking through the cracks.
+        // ApiKey accounts authenticate via `x-api-key` on every send;
+        // there is no bearer to refresh, so the OAuth/cookie token
+        // ladder below does not apply. The retry loop in
+        // `try_chat`/`try_count_tokens` short-circuits the entire
+        // ladder (and the bearer extraction) before reaching here for
+        // an ApiKey slot, so this branch is mostly defensive — but
+        // any code path that ever calls `check_token` on an ApiKey
+        // slot deserves a sensible answer rather than the falsey
+        // `None` that the cookie/oauth ladder would produce.
+        if self
+            .cookie
+            .as_ref()
+            .is_some_and(|s| s.auth_method == AuthMethod::ApiKey)
+        {
+            return TokenStatus::Valid;
+        }
         if let Some(token_info) = &self.oauth_token {
             if token_info.is_expired() {
                 return TokenStatus::Expired;

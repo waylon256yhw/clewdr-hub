@@ -362,6 +362,37 @@ impl ClaudeCodeState {
         }
     }
 
+    /// Mark an ApiKey account as `auth_error` after a terminal-auth
+    /// failure (401/403 from upstream). Same DB shape as the OAuth
+    /// sibling — `auth_error` status + `last_failure` context — minus
+    /// the oauth-flavored token clearing (ApiKey credentials live in
+    /// `api_key_secret`, not the `oauth_*` columns).
+    ///
+    /// The pool `invalidate` step kicks the account out of dispatch
+    /// and clears any affinity pointing at it, so subsequent
+    /// `try_chat` calls do not re-pick this slot until an admin
+    /// re-enables it.
+    async fn mark_api_key_account_auth_error(
+        &mut self,
+        account_id: i64,
+        message: String,
+        persisted: AccountFailureContextPersisted,
+    ) {
+        let Some(db) = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()) else {
+            return;
+        };
+        if let Err(db_err) = set_account_auth_error(&db, account_id, &message).await {
+            warn!("Failed to set ApiKey auth_error for account {account_id}: {db_err}");
+            return;
+        }
+        if let Err(db_err) = set_account_last_failure(&db, account_id, Some(&persisted)).await {
+            warn!("Failed to persist ApiKey last_failure for account {account_id}: {db_err}");
+        }
+        self.account_pool_handle
+            .invalidate(account_id, Reason::Null)
+            .await;
+    }
+
     async fn persist_oauth_refresh(&mut self, account_id: i64) -> Result<(), ClewdrError> {
         let Some(fallback) = self.oauth_token.clone() else {
             return Ok(());
@@ -481,9 +512,10 @@ impl ClaudeCodeState {
             let cookie = state.acquire_account().await?;
             let account_id = cookie.account_id;
             let is_pure_oauth_slot = cookie.auth_method == AuthMethod::OAuth;
+            let is_api_key_slot = cookie.auth_method == AuthMethod::ApiKey;
             // Pure oauth slots have no real cookie-backed reauth path, so hoist
             // their token into `oauth_token`. Cookie-backed slots keep using the
-            // historic cookie/token path.
+            // historic cookie/token path. ApiKey slots have no bearer at all.
             if is_pure_oauth_slot {
                 state.oauth_token = cookie.token.clone();
             } else {
@@ -504,6 +536,17 @@ impl ClaudeCodeState {
             let slot_handle = slot_guard.handle();
 
             let retry = async {
+                // ApiKey bypasses the entire bearer-token ladder: the
+                // slot has no expiring bearer to refresh and no cookie
+                // exchange to perform. `execute_claude_request`'s
+                // ApiKey arm reads `self.api_key` directly and ignores
+                // the access_token param, so empty-string passes
+                // through cleanly.
+                if is_api_key_slot {
+                    return state
+                        .send_chat(String::new(), p, Some(slot_handle.clone()))
+                        .await;
+                }
                 match state.check_token() {
                     TokenStatus::None => {
                         if is_pure_oauth_slot {
@@ -605,6 +648,64 @@ impl ClaudeCodeState {
                             return Err(ClewdrError::UpstreamCoolingDown);
                         }
                         return Err(e);
+                    }
+                    if is_api_key_slot {
+                        slot_guard.finish().await;
+                        error!(
+                            "[{}] {}",
+                            state.cookie.as_ref().unwrap().credential_label().green(),
+                            e
+                        );
+                        // Classify through the unified pipeline, then
+                        // demote Cooldown→TransientUpstream locally —
+                        // PRD Decision 2: ApiKey has no quota window
+                        // and no cooldown semantics, so 429 must not
+                        // park the account. C9 lifts the demotion into
+                        // the classifier's 4th `auth_method` param so
+                        // every classification site shares it; until
+                        // then this site-local mapping suffices.
+                        let verdict = classify_account_failure(&e, FailureSource::Messages, None);
+                        let action = match verdict.action {
+                            AccountFailureAction::Cooldown { .. } => {
+                                AccountFailureAction::TransientUpstream
+                            }
+                            other => other,
+                        };
+                        match action {
+                            AccountFailureAction::TerminalAuth
+                            | AccountFailureAction::TerminalDisabled => {
+                                if let Some(aid) = account_id {
+                                    let persisted = AccountFailureContextPersisted::from(&verdict);
+                                    state
+                                        .mark_api_key_account_auth_error(
+                                            aid,
+                                            e.to_string(),
+                                            persisted,
+                                        )
+                                        .await;
+                                }
+                                return Err(e);
+                            }
+                            AccountFailureAction::TransientUpstream => {
+                                // No cooldown reason — return slot to
+                                // the `valid` bucket and retry against
+                                // the next account.
+                                state.release_account(None).await;
+                                continue;
+                            }
+                            AccountFailureAction::Cooldown { .. } => {
+                                unreachable!("Cooldown demoted to TransientUpstream above");
+                            }
+                            AccountFailureAction::InternalError => {
+                                // Classifier signaled "do not change
+                                // account state" (local logic error,
+                                // not an upstream verdict). Surface
+                                // the error without mutating the slot
+                                // and without retrying — a retry would
+                                // hit the same path.
+                                return Err(e);
+                            }
+                        }
                     }
                     slot_guard.finish().await;
                     error!(
@@ -752,6 +853,18 @@ impl ClaudeCodeState {
     }
 
     async fn persist_count_tokens_allowed(&mut self, value: bool) {
+        // ApiKey accounts always allow count_tokens via direct API — the
+        // `count_tokens_allowed` field is subscription-runtime metadata
+        // (cookie/OAuth slots may be gated by the upstream's per-account
+        // permission), so persisting it for ApiKey is a no-op write that
+        // wastes a DB roundtrip + slot flush.
+        if self
+            .cookie
+            .as_ref()
+            .is_some_and(|s| s.auth_method == AuthMethod::ApiKey)
+        {
+            return;
+        }
         if let Some(cookie) = self.cookie.as_mut() {
             if cookie.count_tokens_allowed == Some(value) {
                 return;
@@ -832,6 +945,7 @@ impl ClaudeCodeState {
             let cookie = state.acquire_account().await?;
             let account_id = cookie.account_id;
             let is_pure_oauth_slot = cookie.auth_method == AuthMethod::OAuth;
+            let is_api_key_slot = cookie.auth_method == AuthMethod::ApiKey;
             if is_pure_oauth_slot {
                 state.oauth_token = cookie.token.clone();
             } else {
@@ -853,6 +967,13 @@ impl ClaudeCodeState {
                 return Ok(response);
             }
             let retry = async {
+                // Mirror of try_chat's ApiKey bypass: no bearer-token
+                // ladder, no access_token extraction. The send arm
+                // (execute_claude_count_tokens_request's ApiKey
+                // branch, C7) consumes self.api_key directly.
+                if is_api_key_slot {
+                    return state.perform_count_tokens(String::new(), p).await;
+                }
                 match state.check_token() {
                     TokenStatus::None => {
                         if is_pure_oauth_slot {
@@ -945,6 +1066,53 @@ impl ClaudeCodeState {
                         }
                         return Err(e);
                     }
+                    if is_api_key_slot {
+                        slot_guard.finish().await;
+                        error!(
+                            "[{}][TOKENS] {}",
+                            state.cookie.as_ref().unwrap().credential_label().green(),
+                            e
+                        );
+                        // Mirror of try_chat's ApiKey error arm — see
+                        // the equivalent comment there. The single
+                        // shape difference is FailureSource::CountTokens
+                        // so AccountHealth reports the right entry
+                        // point.
+                        let verdict =
+                            classify_account_failure(&e, FailureSource::CountTokens, None);
+                        let action = match verdict.action {
+                            AccountFailureAction::Cooldown { .. } => {
+                                AccountFailureAction::TransientUpstream
+                            }
+                            other => other,
+                        };
+                        match action {
+                            AccountFailureAction::TerminalAuth
+                            | AccountFailureAction::TerminalDisabled => {
+                                if let Some(aid) = account_id {
+                                    let persisted = AccountFailureContextPersisted::from(&verdict);
+                                    state
+                                        .mark_api_key_account_auth_error(
+                                            aid,
+                                            e.to_string(),
+                                            persisted,
+                                        )
+                                        .await;
+                                }
+                                return Err(e);
+                            }
+                            AccountFailureAction::TransientUpstream => {
+                                state.release_account(None).await;
+                                continue;
+                            }
+                            AccountFailureAction::Cooldown { .. } => {
+                                unreachable!("Cooldown demoted to TransientUpstream above");
+                            }
+                            AccountFailureAction::InternalError => {
+                                return Err(e);
+                            }
+                        }
+                    }
                     slot_guard.finish().await;
                     error!(
                         "[{}][TOKENS] {}",
@@ -1032,6 +1200,19 @@ impl ClaudeCodeState {
 
     async fn persist_usage_totals(&mut self, input: u64, output: u64, family: ModelFamily) {
         if input == 0 && output == 0 {
+            return;
+        }
+        // ApiKey accounts have no quota window / usage buckets — the
+        // subscription runtime fields (`*_input_tokens`, `*_output_tokens`,
+        // boundaries) are unused. The per-request billing tally written
+        // by `persist_billing_to_db` in `handle_success_response` is
+        // account-agnostic and continues to run; this site only persists
+        // the cookie-specific quota counters.
+        if self
+            .cookie
+            .as_ref()
+            .is_some_and(|s| s.auth_method == AuthMethod::ApiKey)
+        {
             return;
         }
         if let Some(cookie) = self.cookie.as_mut() {
@@ -1171,23 +1352,36 @@ impl ClaudeCodeState {
                             let total_cc = ccsum.load(Ordering::Relaxed);
                             let total_cr = crsum.load(Ordering::Relaxed);
 
-                            // Cookie persistence + slot release
+                            // Cookie persistence + slot release.
+                            // ApiKey skips the runtime persist (no
+                            // quota buckets to add into, no boundary
+                            // refresh) but still must release the slot
+                            // back to the pool. Billing persistence
+                            // below is account-agnostic.
                             if let (Some(cookie), handle) = (cookie.clone(), handle.clone()) {
                                 let mut c = cookie.clone();
                                 let aid = stream_account_id;
                                 let released = slot_released_inner.clone();
+                                let skip_runtime = c.auth_method == AuthMethod::ApiKey;
                                 tokio::spawn(async move {
-                                    ClaudeCodeState::update_cookie_boundaries_if_due(
-                                        &mut c, &handle,
-                                    )
-                                    .await;
-                                    c.add_and_bucket_usage(total_input, total_out, family);
-                                    if let Some(account_id) = c.account_id {
-                                        let update = c.to_runtime_params();
-                                        let fingerprint = CredentialFingerprint::from_slot(&c);
-                                        let _ = handle
-                                            .release_runtime(account_id, update, None, fingerprint)
-                                            .await;
+                                    if !skip_runtime {
+                                        ClaudeCodeState::update_cookie_boundaries_if_due(
+                                            &mut c, &handle,
+                                        )
+                                        .await;
+                                        c.add_and_bucket_usage(total_input, total_out, family);
+                                        if let Some(account_id) = c.account_id {
+                                            let update = c.to_runtime_params();
+                                            let fingerprint = CredentialFingerprint::from_slot(&c);
+                                            let _ = handle
+                                                .release_runtime(
+                                                    account_id,
+                                                    update,
+                                                    None,
+                                                    fingerprint,
+                                                )
+                                                .await;
+                                        }
                                     }
                                     if let Some(aid) = aid
                                         && !released.swap(true, Ordering::Relaxed)
@@ -1295,24 +1489,37 @@ impl ClaudeCodeState {
                         tokio::spawn(async move {
                             if !completed {
                                 if let Some(mut cookie) = cookie {
-                                    if should_persist_usage {
-                                        ClaudeCodeState::update_cookie_boundaries_if_due(
-                                            &mut cookie,
-                                            &h,
-                                        )
-                                        .await;
-                                        cookie.add_and_bucket_usage(
-                                            total_input,
-                                            total_output,
-                                            family,
-                                        );
-                                    }
-                                    if let Some(account_id) = cookie.account_id {
-                                        let update = cookie.to_runtime_params();
-                                        let fingerprint = CredentialFingerprint::from_slot(&cookie);
-                                        let _ = h
-                                            .release_runtime(account_id, update, None, fingerprint)
+                                    // ApiKey: skip subscription-runtime
+                                    // persistence (no quota buckets, no
+                                    // boundary refresh). Billing
+                                    // terminal log + slot release below
+                                    // still run.
+                                    if cookie.auth_method != AuthMethod::ApiKey {
+                                        if should_persist_usage {
+                                            ClaudeCodeState::update_cookie_boundaries_if_due(
+                                                &mut cookie,
+                                                &h,
+                                            )
                                             .await;
+                                            cookie.add_and_bucket_usage(
+                                                total_input,
+                                                total_output,
+                                                family,
+                                            );
+                                        }
+                                        if let Some(account_id) = cookie.account_id {
+                                            let update = cookie.to_runtime_params();
+                                            let fingerprint =
+                                                CredentialFingerprint::from_slot(&cookie);
+                                            let _ = h
+                                                .release_runtime(
+                                                    account_id,
+                                                    update,
+                                                    None,
+                                                    fingerprint,
+                                                )
+                                                .await;
+                                        }
                                     }
                                 }
                                 if let Some(ctx) = billing_ctx {
