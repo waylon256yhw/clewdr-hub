@@ -192,7 +192,26 @@ fn strip_empty_text_blocks(blocks: &mut Vec<ContentBlock>) {
     });
 }
 
+fn has_non_empty_system(system: &Option<Value>) -> bool {
+    match system {
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Array(systems)) => systems.iter().any(|entry| match entry {
+            Value::String(text) => !text.trim().is_empty(),
+            Value::Object(obj) if matches!(obj.get("type"), Some(Value::String(t)) if t == "text") => {
+                obj.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty())
+            }
+            Value::Null => false,
+            other => !other.is_null(),
+        }),
+        Some(Value::Null) | None => false,
+        Some(_) => true,
+    }
+}
+
 pub(crate) fn drop_empty_message_text_blocks(body: &mut CreateMessageParams) {
+    let had_messages = !body.messages.is_empty();
     body.messages
         .retain_mut(|message| match &mut message.content {
             MessageContent::Text { content } => !content.is_empty(),
@@ -201,6 +220,11 @@ pub(crate) fn drop_empty_message_text_blocks(body: &mut CreateMessageParams) {
                 !content.is_empty()
             }
         });
+
+    if body.messages.is_empty() && had_messages && has_non_empty_system(&body.system) {
+        body.messages
+            .push(Message::new_text(Role::User, "Continue."));
+    }
 }
 
 pub(crate) fn strip_ephemeral_scope_from_system(system: &mut Value) {
@@ -719,6 +743,29 @@ mod tests {
         };
         assert_eq!(content.len(), 1);
         assert_eq!(content[0], ContentBlock::text("keep"));
+    }
+
+    #[test]
+    fn drop_empty_message_text_blocks_keeps_system_only_placeholder() {
+        let mut body = CreateMessageParams {
+            messages: vec![Message::new_blocks(
+                Role::User,
+                vec![ContentBlock::text("")],
+            )],
+            model: "claude-sonnet-4-5".to_string(),
+            system: Some(json!([{
+                "type": "text",
+                "text": "Answer from these instructions."
+            }])),
+            ..Default::default()
+        };
+
+        drop_empty_message_text_blocks(&mut body);
+
+        assert_eq!(
+            body.messages,
+            vec![Message::new_text(Role::User, "Continue.")]
+        );
     }
 
     #[test]
