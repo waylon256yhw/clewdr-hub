@@ -469,8 +469,8 @@ function PoliciesTab({ onEdit }: { onEdit: (policy: Policy) => void }) {
                     <Text size="xs" c="dimmed">并发 {p.max_concurrent} · RPM {p.rpm_limit}</Text>
                   </Table.Td>
                   <Table.Td>
-                    <Text size="xs">周 {formatCost(p.weekly_budget_nanousd)}</Text>
-                    <Text size="xs" c="dimmed">月 {formatCost(p.monthly_budget_nanousd)}</Text>
+                    <Text size="xs">周 {p.weekly_budget_nanousd === 0 ? "∞" : formatCost(p.weekly_budget_nanousd)}</Text>
+                    <Text size="xs" c="dimmed">月 {p.monthly_budget_nanousd === 0 ? "∞" : formatCost(p.monthly_budget_nanousd)}</Text>
                   </Table.Td>
                   <Table.Td visibleFrom="md">{p.assigned_user_count}</Table.Td>
                   <Table.Td>
