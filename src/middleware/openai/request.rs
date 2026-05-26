@@ -22,9 +22,10 @@ use serde_json::{Value, json};
 use crate::{
     db::models::AuthenticatedUser,
     middleware::claude::{
-        ClaudeContext, build_claude_context, claude_code_billing_header, drop_empty_system,
-        inject_metadata_user_id, normalize_sampling_params, prepend_system_blocks,
-        strip_billing_headers_from_system, strip_ephemeral_scope_from_system,
+        ClaudeContext, build_claude_context, claude_code_billing_header,
+        drop_empty_message_text_blocks, drop_empty_system, inject_metadata_user_id,
+        normalize_sampling_params, prepend_system_blocks, strip_billing_headers_from_system,
+        strip_ephemeral_scope_from_system,
     },
     stealth,
     types::{
@@ -500,6 +501,7 @@ where
         let (mut body, _stream) = translate_request(oai)?;
 
         drop_empty_system(&mut body);
+        drop_empty_message_text_blocks(&mut body);
 
         let profile = stealth::global_profile().load();
         normalize_sampling_params(&mut body, &profile);

@@ -263,6 +263,18 @@ impl ClaudeCodeState {
         }
     }
 
+    fn should_retry_api_key_transient(err: &ClewdrError) -> bool {
+        let ClewdrError::ClaudeHttpError { code, .. } = err else {
+            return true;
+        };
+
+        match code.as_u16() {
+            408 | 409 | 425 | 429 => true,
+            status if (400..500).contains(&status) => false,
+            _ => true,
+        }
+    }
+
     /// Step 3.5 C4b: persist a pre-classified structured failure
     /// context to `accounts.last_failure_json` for AccountHealth
     /// display. Used by both OAuth and cookie failure paths in the
@@ -721,9 +733,15 @@ impl ClaudeCodeState {
                             }
                             AccountFailureAction::TransientUpstream => {
                                 // No cooldown reason — return slot to
-                                // the `valid` bucket and retry against
-                                // the next account.
+                                // the `valid` bucket. Retry only for
+                                // statuses that may succeed against a
+                                // different account or after a short
+                                // upstream blip; caller/request 4xx
+                                // errors should surface directly.
                                 state.release_account(None).await;
+                                if !Self::should_retry_api_key_transient(&e) {
+                                    return Err(e);
+                                }
                                 continue;
                             }
                             AccountFailureAction::Cooldown { .. } => {
@@ -1158,6 +1176,9 @@ impl ClaudeCodeState {
                             }
                             AccountFailureAction::TransientUpstream => {
                                 state.release_account(None).await;
+                                if !Self::should_retry_api_key_transient(&e) {
+                                    return Err(e);
+                                }
                                 continue;
                             }
                             AccountFailureAction::Cooldown { .. } => {
@@ -2136,6 +2157,46 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn api_key_transient_retry_policy_does_not_retry_caller_4xx() {
+        use crate::error::ClaudeErrorBody;
+        use serde_json::json;
+        use wreq::StatusCode;
+
+        let http = |status: u16, kind: &str| ClewdrError::ClaudeHttpError {
+            code: StatusCode::from_u16(status).unwrap(),
+            inner: Box::new(ClaudeErrorBody {
+                message: json!("upstream"),
+                r#type: kind.to_string(),
+                code: Some(status),
+                ..Default::default()
+            }),
+        };
+
+        assert!(!ClaudeCodeState::should_retry_api_key_transient(&http(
+            400,
+            "invalid_request_error"
+        )));
+        assert!(!ClaudeCodeState::should_retry_api_key_transient(&http(
+            422,
+            "invalid_request_error"
+        )));
+        assert!(ClaudeCodeState::should_retry_api_key_transient(&http(
+            429,
+            "rate_limit_error"
+        )));
+        assert!(ClaudeCodeState::should_retry_api_key_transient(&http(
+            500,
+            "api_error"
+        )));
+        assert!(ClaudeCodeState::should_retry_api_key_transient(
+            &ClewdrError::Whatever {
+                message: "temporary transport wrapper".to_string(),
+                source: None,
+            }
+        ));
     }
 
     /// `try_chat` and `try_count_tokens` route to the OAuth bearer path

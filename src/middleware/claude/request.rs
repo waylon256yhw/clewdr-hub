@@ -177,6 +177,32 @@ pub(crate) fn drop_empty_system(body: &mut CreateMessageParams) {
     body.system = (!is_empty).then_some(system);
 }
 
+fn strip_empty_text_blocks(blocks: &mut Vec<ContentBlock>) {
+    for block in blocks.iter_mut() {
+        if let ContentBlock::SearchResult { content, .. } = block {
+            strip_empty_text_blocks(content);
+        }
+    }
+
+    blocks.retain(|block| {
+        !matches!(
+            block,
+            ContentBlock::Text { text, .. } if text.is_empty()
+        )
+    });
+}
+
+pub(crate) fn drop_empty_message_text_blocks(body: &mut CreateMessageParams) {
+    body.messages
+        .retain_mut(|message| match &mut message.content {
+            MessageContent::Text { content } => !content.is_empty(),
+            MessageContent::Blocks { content } => {
+                strip_empty_text_blocks(content);
+                !content.is_empty()
+            }
+        });
+}
+
 pub(crate) fn strip_ephemeral_scope_from_system(system: &mut Value) {
     let Some(items) = system.as_array_mut() else {
         return;
@@ -496,6 +522,7 @@ where
         let Json(mut body) = Json::<CreateMessageParams>::from_request(req, &()).await?;
 
         drop_empty_system(&mut body);
+        drop_empty_message_text_blocks(&mut body);
 
         // Load runtime settings once so request normalization and billing-header
         // generation see the same profile snapshot.
@@ -667,6 +694,59 @@ mod tests {
             systems[0]["cache_control"]["type"].as_str(),
             Some("ephemeral")
         );
+    }
+
+    #[test]
+    fn drop_empty_message_text_blocks_removes_empty_text_and_empty_messages() {
+        let mut body = CreateMessageParams {
+            messages: vec![
+                Message::new_text(Role::User, ""),
+                Message::new_blocks(
+                    Role::User,
+                    vec![ContentBlock::text(""), ContentBlock::text("keep")],
+                ),
+                Message::new_blocks(Role::Assistant, vec![ContentBlock::text("")]),
+            ],
+            model: "claude-sonnet-4-5".to_string(),
+            ..Default::default()
+        };
+
+        drop_empty_message_text_blocks(&mut body);
+
+        assert_eq!(body.messages.len(), 1);
+        let MessageContent::Blocks { content } = &body.messages[0].content else {
+            panic!("expected block message");
+        };
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0], ContentBlock::text("keep"));
+    }
+
+    #[test]
+    fn drop_empty_message_text_blocks_cleans_nested_search_results() {
+        let mut body = CreateMessageParams {
+            messages: vec![Message::new_blocks(
+                Role::User,
+                vec![ContentBlock::SearchResult {
+                    content: vec![ContentBlock::text(""), ContentBlock::text("nested")],
+                    source: "https://example.com".to_string(),
+                    title: "result".to_string(),
+                    cache_control: None,
+                    citations: None,
+                }],
+            )],
+            model: "claude-sonnet-4-5".to_string(),
+            ..Default::default()
+        };
+
+        drop_empty_message_text_blocks(&mut body);
+
+        let MessageContent::Blocks { content } = &body.messages[0].content else {
+            panic!("expected block message");
+        };
+        let ContentBlock::SearchResult { content, .. } = &content[0] else {
+            panic!("expected search result");
+        };
+        assert_eq!(content, &vec![ContentBlock::text("nested")]);
     }
 
     fn body_with_session_and_system(session: &str, system_text: &str) -> CreateMessageParams {
