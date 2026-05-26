@@ -222,6 +222,12 @@ pub(crate) fn drop_empty_message_text_blocks(body: &mut CreateMessageParams) {
         });
 
     if body.messages.is_empty() && had_messages && has_non_empty_system(&body.system) {
+        fill_system_only_user_placeholder(body);
+    }
+}
+
+pub(crate) fn fill_system_only_user_placeholder(body: &mut CreateMessageParams) {
+    if body.messages.is_empty() && has_non_empty_system(&body.system) {
         body.messages
             .push(Message::new_text(Role::User, "Continue."));
     }

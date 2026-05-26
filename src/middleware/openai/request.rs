@@ -23,9 +23,9 @@ use crate::{
     db::models::AuthenticatedUser,
     middleware::claude::{
         ClaudeContext, build_claude_context, claude_code_billing_header,
-        drop_empty_message_text_blocks, drop_empty_system, inject_metadata_user_id,
-        normalize_sampling_params, prepend_system_blocks, strip_billing_headers_from_system,
-        strip_ephemeral_scope_from_system,
+        drop_empty_message_text_blocks, drop_empty_system, fill_system_only_user_placeholder,
+        inject_metadata_user_id, normalize_sampling_params, prepend_system_blocks,
+        strip_billing_headers_from_system, strip_ephemeral_scope_from_system,
     },
     stealth,
     types::{
@@ -502,6 +502,7 @@ where
 
         drop_empty_system(&mut body);
         drop_empty_message_text_blocks(&mut body);
+        fill_system_only_user_placeholder(&mut body);
 
         let profile = stealth::global_profile().load();
         normalize_sampling_params(&mut body, &profile);
@@ -648,6 +649,27 @@ mod tests {
             MessageContent::Text { content } => assert_eq!(content, "real"),
             _ => panic!("expected text"),
         }
+    }
+
+    #[test]
+    fn system_only_after_cleanup_gets_user_placeholder() {
+        let req = req_from_json(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {"role": "system", "content": "Rewrite the query."},
+                {"role": "user", "content": ""}
+            ]
+        }));
+        let (mut body, _) = translate_request(req).unwrap();
+
+        drop_empty_system(&mut body);
+        drop_empty_message_text_blocks(&mut body);
+        fill_system_only_user_placeholder(&mut body);
+
+        assert_eq!(
+            body.messages,
+            vec![Message::new_text(Role::User, "Continue.")]
+        );
     }
 
     #[test]
