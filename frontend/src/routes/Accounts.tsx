@@ -935,6 +935,7 @@ function AccountFormModal({
           />
           <Tabs
             value={tab}
+            keepMounted={false}
             onChange={(value) => {
               const nextTab = (value as "oauth" | "cookie" | "api_key") ?? "oauth";
               setTab(nextTab);
