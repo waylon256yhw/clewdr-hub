@@ -364,8 +364,8 @@ mod tests {
 
     #[test]
     fn cell_value_roundtrips_real() {
-        match round_trip(CellValue::Real(3.14159)) {
-            CellValue::Real(v) => assert!((v - 3.14159).abs() < 1e-9),
+        match round_trip(CellValue::Real(1.234_567)) {
+            CellValue::Real(v) => assert!((v - 1.234_567).abs() < 1e-9),
             other => panic!("expected Real, got {other:?}"),
         }
     }

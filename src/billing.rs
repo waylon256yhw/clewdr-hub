@@ -92,6 +92,7 @@ pub struct TerminalLogOptions<'a> {
 /// Canonical alias table for model normalization.
 /// Maps known model alias prefixes to pricing_key in model_pricing table.
 static KNOWN_ALIASES: &[(&str, &str)] = &[
+    ("claude-opus-4-8", "claude-opus-4-8"),
     ("claude-opus-4-7", "claude-opus-4-7"),
     ("claude-opus-4-6", "claude-opus-4-6"),
     ("claude-opus-4-5", "claude-opus-4-5"),

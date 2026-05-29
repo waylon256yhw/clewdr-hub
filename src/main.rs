@@ -54,32 +54,6 @@ fn admin_panel_url(addr: SocketAddr) -> String {
     format!("http://{}:{}", host, addr.port())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn interactive_bare_invocation_gets_friendly_default() {
-        let args = Args::default();
-        assert!(should_show_interactive_default(&args, 1, true));
-    }
-
-    #[test]
-    fn non_tty_bare_invocation_keeps_serve_compatibility() {
-        let args = Args::default();
-        assert!(!should_show_interactive_default(&args, 1, false));
-    }
-
-    #[test]
-    fn argv_or_explicit_serve_keeps_serve_path() {
-        let mut args = Args::default();
-        assert!(!should_show_interactive_default(&args, 2, true));
-
-        args.command = Some(Command::Serve);
-        assert!(!should_show_interactive_default(&args, 1, true));
-    }
-}
-
 /// Application entry point.
 ///
 /// Order matters here:
@@ -277,4 +251,30 @@ async fn serve() -> Result<(), ClewdrError> {
                 .expect("Failed to install Ctrl-C handler");
         })
         .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_bare_invocation_gets_friendly_default() {
+        let args = Args::default();
+        assert!(should_show_interactive_default(&args, 1, true));
+    }
+
+    #[test]
+    fn non_tty_bare_invocation_keeps_serve_compatibility() {
+        let args = Args::default();
+        assert!(!should_show_interactive_default(&args, 1, false));
+    }
+
+    #[test]
+    fn argv_or_explicit_serve_keeps_serve_path() {
+        let mut args = Args::default();
+        assert!(!should_show_interactive_default(&args, 2, true));
+
+        args.command = Some(Command::Serve);
+        assert!(!should_show_interactive_default(&args, 1, true));
+    }
 }

@@ -374,12 +374,13 @@ pub(crate) fn request_affinity_hash(
 /// When thinking is active (enabled or adaptive):
 ///   - `temperature` must be 1 or unset
 ///
-/// For Claude Opus 4.7 specifically, legacy `thinking.type=enabled` + `budget_tokens`
-/// is removed upstream: the OAuth surface silently ignores it (client asks for
-/// thinking, gets none), and the public API will 400. Rewrite to `thinking.type=adaptive`
-/// so pre-4.7 clients transparently keep a thinking chain. We pin
-/// `display="summarized"` on the rewritten request so older callers see an explicit
-/// thinking summary instead of depending on upstream defaults, and explicitly pin
+/// For Opus families that dropped extended thinking budgets (4.7+), legacy
+/// `thinking.type=enabled` + `budget_tokens` is removed upstream: the OAuth
+/// surface silently ignores it (client asks for thinking, gets none), and the
+/// public API will 400. Rewrite to `thinking.type=adaptive` so pre-4.7 clients
+/// transparently keep a thinking chain. We pin `display="summarized"` on the
+/// rewritten request so older callers see an explicit thinking summary instead
+/// of depending on upstream defaults, and explicitly pin
 /// `output_config.effort="high"` when the legacy request did not set one.
 ///
 /// Operators can also enable an Opus-only effort override from the admin settings
@@ -399,8 +400,10 @@ pub(crate) fn normalize_sampling_params(body: &mut CreateMessageParams, profile:
         body.temperature = None;
     }
 
-    let mut rewrote_opus_4_7_legacy_thinking = false;
-    if is_opus_4_7(&body.model) {
+    let family = OpusFamily::detect(&body.model);
+
+    let mut rewrote_legacy_thinking = false;
+    if family.is_some_and(OpusFamily::requires_adaptive_thinking_rewrite) {
         let (rewritten, rewrote_legacy) = match body.thinking.take() {
             Some(Thinking::Enabled {
                 budget_tokens: _,
@@ -413,11 +416,11 @@ pub(crate) fn normalize_sampling_params(body: &mut CreateMessageParams, profile:
             ),
             other => (other, false),
         };
-        rewrote_opus_4_7_legacy_thinking = rewrote_legacy;
+        rewrote_legacy_thinking = rewrote_legacy;
         body.thinking = rewritten;
     }
 
-    if rewrote_opus_4_7_legacy_thinking {
+    if rewrote_legacy_thinking {
         body.output_config
             .get_or_insert_with(default_output_config)
             .effort
@@ -427,7 +430,7 @@ pub(crate) fn normalize_sampling_params(body: &mut CreateMessageParams, profile:
     if let Some(force_output_effort) = profile
         .force_output_effort
         .as_ref()
-        .and_then(|effort| remap_forced_output_effort(&body.model, effort))
+        .and_then(|effort| family.map(|f| f.clamp_forced_effort(effort)))
     {
         body.output_config
             .get_or_insert_with(default_output_config)
@@ -442,42 +445,57 @@ fn default_output_config() -> OutputConfig {
     }
 }
 
-fn is_opus_4_7(model: &str) -> bool {
-    matches_model_with_optional_date_suffix(model, "claude-opus-4-7")
+/// Capability matrix for the supported Claude Opus families.
+///
+/// Adding a new Opus model means: extend the enum, add a row to
+/// [`OpusFamily::detect`], and slot it into the two `match` arms below. Other
+/// callers only see `Option<OpusFamily>`, so non-Opus models keep transparent
+/// pass-through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpusFamily {
+    V4_5,
+    V4_6,
+    V4_7,
+    V4_8,
 }
 
-fn is_opus_4_6(model: &str) -> bool {
-    matches_model_with_optional_date_suffix(model, "claude-opus-4-6")
-}
-
-fn is_opus_4_5(model: &str) -> bool {
-    matches_model_with_optional_date_suffix(model, "claude-opus-4-5")
-}
-
-fn remap_forced_output_effort(model: &str, effort: &OutputEffort) -> Option<OutputEffort> {
-    if is_opus_4_7(model) {
-        return Some(effort.clone());
+impl OpusFamily {
+    fn detect(model: &str) -> Option<Self> {
+        const TABLE: &[(&str, OpusFamily)] = &[
+            ("claude-opus-4-8", OpusFamily::V4_8),
+            ("claude-opus-4-7", OpusFamily::V4_7),
+            ("claude-opus-4-6", OpusFamily::V4_6),
+            ("claude-opus-4-5", OpusFamily::V4_5),
+        ];
+        TABLE.iter().find_map(|&(prefix, family)| {
+            matches_model_with_optional_date_suffix(model, prefix).then_some(family)
+        })
     }
 
-    if is_opus_4_6(model) {
-        return Some(match effort {
-            OutputEffort::XHigh => OutputEffort::Max,
-            OutputEffort::Low => OutputEffort::Low,
-            OutputEffort::Medium => OutputEffort::Medium,
-            OutputEffort::High => OutputEffort::High,
-            OutputEffort::Max => OutputEffort::Max,
-        });
+    /// 4.7+ removed extended thinking budgets, so legacy `enabled` requests must
+    /// be rewritten to `adaptive` before going upstream.
+    fn requires_adaptive_thinking_rewrite(self) -> bool {
+        matches!(self, Self::V4_7 | Self::V4_8)
     }
 
-    if is_opus_4_5(model) {
-        return Some(match effort {
-            OutputEffort::Low => OutputEffort::Low,
-            OutputEffort::Medium => OutputEffort::Medium,
-            OutputEffort::High | OutputEffort::XHigh | OutputEffort::Max => OutputEffort::High,
-        });
+    /// Map an admin-forced effort level onto the highest level this family
+    /// actually supports.
+    fn clamp_forced_effort(self, effort: &OutputEffort) -> OutputEffort {
+        match self {
+            Self::V4_5 => match effort {
+                OutputEffort::Low => OutputEffort::Low,
+                OutputEffort::Medium => OutputEffort::Medium,
+                OutputEffort::High | OutputEffort::XHigh | OutputEffort::Max => OutputEffort::High,
+            },
+            Self::V4_6 => match effort {
+                OutputEffort::Low => OutputEffort::Low,
+                OutputEffort::Medium => OutputEffort::Medium,
+                OutputEffort::High => OutputEffort::High,
+                OutputEffort::XHigh | OutputEffort::Max => OutputEffort::Max,
+            },
+            Self::V4_7 | Self::V4_8 => effort.clone(),
+        }
     }
-
-    None
 }
 
 fn matches_model_with_optional_date_suffix(model: &str, prefix: &str) -> bool {
@@ -1149,5 +1167,65 @@ mod tests {
         normalize_sampling_params(&mut body, &profile);
         assert_eq!(body.temperature, Some(0.7));
         assert!(body.output_config.is_none());
+    }
+
+    #[test]
+    fn normalize_opus_4_8_rewrites_enabled_thinking_to_adaptive() {
+        let mut body = make_body(Some(Thinking::new(8000)), Some(0.7), None, None);
+        body.model = "claude-opus-4-8-20260528".to_string();
+        normalize_sampling_params(&mut body, &StealthProfile::default());
+        assert!(matches!(
+            body.thinking,
+            Some(Thinking::Adaptive {
+                display: Some(ThinkingDisplay::Summarized)
+            })
+        ));
+        assert!(matches!(
+            body.output_config,
+            Some(OutputConfig {
+                effort: Some(OutputEffort::High),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn normalize_forced_effort_keeps_all_levels_for_opus_4_8() {
+        let mut body = make_body(None, Some(0.7), None, None);
+        body.model = "claude-opus-4-8".to_string();
+        let profile = StealthProfile {
+            force_output_effort: Some(OutputEffort::XHigh),
+            ..StealthProfile::default()
+        };
+        normalize_sampling_params(&mut body, &profile);
+        assert!(matches!(
+            body.output_config,
+            Some(OutputConfig {
+                effort: Some(OutputEffort::XHigh),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn opus_family_detect_covers_bare_and_dated_ids() {
+        assert_eq!(
+            OpusFamily::detect("claude-opus-4-8"),
+            Some(OpusFamily::V4_8)
+        );
+        assert_eq!(
+            OpusFamily::detect("claude-opus-4-7-20260416"),
+            Some(OpusFamily::V4_7)
+        );
+        assert_eq!(
+            OpusFamily::detect("claude-opus-4-6"),
+            Some(OpusFamily::V4_6)
+        );
+        assert_eq!(
+            OpusFamily::detect("claude-opus-4-5"),
+            Some(OpusFamily::V4_5)
+        );
+        assert_eq!(OpusFamily::detect("claude-sonnet-4-6"), None);
+        assert_eq!(OpusFamily::detect("claude-opus-4-7-preview1"), None);
     }
 }

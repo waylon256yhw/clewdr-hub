@@ -392,7 +392,7 @@ async fn v1_models_list_is_public_and_seeded() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response_json(response).await;
     assert!(body["data"].as_array().unwrap().len() >= 3);
-    assert_eq!(body["first_id"], "claude-opus-4-7");
+    assert_eq!(body["first_id"], "claude-opus-4-8");
 }
 
 #[tokio::test]

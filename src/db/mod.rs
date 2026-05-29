@@ -228,6 +228,7 @@ pub async fn reset_admin_password(
 }
 
 const DEFAULT_MODELS: &[(&str, &str, i32)] = &[
+    ("claude-opus-4-8", "Claude Opus 4.8", 3),
     ("claude-opus-4-7", "Claude Opus 4.7", 5),
     ("claude-opus-4-6", "Claude Opus 4.6", 10),
     ("claude-opus-4-5", "Claude Opus 4.5", 20),
@@ -235,7 +236,6 @@ const DEFAULT_MODELS: &[(&str, &str, i32)] = &[
     ("claude-sonnet-4-6", "Claude Sonnet 4.6", 50),
     ("claude-sonnet-4-5", "Claude Sonnet 4.5", 60),
     ("claude-haiku-4-5", "Claude Haiku 4.5", 80),
-    ("claude-haiku-3-5", "Claude Haiku 3.5", 90),
 ];
 
 pub async fn seed_models(pool: &SqlitePool) -> Result<(), ClewdrError> {

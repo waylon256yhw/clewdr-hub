@@ -829,6 +829,7 @@ impl ClaudeCodeState {
     ///   - `anthropic-beta`: from `api_key_beta_header(...)`, omitted
     ///     if empty (an empty value is worse than no header).
     ///   - Per-account extras after the reserved-name filter.
+    ///
     /// Notably absent: `User-Agent` (Chrome stealth UA is anti-detection
     /// for subscription reverse-proxy, meaningless on direct API and
     /// trip-wire for strict corporate proxies); `Authorization` (auth
