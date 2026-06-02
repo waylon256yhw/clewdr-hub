@@ -264,6 +264,7 @@ export default function Logs() {
     filters.user_id,
     filters.status,
     filters.model,
+    filters.model_key,
     filters.started_from,
   ].filter((value) => value !== undefined && value !== null && value !== "").length;
 
@@ -519,6 +520,10 @@ function parseFiltersFromSearch(search: string): RequestFilters | null {
   const request_type = params.get("request_type") ?? undefined;
   const status = params.get("status") ?? undefined;
   const model = params.get("model") ?? undefined;
+  // Ops drill-down hands us model_key for exact-match filtering. We do
+  // NOT also fall back to `model`, so a ranking row for "其他" stays
+  // un-clickable rather than accidentally substring-matching.
+  const model_key = params.get("model_key") ?? undefined;
   const started_from = params.get("started_from") ?? undefined;
   const started_to = params.get("started_to") ?? undefined;
   const rawUserId = params.get("user_id");
@@ -530,6 +535,7 @@ function parseFiltersFromSearch(search: string): RequestFilters | null {
     request_type !== undefined ||
     status !== undefined ||
     model !== undefined ||
+    model_key !== undefined ||
     started_from !== undefined ||
     started_to !== undefined ||
     user_id !== undefined;
@@ -540,6 +546,7 @@ function parseFiltersFromSearch(search: string): RequestFilters | null {
     request_type,
     status,
     model,
+    model_key,
     started_from,
     started_to,
     user_id,

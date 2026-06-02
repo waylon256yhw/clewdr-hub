@@ -345,6 +345,11 @@ export interface OpsUsageTotals {
   cost_nanousd: number;
 }
 
+// --- Legacy item shapes (pre-PR-B). PR-C consumes the structured
+// counterparts (`distribution` / `ranking` / `series` of `DimensionItem`
+// + `DimensionSeries`) instead, but the types stay exported because
+// the OpsUsageResponse keeps the legacy fields for one release.
+
 export interface ModelDistributionItem {
   model: string;
   request_count: number;
@@ -373,15 +378,108 @@ export interface UserSeries {
   points: UserSeriesPoint[];
 }
 
+// --- Structured Ops shapes (PR-B response). The page reads these
+// directly so it can render the new double-layer KPI / partial-bucket
+// markers / metric-aware ranking / per-user model drill-down.
+
+export type OpsMetric = "cost" | "tokens" | "requests";
+export type OpsRange = "24h" | "7d" | "30d";
+export type OpsDimension = "user" | "model";
+
+export interface OpsBucketLabel {
+  key: string;
+  /** True when the bucket overlaps "now" and is therefore still
+   *  accumulating — the chart marks these with reduced opacity. */
+  partial: boolean;
+}
+
+export interface OpsDimensionItem {
+  kind: OpsDimension;
+  user_id: number | null;
+  model_key: string | null;
+  label: string;
+  /** Synthesized "其他" aggregate row; click-drilldown is disabled. */
+  is_other_bucket: boolean;
+  request_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  total_tokens: number;
+  cost_nanousd: number;
+}
+
+export interface OpsSeriesPoint {
+  bucket: string;
+  partial: boolean;
+  request_count: number;
+  total_tokens: number;
+  cost_nanousd: number;
+}
+
+export interface OpsSeries {
+  kind: OpsDimension;
+  user_id: number | null;
+  model_key: string | null;
+  label: string;
+  points: OpsSeriesPoint[];
+}
+
+export interface OpsComparison {
+  /** Both windows are fully covered by the data source — only then are
+   *  the ratios meaningful. */
+  complete: boolean;
+  current_bucket_count: number;
+  expected_bucket_count: number;
+  /** Human-readable window range, UTC+8. Used in the metadata bar. */
+  window_label: string;
+  cost_ratio: number | null;
+  total_tokens_ratio: number | null;
+  request_count_ratio: number | null;
+}
+
+export interface OpsCoverage {
+  complete: boolean;
+  /** Includes the previous window — gates the comparison hint. */
+  comparison_complete: boolean;
+  writes_started_at: string | null;
+  backfill_available_from: string | null;
+  retention_days: number;
+  /** 24h only: earliest started_at the live logs can surface. */
+  logs_available_from: string | null;
+}
+
 export interface OpsUsageResponse {
-  range: string;
+  range: OpsRange;
+  metric: OpsMetric;
   bucket_unit: "hour" | "day";
+  dimension: OpsDimension;
   selected_user_id: number | null;
   retention_days: number;
-  coverage_limited: boolean;
   window_started_at: string;
   window_ended_at: string;
+  previous_window_started_at: string;
+  previous_window_ended_at: string;
+  /** Legacy: bucket keys only — kept for back-compat. PR-C reads
+   *  `bucket_labels` so the chart can mark partial buckets. */
   buckets: string[];
+  bucket_labels: OpsBucketLabel[];
+
+  window_totals: OpsUsageTotals;
+  previous_window_totals: OpsUsageTotals;
+  lifetime_totals: OpsUsageTotals;
+
+  comparison: OpsComparison;
+  coverage: OpsCoverage;
+
+  /** Always model-keyed. Top 8 + a synthesized "其他" aggregate. */
+  distribution: OpsDimensionItem[];
+  /** User-keyed when `selected_user_id` is null, model-keyed otherwise. */
+  ranking: OpsDimensionItem[];
+  series: OpsSeries[];
+
+  // Legacy fields, populated by backend for one release.
+  coverage_limited: boolean;
   totals: OpsUsageTotals;
   model_distribution: ModelDistributionItem[];
   top_users: UserAggregate[];
@@ -521,9 +619,14 @@ export const getCliVersions = (force?: boolean) =>
   apiFetch<CliVersionsResponse>(`/api/admin/cli-versions${force ? "?force=1" : ""}`);
 
 // Ops
-export const getOpsUsage = (range: string, topUsers = 5, userId?: number) =>
+export const getOpsUsage = (
+  range: OpsRange,
+  metric: OpsMetric,
+  topUsers = 5,
+  userId?: number,
+) =>
   apiFetch<OpsUsageResponse>("/api/admin/ops/usage", {
-    params: { range, top_users: topUsers, user_id: userId },
+    params: { range, metric, top_users: topUsers, user_id: userId },
   });
 
 // Requests
@@ -533,7 +636,11 @@ export interface RequestFilters {
   request_type?: string;
   user_id?: number;
   status?: string;
+  /** Legacy substring filter over model_raw / model_normalized. */
   model?: string;
+  /** Exact match on the canonical model_key (PR-B). Ops uses this when
+   *  drilling down from a donut slice or a ranking row. */
+  model_key?: string;
   started_from?: string;
   started_to?: string;
 }
@@ -582,8 +689,8 @@ export const qk = {
   keys: (userId?: number) => ["keys", userId] as const,
   settings: ["settings"] as const,
   models: ["models"] as const,
-  opsUsage: (range: string, topUsers: number, userId?: number) =>
-    ["opsUsage", range, topUsers, userId] as const,
+  opsUsage: (range: OpsRange, metric: OpsMetric, topUsers: number, userId?: number) =>
+    ["opsUsage", range, metric, topUsers, userId] as const,
   requests: (filters: RequestFilters) => ["requests", filters] as const,
   requestBody: (id: number) => ["request_body", id] as const,
 };
