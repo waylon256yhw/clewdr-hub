@@ -240,7 +240,13 @@ export default function Ops() {
   const windowTotals = data.window_totals;
   const ratio = comparisonRatioForMetric(metric, data);
   const windowMetricZero = metricValueFromTotals(windowTotals, metric) === 0;
-  const comparisonRender = renderComparisonRatio(ratio, windowMetricZero);
+  // When the backend says the comparison window is not fully covered,
+  // the displayed ratio would be misleading — render an em-dash and let
+  // the "数据积累中" hint carry the explanation instead of dressing an
+  // unreliable number up as a real KPI.
+  const comparisonRender: ComparisonRender = data.comparison.complete
+    ? renderComparisonRatio(ratio, windowMetricZero)
+    : { text: "—", trend: "none" };
   const comparisonHint = data.comparison.complete
     ? `对比上一${range === "24h" ? "24 小时" : range === "7d" ? "7 天" : "30 天"}（完整桶）`
     : "数据积累中";
@@ -538,9 +544,19 @@ export default function Ops() {
               <Table.Tbody>
                 {data.ranking.map((item, idx) => {
                   const clickable = !item.is_other_bucket;
+                  // The model ranking under a user filter has every row
+                  // share the same user_id, so user_id alone would
+                  // collide. Prefer model_key when the row IS a model;
+                  // fall back to idx for the synthesized "其他" row
+                  // whose user_id and model_key are both null.
+                  const rowKey = item.is_other_bucket
+                    ? `other:${idx}`
+                    : item.kind === "model"
+                      ? `model:${item.model_key ?? idx}`
+                      : `user:${item.user_id ?? idx}`;
                   return (
                     <Table.Tr
-                      key={`${item.kind}:${item.user_id ?? item.model_key ?? idx}`}
+                      key={rowKey}
                       style={{
                         cursor: clickable ? "pointer" : "default",
                         opacity: clickable ? 1 : 0.7,

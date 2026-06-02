@@ -317,8 +317,20 @@ export default function Logs() {
         label="模型"
         placeholder="全部"
         data={modelData}
-        value={filters.model ?? null}
-        onChange={(v) => updateFilter("model", v ?? undefined)}
+        // Model select drives the exact `model_key` filter (PR-B). The
+        // legacy substring `model` filter still works for bookmarks, but
+        // the dropdown manages model_key so an Ops drill-down lands with
+        // the right chip pre-selected. Switching or clearing here always
+        // clears the legacy field so the two never fight each other.
+        value={filters.model_key ?? null}
+        onChange={(v) =>
+          setFilters((f) => ({
+            ...f,
+            model_key: v || undefined,
+            model: undefined,
+            offset: 0,
+          }))
+        }
         clearable
         size="sm"
       />
