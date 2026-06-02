@@ -418,7 +418,7 @@ async fn coverage_24h_uses_min_started_at_clamp() {
     let resp = call_usage(pool, Some("24h"), None, None, None).await;
     assert!(resp.coverage.logs_available_from.is_some());
     let avail = resp.coverage.logs_available_from.as_deref().unwrap();
-    let avail_dt = parse_rfc3339(avail).unwrap();
+    let avail_dt = parse_timestamp_flexible(avail).unwrap();
     assert!(
         (avail_dt - six_h_ago).num_seconds().abs() < 5,
         "logs_available_from should clamp to the earliest row, got {avail}"
@@ -508,4 +508,96 @@ async fn series_points_align_with_bucket_keys() {
     let other = s.points.iter().find(|p| p.bucket != today).unwrap();
     assert_eq!(other.request_count, 0);
     assert!(!other.partial);
+}
+
+#[test]
+fn parse_timestamp_flexible_accepts_sqlite_and_rfc3339() {
+    // SQLite CURRENT_TIMESTAMP shape — what PR-A's migration seed and
+    // ensure_daily_rollup_state both write.
+    let sqlite_shape =
+        parse_timestamp_flexible("2026-06-02 12:34:56").expect("SQLite format must parse");
+    assert_eq!(
+        sqlite_shape.format("%Y-%m-%d %H:%M:%S").to_string(),
+        "2026-06-02 12:34:56"
+    );
+    // RFC3339 shape — what `chrono::DateTime<Utc>::to_rfc3339` emits, used
+    // by tests and any future Rust-side writers.
+    let rfc3339 = parse_timestamp_flexible("2026-06-02T12:34:56Z").expect("RFC3339 must parse");
+    assert_eq!(rfc3339, sqlite_shape);
+    // RFC3339 with offset normalises to UTC.
+    let with_offset = parse_timestamp_flexible("2026-06-02T20:34:56+08:00").expect("offset");
+    assert_eq!(with_offset, sqlite_shape);
+    // Malformed strings return None instead of panicking.
+    assert!(parse_timestamp_flexible("not-a-timestamp").is_none());
+    assert!(parse_timestamp_flexible("").is_none());
+}
+
+#[tokio::test]
+async fn coverage_7d_accepts_sqlite_writes_started_at_format() {
+    // Regression: PR-A's migration seeds writes_started_at with SQLite
+    // CURRENT_TIMESTAMP, which has no `T` separator and no `Z` suffix.
+    // PR-B's first parse pass only accepted RFC3339, so 7d coverage on
+    // any real deploy would have permanently reported "incomplete".
+    let pool = fresh_pool().await;
+    insert_user(&pool, 10, "alice").await;
+    // 30 days in the past, written in SQLite's native CURRENT_TIMESTAMP
+    // shape. This must be old enough that the 7d window and its previous
+    // 7d sit entirely after writes_started_at.
+    sqlx::query(
+        "UPDATE usage_daily_rollup_state
+         SET writes_started_at = strftime('%Y-%m-%d %H:%M:%S', datetime('now', '-30 days'))
+         WHERE id = 1",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let resp = call_usage(pool, Some("7d"), None, None, None).await;
+    assert!(
+        resp.coverage.complete,
+        "30d-old SQLite-format writes_started_at must cover the 7d window"
+    );
+    assert!(
+        resp.coverage.comparison_complete,
+        "30d-old writes_started_at must also cover the previous 7d window"
+    );
+    let written = resp.coverage.writes_started_at.expect("seeded by UPDATE");
+    assert!(
+        !written.contains('T'),
+        "writes_started_at should be returned verbatim in SQLite shape: {written}"
+    );
+}
+
+#[tokio::test]
+async fn ranking_and_series_stay_aligned_under_metric_ties() {
+    // When the SQL ORDER BY can't choose between two users with
+    // identical metric values, the table and the chart must still pick
+    // the same subjects. We force a 4-user tie on cost, ask for Top 2
+    // by cost, and verify series subjects are a subset of the
+    // non-other-bucket ranking entries.
+    let pool = fresh_pool().await;
+    insert_user(&pool, 10, "alice").await;
+    insert_user(&pool, 11, "bob").await;
+    insert_user(&pool, 12, "carol").await;
+    insert_user(&pool, 13, "dave").await;
+    let today = shanghai_today_string();
+    insert_daily(&pool, 10, "m", &today, 1, 100, 50, 5_000_000).await;
+    insert_daily(&pool, 11, "m", &today, 1, 100, 50, 5_000_000).await;
+    insert_daily(&pool, 12, "m", &today, 1, 100, 50, 5_000_000).await;
+    insert_daily(&pool, 13, "m", &today, 1, 100, 50, 5_000_000).await;
+
+    let resp = call_usage(pool, Some("7d"), Some("cost"), None, Some(2)).await;
+    let ranking_users: std::collections::BTreeSet<i64> = resp
+        .ranking
+        .iter()
+        .filter(|item| !item.is_other_bucket)
+        .filter_map(|item| item.user_id)
+        .collect();
+    let series_users: std::collections::BTreeSet<i64> =
+        resp.series.iter().filter_map(|s| s.user_id).collect();
+    assert_eq!(
+        ranking_users, series_users,
+        "ranking subjects and series subjects must agree even with tied metric values"
+    );
+    assert_eq!(series_users.len(), 2, "Top 2 honored");
 }

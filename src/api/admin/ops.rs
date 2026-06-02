@@ -1018,9 +1018,16 @@ async fn load_user_ranking_and_series(
         .collect();
     ranking = roll_up_into_other(ranking, top_n, metric);
 
-    // Series: per-bucket points for the top-N users (no "其他" row to keep
-    // the chart readable).
-    let top_user_ids: Vec<i64> = ranking_rows.iter().take(top_n).map(|r| r.user_id).collect();
+    // Series picks its subjects from the *final* ranking (sans the
+    // synthetic "其他" row) instead of re-running the SQL ORDER BY. The
+    // raw SQL would re-tiebreak with whatever indexscan order it picks
+    // for equal metric values, which can land on a different user than
+    // the one shown in the ranking table.
+    let top_user_ids: Vec<i64> = ranking
+        .iter()
+        .filter(|item| !item.is_other_bucket)
+        .filter_map(|item| item.user_id)
+        .collect();
     if top_user_ids.is_empty() {
         return Ok((ranking, Vec::new()));
     }
@@ -1254,10 +1261,13 @@ async fn load_model_ranking_and_series(
         .collect();
     ranking = roll_up_into_other(ranking, top_n, metric);
 
-    let top_models: Vec<String> = ranking_rows
+    // Mirror the user-dimension fix: derive series subjects from the
+    // final ranking so a metric tie can never desync the table and the
+    // chart.
+    let top_models: Vec<String> = ranking
         .iter()
-        .take(top_n)
-        .map(|r| r.model_key.clone())
+        .filter(|item| !item.is_other_bucket)
+        .filter_map(|item| item.model_key.clone())
         .collect();
     if top_models.is_empty() {
         return Ok((ranking, Vec::new()));
@@ -1444,7 +1454,10 @@ async fn build_coverage(
             // the window iff `writes_started_at` lands before the window
             // start. We do NOT include `backfill_available_from` in the
             // completeness check: per plan §6.6 it is a UI hint only.
-            let coverage_start = state.writes_started_at.as_deref().and_then(parse_rfc3339);
+            let coverage_start = state
+                .writes_started_at
+                .as_deref()
+                .and_then(parse_timestamp_flexible);
             let complete = match coverage_start {
                 Some(start) => start <= window.start_utc,
                 // No state row → assume not complete; this is the
@@ -1471,16 +1484,29 @@ fn effective_logs_available_from(
     min_started: Option<&str>,
     retention_cutoff: DateTime<Utc>,
 ) -> DateTime<Utc> {
-    match min_started.and_then(parse_rfc3339) {
+    match min_started.and_then(parse_timestamp_flexible) {
         Some(min) => min.max(retention_cutoff),
         None => retention_cutoff,
     }
 }
 
-fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s)
+/// Parse a timestamp produced either by sqlx (RFC3339 with `T` and a
+/// trailing `Z`) or by SQLite's `CURRENT_TIMESTAMP` (`YYYY-MM-DD
+/// HH:MM:SS` in UTC, no separator, no offset).
+///
+/// PR-A seeds `usage_daily_rollup_state.writes_started_at` via
+/// `CURRENT_TIMESTAMP`, so a strict RFC3339 parse here would make the
+/// 7d / 30d coverage check fail on every normal deployment and the page
+/// would permanently report "数据积累中". Tests cover both shapes.
+fn parse_timestamp_flexible(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    let s = s.trim();
+    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
         .ok()
-        .map(|dt| dt.with_timezone(&Utc))
+        .map(|naive| Utc.from_utc_datetime(&naive))
 }
 
 fn build_comparison(
