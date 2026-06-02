@@ -217,16 +217,16 @@ jobs:
             export RUSTFLAGS="-C target-feature=+crt-static"
           fi
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ steps.target.outputs.triple }} $FEATURE_ARGS
+            cross build --profile release-ci --target ${{ steps.target.outputs.triple }} $FEATURE_ARGS
           else
-            cargo build --release --target ${{ steps.target.outputs.triple }} $FEATURE_ARGS
+            cargo build --profile release-ci --target ${{ steps.target.outputs.triple }} $FEATURE_ARGS
           fi
 
       - name: Build with Android NDK
         if: ${{ matrix.os == 'android' }}
         run: |
           cargo install cargo-ndk
-          cargo ndk --target ${{ steps.target.outputs.triple }} build --release $FEATURE_ARGS
+          cargo ndk --target ${{ steps.target.outputs.triple }} build --profile release-ci $FEATURE_ARGS
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -234,7 +234,7 @@ jobs:
       - name: Move artifact to work dir and zip
         shell: bash
         run: |
-          mv target/${{ steps.target.outputs.triple }}/release/${{ env.BIN_NAME }} .
+          mv target/${{ steps.target.outputs.triple }}/release-ci/${{ env.BIN_NAME }} .
           mkdir -p release-package
           mv ${{ env.BIN_NAME }} release-package/
           if [ ${{ matrix.os }} == "android" ]; then

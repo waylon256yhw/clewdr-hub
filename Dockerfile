@@ -27,13 +27,13 @@ COPY --from=planner /build/recipe.json recipe.json
 
 # Build dependencies - this is the caching Docker layer.
 RUN mkdir -p ~/.cargo \
-    && cargo chef cook --release --no-default-features --features embed-resource,xdg,tui,encrypt --recipe-path recipe.json
+    && cargo chef cook --profile release-ci --no-default-features --features embed-resource,xdg,tui,encrypt --recipe-path recipe.json
 
 # Build application
 COPY . .
 COPY --from=frontend-builder /build/static/ ./static
-RUN cargo build --release --no-default-features --features embed-resource,xdg,tui,encrypt --bin clewdr \
-    && cp ./target/release/clewdr /build/clewdr \
+RUN cargo build --profile release-ci --no-default-features --features embed-resource,xdg,tui,encrypt --bin clewdr \
+    && cp ./target/release-ci/clewdr /build/clewdr \
     && mkdir -p /etc/clewdr/log \
     && touch /etc/clewdr/clewdr.toml
 

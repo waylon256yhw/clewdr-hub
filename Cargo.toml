@@ -20,6 +20,11 @@ lto = true
 codegen-units = 1
 panic = "abort"
 
+[profile.release-ci]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 wreq = { version = "6.0.0-rc.28", features = [
