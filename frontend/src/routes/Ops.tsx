@@ -32,7 +32,6 @@ import {
 import {
   formatCompactCount,
   formatCost,
-  formatDate,
   formatShanghaiBucket,
   formatTokenCount,
 } from "../lib/format";
@@ -168,6 +167,28 @@ function KpiCard({
   );
 }
 
+/// Four-tone Token breakdown used by both the window and lifetime Token
+/// KPI cards. Keeping it in one place so the two cards stay visually
+/// identical when the badge palette changes.
+function TokenBreakdownBadges({ totals }: { totals: OpsUsageTotals }) {
+  return (
+    <Group gap={4} wrap="nowrap" mt={4}>
+      <Badge size="sm" variant="light" color="cyan" radius="sm" title="输入 token">
+        ↑{formatTokenCount(totals.input_tokens)}
+      </Badge>
+      <Badge size="sm" variant="light" color="teal" radius="sm" title="输出 token">
+        ↓{formatTokenCount(totals.output_tokens)}
+      </Badge>
+      <Badge size="sm" variant="light" color="grape" radius="sm" title="缓存写入 (1.25× 输入价)">
+        +{formatTokenCount(totals.cache_creation_tokens)}
+      </Badge>
+      <Badge size="sm" variant="light" color="gray" radius="sm" title="缓存读取 (0.10× 输入价)">
+        ↻{formatTokenCount(totals.cache_read_tokens)}
+      </Badge>
+    </Group>
+  );
+}
+
 // ---- Main component -------------------------------------------------------
 
 export default function Ops() {
@@ -250,8 +271,6 @@ export default function Ops() {
   const comparisonHint = data.comparison.complete
     ? `对比上一${range === "24h" ? "24 小时" : range === "7d" ? "7 天" : "30 天"}（完整桶）`
     : "数据积累中";
-
-  // ---- Donut + line data ----
   const donutData = data.distribution.map((item, index) => ({
     name: item.label,
     value: metricValueFromItem(item, metric),
@@ -285,31 +304,7 @@ export default function Ops() {
       ]
     : [];
 
-  // ---- Metadata bar pieces ----
-  const windowLabel = data.comparison.window_label;
-  const coverageFromBackfill = data.coverage.backfill_available_from;
-  const coverageFromWrites = data.coverage.writes_started_at;
-  const coverageBits: string[] = [];
-  coverageBits.push(`窗口 ${windowLabel}`);
-  coverageBits.push("已产生可计费用量的 messages 请求");
-  if (range === "24h" && data.coverage.logs_available_from) {
-    coverageBits.push(`日志可追溯至 ${formatDate(data.coverage.logs_available_from)}`);
-  } else if (range !== "24h") {
-    if (coverageFromWrites) {
-      coverageBits.push(`持续聚合自 ${formatDate(coverageFromWrites)}`);
-    }
-    if (coverageFromBackfill) {
-      coverageBits.push(`历史回填最早至 ${coverageFromBackfill}`);
-    }
-  }
-  const accumulatingNotice =
-    range === "30d" && !data.coverage.complete
-      ? "30 天数据仍在积累"
-      : range === "7d" && !data.coverage.complete
-        ? "7 天数据仍在积累"
-        : null;
-
-  // ---- Lifetime Paper text ----
+  // ---- Lifetime totals ----
   const lifetime = data.lifetime_totals;
 
   return (
@@ -366,15 +361,6 @@ export default function Ops() {
         </Tooltip>
       </Group>
 
-      <Paper p="sm" radius="md" withBorder mb="md" bg="var(--mantine-color-gray-light)">
-        <Text size="xs" c="dimmed">
-          {coverageBits.join(" · ")}
-          {accumulatingNotice ? (
-            <Text component="span" c="orange" ml={6} fw={500}>· {accumulatingNotice}</Text>
-          ) : null}
-        </Text>
-      </Paper>
-
       <SimpleGrid cols={{ base: 1, sm: 2, xl: 4 }} spacing="md" mb="md">
         <KpiCard
           label={`窗口请求数（${rangeLabel(range)}）`}
@@ -383,22 +369,7 @@ export default function Ops() {
         <KpiCard
           label={`窗口 Token（${rangeLabel(range)}）`}
           value={formatTokenCount(windowTotals.total_tokens)}
-          hint={(
-            <Group gap={4} wrap="nowrap" mt={4}>
-              <Badge size="sm" variant="light" color="cyan" radius="sm" title="输入 token">
-                ↑{formatTokenCount(windowTotals.input_tokens)}
-              </Badge>
-              <Badge size="sm" variant="light" color="teal" radius="sm" title="输出 token">
-                ↓{formatTokenCount(windowTotals.output_tokens)}
-              </Badge>
-              <Badge size="sm" variant="light" color="grape" radius="sm" title="缓存写入 (1.25× 输入价)">
-                +{formatTokenCount(windowTotals.cache_creation_tokens)}
-              </Badge>
-              <Badge size="sm" variant="light" color="gray" radius="sm" title="缓存读取 (0.10× 输入价)">
-                ↻{formatTokenCount(windowTotals.cache_read_tokens)}
-              </Badge>
-            </Group>
-          )}
+          hint={<TokenBreakdownBadges totals={windowTotals} />}
         />
         <KpiCard
           label={`窗口金额（${rangeLabel(range)}）`}
@@ -412,27 +383,25 @@ export default function Ops() {
         />
       </SimpleGrid>
 
-      <Paper p="sm" radius="md" withBorder mb="md">
-        <Group justify="space-between" align="start" wrap="wrap" gap="md">
-          <Group gap="lg" wrap="wrap">
-            <Group gap={6}>
-              <Text size="xs" c="dimmed">全期累计 · 请求</Text>
-              <Text size="sm" fw={600}>{formatCompactCount(lifetime.request_count)}</Text>
-            </Group>
-            <Group gap={6}>
-              <Text size="xs" c="dimmed">Token</Text>
-              <Text size="sm" fw={600}>{formatTokenCount(lifetime.total_tokens)}</Text>
-            </Group>
-            <Group gap={6}>
-              <Text size="xs" c="dimmed">金额</Text>
-              <Text size="sm" fw={600}>{formatCost(lifetime.cost_nanousd)}</Text>
-            </Group>
-          </Group>
-          <Text size="xs" c="dimmed">
-            累计含迁移前历史，可能与窗口数据口径略有差异
-          </Text>
-        </Group>
-      </Paper>
+      <Group gap={6} mb={6} align="baseline">
+        <Text size="sm" fw={600} c="dimmed">全期累计</Text>
+        <Text size="xs" c="dimmed">含迁移前历史，可能与窗口数据口径略有差异</Text>
+      </Group>
+      <SimpleGrid cols={{ base: 1, sm: 3 }} spacing="md" mb="md">
+        <KpiCard
+          label="累计请求数"
+          value={formatCompactCount(lifetime.request_count)}
+        />
+        <KpiCard
+          label="累计 Token"
+          value={formatTokenCount(lifetime.total_tokens)}
+          hint={<TokenBreakdownBadges totals={lifetime} />}
+        />
+        <KpiCard
+          label="累计金额"
+          value={formatCost(lifetime.cost_nanousd)}
+        />
+      </SimpleGrid>
 
       <SimpleGrid cols={{ base: 1, xl: 2 }} spacing="md" mb="md">
         <Paper shadow="xs" p="md" radius="md" withBorder>
