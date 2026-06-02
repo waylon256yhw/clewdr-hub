@@ -49,7 +49,14 @@ pub struct RequestListParams {
     pub request_type: Option<String>,
     pub user_id: Option<i64>,
     pub status: Option<String>,
+    /// Legacy substring filter on `model_raw` / `model_normalized`. Kept
+    /// for back-compat with bookmarks; new callers should prefer
+    /// `model_key` for an exact match.
     pub model: Option<String>,
+    /// Exact match on the canonical `model_key` column. Used by Ops
+    /// drill-down so the "其他" donut slice can be reliably distinguished
+    /// from the substring "其他" appearing inside a model name.
+    pub model_key: Option<String>,
     pub started_from: Option<String>,
     pub started_to: Option<String>,
 }
@@ -80,6 +87,10 @@ pub async fn list(
         where_clauses.push(format!(
             "(COALESCE(r.model_raw, '') || ' ' || COALESCE(r.model_normalized, '')) LIKE ?{bind_idx}"
         ));
+        bind_idx += 1;
+    }
+    if params.model_key.is_some() {
+        where_clauses.push(format!("r.model_key = ?{bind_idx}"));
         bind_idx += 1;
     }
     if params.started_from.is_some() {
@@ -134,6 +145,9 @@ pub async fn list(
     if let Some(ref m) = params.model {
         count_query = count_query.bind(format!("%{m}%"));
     }
+    if let Some(ref mk) = params.model_key {
+        count_query = count_query.bind(mk);
+    }
     if let Some(ref f) = params.started_from {
         count_query = count_query.bind(f);
     }
@@ -155,6 +169,9 @@ pub async fn list(
     }
     if let Some(ref m) = params.model {
         list_query = list_query.bind(format!("%{m}%"));
+    }
+    if let Some(ref mk) = params.model_key {
+        list_query = list_query.bind(mk);
     }
     if let Some(ref f) = params.started_from {
         list_query = list_query.bind(f);
@@ -196,4 +213,115 @@ pub async fn get_response_body(
         })?
         .0;
     Ok(Json(ResponseBodyPayload { response_body }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use axum::{
+        Json,
+        extract::{Query, State},
+    };
+    use sqlx::SqlitePool;
+
+    use super::{RequestListParams, list};
+
+    async fn fresh_pool() -> SqlitePool {
+        let pool = crate::db::init_pool(Path::new(":memory:"))
+            .await
+            .expect("init_pool");
+        crate::db::seed_admin(&pool).await.expect("seed_admin");
+        sqlx::query(
+            "INSERT INTO users (id, username, display_name, password_hash, role, policy_id)
+             VALUES (10, 'alice', 'alice', '$argon2id$dummy', 'member', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    async fn insert_log_row(pool: &SqlitePool, request_id: &str, model_raw: &str, model_key: &str) {
+        sqlx::query(
+            r#"INSERT INTO request_logs (
+                request_id, request_type, user_id, model_raw, model_normalized,
+                model_key, usage_accounted, stream,
+                started_at, completed_at, status, http_status, cost_nanousd
+            ) VALUES (?1, 'messages', 10, ?2, ?2, ?3, 1, 1,
+                      '2026-06-01T00:00:00Z', '2026-06-01T00:00:01Z',
+                      'ok', 200, 0)"#,
+        )
+        .bind(request_id)
+        .bind(model_raw)
+        .bind(model_key)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn list_with(pool: SqlitePool, params: RequestListParams) -> Vec<String> {
+        let Json(page) = list(State(pool), Query(params)).await.expect("list ok");
+        page.items.into_iter().map(|i| i.request_id).collect()
+    }
+
+    /// `model_key=claude-opus-4-7` must match only the canonical row and
+    /// reject "claude-opus-4-7-experimental", where the legacy
+    /// substring filter (`model=claude-opus-4-7`) would have matched
+    /// both.
+    #[tokio::test]
+    async fn model_key_filter_is_exact_match_not_substring() {
+        let pool = fresh_pool().await;
+        insert_log_row(
+            &pool,
+            "exact",
+            "claude-opus-4-7-20260101",
+            "claude-opus-4-7",
+        )
+        .await;
+        insert_log_row(
+            &pool,
+            "experimental",
+            "claude-opus-4-7-experimental",
+            "claude-opus-4-7-experimental",
+        )
+        .await;
+
+        let matches = list_with(
+            pool.clone(),
+            RequestListParams {
+                offset: None,
+                limit: None,
+                request_type: None,
+                user_id: None,
+                status: None,
+                model: None,
+                model_key: Some("claude-opus-4-7".into()),
+                started_from: None,
+                started_to: None,
+            },
+        )
+        .await;
+        assert_eq!(matches, vec!["exact"], "model_key must be exact");
+
+        // Confirm the legacy substring filter still catches both rows so
+        // the migration path doesn't surprise existing bookmarks.
+        let mut legacy = list_with(
+            pool,
+            RequestListParams {
+                offset: None,
+                limit: None,
+                request_type: None,
+                user_id: None,
+                status: None,
+                model: Some("claude-opus-4-7".into()),
+                model_key: None,
+                started_from: None,
+                started_to: None,
+            },
+        )
+        .await;
+        legacy.sort();
+        assert_eq!(legacy, vec!["exact", "experimental"]);
+    }
 }
