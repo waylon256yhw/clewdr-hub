@@ -390,8 +390,12 @@ pub async fn reset_usage(
             crate::db::billing::delete_usage_rollup(&db, id, "month", &month_start).await?;
         }
         "all" => {
-            crate::db::billing::delete_usage_rollup(&db, id, "week", &week_start).await?;
-            crate::db::billing::delete_usage_rollup(&db, id, "month", &month_start).await?;
+            // Plan §5.3: week + month deletes share a transaction so the
+            // "reset everything" path is atomic from the caller's view.
+            let mut tx = db.begin().await?;
+            crate::db::billing::delete_usage_rollup(&mut *tx, id, "week", &week_start).await?;
+            crate::db::billing::delete_usage_rollup(&mut *tx, id, "month", &month_start).await?;
+            tx.commit().await?;
         }
         _ => {
             return Err(ClewdrError::BadRequest {

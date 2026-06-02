@@ -42,6 +42,8 @@ pub const RUNTIME_TABLES: &[&str] = &[
     "account_runtime_state",
     "usage_rollups",
     "usage_lifetime_totals",
+    "usage_daily_rollups",
+    "usage_daily_rollup_state",
 ];
 
 /// Tables we never export, regardless of flags:

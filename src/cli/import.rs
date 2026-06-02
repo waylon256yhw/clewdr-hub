@@ -61,12 +61,16 @@ const TABLE_INSERT_ORDER: &[&str] = &[
     "model_pricing",
     "usage_rollups",
     "usage_lifetime_totals",
+    "usage_daily_rollups",
+    "usage_daily_rollup_state",
 ];
 
 /// Tables wiped at the start of `--mode restore`. Reverse FK order so each
 /// child's rows are gone before its parent's, even though deferred FKs
 /// would also accept any delete order.
 const TABLE_DELETE_ORDER_RESTORE: &[&str] = &[
+    "usage_daily_rollup_state",
+    "usage_daily_rollups",
     "usage_lifetime_totals",
     "usage_rollups",
     "model_pricing",
@@ -165,6 +169,19 @@ fn merge_spec(table: &str) -> TableMergeSpec {
             id_column: None,
             natural_key: &["user_id"],
             fks: &[("user_id", "users")],
+        },
+        "usage_daily_rollups" => TableMergeSpec {
+            id_column: Some("id"),
+            natural_key: &["user_id", "model_key", "bucket_date_local"],
+            fks: &[("user_id", "users")],
+        },
+        // Single-row state table: id is always 1 (CHECK constraint), so we
+        // merge by id directly without translating it from the bundle's id
+        // space. No FKs.
+        "usage_daily_rollup_state" => TableMergeSpec {
+            id_column: None,
+            natural_key: &["id"],
+            fks: &[],
         },
         _ => TableMergeSpec {
             id_column: None,
@@ -1432,6 +1449,18 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        // Daily rollup fixture for one user/day/model bucket. The migration
+        // also seeded usage_daily_rollup_state, so both new runtime tables
+        // need to round-trip cleanly.
+        sqlx::query(
+            "INSERT INTO usage_daily_rollups (
+                 user_id, model_key, bucket_date_local,
+                 request_count, input_tokens, output_tokens, cost_nanousd
+             ) VALUES (1, 'claude-opus-4-7', '2026-05-01', 3, 1500, 700, 8888)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         pool.close().await;
 
         let bundle_path = dir.path().join("runtime-bundle.json");
@@ -1445,6 +1474,8 @@ mod tests {
         assert!(bundle.tables.contains_key("account_runtime_state"));
         assert!(bundle.tables.contains_key("usage_rollups"));
         assert!(bundle.tables.contains_key("usage_lifetime_totals"));
+        assert!(bundle.tables.contains_key("usage_daily_rollups"));
+        assert!(bundle.tables.contains_key("usage_daily_rollup_state"));
 
         let tgt_db = dir.path().join("tgt.db");
         let pool = crate::db::init_pool(&tgt_db).await.unwrap();
@@ -1479,9 +1510,32 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((lifetime_requests, lifetime_cost), (11, 12001));
+
+        // Daily rollup round-trips with the (user, model, bucket) row intact.
+        let (daily_requests, daily_input, daily_cost): (i64, i64, i64) = sqlx::query_as(
+            "SELECT request_count, input_tokens, cost_nanousd FROM usage_daily_rollups
+             WHERE user_id = 1 AND model_key = 'claude-opus-4-7'
+               AND bucket_date_local = '2026-05-01'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((daily_requests, daily_input, daily_cost), (3, 1500, 8888));
+
+        // The single-row state table is preserved (the bundle's row replaces
+        // the local row that init_pool just seeded).
+        let (state_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM usage_daily_rollup_state")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state_count, 1, "state table must still hold one row");
+
         assert_eq!(summary.per_table["account_runtime_state"].inserted, 1);
         assert_eq!(summary.per_table["usage_rollups"].inserted, 1);
         assert_eq!(summary.per_table["usage_lifetime_totals"].inserted, 1);
+        assert_eq!(summary.per_table["usage_daily_rollups"].inserted, 1);
+        assert_eq!(summary.per_table["usage_daily_rollup_state"].inserted, 1);
         pool.close().await;
     }
 

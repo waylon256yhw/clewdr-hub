@@ -187,6 +187,14 @@ pub async fn seed_admin(pool: &SqlitePool) -> Result<(), ClewdrError> {
 
     seed_models(pool).await?;
 
+    // Plan §9: idempotent state-row seed. The migration seeds this row
+    // on first deploy; a subsequent "default restore" wipes runtime
+    // tables (including this one) but leaves request_logs in place. On
+    // the next startup the row is re-created with a fresh
+    // writes_started_at so Ops accumulates daily rollups from that
+    // moment forward without an import-time special case.
+    crate::db::billing::ensure_daily_rollup_state(pool).await?;
+
     Ok(())
 }
 

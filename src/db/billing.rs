@@ -1,4 +1,4 @@
-use sqlx::SqlitePool;
+use sqlx::{Executor, Sqlite, SqlitePool};
 
 use crate::billing::BillingUsage;
 
@@ -11,6 +11,8 @@ pub struct RequestLogRow<'a> {
     pub account_id: Option<i64>,
     pub model_raw: Option<&'a str>,
     pub model_normalized: Option<&'a str>,
+    pub model_key: &'a str,
+    pub usage_accounted: bool,
     pub stream: bool,
     pub started_at: &'a str,
     pub completed_at: Option<&'a str>,
@@ -45,14 +47,20 @@ pub async fn lookup_model_pricing(
 }
 
 /// Insert a request log row.
-pub async fn insert_request_log(
-    pool: &SqlitePool,
+///
+/// Accepts any sqlx `Executor` (a pool or a transaction connection) so the
+/// terminal write path can bundle log + rollups into a single transaction.
+pub async fn insert_request_log<'e, E>(
+    executor: E,
     r: &RequestLogRow<'_>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     sqlx::query(
         r#"INSERT INTO request_logs (
             request_id, request_type, user_id, api_key_id, account_id,
-            model_raw, model_normalized, stream,
+            model_raw, model_normalized, model_key, usage_accounted, stream,
             started_at, completed_at, duration_ms, ttft_ms,
             status, http_status,
             input_tokens, output_tokens,
@@ -61,13 +69,13 @@ pub async fn insert_request_log(
             cost_nanousd, error_code, error_message, response_body
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
-            ?6, ?7, ?8,
-            ?9, ?10, ?11, ?12,
-            ?13, ?14,
+            ?6, ?7, ?8, ?9, ?10,
+            ?11, ?12, ?13, ?14,
             ?15, ?16,
             ?17, ?18,
             ?19, ?20,
-            ?21, ?22, ?23, ?24
+            ?21, ?22,
+            ?23, ?24, ?25, ?26
         )"#,
     )
     .bind(r.request_id)
@@ -77,6 +85,8 @@ pub async fn insert_request_log(
     .bind(r.account_id)
     .bind(r.model_raw)
     .bind(r.model_normalized)
+    .bind(r.model_key)
+    .bind(r.usage_accounted as i32)
     .bind(r.stream as i32)
     .bind(r.started_at)
     .bind(r.completed_at)
@@ -94,21 +104,24 @@ pub async fn insert_request_log(
     .bind(r.error_code)
     .bind(r.error_message)
     .bind(r.response_body)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
 
 /// Upsert a usage rollup row, incrementing counters on conflict.
-pub async fn upsert_usage_rollup(
-    pool: &SqlitePool,
+pub async fn upsert_usage_rollup<'e, E>(
+    executor: E,
     user_id: i64,
     period_type: &str,
     period_start: &str,
     period_end: &str,
     usage: &BillingUsage,
     cost_nanousd: i64,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     sqlx::query(
         r#"INSERT INTO usage_rollups (
             user_id, period_type, period_start, period_end,
@@ -134,18 +147,21 @@ pub async fn upsert_usage_rollup(
     .bind(usage.cache_creation_tokens as i64)
     .bind(usage.cache_read_tokens as i64)
     .bind(cost_nanousd)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
 
 /// Upsert a per-user lifetime usage total, incrementing counters on conflict.
-pub async fn upsert_usage_lifetime_total(
-    pool: &SqlitePool,
+pub async fn upsert_usage_lifetime_total<'e, E>(
+    executor: E,
     user_id: i64,
     usage: &BillingUsage,
     cost_nanousd: i64,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     sqlx::query(
         r#"INSERT INTO usage_lifetime_totals (
             user_id,
@@ -172,6 +188,74 @@ pub async fn upsert_usage_lifetime_total(
     .bind(usage.cache_creation_tokens as i64)
     .bind(usage.cache_read_tokens as i64)
     .bind(cost_nanousd)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Upsert a per-(user, model_key, UTC+8 day) rollup, incrementing counters
+/// on conflict.
+///
+/// `bucket_date_local` is a YYYY-MM-DD string for the UTC+8 day boundary,
+/// computed by the writer from `started_at`. Keeping this column as plain
+/// TEXT avoids any timezone surprises at read time and lets indexes serve
+/// 7d / 30d range scans directly.
+pub async fn upsert_usage_daily_rollup<'e, E>(
+    executor: E,
+    user_id: i64,
+    model_key: &str,
+    bucket_date_local: &str,
+    usage: &BillingUsage,
+    cost_nanousd: i64,
+) -> Result<(), sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        r#"INSERT INTO usage_daily_rollups (
+            user_id,
+            model_key,
+            bucket_date_local,
+            request_count,
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+            cost_nanousd,
+            updated_at
+        ) VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, CURRENT_TIMESTAMP)
+        ON CONFLICT (user_id, model_key, bucket_date_local) DO UPDATE SET
+            request_count = request_count + 1,
+            input_tokens = input_tokens + excluded.input_tokens,
+            output_tokens = output_tokens + excluded.output_tokens,
+            cache_creation_tokens = cache_creation_tokens + excluded.cache_creation_tokens,
+            cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+            cost_nanousd = cost_nanousd + excluded.cost_nanousd,
+            updated_at = CURRENT_TIMESTAMP"#,
+    )
+    .bind(user_id)
+    .bind(model_key)
+    .bind(bucket_date_local)
+    .bind(usage.input_tokens as i64)
+    .bind(usage.output_tokens as i64)
+    .bind(usage.cache_creation_tokens as i64)
+    .bind(usage.cache_read_tokens as i64)
+    .bind(cost_nanousd)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Ensure the single-row `usage_daily_rollup_state` exists. Migrations
+/// seed this row on first deploy; this helper covers the
+/// default-restore-then-restart path where runtime tables get wiped but
+/// the application keeps writing rollups from that moment forward.
+pub async fn ensure_daily_rollup_state(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT OR IGNORE INTO usage_daily_rollup_state (
+            id, writes_started_at, backfill_available_from
+        ) VALUES (1, CURRENT_TIMESTAMP, NULL)"#,
+    )
     .execute(pool)
     .await?;
     Ok(())
@@ -197,19 +281,22 @@ pub async fn get_current_period_cost(
 
 /// Delete a single usage_rollups row for the given user/period.
 /// Returns rows deleted (0 if no row existed for that period).
-pub async fn delete_usage_rollup(
-    pool: &SqlitePool,
+pub async fn delete_usage_rollup<'e, E>(
+    executor: E,
     user_id: i64,
     period_type: &str,
     period_start: &str,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let result = sqlx::query(
         "DELETE FROM usage_rollups WHERE user_id = ?1 AND period_type = ?2 AND period_start = ?3",
     )
     .bind(user_id)
     .bind(period_type)
     .bind(period_start)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(result.rows_affected())
 }
