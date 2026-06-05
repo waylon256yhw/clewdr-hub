@@ -282,6 +282,7 @@ export interface KeyRow {
   last_used_ip: string | null;
   created_at: string;
   bound_account_ids: number[];
+  auto_cache_enabled: boolean;
 }
 
 export interface KeyCreated {
@@ -292,6 +293,7 @@ export interface KeyCreated {
   plaintext_key: string;
   created_at: string;
   bound_account_ids: number[];
+  auto_cache_enabled: boolean;
 }
 
 export interface RequestLog {
@@ -604,12 +606,14 @@ export const listKeys = (userId?: number) =>
   apiFetch<Paginated<KeyRow>>("/api/admin/keys", {
     params: { limit: 100, ...(userId !== undefined ? { user_id: userId } : {}) },
   });
-export const createKey = (data: { user_id: number; label?: string; bound_account_ids?: number[] }) =>
+export const createKey = (data: { user_id: number; label?: string; bound_account_ids?: number[]; auto_cache_enabled?: boolean }) =>
   apiFetch<KeyCreated>("/api/admin/keys", { method: "POST", body: data });
 export const deleteKey = (id: number) =>
   apiFetch<void>(`/api/admin/keys/${id}`, { method: "DELETE" });
 export const updateKeyBindings = (id: number, accountIds: number[]) =>
   apiFetch<void>(`/api/admin/keys/${id}/bindings`, { method: "PUT", body: { account_ids: accountIds } });
+export const updateKeyAutoCache = (id: number, enabled: boolean) =>
+  apiFetch<void>(`/api/admin/keys/${id}/auto_cache`, { method: "PUT", body: { enabled } });
 
 // Settings
 export const getSettings = () => apiFetch<Record<string, string>>("/api/admin/settings");

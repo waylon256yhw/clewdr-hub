@@ -35,6 +35,7 @@ pub fn admin_router() -> Router<AppState> {
         .route("/keys", get(keys::list).post(keys::create))
         .route("/keys/{id}", delete(keys::remove))
         .route("/keys/{id}/bindings", put(keys::update_bindings))
+        .route("/keys/{id}/auto_cache", put(keys::update_auto_cache))
         // Accounts
         .route("/accounts", get(accounts::list).post(accounts::create))
         .route("/accounts/probe", post(accounts::probe_all))

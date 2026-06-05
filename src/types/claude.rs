@@ -130,6 +130,14 @@ pub struct CreateMessageParams {
     /// Number of completions to generate
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n: Option<u32>,
+    /// Top-level automatic prompt caching breakpoint.
+    ///
+    /// When `Some`, the Anthropic server auto-places the cache breakpoint on
+    /// the last cacheable block and advances it as the conversation grows.
+    /// Occupies 1 of the 4 available breakpoint slots; coexists with explicit
+    /// per-block `cache_control`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControlEphemeral>,
 }
 
 impl CreateMessageParams {
@@ -1086,5 +1094,31 @@ mod tests {
 
         let params: CreateMessageParams = serde_json::from_value(body).unwrap();
         assert!(matches!(params.tool_choice, Some(ToolChoice::Auto { .. })));
+    }
+
+    #[test]
+    fn cache_control_omitted_when_none() {
+        let params = CreateMessageParams {
+            model: "claude-sonnet-4-6".to_string(),
+            messages: vec![Message::new_text(Role::User, "hi")],
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&params).unwrap();
+        assert!(value.get("cache_control").is_none());
+    }
+
+    #[test]
+    fn cache_control_ephemeral_serializes_without_ttl() {
+        let params = CreateMessageParams {
+            model: "claude-sonnet-4-6".to_string(),
+            messages: vec![Message::new_text(Role::User, "hi")],
+            cache_control: Some(CacheControlEphemeral {
+                type_: CacheControlType::Ephemeral,
+                ttl: None,
+            }),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&params).unwrap();
+        assert_eq!(value["cache_control"], json!({ "type": "ephemeral" }));
     }
 }

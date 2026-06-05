@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use crate::{
     db::models::AuthenticatedUser,
     middleware::claude::{
-        ClaudeContext, build_claude_context, claude_code_billing_header,
+        ClaudeContext, apply_auto_cache, build_claude_context, claude_code_billing_header,
         drop_empty_message_text_blocks, drop_empty_system, fill_system_only_user_placeholder,
         inject_metadata_user_id, normalize_sampling_params, prepend_system_blocks,
         strip_billing_headers_from_system, strip_ephemeral_scope_from_system,
@@ -518,6 +518,8 @@ where
         if let Some(system) = body.system.as_mut() {
             strip_ephemeral_scope_from_system(system);
         }
+
+        apply_auto_cache(&mut body, auth_user.as_ref());
 
         // Build context before inject_metadata_user_id so the affinity hash
         // observes the pre-injection state — see ClaudeCodePreprocess for

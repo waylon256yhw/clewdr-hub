@@ -182,6 +182,7 @@ where
                 weekly_budget_nanousd,
                 monthly_budget_nanousd,
                 bound_account_ids: Vec::new(),
+                auto_cache_enabled: false,
             });
 
         Ok(Self)

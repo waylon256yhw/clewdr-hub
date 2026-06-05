@@ -18,8 +18,8 @@ use crate::{
     middleware::claude::ClaudeContext,
     stealth::{self, StealthProfile},
     types::claude::{
-        ContentBlock, CreateMessageParams, Message, MessageContent, OutputConfig, OutputEffort,
-        Role, Thinking, ThinkingDisplay, Usage,
+        CacheControlEphemeral, CacheControlType, ContentBlock, CreateMessageParams, Message,
+        MessageContent, OutputConfig, OutputEffort, Role, Thinking, ThinkingDisplay, Usage,
     },
 };
 
@@ -278,6 +278,29 @@ pub(crate) fn extract_anthropic_beta_header(headers: &HeaderMap) -> Option<Strin
         None
     } else {
         Some(parts.join(","))
+    }
+}
+
+/// Returns true when the request path targets `/v1/messages/count_tokens`.
+/// Counting tokens should not write to cache; the upstream may also reject the
+/// top-level `cache_control` field on this endpoint.
+pub(crate) fn is_count_tokens_path(path: &str) -> bool {
+    path.ends_with("/count_tokens")
+}
+
+/// Set the top-level `cache_control` breakpoint when the API key has
+/// `auto_cache_enabled = true`. With this set, the server auto-places the
+/// breakpoint on the last cacheable block and advances it as the conversation
+/// grows. No-op when the flag is off or when no authenticated user is present.
+pub(crate) fn apply_auto_cache(
+    body: &mut CreateMessageParams,
+    auth_user: Option<&crate::db::models::AuthenticatedUser>,
+) {
+    if auth_user.is_some_and(|u| u.auto_cache_enabled) {
+        body.cache_control = Some(CacheControlEphemeral {
+            type_: CacheControlType::Ephemeral,
+            ttl: None,
+        });
     }
 }
 
@@ -567,6 +590,7 @@ where
             .get::<crate::db::models::AuthenticatedUser>()
             .cloned();
         let anthropic_beta = extract_anthropic_beta_header(req.headers());
+        let is_count_tokens = is_count_tokens_path(req.uri().path());
         let Json(mut body) = Json::<CreateMessageParams>::from_request(req, &()).await?;
 
         drop_empty_system(&mut body);
@@ -595,6 +619,12 @@ where
 
         if let Some(system) = body.system.as_mut() {
             strip_ephemeral_scope_from_system(system);
+        }
+
+        // count_tokens path skips automatic cache: that endpoint has no value
+        // from caching and the top-level cache_control may be rejected upstream.
+        if !is_count_tokens {
+            apply_auto_cache(&mut body, auth_user.as_ref());
         }
 
         // Compute the affinity hash from the pre-injection request so two
@@ -1227,5 +1257,69 @@ mod tests {
         );
         assert_eq!(OpusFamily::detect("claude-sonnet-4-6"), None);
         assert_eq!(OpusFamily::detect("claude-opus-4-7-preview1"), None);
+    }
+
+    fn auth_user_with_auto_cache(enabled: bool) -> crate::db::models::AuthenticatedUser {
+        crate::db::models::AuthenticatedUser {
+            user_id: 1,
+            username: "u".to_string(),
+            role: "user".to_string(),
+            api_key_id: Some(42),
+            policy_id: 1,
+            max_concurrent: 10,
+            rpm_limit: 60,
+            weekly_budget_nanousd: 0,
+            monthly_budget_nanousd: 0,
+            bound_account_ids: Vec::new(),
+            auto_cache_enabled: enabled,
+        }
+    }
+
+    fn simple_body() -> CreateMessageParams {
+        CreateMessageParams {
+            model: "claude-sonnet-4-6".to_string(),
+            messages: vec![Message::new_text(Role::User, "hi")],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn is_count_tokens_path_recognizes_suffix() {
+        assert!(is_count_tokens_path("/v1/messages/count_tokens"));
+        assert!(is_count_tokens_path("/proxy/v1/messages/count_tokens"));
+        assert!(!is_count_tokens_path("/v1/messages"));
+        assert!(!is_count_tokens_path("/v1/messages/count_tokens/extra"));
+    }
+
+    #[test]
+    fn apply_auto_cache_off_omits_field() {
+        let user = auth_user_with_auto_cache(false);
+        let mut body = simple_body();
+        apply_auto_cache(&mut body, Some(&user));
+        assert!(body.cache_control.is_none());
+        let value = serde_json::to_value(&body).unwrap();
+        assert!(value.get("cache_control").is_none());
+    }
+
+    #[test]
+    fn apply_auto_cache_on_sets_top_level_ephemeral() {
+        let user = auth_user_with_auto_cache(true);
+        let mut body = simple_body();
+        apply_auto_cache(&mut body, Some(&user));
+        let cc = body.cache_control.as_ref().expect("cache_control set");
+        assert!(matches!(cc.type_, CacheControlType::Ephemeral));
+        assert!(cc.ttl.is_none());
+        let value = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            value["cache_control"],
+            serde_json::json!({ "type": "ephemeral" })
+        );
+    }
+
+    #[test]
+    fn apply_auto_cache_no_auth_user_is_noop() {
+        let mut body = simple_body();
+        apply_auto_cache(&mut body, None);
+        assert!(body.cache_control.is_none());
     }
 }

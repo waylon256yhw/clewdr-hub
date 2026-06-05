@@ -5,8 +5,21 @@ use super::models::AuthenticatedUser;
 
 /// Row shape returned by `authenticate_api_key`'s `sqlx::query_as`:
 /// (ak.id, u.id, u.username, u.role, ak.key_hash, u.policy_id,
-///  p.max_concurrent, p.rpm_limit, p.weekly_budget_nanousd, p.monthly_budget_nanousd).
-type ApiKeyAuthRow = (i64, i64, String, String, Vec<u8>, i64, i32, i32, i64, i64);
+///  p.max_concurrent, p.rpm_limit, p.weekly_budget_nanousd, p.monthly_budget_nanousd,
+///  ak.auto_cache_enabled).
+type ApiKeyAuthRow = (
+    i64,
+    i64,
+    String,
+    String,
+    Vec<u8>,
+    i64,
+    i32,
+    i32,
+    i64,
+    i64,
+    i64,
+);
 
 /// Look up an API key by its lookup_key prefix, then verify the full blake3 hash.
 pub async fn authenticate_api_key(
@@ -18,7 +31,8 @@ pub async fn authenticate_api_key(
         r#"
         SELECT ak.id, u.id, u.username, u.role, ak.key_hash, u.policy_id,
                p.max_concurrent, p.rpm_limit,
-               p.weekly_budget_nanousd, p.monthly_budget_nanousd
+               p.weekly_budget_nanousd, p.monthly_budget_nanousd,
+               ak.auto_cache_enabled
         FROM api_keys ak
         JOIN users u ON ak.user_id = u.id
         JOIN policies p ON u.policy_id = p.id
@@ -43,6 +57,7 @@ pub async fn authenticate_api_key(
         rpm_limit,
         weekly_budget_nanousd,
         monthly_budget_nanousd,
+        auto_cache_enabled_int,
     )) = row
     else {
         return Ok(None);
@@ -76,6 +91,7 @@ pub async fn authenticate_api_key(
             .await?;
             rows.into_iter().map(|(id,)| id).collect()
         },
+        auto_cache_enabled: auto_cache_enabled_int != 0,
     }))
 }
 

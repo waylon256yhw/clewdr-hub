@@ -1,0 +1,1 @@
+ALTER TABLE api_keys ADD COLUMN auto_cache_enabled INTEGER NOT NULL DEFAULT 0;

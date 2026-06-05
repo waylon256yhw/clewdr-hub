@@ -23,6 +23,7 @@ pub struct KeyResponse {
     pub last_used_ip: Option<String>,
     pub created_at: String,
     pub bound_account_ids: Vec<i64>,
+    pub auto_cache_enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -34,6 +35,7 @@ pub struct KeyCreatedResponse {
     pub plaintext_key: String,
     pub created_at: String,
     pub bound_account_ids: Vec<i64>,
+    pub auto_cache_enabled: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -49,6 +51,7 @@ struct KeyRow {
     last_used_at: Option<String>,
     last_used_ip: Option<String>,
     created_at: String,
+    auto_cache_enabled: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -62,6 +65,8 @@ pub struct CreateKeyRequest {
     pub user_id: i64,
     pub label: Option<String>,
     pub bound_account_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    pub auto_cache_enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +79,11 @@ pub struct KeyListParams {
 #[derive(Deserialize)]
 pub struct UpdateBindingsRequest {
     pub account_ids: Vec<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateAutoCacheRequest {
+    pub enabled: bool,
 }
 
 async fn load_bindings_for_keys(
@@ -115,6 +125,7 @@ fn attach_bindings(keys: Vec<KeyRow>, bindings: Vec<BindingRow>) -> Vec<KeyRespo
                 last_used_ip: k.last_used_ip,
                 created_at: k.created_at,
                 bound_account_ids: bound,
+                auto_cache_enabled: k.auto_cache_enabled != 0,
             }
         })
         .collect()
@@ -134,7 +145,8 @@ pub async fn list(
             .await?;
         let items: Vec<KeyRow> = sqlx::query_as(
             r#"SELECT ak.id, ak.user_id, u.username, ak.label, ak.lookup_key, ak.plaintext_key,
-                      ak.disabled_at, ak.expires_at, ak.last_used_at, ak.last_used_ip, ak.created_at
+                      ak.disabled_at, ak.expires_at, ak.last_used_at, ak.last_used_ip, ak.created_at,
+                      ak.auto_cache_enabled
                FROM api_keys ak JOIN users u ON ak.user_id = u.id
                WHERE ak.user_id = ?1 ORDER BY ak.id LIMIT ?2 OFFSET ?3"#,
         )
@@ -150,7 +162,8 @@ pub async fn list(
             .await?;
         let items: Vec<KeyRow> = sqlx::query_as(
             r#"SELECT ak.id, ak.user_id, u.username, ak.label, ak.lookup_key, ak.plaintext_key,
-                      ak.disabled_at, ak.expires_at, ak.last_used_at, ak.last_used_ip, ak.created_at
+                      ak.disabled_at, ak.expires_at, ak.last_used_at, ak.last_used_ip, ak.created_at,
+                      ak.auto_cache_enabled
                FROM api_keys ak JOIN users u ON ak.user_id = u.id
                ORDER BY ak.id LIMIT ?1 OFFSET ?2"#,
         )
@@ -209,6 +222,13 @@ pub async fn create(
         .await?;
     }
 
+    if req.auto_cache_enabled {
+        sqlx::query("UPDATE api_keys SET auto_cache_enabled = 1 WHERE id = ?1")
+            .bind(ak_id)
+            .execute(&db)
+            .await?;
+    }
+
     Ok((
         StatusCode::CREATED,
         Json(KeyCreatedResponse {
@@ -219,6 +239,7 @@ pub async fn create(
             plaintext_key: plaintext,
             created_at: row.1,
             bound_account_ids: bound,
+            auto_cache_enabled: req.auto_cache_enabled,
         }),
     ))
 }
@@ -261,6 +282,26 @@ pub async fn remove(
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ClewdrError> {
     let result = sqlx::query("DELETE FROM api_keys WHERE id = ?1")
+        .bind(id)
+        .execute(&db)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ClewdrError::NotFound {
+            msg: "api key not found",
+        });
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn update_auto_cache(
+    State(db): State<SqlitePool>,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateAutoCacheRequest>,
+) -> Result<StatusCode, ClewdrError> {
+    let result = sqlx::query("UPDATE api_keys SET auto_cache_enabled = ?1 WHERE id = ?2")
+        .bind(req.enabled as i64)
         .bind(id)
         .execute(&db)
         .await?;

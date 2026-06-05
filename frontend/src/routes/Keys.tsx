@@ -9,6 +9,7 @@ import {
   Modal,
   MultiSelect,
   Select,
+  Switch,
   TextInput,
   Stack,
   Text,
@@ -36,6 +37,7 @@ import {
   createKey,
   deleteKey,
   updateKeyBindings,
+  updateKeyAutoCache,
   qk,
   ApiError,
   type KeyRow,
@@ -63,6 +65,7 @@ function CreateKeyModal({
   const [userId, setUserId] = useState<string | null>(null);
   const [label, setLabel] = useState("");
   const [boundIds, setBoundIds] = useState<string[]>([]);
+  const [autoCache, setAutoCache] = useState(false);
   const [newKey, setNewKey] = useState<string | null>(null);
   const [newKeyCopied, setNewKeyCopied] = useState(false);
   const newKeyFieldRef = useRef<HTMLTextAreaElement | null>(null);
@@ -72,6 +75,7 @@ function CreateKeyModal({
       user_id: Number(userId),
       label: label || undefined,
       bound_account_ids: boundIds.length > 0 ? boundIds.map(Number) : undefined,
+      auto_cache_enabled: autoCache,
     }),
     onSuccess: async (res) => {
       setNewKey(res.plaintext_key);
@@ -112,6 +116,7 @@ function CreateKeyModal({
     setUserId(null);
     setLabel("");
     setBoundIds([]);
+    setAutoCache(false);
     onClose();
   };
 
@@ -180,6 +185,12 @@ function CreateKeyModal({
               onChange={setBoundIds}
               searchable
               clearable
+            />
+            <Switch
+              label="启用 Automatic Cache"
+              description="在请求体顶层注入 cache_control，由上游自动管理缓存断点。适合多轮对话，对历史插入/修改敏感。"
+              checked={autoCache}
+              onChange={(e) => setAutoCache(e.currentTarget.checked)}
             />
             <Group justify="flex-end">
               <Button variant="default" onClick={handleClose}>取消</Button>
@@ -273,6 +284,16 @@ export default function Keys() {
       notifications.show({ message: e instanceof ApiError ? e.message : "删除失败", color: "red" }),
   });
 
+  const autoCacheMut = useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
+      updateKeyAutoCache(id, enabled),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["keys"] });
+    },
+    onError: (e) =>
+      notifications.show({ message: e instanceof ApiError ? e.message : "切换失败", color: "red" }),
+  });
+
   const keys: KeyRow[] = data?.items ?? [];
   const insecureContext = typeof window !== "undefined" && !window.isSecureContext;
 
@@ -326,6 +347,7 @@ export default function Keys() {
                 <Table.Th>Key</Table.Th>
                 <Table.Th>用户</Table.Th>
                 <Table.Th visibleFrom="sm">绑定</Table.Th>
+                <Table.Th visibleFrom="md">自动缓存</Table.Th>
                 <Table.Th visibleFrom="md">最后使用</Table.Th>
                 <Table.Th style={{ width: 80 }}>操作</Table.Th>
               </Table.Tr>
@@ -352,6 +374,16 @@ export default function Keys() {
                         ))}
                       </Group>
                     )}
+                  </Table.Td>
+                  <Table.Td visibleFrom="md">
+                    <Switch
+                      checked={k.auto_cache_enabled}
+                      onChange={(e) =>
+                        autoCacheMut.mutate({ id: k.id, enabled: e.currentTarget.checked })
+                      }
+                      disabled={autoCacheMut.isPending}
+                      size="sm"
+                    />
                   </Table.Td>
                   <Table.Td visibleFrom="md"><Text size="xs">{formatDate(k.last_used_at)}</Text></Table.Td>
                   <Table.Td>

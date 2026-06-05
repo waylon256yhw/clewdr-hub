@@ -53,4 +53,5 @@ pub struct AuthenticatedUser {
     pub weekly_budget_nanousd: i64,
     pub monthly_budget_nanousd: i64,
     pub bound_account_ids: Vec<i64>,
+    pub auto_cache_enabled: bool,
 }
