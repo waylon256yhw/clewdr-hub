@@ -136,6 +136,20 @@ API Key 账号不会显示 5h / 7d 订阅用量窗口，也不会参与全量订
 
 这是有意的兼容性取舍：对这个项目的目标场景，保留 `temperature` 作为主要采样旋钮已经足够，同时可以减少不同客户端和不同 Claude 模型之间的参数兼容问题。
 
+### Automatic Prompt Caching（per-key 开关）
+
+API Keys 页面每条 key 都有一个**自动缓存**开关：
+
+- **开启时**：服务端会在每个出口请求体顶层注入 `"cache_control": {"type": "ephemeral"}`。Anthropic 服务端会自动把缓存断点放在最后一个可缓存 block 上，并随多轮对话自动前移。命中后只对 prompt 收 0.1x 的 cache-read 价。
+- **关闭时**：不注入任何字段，请求按客户端原样透传，行为与之前一致。
+- **/v1/messages/count_tokens 路径不会注入**（缓存对它无意义），不用担心。
+- **生效阈值**：Sonnet ≥ 1024 token、Opus / Haiku 4.5 ≥ 4096 token 才会真正写入缓存，达不到只是没收益、不会报错。
+
+**适用场景**：上下文稳定增长的多轮对话（聊天、Agent 反复读同一份资料）。
+**不要开的场景**：客户端已经自己管理 cache 断点（比如官方 Claude Code，自己会塞 3~4 个，再加一个可能超出 4 个 slot 上限触发 400）；或者经常重写历史 / 插入中间消息的工作流，每改一次都会让 prefix hash 变化命中失败。
+
+第一版 TTL 锁死默认 5 分钟（每次命中重置倒计时），暂不暴露 1h 选项。
+
 ### OpenAI 兼容端点
 
 `POST /v1/chat/completions` 接受标准 OpenAI Chat Completions 请求体，内部翻译成 Anthropic Messages 调用同一套上游链路。鉴权、配额、限流、计费、日志都和 `/v1/messages` 共享，所以 `RequestType` 仍记为 `messages`、`/api/admin/logs` 不需要新过滤项。

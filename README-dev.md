@@ -185,7 +185,7 @@ Claude Code / 任意 Anthropic 客户端
 
 1. **认证**（`RequireFlexibleAuth`）：从 `x-api-key` 或 `Authorization: Bearer` 提取 key → 查 `api_keys` 表 → blake3 校验 → 注入 `AuthenticatedUser` 到 request extensions。同时 fire-and-forget 更新 `last_used_at`/`last_used_ip`/`last_seen_at`。
 
-2. **预处理**（`ClaudeCodePreprocess`）：解析请求体 → 提取模型名 → 构建 `ClaudeContext`（request_id, user_id, api_key_id, bound_account_ids, started_at）。
+2. **预处理**（`ClaudeCodePreprocess`）：解析请求体 → 提取模型名 → 构建 `ClaudeContext`（request_id, user_id, api_key_id, bound_account_ids, started_at）。如果当前 API key 打开了 `auto_cache_enabled`，并且不是 `/v1/messages/count_tokens` 路径，会在 body 顶层注入 `cache_control: {type: "ephemeral"}`（`apply_auto_cache` helper，OpenAI 兼容入口同样接入）。
 
 3. **限流**（handler 内）：
    - `UserLimiterMap::try_acquire()`：per-user semaphore，基于策略的 `max_concurrent`
