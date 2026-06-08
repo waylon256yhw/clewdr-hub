@@ -38,6 +38,7 @@ import {
   deleteKey,
   updateKeyBindings,
   updateKeyAutoCache,
+  updateKeyEnhancedAudit,
   qk,
   ApiError,
   type KeyRow,
@@ -66,6 +67,7 @@ function CreateKeyModal({
   const [label, setLabel] = useState("");
   const [boundIds, setBoundIds] = useState<string[]>([]);
   const [autoCache, setAutoCache] = useState(false);
+  const [enhancedAudit, setEnhancedAudit] = useState(false);
   const [newKey, setNewKey] = useState<string | null>(null);
   const [newKeyCopied, setNewKeyCopied] = useState(false);
   const newKeyFieldRef = useRef<HTMLTextAreaElement | null>(null);
@@ -76,6 +78,7 @@ function CreateKeyModal({
       label: label || undefined,
       bound_account_ids: boundIds.length > 0 ? boundIds.map(Number) : undefined,
       auto_cache_enabled: autoCache,
+      enhanced_audit_enabled: enhancedAudit,
     }),
     onSuccess: async (res) => {
       setNewKey(res.plaintext_key);
@@ -117,6 +120,7 @@ function CreateKeyModal({
     setLabel("");
     setBoundIds([]);
     setAutoCache(false);
+    setEnhancedAudit(false);
     onClose();
   };
 
@@ -191,6 +195,12 @@ function CreateKeyModal({
               description="在请求体顶层注入 cache_control，由上游自动管理缓存断点。适合多轮对话，对历史插入/修改敏感。"
               checked={autoCache}
               onChange={(e) => setAutoCache(e.currentTarget.checked)}
+            />
+            <Switch
+              label="启用增强审计"
+              description="记录此 Key 后续请求的解析客户端 IP、User-Agent 等元信息，保留周期同请求日志。怀疑凭据泄漏或异常流量时打开。"
+              checked={enhancedAudit}
+              onChange={(e) => setEnhancedAudit(e.currentTarget.checked)}
             />
             <Group justify="flex-end">
               <Button variant="default" onClick={handleClose}>取消</Button>
@@ -294,6 +304,16 @@ export default function Keys() {
       notifications.show({ message: e instanceof ApiError ? e.message : "切换失败", color: "red" }),
   });
 
+  const enhancedAuditMut = useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
+      updateKeyEnhancedAudit(id, enabled),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["keys"] });
+    },
+    onError: (e) =>
+      notifications.show({ message: e instanceof ApiError ? e.message : "切换失败", color: "red" }),
+  });
+
   const keys: KeyRow[] = data?.items ?? [];
   const insecureContext = typeof window !== "undefined" && !window.isSecureContext;
 
@@ -348,6 +368,7 @@ export default function Keys() {
                 <Table.Th>用户</Table.Th>
                 <Table.Th visibleFrom="sm">绑定</Table.Th>
                 <Table.Th visibleFrom="md">自动缓存</Table.Th>
+                <Table.Th visibleFrom="md">增强审计</Table.Th>
                 <Table.Th visibleFrom="md">最后使用</Table.Th>
                 <Table.Th style={{ width: 80 }}>操作</Table.Th>
               </Table.Tr>
@@ -384,6 +405,19 @@ export default function Keys() {
                       disabled={autoCacheMut.isPending}
                       size="sm"
                     />
+                  </Table.Td>
+                  <Table.Td visibleFrom="md">
+                    <Tooltip label="开启后记录此 Key 后续请求的客户端 IP、UA 等元信息（遵循请求日志保留周期）">
+                      <Switch
+                        checked={k.enhanced_audit_enabled}
+                        onChange={(e) =>
+                          enhancedAuditMut.mutate({ id: k.id, enabled: e.currentTarget.checked })
+                        }
+                        disabled={enhancedAuditMut.isPending}
+                        size="sm"
+                        color="orange"
+                      />
+                    </Tooltip>
                   </Table.Td>
                   <Table.Td visibleFrom="md"><Text size="xs">{formatDate(k.last_used_at)}</Text></Table.Td>
                   <Table.Td>

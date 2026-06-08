@@ -11,7 +11,7 @@ export class ApiError extends Error {
 interface FetchOptions {
   method?: string;
   body?: unknown;
-  params?: Record<string, string | number | undefined>;
+  params?: Record<string, string | number | boolean | undefined>;
 }
 
 export async function apiFetch<T>(path: string, opts?: FetchOptions): Promise<T> {
@@ -283,6 +283,7 @@ export interface KeyRow {
   created_at: string;
   bound_account_ids: number[];
   auto_cache_enabled: boolean;
+  enhanced_audit_enabled: boolean;
 }
 
 export interface KeyCreated {
@@ -294,6 +295,19 @@ export interface KeyCreated {
   created_at: string;
   bound_account_ids: number[];
   auto_cache_enabled: boolean;
+  enhanced_audit_enabled: boolean;
+}
+
+export interface RequestAuditDetail {
+  peer_ip: string | null;
+  client_ip: string | null;
+  ip_source: string | null;
+  forwarded_chain: string | null;
+  user_agent: string | null;
+  api_surface: string | null;
+  anthropic_version: string | null;
+  anthropic_beta: string | null;
+  content_length: number | null;
 }
 
 export interface RequestLog {
@@ -322,6 +336,9 @@ export interface RequestLog {
   cost_nanousd: number;
   error_code: string | null;
   error_message: string | null;
+  /// Derived (EXISTS on request_log_audits). When true, the row has
+  /// a sidecar audit payload reachable via GET /requests/:id/audit.
+  enhanced_audit: boolean;
 }
 
 export interface LoginResponse {
@@ -606,7 +623,7 @@ export const listKeys = (userId?: number) =>
   apiFetch<Paginated<KeyRow>>("/api/admin/keys", {
     params: { limit: 100, ...(userId !== undefined ? { user_id: userId } : {}) },
   });
-export const createKey = (data: { user_id: number; label?: string; bound_account_ids?: number[]; auto_cache_enabled?: boolean }) =>
+export const createKey = (data: { user_id: number; label?: string; bound_account_ids?: number[]; auto_cache_enabled?: boolean; enhanced_audit_enabled?: boolean }) =>
   apiFetch<KeyCreated>("/api/admin/keys", { method: "POST", body: data });
 export const deleteKey = (id: number) =>
   apiFetch<void>(`/api/admin/keys/${id}`, { method: "DELETE" });
@@ -614,6 +631,8 @@ export const updateKeyBindings = (id: number, accountIds: number[]) =>
   apiFetch<void>(`/api/admin/keys/${id}/bindings`, { method: "PUT", body: { account_ids: accountIds } });
 export const updateKeyAutoCache = (id: number, enabled: boolean) =>
   apiFetch<void>(`/api/admin/keys/${id}/auto_cache`, { method: "PUT", body: { enabled } });
+export const updateKeyEnhancedAudit = (id: number, enabled: boolean) =>
+  apiFetch<void>(`/api/admin/keys/${id}/enhanced_audit`, { method: "PUT", body: { enabled } });
 
 // Settings
 export const getSettings = () => apiFetch<Record<string, string>>("/api/admin/settings");
@@ -647,14 +666,19 @@ export interface RequestFilters {
   model_key?: string;
   started_from?: string;
   started_to?: string;
+  /** Restrict to rows with a sidecar audit row. */
+  enhanced_audit?: boolean;
 }
 export const listRequests = (filters: RequestFilters) =>
   apiFetch<Paginated<RequestLog>>("/api/admin/requests", {
-    params: filters as Record<string, string | number | undefined>,
+    params: filters as Record<string, string | number | boolean | undefined>,
   });
 
 export const getRequestResponseBody = (id: number) =>
   apiFetch<{ response_body: string | null }>(`/api/admin/requests/${id}/response_body`);
+
+export const getRequestAudit = (id: number) =>
+  apiFetch<RequestAuditDetail>(`/api/admin/requests/${id}/audit`);
 
 // Me
 export const changePassword = (data: { current_password: string; new_password: string }) =>
@@ -697,4 +721,5 @@ export const qk = {
     ["opsUsage", range, metric, topUsers, userId] as const,
   requests: (filters: RequestFilters) => ["requests", filters] as const,
   requestBody: (id: number) => ["request_body", id] as const,
+  requestAudit: (id: number) => ["request_audit", id] as const,
 };

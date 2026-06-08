@@ -20,6 +20,7 @@ import {
 import { IconCheck, IconChevronLeft, IconChevronRight, IconCopy } from "@tabler/icons-react";
 import { useLocation } from "react-router";
 import {
+  getRequestAudit,
   getRequestResponseBody,
   listModelsAdmin,
   listRequests,
@@ -74,6 +75,15 @@ function LogDetail({ log, onClose }: { log: RequestLog | null; onClose: () => vo
     queryKey: log ? qk.requestBody(log.id) : ["request_body", "none"],
     queryFn: () => getRequestResponseBody(log!.id),
     enabled: !!log && showProbeJson,
+    staleTime: 5 * 60_000,
+  });
+  // Lazy-load audit detail only when the list response advertised
+  // `enhanced_audit: true`. Gating here avoids 404 spam from
+  // un-audited rows.
+  const { data: auditData, isLoading: auditLoading } = useQuery({
+    queryKey: log ? qk.requestAudit(log.id) : ["request_audit", "none"],
+    queryFn: () => getRequestAudit(log!.id),
+    enabled: !!log && !!log.enhanced_audit,
     staleTime: 5 * 60_000,
   });
 
@@ -157,6 +167,65 @@ function LogDetail({ log, onClose }: { log: RequestLog | null; onClose: () => vo
             ))}
           </Table.Tbody>
         </Table>
+        {log.enhanced_audit && (
+          <div>
+            <Group justify="space-between" align="center" mb={4}>
+              <Text fw={600} size="sm">客户端与网络信息</Text>
+              <Badge color="orange" variant="light" size="sm">增强审计</Badge>
+            </Group>
+            {auditLoading ? (
+              <Skeleton height={120} />
+            ) : auditData ? (
+              <Table>
+                <Table.Tbody>
+                  <Table.Tr>
+                    <Table.Td fw={600} w={140}>Client IP</Table.Td>
+                    <Table.Td>
+                      <Group gap={6}>
+                        <Code>{auditData.client_ip ?? "—"}</Code>
+                        {auditData.ip_source && (
+                          <Badge size="xs" variant="outline" color={auditData.ip_source === "peer" ? "gray" : auditData.ip_source === "xff" ? "blue" : "grape"}>
+                            {auditData.ip_source}
+                          </Badge>
+                        )}
+                      </Group>
+                    </Table.Td>
+                  </Table.Tr>
+                  <Table.Tr>
+                    <Table.Td fw={600}>Peer IP</Table.Td>
+                    <Table.Td><Code>{auditData.peer_ip ?? "—"}</Code></Table.Td>
+                  </Table.Tr>
+                  <Table.Tr>
+                    <Table.Td fw={600}>Forwarded chain</Table.Td>
+                    <Table.Td><Text size="xs" style={{ wordBreak: "break-all" }}>{auditData.forwarded_chain ?? "—"}</Text></Table.Td>
+                  </Table.Tr>
+                  <Table.Tr>
+                    <Table.Td fw={600}>User-Agent</Table.Td>
+                    <Table.Td><Text size="xs" style={{ wordBreak: "break-all" }}>{auditData.user_agent ?? "—"}</Text></Table.Td>
+                  </Table.Tr>
+                  <Table.Tr>
+                    <Table.Td fw={600}>API surface</Table.Td>
+                    <Table.Td>{auditData.api_surface ?? "—"}</Table.Td>
+                  </Table.Tr>
+                  <Table.Tr>
+                    <Table.Td fw={600}>anthropic-version</Table.Td>
+                    <Table.Td><Text size="xs">{auditData.anthropic_version ?? "—"}</Text></Table.Td>
+                  </Table.Tr>
+                  <Table.Tr>
+                    <Table.Td fw={600}>anthropic-beta</Table.Td>
+                    <Table.Td><Text size="xs" style={{ wordBreak: "break-all" }}>{auditData.anthropic_beta ?? "—"}</Text></Table.Td>
+                  </Table.Tr>
+                  <Table.Tr>
+                    <Table.Td fw={600}>Content-Length</Table.Td>
+                    <Table.Td>{auditData.content_length ?? "—"}</Table.Td>
+                  </Table.Tr>
+                </Table.Tbody>
+              </Table>
+            ) : (
+              <Text size="sm" c="dimmed">审计详情不可用。</Text>
+            )}
+          </div>
+        )}
         {showProbeJson && (
           <div>
             <Group justify="space-between" align="center" mb={4}>
@@ -266,6 +335,7 @@ export default function Logs() {
     filters.model,
     filters.model_key,
     filters.started_from,
+    filters.enhanced_audit ? "1" : undefined,
   ].filter((value) => value !== undefined && value !== null && value !== "").length;
 
   const renderFilters = () => (
@@ -331,6 +401,15 @@ export default function Logs() {
             offset: 0,
           }))
         }
+        clearable
+        size="sm"
+      />
+      <Select
+        label="增强审计"
+        placeholder="全部"
+        data={[{ value: "1", label: "仅看已审计" }]}
+        value={filters.enhanced_audit ? "1" : null}
+        onChange={(v) => setFilters((f) => ({ ...f, enhanced_audit: v === "1" ? true : undefined, offset: 0 }))}
         clearable
         size="sm"
       />
