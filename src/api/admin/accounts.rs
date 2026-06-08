@@ -20,10 +20,10 @@ use crate::{
     },
     config::{AccountSlot, AuthMethod, CLAUDE_ENDPOINT, ClewdrCookie},
     db::accounts::{
-        AccountWithRuntime, batch_upsert_runtime_states, find_account_by_organization_uuid,
-        get_account_by_id, load_all_accounts, set_account_active, set_account_auth_error,
-        set_account_disabled, set_account_last_failure, set_account_reset_time,
-        update_account_metadata_unchecked, upsert_account_oauth,
+        AccountWithRuntime, batch_upsert_runtime_states, clear_account_cooldown,
+        find_account_by_organization_uuid, get_account_by_id, load_all_accounts,
+        set_account_active, set_account_auth_error, set_account_disabled, set_account_last_failure,
+        set_account_reset_time, update_account_metadata_unchecked, upsert_account_oauth,
     },
     db::proxies::{build_proxy_url, get_proxy_by_id},
     error::{
@@ -1148,6 +1148,20 @@ async fn clear_test_failure_verdict(state: &AppState, account_id: i64, previous_
     if previous_status == "auth_error" {
         match set_account_active(&state.db, account_id).await {
             Ok(()) => {
+                // Drop any stale cooldown left over from an earlier 429
+                // before we flipped to auth_error. Without this, the
+                // pool loader sees a future `reset_time` and immediately
+                // re-parks the just-reactivated row in
+                // exhausted/cooling — the row would read as `active` in
+                // the DB but never dispatch. The OAuth probe path
+                // doesn't need this because it writes a fresh
+                // `reset_time` from the quota snapshot in the same
+                // pass; `/test` has no such snapshot.
+                if let Err(err) = clear_account_cooldown(&state.db, account_id).await {
+                    tracing::warn!(
+                        "Failed to clear cooldown for reactivated account {account_id}: {err}"
+                    );
+                }
                 // `set_account_active` has a `status != 'disabled'` guard,
                 // so a concurrent admin disable still wins; reload the
                 // pool so its in-memory invalid set picks up whichever

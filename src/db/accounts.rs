@@ -633,6 +633,30 @@ pub async fn set_account_active(pool: &SqlitePool, account_id: i64) -> Result<()
     Ok(())
 }
 
+/// Clear any pending cooldown on the account's runtime state. Distinct
+/// from `set_account_active` because the OAuth probe success path sets
+/// `reset_time` from a fresh quota snapshot (see
+/// `claude_code_state/probe.rs`) and must not have its computed value
+/// clobbered. The `/test` reactivation path has no snapshot to consult
+/// and would otherwise leave a stale future `reset_time` from a prior
+/// 429 in place — the pool's loader would then re-park the row in
+/// `exhausted/cooling` immediately after we flipped status back to
+/// `active`, defeating the reactivation.
+///
+/// No-op if no runtime_state row exists yet.
+pub async fn clear_account_cooldown(pool: &SqlitePool, account_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE account_runtime_state
+         SET reset_time = NULL,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE account_id = ?1",
+    )
+    .bind(account_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Probe-derived metadata payload for [`update_account_metadata`] and
 /// [`update_account_metadata_unchecked`]. `None` for any field
 /// preserves the existing column value (COALESCE semantics) — not
