@@ -621,6 +621,13 @@ function parseFiltersFromSearch(search: string): RequestFilters | null {
   const user_id = rawUserId != null && Number.isFinite(Number(rawUserId))
     ? Number(rawUserId)
     : undefined;
+  // enhanced_audit is a tri-state (unset / true / false). Only "true"
+  // and "1" turn it on so a stray `enhanced_audit=` empty value or
+  // `false` doesn't accidentally enable filtering. Returning undefined
+  // for unset matches the rest of the parser.
+  const rawAudit = params.get("enhanced_audit");
+  const enhanced_audit =
+    rawAudit === "true" || rawAudit === "1" ? true : undefined;
 
   const hasAny =
     request_type !== undefined ||
@@ -629,7 +636,8 @@ function parseFiltersFromSearch(search: string): RequestFilters | null {
     model_key !== undefined ||
     started_from !== undefined ||
     started_to !== undefined ||
-    user_id !== undefined;
+    user_id !== undefined ||
+    enhanced_audit !== undefined;
 
   if (!hasAny) return null;
 
@@ -641,5 +649,6 @@ function parseFiltersFromSearch(search: string): RequestFilters | null {
     started_from,
     started_to,
     user_id,
+    enhanced_audit,
   };
 }
