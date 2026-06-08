@@ -92,6 +92,7 @@ rand = { version = "0.10.0", features = ["std_rng"] }
 hmac = "0.12"
 rpassword = "7"
 semver = "1"
+ipnet = { version = "2", features = ["serde"] }
 aes-gcm = { version = "0.10", optional = true }
 inquire = { version = "0.7", default-features = false, features = ["crossterm"], optional = true }
 

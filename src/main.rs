@@ -244,13 +244,16 @@ async fn serve() -> Result<(), ClewdrError> {
         admin_panel_url(local_addr).green().underline()
     );
     // serve the application
-    Ok(axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to install Ctrl-C handler");
-        })
-        .await?)
+    Ok(axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl-C handler");
+    })
+    .await?)
 }
 
 #[cfg(test)]

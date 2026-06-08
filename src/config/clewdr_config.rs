@@ -8,6 +8,7 @@ use figment::{
     Figment,
     providers::{Env, Format, Toml},
 };
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use tokio::spawn;
 use tracing::error;
@@ -20,6 +21,17 @@ use crate::{
     config::{CC_CLIENT_ID, default_check_update, default_ip, default_port},
     error::ClewdrError,
 };
+
+/// Default trusted reverse-proxy CIDRs. See `trusted_proxies` field for semantics.
+fn default_trusted_proxies() -> Vec<IpNet> {
+    ["127.0.0.0/8", "::1/128", "172.16.0.0/12"]
+        .iter()
+        .map(|s| {
+            s.parse()
+                .expect("hard-coded default trusted_proxies CIDR must parse")
+        })
+        .collect()
+}
 
 /// A struct representing the configuration of the application
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -46,6 +58,15 @@ pub struct ClewdrConfig {
     #[serde(default)]
     pub proxy: Option<String>,
 
+    /// CIDR list of reverse proxies whose `X-Forwarded-For` / `X-Real-IP`
+    /// headers are trusted. When the TCP peer is in this list, the rightmost
+    /// non-trusted hop in XFF (or X-Real-IP fallback) is taken as the client
+    /// IP. Otherwise the peer address is used directly and forwarded headers
+    /// are ignored — preventing spoofing by direct callers. Set to `[]` to
+    /// disable header parsing entirely (always use peer IP).
+    #[serde(default = "default_trusted_proxies")]
+    pub trusted_proxies: Vec<IpNet>,
+
     // Claude Code settings
     #[serde(default)]
     pub claude_code_client_id: Option<String>,
@@ -66,6 +87,7 @@ impl Default for ClewdrConfig {
             log_to_file: false,
             debug_cookie: false,
             proxy: None,
+            trusted_proxies: default_trusted_proxies(),
             claude_code_client_id: None,
             wreq_proxy: None,
         }

@@ -1,8 +1,10 @@
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use axum::{
     Router,
     body::{Body, to_bytes},
+    extract::ConnectInfo,
     http::{Method, Request, StatusCode, header},
 };
 use clewdr_hub::{
@@ -65,12 +67,19 @@ impl TestApp {
             builder = builder.header(*name, *value);
         }
 
-        let request = builder
+        let mut request = builder
             .body(match body {
                 Some(value) => Body::from(serde_json::to_vec(&value).unwrap()),
                 None => Body::empty(),
             })
             .unwrap();
+
+        // Inject ConnectInfo so the new resolve_client_ip() treats the peer
+        // as trusted (loopback) and honors forwarded headers; without this
+        // tower::oneshot bypasses the make_service that normally sets it.
+        request
+            .extensions_mut()
+            .insert(ConnectInfo::<SocketAddr>("127.0.0.1:0".parse().unwrap()));
 
         self.router.clone().oneshot(request).await.unwrap()
     }

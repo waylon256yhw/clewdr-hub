@@ -1,8 +1,10 @@
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use axum::{
     Router,
     body::{Body, to_bytes},
+    extract::ConnectInfo,
     http::{Method, Request, StatusCode, header},
 };
 use clewdr_hub::{
@@ -67,12 +69,21 @@ impl TestApp {
             builder = builder.header(*name, *value);
         }
 
-        let request = builder
+        let mut request = builder
             .body(match body {
                 Some(value) => Body::from(serde_json::to_vec(&value).unwrap()),
                 None => Body::empty(),
             })
             .unwrap();
+
+        // Router::oneshot does not run the make_service that normally
+        // populates ConnectInfo. Inject loopback so resolve_client_ip()
+        // treats the peer as trusted (matches real prod behind same-host
+        // reverse proxy). Tests that need to assert untrusted behavior
+        // should override this manually.
+        request
+            .extensions_mut()
+            .insert(ConnectInfo::<SocketAddr>("127.0.0.1:0".parse().unwrap()));
 
         self.router.clone().oneshot(request).await.unwrap()
     }
