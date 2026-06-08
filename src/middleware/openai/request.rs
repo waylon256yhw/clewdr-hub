@@ -491,6 +491,12 @@ where
 
     async fn from_request(req: Request, _: &S) -> Result<Self, Self::Rejection> {
         let auth_user = req.extensions().get::<AuthenticatedUser>().cloned();
+        // Snapshot the audit context here — Json::from_request below
+        // consumes `req`. Mirrors ClaudeCodePreprocess ordering.
+        let audit_snapshot = req
+            .extensions()
+            .get::<crate::db::models::RequestAuditSnapshot>()
+            .cloned();
         let include_reasoning = parse_include_reasoning(req.headers());
         let Json(oai) = Json::<ChatCompletionRequest>::from_request(req, &()).await?;
         let include_usage = oai
@@ -524,7 +530,14 @@ where
         // Build context before inject_metadata_user_id so the affinity hash
         // observes the pre-injection state — see ClaudeCodePreprocess for
         // the matching ordering on the Anthropic path.
-        let context = build_claude_context(&body, auth_user.as_ref(), None);
+        let mut context = build_claude_context(&body, auth_user.as_ref(), None);
+
+        // Tag api_surface for audited keys entering through the OpenAI
+        // compat surface. Non-audited keys (snapshot is None) skip.
+        if let Some(mut snapshot) = audit_snapshot {
+            snapshot.api_surface = Some("openai");
+            context.audit = Some(snapshot);
+        }
 
         inject_metadata_user_id(&mut body, auth_user.as_ref());
 

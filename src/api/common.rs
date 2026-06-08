@@ -63,6 +63,11 @@ pub async fn log_error_request(
         request_id: ctx.request_id.clone(),
         started_at: ctx.started_at,
         event_tx: state.event_tx.clone(),
+        // Early-failure path (quota / RPM / upstream error): forward
+        // the audit snapshot so "failed but audited" requests still
+        // produce a sidecar row. Codex flagged this as the contract
+        // most likely to break silently.
+        audit: ctx.audit.clone(),
     };
     persist_terminal_request_log(
         &billing_ctx,

@@ -308,6 +308,8 @@ async fn persist_probe_row(
         request_id: format!("probe-{}-{}", account_id, uuid::Uuid::new_v4()),
         started_at,
         event_tx,
+        // Probes are infrastructure pokes, not per-key requests.
+        audit: None,
     };
     persist_probe_log(
         &ctx,

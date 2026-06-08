@@ -828,6 +828,8 @@ pub async fn test(
         request_id: format!("probe-proxy-{}-{}", id, uuid::Uuid::new_v4()),
         started_at,
         event_tx: state.event_tx.clone(),
+        // Proxy probe is not an authenticated user request.
+        audit: None,
     };
     persist_probe_log(
         &ctx,

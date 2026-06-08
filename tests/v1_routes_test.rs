@@ -606,3 +606,110 @@ async fn v1_messages_returns_no_account_available_for_real_requests() {
     let body = response_json(response).await;
     assert_eq!(error_message(&body), "No valid upstream accounts available");
 }
+
+async fn enable_enhanced_audit(pool: &SqlitePool, api_key_id: i64) {
+    sqlx::query("UPDATE api_keys SET enhanced_audit_enabled = 1 WHERE id = ?1")
+        .bind(api_key_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn latest_audit_row(
+    pool: &SqlitePool,
+) -> Option<(
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+)> {
+    sqlx::query_as::<
+        _,
+        (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
+        "SELECT a.peer_ip, a.client_ip, a.ip_source, a.user_agent, a.api_surface
+         FROM request_log_audits a
+         JOIN request_logs r ON r.id = a.request_log_id
+         ORDER BY r.id DESC
+         LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
+async fn audit_row_count(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM request_log_audits")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Audit ON + quota-rejected request → sidecar row written in the same
+/// transaction as the failure log. This is the "failed but audited"
+/// contract codex called out as easy to silently break.
+#[tokio::test]
+async fn enhanced_audit_writes_sidecar_on_quota_rejection() {
+    let app = setup_app(PolicyConfig {
+        weekly_budget_nanousd: 100,
+        ..PolicyConfig::default()
+    })
+    .await;
+    seed_current_week_cost(&app.pool, app.user_id, 100).await;
+    enable_enhanced_audit(&app.pool, app.api_key_id).await;
+
+    let response = app
+        .request(
+            Method::POST,
+            "/v1/messages",
+            Some(real_message_body()),
+            Some(("x-api-key", app.api_key.as_str())),
+            &[
+                ("x-forwarded-for", "203.0.113.42"),
+                ("user-agent", "test-agent/1.0"),
+            ],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let row = latest_audit_row(&app.pool)
+        .await
+        .expect("audit sidecar row should exist for the quota rejection");
+    assert_eq!(row.0.as_deref(), Some("127.0.0.1"), "peer_ip");
+    assert_eq!(row.1.as_deref(), Some("203.0.113.42"), "client_ip from XFF");
+    assert_eq!(row.2.as_deref(), Some("xff"));
+    assert_eq!(row.3.as_deref(), Some("test-agent/1.0"));
+    assert_eq!(row.4.as_deref(), Some("anthropic"));
+}
+
+/// Audit OFF (default) → no sidecar row regardless of header presence.
+#[tokio::test]
+async fn enhanced_audit_off_writes_no_sidecar() {
+    let app = setup_app(PolicyConfig {
+        weekly_budget_nanousd: 100,
+        ..PolicyConfig::default()
+    })
+    .await;
+    seed_current_week_cost(&app.pool, app.user_id, 100).await;
+    // Note: NOT enabling enhanced_audit_enabled.
+
+    let response = app
+        .request(
+            Method::POST,
+            "/v1/messages",
+            Some(real_message_body()),
+            Some(("x-api-key", app.api_key.as_str())),
+            &[("x-forwarded-for", "203.0.113.42")],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    // Quota path writes request_logs, but not the sidecar.
+    assert_eq!(audit_row_count(&app.pool).await, 0);
+}

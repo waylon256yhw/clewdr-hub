@@ -36,6 +36,10 @@ pub fn admin_router() -> Router<AppState> {
         .route("/keys/{id}", delete(keys::remove))
         .route("/keys/{id}/bindings", put(keys::update_bindings))
         .route("/keys/{id}/auto_cache", put(keys::update_auto_cache))
+        .route(
+            "/keys/{id}/enhanced_audit",
+            put(keys::update_enhanced_audit),
+        )
         // Accounts
         .route("/accounts", get(accounts::list).post(accounts::create))
         .route("/accounts/probe", post(accounts::probe_all))
@@ -71,6 +75,7 @@ pub fn admin_router() -> Router<AppState> {
             "/requests/{id}/response_body",
             get(requests::get_response_body),
         )
+        .route("/requests/{id}/audit", get(requests::get_audit))
         // SSE events
         .route("/events", get(events::events))
         // Overview

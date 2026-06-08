@@ -1239,6 +1239,8 @@ async fn test_account_api_key(
         request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
         started_at,
         event_tx: state.event_tx.clone(),
+        // Admin-driven infrastructure test, no associated api_key.
+        audit: None,
     };
     persist_probe_log(
         &ctx,
@@ -1332,6 +1334,7 @@ pub async fn test_account(
                                     request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
                                     started_at,
                                     event_tx: state.event_tx.clone(),
+                                    audit: None,
                                 };
                                 persist_probe_log(
                                     &ctx,
@@ -1381,6 +1384,7 @@ pub async fn test_account(
                                 request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
                                 started_at,
                                 event_tx: state.event_tx.clone(),
+                                audit: None,
                             };
                             persist_probe_log(
                                 &ctx,
@@ -1521,6 +1525,8 @@ pub async fn test_account(
         request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
         started_at,
         event_tx: state.event_tx.clone(),
+        // Admin-driven infrastructure test, no associated api_key.
+        audit: None,
     };
     persist_probe_log(
         &ctx,

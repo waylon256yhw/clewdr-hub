@@ -144,6 +144,10 @@ impl LLMProvider for ClaudeCodeProvider {
             request_id: request.context.request_id.clone(),
             started_at: request.context.started_at,
             event_tx: self.shared.event_tx.clone(),
+            // Main message path: forward the per-key audit snapshot
+            // built by auth. Presence here is what triggers the
+            // sidecar row insert in the terminal-log transaction.
+            audit: request.context.audit.clone(),
         });
 
         let ClaudeInvocation {

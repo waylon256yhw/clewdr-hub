@@ -46,14 +46,35 @@ pub async fn lookup_model_pricing(
     Ok(row)
 }
 
-/// Insert a request log row.
+/// Row shape for the enhanced-audit sidecar table. Inserted in the same
+/// transaction as the parent `request_logs` row when (and only when)
+/// the API key has `enhanced_audit_enabled = true`. The presence of a
+/// row here is the authoritative "this request was audited" signal —
+/// we deliberately do not denormalize a flag back onto `request_logs`.
+#[derive(Debug)]
+pub struct RequestLogAuditRow<'a> {
+    pub request_log_id: i64,
+    pub peer_ip: Option<&'a str>,
+    pub client_ip: Option<&'a str>,
+    pub ip_source: Option<&'a str>,
+    pub forwarded_chain: Option<&'a str>,
+    pub user_agent: Option<&'a str>,
+    pub api_surface: Option<&'a str>,
+    pub anthropic_version: Option<&'a str>,
+    pub anthropic_beta: Option<&'a str>,
+    pub content_length: Option<i64>,
+}
+
+/// Insert a request log row. Returns the new row's `id`, retrieved via
+/// `last_insert_rowid()` so the caller can attach a sidecar audit row
+/// inside the same transaction.
 ///
 /// Accepts any sqlx `Executor` (a pool or a transaction connection) so the
 /// terminal write path can bundle log + rollups into a single transaction.
 pub async fn insert_request_log<'e, E>(
     executor: E,
     r: &RequestLogRow<'_>,
-) -> Result<(), sqlx::Error>
+) -> Result<i64, sqlx::Error>
 where
     E: Executor<'e, Database = Sqlite>,
 {
@@ -104,6 +125,42 @@ where
     .bind(r.error_code)
     .bind(r.error_message)
     .bind(r.response_body)
+    .execute(executor)
+    .await
+    .map(|res| res.last_insert_rowid())
+}
+
+/// Insert one row into `request_log_audits`. Must run inside the same
+/// transaction as the parent `request_logs` insert so a partial failure
+/// rolls both back together. `PRAGMA foreign_keys = ON` (set in
+/// `db::init_pool`) keeps the FK live.
+pub async fn insert_request_log_audit<'e, E>(
+    executor: E,
+    r: &RequestLogAuditRow<'_>,
+) -> Result<(), sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(
+        r#"INSERT INTO request_log_audits (
+            request_log_id, peer_ip, client_ip, ip_source, forwarded_chain,
+            user_agent, api_surface, anthropic_version, anthropic_beta,
+            content_length
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5,
+            ?6, ?7, ?8, ?9, ?10
+        )"#,
+    )
+    .bind(r.request_log_id)
+    .bind(r.peer_ip)
+    .bind(r.client_ip)
+    .bind(r.ip_source)
+    .bind(r.forwarded_chain)
+    .bind(r.user_agent)
+    .bind(r.api_surface)
+    .bind(r.anthropic_version)
+    .bind(r.anthropic_beta)
+    .bind(r.content_length)
     .execute(executor)
     .await?;
     Ok(())

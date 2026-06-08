@@ -35,11 +35,29 @@ pub struct RequestLogResponse {
     pub cost_nanousd: i64,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    /// Derived from `EXISTS (SELECT 1 FROM request_log_audits ...)` —
+    /// the sidecar's existence is the authoritative "this row was
+    /// audited" signal. Frontend gates the lazy detail fetch on this
+    /// flag to avoid 404s on un-audited rows.
+    pub enhanced_audit: bool,
 }
 
 #[derive(Serialize)]
 pub struct ResponseBodyPayload {
     pub response_body: Option<String>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct RequestAuditPayload {
+    pub peer_ip: Option<String>,
+    pub client_ip: Option<String>,
+    pub ip_source: Option<String>,
+    pub forwarded_chain: Option<String>,
+    pub user_agent: Option<String>,
+    pub api_surface: Option<String>,
+    pub anthropic_version: Option<String>,
+    pub anthropic_beta: Option<String>,
+    pub content_length: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -59,6 +77,10 @@ pub struct RequestListParams {
     pub model_key: Option<String>,
     pub started_from: Option<String>,
     pub started_to: Option<String>,
+    /// When `Some(true)`, restrict to rows that have a matching
+    /// `request_log_audits` sidecar row. `Some(false)` / `None` apply
+    /// no constraint.
+    pub enhanced_audit: Option<bool>,
 }
 
 pub async fn list(
@@ -101,6 +123,13 @@ pub async fn list(
         where_clauses.push(format!("r.started_at <= ?{bind_idx}"));
         bind_idx += 1;
     }
+    // enhanced_audit=true → only rows with a sidecar audit row. No
+    // bind needed; the EXISTS subquery is parameterless.
+    if matches!(params.enhanced_audit, Some(true)) {
+        where_clauses.push(
+            "EXISTS (SELECT 1 FROM request_log_audits a WHERE a.request_log_id = r.id)".to_string(),
+        );
+    }
 
     let where_sql = if where_clauses.is_empty() {
         String::new()
@@ -120,7 +149,10 @@ pub async fn list(
                   r.input_tokens, r.output_tokens,
                   r.cache_creation_tokens, r.cache_read_tokens,
                   r.cost_nanousd,
-                  r.error_code, r.error_message
+                  r.error_code, r.error_message,
+                  CASE WHEN EXISTS (
+                      SELECT 1 FROM request_log_audits a WHERE a.request_log_id = r.id
+                  ) THEN 1 ELSE 0 END AS enhanced_audit
            FROM request_logs r
            LEFT JOIN users u ON r.user_id = u.id
            LEFT JOIN api_keys ak ON r.api_key_id = ak.id
@@ -193,6 +225,30 @@ pub async fn list(
         offset,
         limit,
     }))
+}
+
+/// Lazy-load the audit sidecar row for a single request log row. The
+/// frontend should only call this when the list response indicated
+/// `enhanced_audit: true` — un-audited rows return 404 here, which is
+/// expected (the sidecar's absence is the "not audited" signal).
+pub async fn get_audit(
+    State(db): State<SqlitePool>,
+    Path(id): Path<i64>,
+) -> Result<Json<RequestAuditPayload>, ClewdrError> {
+    let row: Option<RequestAuditPayload> = sqlx::query_as(
+        r#"SELECT peer_ip, client_ip, ip_source, forwarded_chain,
+                  user_agent, api_surface, anthropic_version, anthropic_beta,
+                  content_length
+           FROM request_log_audits
+           WHERE request_log_id = ?1"#,
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await?;
+    let payload = row.ok_or(ClewdrError::NotFound {
+        msg: "request log audit not found",
+    })?;
+    Ok(Json(payload))
 }
 
 /// Lazy-load the upstream `response_body` for a single request log row.
@@ -299,6 +355,7 @@ mod tests {
                 model_key: Some("claude-opus-4-7".into()),
                 started_from: None,
                 started_to: None,
+                enhanced_audit: None,
             },
         )
         .await;
@@ -318,6 +375,7 @@ mod tests {
                 model_key: None,
                 started_from: None,
                 started_to: None,
+                enhanced_audit: None,
             },
         )
         .await;

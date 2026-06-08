@@ -18,10 +18,31 @@ use crate::state::AuthState;
 use crate::types::openai::OpenAIErrorBody;
 
 // Caps applied at parse time so an audited / curious client cannot bloat
-// rows in api_keys.last_used_ip or future request_log_audits.
+// rows in api_keys.last_used_ip or request_log_audits.
 const MAX_XFF_RAW_BYTES: usize = 1024;
 const MAX_XFF_HOPS: usize = 16;
 const MAX_IP_TOKEN_BYTES: usize = 64;
+const MAX_USER_AGENT_BYTES: usize = 512;
+const MAX_ANTHROPIC_VERSION_BYTES: usize = 64;
+const MAX_ANTHROPIC_BETA_BYTES: usize = 256;
+
+/// Trim and length-cap a header value. Returns `None` if absent or empty
+/// post-trim. Audited keys cannot use giant headers to inflate sidecar rows.
+fn header_truncated(parts: &Parts, name: &str, max: usize) -> Option<String> {
+    parts
+        .headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            if s.len() <= max {
+                s.to_string()
+            } else {
+                s[..max].to_string()
+            }
+        })
+}
 
 /// Source of the resolved client IP. Lets administrators tell at a glance
 /// whether the value came from the TCP peer (most trustworthy) or from a
@@ -244,10 +265,40 @@ where
                         }
                         let _ = crate::db::queries::touch_user(&db, uid).await;
                     });
-                    // Stash the resolved IP info for downstream consumers
-                    // (audit pipeline in Step B reads this). Always inserted,
-                    // not conditional on audit being enabled — keeps the
-                    // hot path branch-free and lets debugging tools peek.
+                    // Build the audit snapshot only when the key has it
+                    // enabled. Existence in extensions later == "this
+                    // request should be audited". Non-audited keys carry
+                    // no snapshot, so the billing layer's
+                    // `ctx.audit.is_some()` check skips the sidecar write.
+                    if authed_user.enhanced_audit_enabled {
+                        let content_length: Option<i64> = parts
+                            .headers
+                            .get("content-length")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<i64>().ok());
+                        let snapshot = crate::db::models::RequestAuditSnapshot {
+                            peer_ip: resolved.peer_ip.clone(),
+                            client_ip: resolved.client_ip.clone(),
+                            ip_source: resolved.source.as_str(),
+                            forwarded_chain: resolved.forwarded_chain.clone(),
+                            user_agent: header_truncated(parts, "user-agent", MAX_USER_AGENT_BYTES),
+                            anthropic_version: header_truncated(
+                                parts,
+                                "anthropic-version",
+                                MAX_ANTHROPIC_VERSION_BYTES,
+                            ),
+                            anthropic_beta: header_truncated(
+                                parts,
+                                "anthropic-beta",
+                                MAX_ANTHROPIC_BETA_BYTES,
+                            ),
+                            api_surface: None, // filled by surface preprocess
+                            content_length,
+                        };
+                        parts.extensions.insert(snapshot);
+                    }
+                    // Resolved IP info is always inserted (debugging /
+                    // future consumers); audit snapshot is conditional.
                     parts.extensions.insert(resolved);
                     parts.extensions.insert(authed_user);
                     return Ok(Self);
@@ -366,6 +417,10 @@ where
                 monthly_budget_nanousd,
                 bound_account_ids: Vec::new(),
                 auto_cache_enabled: false,
+                // Admin cookie sessions are never audited — there's no
+                // api_key behind them, and we don't want the admin UI's
+                // own requests filling request_log_audits.
+                enhanced_audit_enabled: false,
             });
 
         Ok(Self)

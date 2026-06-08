@@ -573,6 +573,10 @@ pub(crate) fn build_claude_context(
             .map(|u| u.bound_account_ids.clone())
             .unwrap_or_default(),
         selected_account_id: Default::default(),
+        // Filled by the surface preprocess (Claude/OpenAI from_request)
+        // from the snapshot auth stored in extensions. None here means
+        // the request was not audited, or hasn't reached preprocess yet.
+        audit: None,
     }
 }
 
@@ -588,6 +592,12 @@ where
         let auth_user = req
             .extensions()
             .get::<crate::db::models::AuthenticatedUser>()
+            .cloned();
+        // Snapshot the audit context here — `Json::from_request` below
+        // consumes `req`, so we cannot read extensions afterwards.
+        let audit_snapshot = req
+            .extensions()
+            .get::<crate::db::models::RequestAuditSnapshot>()
             .cloned();
         let anthropic_beta = extract_anthropic_beta_header(req.headers());
         let is_count_tokens = is_count_tokens_path(req.uri().path());
@@ -631,7 +641,16 @@ where
         // requests from the same client share an affinity slot. Injecting a
         // generated `metadata.user_id` first would make every anonymous
         // request hash uniquely and defeat caching.
-        let context = build_claude_context(&body, auth_user.as_ref(), anthropic_beta);
+        let mut context = build_claude_context(&body, auth_user.as_ref(), anthropic_beta);
+
+        // If the API key has enhanced audit enabled, tag api_surface
+        // for this entry point and attach the snapshot. Non-audited
+        // keys leave `context.audit` as None and the billing layer
+        // skips the sidecar write.
+        if let Some(mut snapshot) = audit_snapshot {
+            snapshot.api_surface = Some("anthropic");
+            context.audit = Some(snapshot);
+        }
 
         // Inject metadata.user_id if missing (for non-CLI clients like 2API).
         // The context above intentionally observes the pre-injection state.
@@ -1272,6 +1291,7 @@ mod tests {
             monthly_budget_nanousd: 0,
             bound_account_ids: Vec::new(),
             auto_cache_enabled: enabled,
+            enhanced_audit_enabled: false,
         }
     }
 

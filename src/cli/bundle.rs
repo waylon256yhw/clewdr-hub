@@ -48,8 +48,10 @@ pub const RUNTIME_TABLES: &[&str] = &[
 
 /// Tables we never export, regardless of flags:
 /// - `request_logs` is append-only log data, large and not portable
+/// - `request_log_audits` carries per-request client IP / UA — PII that
+///   must not leak out of the operator's environment via bundle export
 /// - `_sqlx_migrations` is rebuilt on import via the migration step
-pub const NEVER_EXPORTED: &[&str] = &["request_logs", "_sqlx_migrations"];
+pub const NEVER_EXPORTED: &[&str] = &["request_logs", "request_log_audits", "_sqlx_migrations"];
 
 /// `settings` rows whose `key` matches this list are never exported, even
 /// without `--no-secrets`. `session_secret` is the HMAC signing key for

@@ -3,9 +3,11 @@ use sqlx::SqlitePool;
 use tracing::warn;
 
 use crate::db::billing::{
-    RequestLogRow, insert_request_log, lookup_model_pricing, upsert_usage_daily_rollup,
-    upsert_usage_lifetime_total, upsert_usage_rollup,
+    RequestLogAuditRow, RequestLogRow, insert_request_log, insert_request_log_audit,
+    lookup_model_pricing, upsert_usage_daily_rollup, upsert_usage_lifetime_total,
+    upsert_usage_rollup,
 };
+use crate::db::models::RequestAuditSnapshot;
 use crate::state::AdminEvent;
 
 /// UTC+8 offset used to bucket daily rollups. Matches the migration SQL
@@ -49,6 +51,12 @@ impl BillingUsage {
 }
 
 /// Billing context carried through the request lifecycle.
+///
+/// `audit` field has no `Default` and no `#[serde(default)]` so every
+/// construction site is forced by the compiler to make an explicit
+/// choice: either thread an existing snapshot through (audited request)
+/// or set `None` (probe / admin test / non-audited key). This is the
+/// "failed-but-still-audited" contract guard codex called out.
 #[derive(Debug, Clone)]
 pub struct BillingContext {
     pub db: SqlitePool,
@@ -59,6 +67,7 @@ pub struct BillingContext {
     pub request_id: String,
     pub started_at: DateTime<Utc>,
     pub event_tx: tokio::sync::broadcast::Sender<AdminEvent>,
+    pub audit: Option<RequestAuditSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,7 +303,28 @@ pub async fn persist_terminal_request_log(ctx: &BillingContext, opts: TerminalLo
     // never see a log row that lacks a matching rollup contribution.
     let tx_result: Result<(), sqlx::Error> = async {
         let mut tx = ctx.db.begin().await?;
-        insert_request_log(&mut *tx, &log).await?;
+        let request_log_id = insert_request_log(&mut *tx, &log).await?;
+
+        // Enhanced-audit sidecar: presence of `ctx.audit` is the
+        // single source of truth for "this request was audited".
+        // Auth only populates it for keys with the flag on (and never
+        // for admin cookie sessions), so this branch is the contract
+        // boundary. Failure of either insert rolls the whole batch back.
+        if let Some(ref audit) = ctx.audit {
+            let audit_row = RequestLogAuditRow {
+                request_log_id,
+                peer_ip: Some(audit.peer_ip.as_str()),
+                client_ip: Some(audit.client_ip.as_str()),
+                ip_source: Some(audit.ip_source),
+                forwarded_chain: audit.forwarded_chain.as_deref(),
+                user_agent: audit.user_agent.as_deref(),
+                api_surface: audit.api_surface,
+                anthropic_version: audit.anthropic_version.as_deref(),
+                anthropic_beta: audit.anthropic_beta.as_deref(),
+                content_length: audit.content_length,
+            };
+            insert_request_log_audit(&mut *tx, &audit_row).await?;
+        }
 
         if usage_accounted && let (Some(user_id), Some(usage)) = (ctx.user_id, opts.usage.as_ref())
         {
@@ -477,6 +507,7 @@ mod tests {
             request_id: request_id.to_string(),
             started_at: Utc::now(),
             event_tx: tx,
+            audit: None,
         }
     }
 

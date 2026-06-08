@@ -24,6 +24,7 @@ pub struct KeyResponse {
     pub created_at: String,
     pub bound_account_ids: Vec<i64>,
     pub auto_cache_enabled: bool,
+    pub enhanced_audit_enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -36,6 +37,7 @@ pub struct KeyCreatedResponse {
     pub created_at: String,
     pub bound_account_ids: Vec<i64>,
     pub auto_cache_enabled: bool,
+    pub enhanced_audit_enabled: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -52,6 +54,7 @@ struct KeyRow {
     last_used_ip: Option<String>,
     created_at: String,
     auto_cache_enabled: i64,
+    enhanced_audit_enabled: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -67,6 +70,8 @@ pub struct CreateKeyRequest {
     pub bound_account_ids: Option<Vec<i64>>,
     #[serde(default)]
     pub auto_cache_enabled: bool,
+    #[serde(default)]
+    pub enhanced_audit_enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -83,6 +88,11 @@ pub struct UpdateBindingsRequest {
 
 #[derive(Deserialize)]
 pub struct UpdateAutoCacheRequest {
+    pub enabled: bool,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateEnhancedAuditRequest {
     pub enabled: bool,
 }
 
@@ -126,6 +136,7 @@ fn attach_bindings(keys: Vec<KeyRow>, bindings: Vec<BindingRow>) -> Vec<KeyRespo
                 created_at: k.created_at,
                 bound_account_ids: bound,
                 auto_cache_enabled: k.auto_cache_enabled != 0,
+                enhanced_audit_enabled: k.enhanced_audit_enabled != 0,
             }
         })
         .collect()
@@ -146,7 +157,7 @@ pub async fn list(
         let items: Vec<KeyRow> = sqlx::query_as(
             r#"SELECT ak.id, ak.user_id, u.username, ak.label, ak.lookup_key, ak.plaintext_key,
                       ak.disabled_at, ak.expires_at, ak.last_used_at, ak.last_used_ip, ak.created_at,
-                      ak.auto_cache_enabled
+                      ak.auto_cache_enabled, ak.enhanced_audit_enabled
                FROM api_keys ak JOIN users u ON ak.user_id = u.id
                WHERE ak.user_id = ?1 ORDER BY ak.id LIMIT ?2 OFFSET ?3"#,
         )
@@ -163,7 +174,7 @@ pub async fn list(
         let items: Vec<KeyRow> = sqlx::query_as(
             r#"SELECT ak.id, ak.user_id, u.username, ak.label, ak.lookup_key, ak.plaintext_key,
                       ak.disabled_at, ak.expires_at, ak.last_used_at, ak.last_used_ip, ak.created_at,
-                      ak.auto_cache_enabled
+                      ak.auto_cache_enabled, ak.enhanced_audit_enabled
                FROM api_keys ak JOIN users u ON ak.user_id = u.id
                ORDER BY ak.id LIMIT ?1 OFFSET ?2"#,
         )
@@ -222,11 +233,18 @@ pub async fn create(
         .await?;
     }
 
-    if req.auto_cache_enabled {
-        sqlx::query("UPDATE api_keys SET auto_cache_enabled = 1 WHERE id = ?1")
-            .bind(ak_id)
-            .execute(&db)
-            .await?;
+    if req.auto_cache_enabled || req.enhanced_audit_enabled {
+        // Both flags default to 0 in the migration; flip in a single
+        // UPDATE so a partial flip doesn't leave the key in a confused
+        // state on transient DB error.
+        sqlx::query(
+            "UPDATE api_keys SET auto_cache_enabled = ?1, enhanced_audit_enabled = ?2 WHERE id = ?3",
+        )
+        .bind(req.auto_cache_enabled as i64)
+        .bind(req.enhanced_audit_enabled as i64)
+        .bind(ak_id)
+        .execute(&db)
+        .await?;
     }
 
     Ok((
@@ -240,6 +258,7 @@ pub async fn create(
             created_at: row.1,
             bound_account_ids: bound,
             auto_cache_enabled: req.auto_cache_enabled,
+            enhanced_audit_enabled: req.enhanced_audit_enabled,
         }),
     ))
 }
@@ -301,6 +320,26 @@ pub async fn update_auto_cache(
     Json(req): Json<UpdateAutoCacheRequest>,
 ) -> Result<StatusCode, ClewdrError> {
     let result = sqlx::query("UPDATE api_keys SET auto_cache_enabled = ?1 WHERE id = ?2")
+        .bind(req.enabled as i64)
+        .bind(id)
+        .execute(&db)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ClewdrError::NotFound {
+            msg: "api key not found",
+        });
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn update_enhanced_audit(
+    State(db): State<SqlitePool>,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateEnhancedAuditRequest>,
+) -> Result<StatusCode, ClewdrError> {
+    let result = sqlx::query("UPDATE api_keys SET enhanced_audit_enabled = ?1 WHERE id = ?2")
         .bind(req.enabled as i64)
         .bind(id)
         .execute(&db)

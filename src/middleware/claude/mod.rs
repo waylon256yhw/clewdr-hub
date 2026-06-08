@@ -4,6 +4,7 @@ pub use request::*;
 
 use std::sync::{Arc, Mutex};
 
+use crate::db::models::RequestAuditSnapshot;
 use crate::types::claude::Usage;
 
 /// Context carried through the request pipeline for Claude Code
@@ -29,6 +30,10 @@ pub struct ClaudeContext {
     pub monthly_budget_nanousd: Option<i64>,
     pub bound_account_ids: Vec<i64>,
     pub selected_account_id: Arc<Mutex<Option<i64>>>,
+    /// Per-request audit snapshot when the API key has enhanced audit
+    /// enabled. `None` for non-audited keys; presence is the trigger
+    /// for the sidecar write in the terminal-log transaction.
+    pub audit: Option<RequestAuditSnapshot>,
 }
 
 impl ClaudeContext {
