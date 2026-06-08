@@ -21,9 +21,9 @@ use crate::{
     config::{AccountSlot, AuthMethod, CLAUDE_ENDPOINT, ClewdrCookie},
     db::accounts::{
         AccountWithRuntime, batch_upsert_runtime_states, find_account_by_organization_uuid,
-        get_account_by_id, load_all_accounts, set_account_auth_error, set_account_disabled,
-        set_account_last_failure, set_account_reset_time, update_account_metadata_unchecked,
-        upsert_account_oauth,
+        get_account_by_id, load_all_accounts, set_account_active, set_account_auth_error,
+        set_account_disabled, set_account_last_failure, set_account_reset_time,
+        update_account_metadata_unchecked, upsert_account_oauth,
     },
     db::proxies::{build_proxy_url, get_proxy_by_id},
     error::{
@@ -1123,11 +1123,48 @@ async fn persist_test_failure_verdict(
     state.account_pool.invalidate(account_id, reason).await;
 }
 
-async fn clear_test_failure_verdict(state: &AppState, account_id: i64) {
+/// Clean up after a successful `/test`: drop any persisted failure verdict
+/// and clear the in-memory probe-error marker, then **reactivate** if the
+/// account was sitting in `auth_error`.
+///
+/// The reactivation half mirrors the OAuth probe success tail in
+/// `claude_code_state/probe.rs` (search `did_reactivate`). Without it,
+/// `auth_source = 'api_key'` accounts have no recovery path — they have
+/// no `/probe` endpoint and `/test` only cleared the failure metadata,
+/// leaving the row stuck in `auth_error` and the pool's `state.invalid`
+/// set. Cookie / OAuth callers were not stuck because `/probe` could
+/// reactivate them, but extending the behavior here also fixes the
+/// "test succeeded but pool still won't dispatch" asymmetry for them.
+///
+/// `previous_status` is the status observed when the test handler loaded
+/// the account; using the start-of-test snapshot matches the OAuth
+/// probe pattern and side-steps a concurrent flip happening mid-test.
+async fn clear_test_failure_verdict(state: &AppState, account_id: i64, previous_status: &str) {
     if let Err(err) = set_account_last_failure(&state.db, account_id, None).await {
         tracing::warn!("Failed to clear test failure for account {account_id}: {err}");
     }
     state.account_pool.clear_probe_error(account_id).await;
+
+    if previous_status == "auth_error" {
+        match set_account_active(&state.db, account_id).await {
+            Ok(()) => {
+                // `set_account_active` has a `status != 'disabled'` guard,
+                // so a concurrent admin disable still wins; reload the
+                // pool so its in-memory invalid set picks up whichever
+                // outcome landed.
+                if let Err(err) = state.account_pool.reload_from_db().await {
+                    tracing::warn!(
+                        "Failed to reload pool after test reactivation for account {account_id}: {err}"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to reactivate account {account_id} after successful test: {err}"
+                );
+            }
+        }
+    }
 }
 
 /// `/test` flow for `auth_source = 'api_key'` slots. The cookie /
@@ -1142,6 +1179,10 @@ async fn test_account_api_key(
     account: AccountWithRuntime,
     started_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<Json<TestAccountResponse>, ClewdrError> {
+    // Captured before any potential field consumption so we can later
+    // pass it into `clear_test_failure_verdict` for the reactivation
+    // path (see that helper's doc comment).
+    let previous_status = account.status.clone();
     let base_url = account
         .api_key_base_url
         .as_deref()
@@ -1252,7 +1293,7 @@ async fn test_account_api_key(
     )
     .await;
     if success {
-        clear_test_failure_verdict(&state, id).await;
+        clear_test_failure_verdict(&state, id, &previous_status).await;
     } else if let (Some(failure), Some(message)) = (&failure, error_msg.as_deref()) {
         persist_test_failure_verdict(&state, id, failure, message).await;
     }
@@ -1282,6 +1323,9 @@ pub async fn test_account(
             msg: "account is disabled",
         });
     }
+
+    // Snapshot for the reactivation path in clear_test_failure_verdict.
+    let previous_status = account.status.clone();
 
     let started_at = chrono::Utc::now();
 
@@ -1538,7 +1582,7 @@ pub async fn test_account(
     )
     .await;
     if success {
-        clear_test_failure_verdict(&state, id).await;
+        clear_test_failure_verdict(&state, id, &previous_status).await;
     } else if let (Some(failure), Some(message)) = (&failure, error_msg.as_deref()) {
         persist_test_failure_verdict(&state, id, failure, message).await;
     }
