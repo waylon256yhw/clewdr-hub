@@ -228,6 +228,12 @@ impl StreamState {
                 ContentBlock::Thinking { .. } => {
                     self.block_kind.insert(index, BlockKind::Thinking);
                 }
+                block @ ContentBlock::Fallback { .. } => {
+                    if let Some(model) = block.fallback_target_model() {
+                        self.model = model.to_string();
+                    }
+                    self.block_kind.insert(index, BlockKind::Other);
+                }
                 _ => {
                     self.block_kind.insert(index, BlockKind::Other);
                 }
@@ -518,6 +524,42 @@ mod tests {
         );
         assert_eq!(chunks[2].choices[0].delta.content.as_deref(), Some("world"));
         assert_eq!(chunks[3].choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn fallback_boundary_updates_serving_model() {
+        let fallback = serde_json::from_value::<ContentBlock>(serde_json::json!({
+            "type": "fallback",
+            "from": { "model": "claude-fable-5" },
+            "to": { "model": "claude-opus-4-8" },
+            "reason": "refusal"
+        }))
+        .unwrap();
+        let events = vec![
+            message_start("claude-fable-5", None),
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: fallback,
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::ContentBlockStart {
+                index: 1,
+                content_block: ContentBlock::text(""),
+            },
+            StreamEvent::ContentBlockDelta {
+                index: 1,
+                delta: ContentBlockDelta::TextDelta {
+                    text: "served by fallback".to_string(),
+                },
+            },
+        ];
+        let payloads = drive(events, true, false);
+        let chunks = collect_chunks(&payloads);
+        let content = chunks
+            .iter()
+            .find(|chunk| chunk.choices[0].delta.content.is_some())
+            .unwrap();
+        assert_eq!(content.model, "claude-opus-4-8");
     }
 
     #[test]

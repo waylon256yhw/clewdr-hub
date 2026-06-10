@@ -106,6 +106,7 @@ pub struct TerminalLogOptions<'a> {
 /// Canonical alias table for model normalization.
 /// Maps known model alias prefixes to pricing_key in model_pricing table.
 static KNOWN_ALIASES: &[(&str, &str)] = &[
+    ("claude-fable-5", "claude-fable-5"),
     ("claude-opus-4-8", "claude-opus-4-8"),
     ("claude-opus-4-7", "claude-opus-4-7"),
     ("claude-opus-4-6", "claude-opus-4-6"),
@@ -539,6 +540,19 @@ mod tests {
         assert_eq!(k, "unknown");
         let k = compute_model_key("   ", &None);
         assert_eq!(k, "unknown");
+    }
+
+    #[test]
+    fn normalize_fable_5_bare_and_dated_ids() {
+        assert_eq!(
+            normalize_model("claude-fable-5"),
+            Some("claude-fable-5".into())
+        );
+        assert_eq!(
+            normalize_model("claude-fable-5-20260609"),
+            Some("claude-fable-5".into())
+        );
+        assert_eq!(normalize_model("claude-fable-5-preview1"), None);
     }
 
     #[test]

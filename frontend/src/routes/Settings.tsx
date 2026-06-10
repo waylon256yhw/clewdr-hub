@@ -175,10 +175,10 @@ function EffortOverrideSection({
       <Stack>
         <Text fw={600}>Effort 覆盖</Text>
         <Text size="sm" c="dimmed">
-          开启后覆盖 Opus 请求的 `output_config.effort`。
+          开启后覆盖受支持推理模型的 `output_config.effort`。
         </Text>
         <Switch
-          label="启用 Opus effort 覆盖"
+          label="启用推理模型 effort 覆盖"
           checked={overrideEnabled}
           onChange={(e) => setOverrideEnabled(e.currentTarget.checked)}
         />

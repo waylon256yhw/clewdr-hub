@@ -22,8 +22,9 @@ use serde_json::{Value, json};
 use crate::{
     db::models::AuthenticatedUser,
     middleware::claude::{
-        ClaudeContext, apply_auto_cache, build_claude_context, claude_code_billing_header,
-        drop_empty_message_text_blocks, drop_empty_system, fill_system_only_user_placeholder,
+        ClaudeContext, SERVER_SIDE_FALLBACK_BETA, apply_auto_cache, apply_fable_fallback,
+        build_claude_context, claude_code_billing_header, drop_empty_message_text_blocks,
+        drop_empty_system, ensure_anthropic_beta_token, fill_system_only_user_placeholder,
         inject_metadata_user_id, normalize_sampling_params, prepend_system_blocks,
         strip_billing_headers_from_system, strip_ephemeral_scope_from_system,
     },
@@ -526,11 +527,15 @@ where
         }
 
         apply_auto_cache(&mut body, auth_user.as_ref());
+        let anthropic_beta = apply_fable_fallback(&mut body).then(|| {
+            ensure_anthropic_beta_token(None, SERVER_SIDE_FALLBACK_BETA)
+                .expect("required beta token is non-empty")
+        });
 
         // Build context before inject_metadata_user_id so the affinity hash
         // observes the pre-injection state — see ClaudeCodePreprocess for
         // the matching ordering on the Anthropic path.
-        let mut context = build_claude_context(&body, auth_user.as_ref(), None);
+        let mut context = build_claude_context(&body, auth_user.as_ref(), anthropic_beta);
 
         // Tag api_surface for audited keys entering through the OpenAI
         // compat surface. Non-audited keys (snapshot is None) skip.
@@ -558,6 +563,37 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn openai_preprocess_enables_fable_fallback() {
+        let pool = crate::db::init_pool(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        crate::stealth::init_stealth_profile(&pool).await;
+        let request = Request::builder()
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&json!({
+                    "model": "claude-fable-5",
+                    "max_tokens": 64,
+                    "messages": [{ "role": "user", "content": "hello fallback" }]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let parsed = OpenAIChatPreprocess::from_request(request, &())
+            .await
+            .unwrap();
+        assert_eq!(
+            parsed.params.fallbacks.as_ref().unwrap()[0].model,
+            "claude-opus-4-8"
+        );
+        assert_eq!(
+            parsed.context.anthropic_beta.as_deref(),
+            Some("server-side-fallback-2026-06-01")
+        );
+    }
 
     fn req_from_json(value: Value) -> ChatCompletionRequest {
         serde_json::from_value(value).expect("valid request fixture")

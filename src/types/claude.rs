@@ -55,6 +55,11 @@ pub enum ServiceTier {
     StandardOnly,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Hash)]
+pub struct FallbackTarget {
+    pub model: String,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct McpServer {
     pub name: String,
@@ -127,6 +132,9 @@ pub struct CreateMessageParams {
     /// Service tier selection
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
+    /// Ordered server-side fallback targets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallbacks: Option<Vec<FallbackTarget>>,
     /// Number of completions to generate
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n: Option<u32>,
@@ -462,6 +470,12 @@ pub enum ContentBlock {
         file_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControlEphemeral>,
+    },
+    /// Boundary emitted when server-side fallback switches serving models.
+    #[serde(rename = "fallback")]
+    Fallback {
+        #[serde(flatten)]
+        details: std::collections::BTreeMap<String, serde_json::Value>,
     },
 }
 
@@ -926,6 +940,17 @@ impl ContentBlock {
             cache_control: None,
         }
     }
+
+    pub fn fallback_target_model(&self) -> Option<&str> {
+        let Self::Fallback { details } = self else {
+            return None;
+        };
+        details
+            .get("to")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|to| to.get("model"))
+            .and_then(serde_json::Value::as_str)
+    }
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -1120,5 +1145,33 @@ mod tests {
         };
         let value = serde_json::to_value(&params).unwrap();
         assert_eq!(value["cache_control"], json!({ "type": "ephemeral" }));
+    }
+
+    #[test]
+    fn fallback_target_serializes_in_request_shape() {
+        let params = CreateMessageParams {
+            model: "claude-fable-5".to_string(),
+            messages: vec![Message::new_text(Role::User, "hi")],
+            fallbacks: Some(vec![FallbackTarget {
+                model: "claude-opus-4-8".to_string(),
+            }]),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&params).unwrap();
+        assert_eq!(value["fallbacks"], json!([{ "model": "claude-opus-4-8" }]));
+    }
+
+    #[test]
+    fn fallback_content_block_round_trips_without_losing_metadata() {
+        let value = json!({
+            "type": "fallback",
+            "from": { "model": "claude-fable-5" },
+            "to": { "model": "claude-opus-4-8" },
+            "reason": "refusal"
+        });
+        let parsed: ContentBlock = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(parsed, ContentBlock::Fallback { .. }));
+        assert_eq!(parsed.fallback_target_model(), Some("claude-opus-4-8"));
+        assert_eq!(serde_json::to_value(parsed).unwrap(), value);
     }
 }

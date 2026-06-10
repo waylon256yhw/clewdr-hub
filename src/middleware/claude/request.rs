@@ -18,8 +18,9 @@ use crate::{
     middleware::claude::ClaudeContext,
     stealth::{self, StealthProfile},
     types::claude::{
-        CacheControlEphemeral, CacheControlType, ContentBlock, CreateMessageParams, Message,
-        MessageContent, OutputConfig, OutputEffort, Role, Thinking, ThinkingDisplay, Usage,
+        CacheControlEphemeral, CacheControlType, ContentBlock, CreateMessageParams, FallbackTarget,
+        Message, MessageContent, OutputConfig, OutputEffort, Role, Thinking, ThinkingDisplay,
+        Usage,
     },
 };
 
@@ -281,6 +282,41 @@ pub(crate) fn extract_anthropic_beta_header(headers: &HeaderMap) -> Option<Strin
     }
 }
 
+pub(crate) const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-06-01";
+
+pub(crate) fn ensure_anthropic_beta_token(
+    current: Option<String>,
+    required: &str,
+) -> Option<String> {
+    let mut tokens = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for token in current
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .chain(std::iter::once(required))
+    {
+        let token = token.trim();
+        if !token.is_empty() && seen.insert(token.to_ascii_lowercase()) {
+            tokens.push(token.to_string());
+        }
+    }
+    (!tokens.is_empty()).then(|| tokens.join(","))
+}
+
+/// Fable's conservative safety classifiers can refuse benign requests. Keep
+/// the public model usable by always enabling Anthropic's same-request
+/// server-side fallback to the only permitted launch target, Opus 4.8.
+pub(crate) fn apply_fable_fallback(body: &mut CreateMessageParams) -> bool {
+    if !matches_model_with_optional_date_suffix(&body.model, "claude-fable-5") {
+        return false;
+    }
+    body.fallbacks = Some(vec![FallbackTarget {
+        model: "claude-opus-4-8".to_string(),
+    }]);
+    true
+}
+
 /// Returns true when the request path targets `/v1/messages/count_tokens`.
 /// Counting tokens should not write to cache; the upstream may also reject the
 /// top-level `cache_control` field on this endpoint.
@@ -397,7 +433,7 @@ pub(crate) fn request_affinity_hash(
 /// When thinking is active (enabled or adaptive):
 ///   - `temperature` must be 1 or unset
 ///
-/// For Opus families that dropped extended thinking budgets (4.7+), legacy
+/// For model families that dropped extended thinking budgets, legacy
 /// `thinking.type=enabled` + `budget_tokens` is removed upstream: the OAuth
 /// surface silently ignores it (client asks for thinking, gets none), and the
 /// public API will 400. Rewrite to `thinking.type=adaptive` so pre-4.7 clients
@@ -406,27 +442,21 @@ pub(crate) fn request_affinity_hash(
 /// of depending on upstream defaults, and explicitly pin
 /// `output_config.effort="high"` when the legacy request did not set one.
 ///
-/// Operators can also enable an Opus-only effort override from the admin settings
-/// page; when enabled it overwrites `output_config.effort` on supported Opus
+/// Fable 5 requires thinking, so missing or explicitly disabled thinking is
+/// normalized to adaptive thinking with a summarized display.
+///
+/// Operators can also enable an effort override from the admin settings page;
+/// when enabled it overwrites `output_config.effort` on supported reasoning
 /// requests and leaves other models untouched. Older Opus versions receive a
 /// compatible fallback when the configured effort level is no longer supported.
 pub(crate) fn normalize_sampling_params(body: &mut CreateMessageParams, profile: &StealthProfile) {
-    let thinking_active = matches!(
-        body.thinking,
-        Some(Thinking::Adaptive { .. }) | Some(Thinking::Enabled { .. })
-    );
-
     body.top_p = None;
     body.top_k = None;
 
-    if thinking_active && body.temperature != Some(1.0) {
-        body.temperature = None;
-    }
-
-    let family = OpusFamily::detect(&body.model);
+    let family = ReasoningFamily::detect(&body.model);
 
     let mut rewrote_legacy_thinking = false;
-    if family.is_some_and(OpusFamily::requires_adaptive_thinking_rewrite) {
+    if family.is_some_and(ReasoningFamily::requires_adaptive_thinking_rewrite) {
         let (rewritten, rewrote_legacy) = match body.thinking.take() {
             Some(Thinking::Enabled {
                 budget_tokens: _,
@@ -443,7 +473,21 @@ pub(crate) fn normalize_sampling_params(body: &mut CreateMessageParams, profile:
         body.thinking = rewritten;
     }
 
-    if rewrote_legacy_thinking {
+    let forced_thinking = family.is_some_and(ReasoningFamily::requires_thinking)
+        && matches!(body.thinking, None | Some(Thinking::Disabled));
+    if forced_thinking {
+        body.thinking = Some(Thinking::adaptive_with_display(ThinkingDisplay::Summarized));
+    }
+
+    let thinking_active = matches!(
+        body.thinking,
+        Some(Thinking::Adaptive { .. }) | Some(Thinking::Enabled { .. })
+    );
+    if thinking_active && body.temperature != Some(1.0) {
+        body.temperature = None;
+    }
+
+    if rewrote_legacy_thinking || forced_thinking {
         body.output_config
             .get_or_insert_with(default_output_config)
             .effort
@@ -468,27 +512,29 @@ fn default_output_config() -> OutputConfig {
     }
 }
 
-/// Capability matrix for the supported Claude Opus families.
+/// Capability matrix for Claude model families with special reasoning behavior.
 ///
-/// Adding a new Opus model means: extend the enum, add a row to
-/// [`OpusFamily::detect`], and slot it into the two `match` arms below. Other
-/// callers only see `Option<OpusFamily>`, so non-Opus models keep transparent
-/// pass-through.
+/// Adding a new model means: extend the enum, add a row to
+/// [`ReasoningFamily::detect`], and slot it into the capability methods below.
+/// Other callers only see `Option<ReasoningFamily>`, so unrelated models keep
+/// transparent pass-through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OpusFamily {
+enum ReasoningFamily {
+    Fable5,
     V4_5,
     V4_6,
     V4_7,
     V4_8,
 }
 
-impl OpusFamily {
+impl ReasoningFamily {
     fn detect(model: &str) -> Option<Self> {
-        const TABLE: &[(&str, OpusFamily)] = &[
-            ("claude-opus-4-8", OpusFamily::V4_8),
-            ("claude-opus-4-7", OpusFamily::V4_7),
-            ("claude-opus-4-6", OpusFamily::V4_6),
-            ("claude-opus-4-5", OpusFamily::V4_5),
+        const TABLE: &[(&str, ReasoningFamily)] = &[
+            ("claude-fable-5", ReasoningFamily::Fable5),
+            ("claude-opus-4-8", ReasoningFamily::V4_8),
+            ("claude-opus-4-7", ReasoningFamily::V4_7),
+            ("claude-opus-4-6", ReasoningFamily::V4_6),
+            ("claude-opus-4-5", ReasoningFamily::V4_5),
         ];
         TABLE.iter().find_map(|&(prefix, family)| {
             matches_model_with_optional_date_suffix(model, prefix).then_some(family)
@@ -498,7 +544,11 @@ impl OpusFamily {
     /// 4.7+ removed extended thinking budgets, so legacy `enabled` requests must
     /// be rewritten to `adaptive` before going upstream.
     fn requires_adaptive_thinking_rewrite(self) -> bool {
-        matches!(self, Self::V4_7 | Self::V4_8)
+        matches!(self, Self::Fable5 | Self::V4_7 | Self::V4_8)
+    }
+
+    fn requires_thinking(self) -> bool {
+        matches!(self, Self::Fable5)
     }
 
     /// Map an admin-forced effort level onto the highest level this family
@@ -516,7 +566,7 @@ impl OpusFamily {
                 OutputEffort::High => OutputEffort::High,
                 OutputEffort::XHigh | OutputEffort::Max => OutputEffort::Max,
             },
-            Self::V4_7 | Self::V4_8 => effort.clone(),
+            Self::Fable5 | Self::V4_7 | Self::V4_8 => effort.clone(),
         }
     }
 }
@@ -599,7 +649,7 @@ where
             .extensions()
             .get::<crate::db::models::RequestAuditSnapshot>()
             .cloned();
-        let anthropic_beta = extract_anthropic_beta_header(req.headers());
+        let mut anthropic_beta = extract_anthropic_beta_header(req.headers());
         let is_count_tokens = is_count_tokens_path(req.uri().path());
         let Json(mut body) = Json::<CreateMessageParams>::from_request(req, &()).await?;
 
@@ -635,6 +685,12 @@ where
         // from caching and the top-level cache_control may be rejected upstream.
         if !is_count_tokens {
             apply_auto_cache(&mut body, auth_user.as_ref());
+            if apply_fable_fallback(&mut body) {
+                anthropic_beta =
+                    ensure_anthropic_beta_token(anthropic_beta, SERVER_SIDE_FALLBACK_BETA);
+            }
+        } else {
+            body.fallbacks = None;
         }
 
         // Compute the affinity hash from the pre-injection request so two
@@ -1257,25 +1313,94 @@ mod tests {
     }
 
     #[test]
-    fn opus_family_detect_covers_bare_and_dated_ids() {
+    fn normalize_fable_5_forces_missing_thinking_on() {
+        let mut body = make_body(None, Some(0.7), None, None);
+        body.model = "claude-fable-5".to_string();
+        normalize_sampling_params(&mut body, &StealthProfile::default());
+        assert!(matches!(
+            body.thinking,
+            Some(Thinking::Adaptive {
+                display: Some(ThinkingDisplay::Summarized)
+            })
+        ));
+        assert!(matches!(
+            body.output_config,
+            Some(OutputConfig {
+                effort: Some(OutputEffort::High),
+                ..
+            })
+        ));
+        assert_eq!(body.temperature, None);
+    }
+
+    #[test]
+    fn normalize_fable_5_forces_disabled_thinking_on() {
+        let mut body = make_body(Some(Thinking::Disabled), Some(1.0), None, None);
+        body.model = "claude-fable-5-20260609".to_string();
+        normalize_sampling_params(&mut body, &StealthProfile::default());
+        assert!(matches!(
+            body.thinking,
+            Some(Thinking::Adaptive {
+                display: Some(ThinkingDisplay::Summarized)
+            })
+        ));
+        assert_eq!(body.temperature, Some(1.0));
+    }
+
+    #[test]
+    fn normalize_fable_5_rewrites_legacy_thinking_and_honors_effort_override() {
+        let mut body = make_body(Some(Thinking::new(8000)), Some(0.7), None, None);
+        body.model = "claude-fable-5".to_string();
+        let profile = StealthProfile {
+            force_output_effort: Some(OutputEffort::XHigh),
+            ..StealthProfile::default()
+        };
+        normalize_sampling_params(&mut body, &profile);
+        assert!(matches!(
+            body.thinking,
+            Some(Thinking::Adaptive {
+                display: Some(ThinkingDisplay::Summarized)
+            })
+        ));
+        assert!(matches!(
+            body.output_config,
+            Some(OutputConfig {
+                effort: Some(OutputEffort::XHigh),
+                ..
+            })
+        ));
+        assert_eq!(body.temperature, None);
+    }
+
+    #[test]
+    fn reasoning_family_detect_covers_bare_and_dated_ids() {
         assert_eq!(
-            OpusFamily::detect("claude-opus-4-8"),
-            Some(OpusFamily::V4_8)
+            ReasoningFamily::detect("claude-fable-5"),
+            Some(ReasoningFamily::Fable5)
         );
         assert_eq!(
-            OpusFamily::detect("claude-opus-4-7-20260416"),
-            Some(OpusFamily::V4_7)
+            ReasoningFamily::detect("claude-fable-5-20260609"),
+            Some(ReasoningFamily::Fable5)
         );
         assert_eq!(
-            OpusFamily::detect("claude-opus-4-6"),
-            Some(OpusFamily::V4_6)
+            ReasoningFamily::detect("claude-opus-4-8"),
+            Some(ReasoningFamily::V4_8)
         );
         assert_eq!(
-            OpusFamily::detect("claude-opus-4-5"),
-            Some(OpusFamily::V4_5)
+            ReasoningFamily::detect("claude-opus-4-7-20260416"),
+            Some(ReasoningFamily::V4_7)
         );
-        assert_eq!(OpusFamily::detect("claude-sonnet-4-6"), None);
-        assert_eq!(OpusFamily::detect("claude-opus-4-7-preview1"), None);
+        assert_eq!(
+            ReasoningFamily::detect("claude-opus-4-6"),
+            Some(ReasoningFamily::V4_6)
+        );
+        assert_eq!(
+            ReasoningFamily::detect("claude-opus-4-5"),
+            Some(ReasoningFamily::V4_5)
+        );
+        assert_eq!(ReasoningFamily::detect("claude-sonnet-4-6"), None);
+        assert_eq!(ReasoningFamily::detect("claude-fable-5-preview1"), None);
+        assert_eq!(ReasoningFamily::detect("claude-opus-4-7-preview1"), None);
     }
 
     fn auth_user_with_auto_cache(enabled: bool) -> crate::db::models::AuthenticatedUser {
@@ -1301,6 +1426,13 @@ mod tests {
             messages: vec![Message::new_text(Role::User, "hi")],
             ..Default::default()
         }
+    }
+
+    async fn ensure_test_stealth_profile() {
+        let pool = crate::db::init_pool(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        crate::stealth::init_stealth_profile(&pool).await;
     }
 
     #[test]
@@ -1341,5 +1473,92 @@ mod tests {
         let mut body = simple_body();
         apply_auto_cache(&mut body, None);
         assert!(body.cache_control.is_none());
+    }
+
+    #[test]
+    fn apply_fable_fallback_forces_opus_4_8() {
+        let mut body = simple_body();
+        body.model = "claude-fable-5".to_string();
+        body.fallbacks = Some(vec![FallbackTarget {
+            model: "some-other-model".to_string(),
+        }]);
+        assert!(apply_fable_fallback(&mut body));
+        assert_eq!(body.fallbacks.as_ref().unwrap()[0].model, "claude-opus-4-8");
+    }
+
+    #[test]
+    fn apply_fable_fallback_ignores_other_models() {
+        let mut body = simple_body();
+        assert!(!apply_fable_fallback(&mut body));
+        assert!(body.fallbacks.is_none());
+    }
+
+    #[test]
+    fn ensure_anthropic_beta_token_appends_once() {
+        assert_eq!(
+            ensure_anthropic_beta_token(
+                Some("context-management-2025-06-27".to_string()),
+                SERVER_SIDE_FALLBACK_BETA,
+            )
+            .as_deref(),
+            Some("context-management-2025-06-27,server-side-fallback-2026-06-01")
+        );
+        assert_eq!(
+            ensure_anthropic_beta_token(
+                Some("SERVER-SIDE-FALLBACK-2026-06-01".to_string()),
+                SERVER_SIDE_FALLBACK_BETA,
+            )
+            .as_deref(),
+            Some("SERVER-SIDE-FALLBACK-2026-06-01")
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_messages_preprocess_enables_fable_fallback() {
+        ensure_test_stealth_profile().await;
+        let request = Request::builder()
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .header("anthropic-beta", "context-management-2025-06-27")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "claude-fable-5",
+                    "max_tokens": 64,
+                    "messages": [{ "role": "user", "content": "hello fallback" }]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let ClaudeCodePreprocess(body, context) = ClaudeCodePreprocess::from_request(request, &())
+            .await
+            .unwrap();
+        assert_eq!(body.fallbacks.as_ref().unwrap()[0].model, "claude-opus-4-8");
+        assert_eq!(
+            context.anthropic_beta.as_deref(),
+            Some("context-management-2025-06-27,server-side-fallback-2026-06-01")
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_count_tokens_preprocess_strips_fallbacks() {
+        ensure_test_stealth_profile().await;
+        let request = Request::builder()
+            .uri("/v1/messages/count_tokens")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "claude-fable-5",
+                    "max_tokens": 64,
+                    "fallbacks": [{ "model": "claude-opus-4-8" }],
+                    "messages": [{ "role": "user", "content": "hello fallback" }]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let ClaudeCodePreprocess(body, context) = ClaudeCodePreprocess::from_request(request, &())
+            .await
+            .unwrap();
+        assert!(body.fallbacks.is_none());
+        assert!(context.anthropic_beta.is_none());
     }
 }

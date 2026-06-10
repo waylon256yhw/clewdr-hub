@@ -236,6 +236,7 @@ pub async fn reset_admin_password(
 }
 
 const DEFAULT_MODELS: &[(&str, &str, i32)] = &[
+    ("claude-fable-5", "Claude Fable 5", 1),
     ("claude-opus-4-8", "Claude Opus 4.8", 3),
     ("claude-opus-4-7", "Claude Opus 4.7", 5),
     ("claude-opus-4-6", "Claude Opus 4.6", 10),
