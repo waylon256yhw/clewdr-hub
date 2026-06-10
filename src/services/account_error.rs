@@ -991,14 +991,6 @@ mod tests {
         assert_eq!(ctx.normalized_reason.to_reason(), None);
     }
 
-    // ---- Other variants ----
-
-    #[test]
-    fn empty_choices_is_internal_error() {
-        let ctx = classify(ClewdrError::EmptyChoices, FailureSource::Messages);
-        assert_eq!(ctx.action, AccountFailureAction::InternalError);
-    }
-
     #[test]
     fn quota_exceeded_is_internal_error_not_account_failure() {
         // Quota / Rpm / UserConcurrency are not account-side failures —

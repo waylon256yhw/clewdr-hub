@@ -571,7 +571,22 @@ pub async fn set_account_last_failure(
     account_id: i64,
     failure: Option<&AccountFailureContextPersisted>,
 ) -> Result<(), sqlx::Error> {
-    let payload = match failure {
+    let payload = serialize_last_failure(account_id, failure);
+    sqlx::query(
+        "UPDATE accounts SET last_failure_json = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+    )
+    .bind(payload)
+    .bind(account_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn serialize_last_failure(
+    account_id: i64,
+    failure: Option<&AccountFailureContextPersisted>,
+) -> Option<String> {
+    match failure {
         Some(ctx) => match serde_json::to_string(ctx) {
             Ok(json) => Some(json),
             Err(err) => {
@@ -584,15 +599,43 @@ pub async fn set_account_last_failure(
             }
         },
         None => None,
-    };
-    sqlx::query(
-        "UPDATE accounts SET last_failure_json = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+    }
+}
+
+/// Persist an OAuth terminal failure only while the refresh token that
+/// produced the verdict is still current. Status and structured failure
+/// context move together so an admin credential rotation cannot land between
+/// the two writes.
+pub async fn set_oauth_account_failure_if_current(
+    pool: &SqlitePool,
+    account_id: i64,
+    expected_refresh_token: &str,
+    status: &str,
+    invalid_reason: Option<&str>,
+    last_error: &str,
+    failure: &AccountFailureContextPersisted,
+) -> Result<bool, sqlx::Error> {
+    let payload = serialize_last_failure(account_id, Some(failure));
+    let result = sqlx::query(
+        "UPDATE accounts
+         SET status = ?1,
+             invalid_reason = ?2,
+             last_error = ?3,
+             last_failure_json = ?4,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?5
+           AND auth_source = 'oauth'
+           AND oauth_refresh_token = ?6",
     )
+    .bind(status)
+    .bind(invalid_reason)
+    .bind(last_error)
     .bind(payload)
     .bind(account_id)
+    .bind(expected_refresh_token)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 pub async fn set_accounts_active(pool: &SqlitePool, ids: &[i64]) -> Result<(), sqlx::Error> {
@@ -851,12 +894,16 @@ pub async fn update_account_metadata_unchecked(
     Ok(())
 }
 
+/// Replace OAuth token fields. When `expected_refresh_token` is present, the
+/// update is a compare-and-swap and returns `false` if another writer rotated
+/// the credential first.
 pub async fn upsert_account_oauth(
     pool: &SqlitePool,
     account_id: i64,
     token: Option<&TokenInfo>,
     last_error: Option<&str>,
-) -> Result<(), sqlx::Error> {
+    expected_refresh_token: Option<&str>,
+) -> Result<bool, sqlx::Error> {
     let (access_token, refresh_token, expires_at, last_refresh_at) = match token {
         Some(token) => (
             Some(token.access_token.as_str()),
@@ -867,7 +914,7 @@ pub async fn upsert_account_oauth(
         None => (None, None, None, None),
     };
 
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE accounts
          SET oauth_access_token = ?1,
              oauth_refresh_token = ?2,
@@ -875,7 +922,8 @@ pub async fn upsert_account_oauth(
              last_refresh_at = COALESCE(?4, last_refresh_at),
              last_error = ?5,
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?6",
+         WHERE id = ?6
+           AND (?7 IS NULL OR (auth_source = 'oauth' AND oauth_refresh_token = ?7))",
     )
     .bind(access_token)
     .bind(refresh_token)
@@ -883,9 +931,10 @@ pub async fn upsert_account_oauth(
     .bind(last_refresh_at)
     .bind(last_error)
     .bind(account_id)
+    .bind(expected_refresh_token)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 pub async fn set_account_auth_error(

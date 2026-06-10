@@ -183,6 +183,7 @@ enum AccountPoolMessage {
     /// token to DB — this only keeps the in-memory slot in sync so subsequent
     /// dispatches don't hand out a stale token.
     UpdateCredential(i64, Option<TokenInfo>),
+    UpdateCredentialIfCurrent(i64, String, Option<TokenInfo>, RpcReplyPort<bool>),
     /// Read the currently cached OAuth token for an account from the pool's
     /// in-memory slot. Used by refresh callers to re-check (after acquiring the
     /// per-account refresh guard) whether a peer already refreshed the token.
@@ -194,6 +195,7 @@ enum AccountPoolMessage {
     /// responsibility, `do_flush` must not touch the authoritative status by
     /// way of `state.invalid`.
     Invalidate(i64, Reason),
+    InvalidateIfCurrent(i64, String, Reason, RpcReplyPort<bool>),
     /// Return a cheap in-memory pool snapshot for the health read path,
     /// along with the actor's DB handle. The caller runs
     /// `load_all_accounts` and `account_health::compose_health_snapshot`
@@ -259,6 +261,20 @@ impl AccountPoolActor {
         if let Some(slot) = state.exhausted.get_mut(&account_id) {
             slot.token = token;
         }
+    }
+
+    fn pool_oauth_refresh_token_matches(
+        state: &AccountPoolState,
+        account_id: i64,
+        expected_refresh_token: &str,
+    ) -> bool {
+        state
+            .valid
+            .iter()
+            .find(|slot| slot.account_id == Some(account_id))
+            .or_else(|| state.exhausted.get(&account_id))
+            .and_then(|slot| slot.token.as_ref())
+            .is_some_and(|token| token.refresh_token == expected_refresh_token)
     }
 
     /// In-memory convergence for an account whose authoritative status was
@@ -1516,6 +1532,22 @@ impl Actor for AccountPoolActor {
             AccountPoolMessage::UpdateCredential(account_id, token) => {
                 Self::update_slot_credential(state, account_id, token);
             }
+            AccountPoolMessage::UpdateCredentialIfCurrent(
+                account_id,
+                expected_refresh_token,
+                token,
+                reply_port,
+            ) => {
+                let matched = Self::pool_oauth_refresh_token_matches(
+                    state,
+                    account_id,
+                    &expected_refresh_token,
+                );
+                if matched {
+                    Self::update_slot_credential(state, account_id, token);
+                }
+                reply_port.send(matched)?;
+            }
             AccountPoolMessage::GetToken(account_id, reply_port) => {
                 let token = state
                     .valid
@@ -1527,6 +1559,22 @@ impl Actor for AccountPoolActor {
             }
             AccountPoolMessage::Invalidate(account_id, reason) => {
                 Self::converge_invalidate(state, account_id, reason);
+            }
+            AccountPoolMessage::InvalidateIfCurrent(
+                account_id,
+                expected_refresh_token,
+                reason,
+                reply_port,
+            ) => {
+                let matched = Self::pool_oauth_refresh_token_matches(
+                    state,
+                    account_id,
+                    &expected_refresh_token,
+                );
+                if matched {
+                    Self::converge_invalidate(state, account_id, reason);
+                }
+                reply_port.send(matched)?;
             }
             AccountPoolMessage::SnapshotPoolState(reply_port) => {
                 reply_port.send((Self::snapshot_view(state), state.db.clone()))?;
@@ -1833,6 +1881,28 @@ impl AccountPoolHandle {
         );
     }
 
+    /// Update a refreshed OAuth token only if the pool still carries the
+    /// credential that produced it. This closes the DB-CAS-to-pool-sync
+    /// window when an admin rotation and its reload race a refresh result.
+    pub async fn update_credential_if_current(
+        &self,
+        account_id: i64,
+        expected_refresh_token: &str,
+        token: Option<TokenInfo>,
+    ) -> Result<bool, ClewdrError> {
+        ractor::call!(
+            self.actor_ref,
+            AccountPoolMessage::UpdateCredentialIfCurrent,
+            account_id,
+            expected_refresh_token.to_string(),
+            token
+        )
+        .map_err(|e| ClewdrError::RactorError {
+            loc: Location::generate(),
+            msg: format!("Failed to conditionally update credential: {e}"),
+        })
+    }
+
     /// Read the currently cached OAuth token for an account from the pool's
     /// in-memory slot. Used by refresh call sites (after acquiring the
     /// per-account refresh guard) to decide whether a peer already refreshed
@@ -1856,11 +1926,35 @@ impl AccountPoolHandle {
             AccountPoolMessage::Invalidate(account_id, reason)
         );
     }
+
+    /// Invalidate an OAuth slot only if it still represents the credential
+    /// whose terminal failure was committed to DB.
+    pub async fn invalidate_if_current(
+        &self,
+        account_id: i64,
+        expected_refresh_token: &str,
+        reason: Reason,
+    ) -> Result<bool, ClewdrError> {
+        ractor::call!(
+            self.actor_ref,
+            AccountPoolMessage::InvalidateIfCurrent,
+            account_id,
+            expected_refresh_token.to_string(),
+            reason
+        )
+        .map_err(|e| ClewdrError::RactorError {
+            loc: Location::generate(),
+            msg: format!("Failed to conditionally invalidate credential: {e}"),
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AccountPoolActor, AccountPoolState, CredentialFingerprint, RuntimeMergeMode};
+    use super::{
+        AccountPoolActor, AccountPoolHandle, AccountPoolState, CredentialFingerprint,
+        RuntimeMergeMode,
+    };
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::time::Duration;
 
@@ -1945,8 +2039,9 @@ mod tests {
         sqlx::query(
             "INSERT INTO accounts (
                 id, name, rr_order, max_slots, status, auth_source,
-                oauth_access_token, oauth_refresh_token, oauth_expires_at, drain_first
-            ) VALUES (?1, ?2, 1, 5, 'active', 'oauth', ?3, ?4, '2030-01-01T00:00:00Z', 0)",
+                oauth_access_token, oauth_refresh_token, oauth_expires_at,
+                organization_uuid, drain_first
+            ) VALUES (?1, ?2, 1, 5, 'active', 'oauth', ?3, ?4, '2030-01-01T00:00:00Z', 'org', 0)",
         )
         .bind(id)
         .bind(format!("acc-{id}"))
@@ -1989,7 +2084,7 @@ mod tests {
             Duration::from_secs(3600),
             "org".to_string(),
         );
-        crate::db::accounts::upsert_account_oauth(&pool, 1, Some(&rotated), None)
+        crate::db::accounts::upsert_account_oauth(&pool, 1, Some(&rotated), None, None)
             .await
             .unwrap();
         assert_eq!(read_refresh_token(&pool, 1).await, "rt1");
@@ -2026,6 +2121,45 @@ mod tests {
         assert_eq!(updated.as_deref(), Some("rt1"));
         // No dirty marking — flush should not write token via this path.
         assert!(state.dirty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn conditional_pool_convergence_rejects_rotated_credential() {
+        let pool = init_pool(std::path::Path::new(":memory:")).await.unwrap();
+        insert_oauth_row(&pool, 1, "at0", "rt0").await;
+        let (event_tx, _) = broadcast::channel(16);
+        let handle = AccountPoolHandle::start(pool, event_tx).await.unwrap();
+
+        assert!(
+            !handle
+                .update_credential_if_current(1, "rt-admin", Some(token_with_refresh("rt-stale")))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            handle.get_token(1).await.unwrap().unwrap().refresh_token,
+            "rt0"
+        );
+
+        assert!(
+            handle
+                .update_credential_if_current(1, "rt0", Some(token_with_refresh("rt1")))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !handle
+                .invalidate_if_current(1, "rt0", Reason::Null)
+                .await
+                .unwrap()
+        );
+        assert!(
+            handle
+                .invalidate_if_current(1, "rt1", Reason::Null)
+                .await
+                .unwrap()
+        );
+        assert!(handle.get_token(1).await.unwrap().is_none());
     }
 
     // Compile-time assertion that the affinity cache stores account_id, not a

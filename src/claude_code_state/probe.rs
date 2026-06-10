@@ -803,23 +803,77 @@ async fn run_oauth_probe(
         .unwrap_or_else(|| token.refresh_token.clone());
 
     if let Some(new_token) = refreshed_token {
-        if let Err(err) = upsert_account_oauth(db, account_id, Some(&new_token), None).await {
-            let msg = format!("failed to persist refreshed token: {err}");
-            warn!("[probe][oauth] account {account_id}: {msg}");
-            handle
-                .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
-                .await;
-            let _ = handle.clear_probing(account_id).await;
-            return Err(ProbeFailure {
-                stage: "persist_token",
-                message: msg,
-                http_status: None,
-                action: AccountFailureAction::InternalError,
-            });
+        match upsert_account_oauth(
+            db,
+            account_id,
+            Some(&new_token),
+            None,
+            Some(&token.refresh_token),
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                info!(
+                    "[probe][oauth] account {account_id}: credential rotated during refresh; dropping stale probe result"
+                );
+                let _ = handle.clear_probing(account_id).await;
+                return Ok(());
+            }
+            Err(err) => {
+                let msg = format!("failed to persist refreshed token: {err}");
+                warn!("[probe][oauth] account {account_id}: {msg}");
+                handle
+                    .set_probe_error(account_id, format!("OAuth probe failed: {msg}"))
+                    .await;
+                let _ = handle.clear_probing(account_id).await;
+                return Err(ProbeFailure {
+                    stage: "persist_token",
+                    message: msg,
+                    http_status: None,
+                    action: AccountFailureAction::InternalError,
+                });
+            }
         }
         // Mirror the freshly-rotated token into the pool so subsequent
         // dispatches and flushes don't fall back to the now-invalid RT.
-        handle.update_credential(account_id, Some(new_token)).await;
+        match handle
+            .update_credential_if_current(account_id, &token.refresh_token, Some(new_token))
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                let db_still_has_refreshed_token = get_account_by_id(db, account_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|account| account.oauth_token)
+                    .is_some_and(|current| current.refresh_token == authoritative_refresh_token);
+                if db_still_has_refreshed_token {
+                    // Auth-error accounts intentionally have no credential-bearing
+                    // pool slot. Reload the CAS-committed token, then continue the
+                    // successful probe so it can reactivate the account.
+                    let _ = handle.reload_from_db().await;
+                } else {
+                    info!(
+                        "[probe][oauth] account {account_id}: pool and DB credential rotated after persist; dropping stale probe result"
+                    );
+                    let _ = handle.clear_probing(account_id).await;
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                let msg = format!("failed to conditionally update pool credential: {err}");
+                warn!("[probe][oauth] account {account_id}: {msg}");
+                let _ = handle.clear_probing(account_id).await;
+                return Err(ProbeFailure {
+                    stage: "persist_token",
+                    message: msg,
+                    http_status: None,
+                    action: AccountFailureAction::InternalError,
+                });
+            }
+        }
     }
 
     let access_prefix = &authoritative_access_token[..20.min(authoritative_access_token.len())];

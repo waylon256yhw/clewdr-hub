@@ -63,8 +63,6 @@ pub enum ClewdrError {
         uri: String,
         source: http::uri::InvalidUri,
     },
-    #[snafu(display("Empty choices"))]
-    EmptyChoices,
     #[snafu(display("JSON error: {}", source))]
     #[snafu(context(false))]
     JsonError { source: serde_json::Error },
@@ -360,7 +358,6 @@ impl IntoResponse for ClewdrError {
             ClewdrError::InvalidHeaderValue { .. } => {
                 (StatusCode::BAD_REQUEST, json!(self.to_string()))
             }
-            ClewdrError::EmptyChoices => (StatusCode::NO_CONTENT, json!(self.to_string())),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, json!(self.to_string())),
         };
         let err = ClaudeError {

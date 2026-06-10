@@ -9,9 +9,8 @@ use crate::{
     config::{Reason, TokenInfo},
     db::accounts::{
         AccountMetadataUpdate, AccountWithRuntime, account_credential_matches_prefix,
-        get_account_by_id, load_all_accounts, set_account_auth_error, set_account_disabled,
-        set_account_last_failure, update_account_metadata, upsert_account_oauth,
-        upsert_oauth_snapshot_runtime_fields,
+        get_account_by_id, load_all_accounts, set_oauth_account_failure_if_current,
+        update_account_metadata, upsert_account_oauth, upsert_oauth_snapshot_runtime_fields,
     },
     error::ClewdrError,
     oauth::{OAuthAccountSnapshot, fetch_oauth_snapshot, refresh_oauth_token_only},
@@ -177,7 +176,15 @@ async fn refresh_account(
 
     match refresher(token, account.proxy_url.as_deref()).await {
         Ok(refreshed_token) => {
-            match credential_still_current(db, account_id, &expected_refresh_token).await {
+            match persist_refreshed_token(
+                db,
+                account_pool,
+                account_id,
+                &expected_refresh_token,
+                &refreshed_token,
+            )
+            .await
+            {
                 Ok(true) => {}
                 Ok(false) => {
                     info!(
@@ -186,18 +193,9 @@ async fn refresh_account(
                     return;
                 }
                 Err(err) => {
-                    warn!(
-                        "[oauth-keepalive] account {account_id}: failed credential check before persist: {err}"
-                    );
+                    warn!("[oauth-keepalive] account {account_id}: failed to persist token: {err}");
                     return;
                 }
-            }
-
-            if let Err(err) =
-                persist_refreshed_token(db, account_pool, account_id, &refreshed_token).await
-            {
-                warn!("[oauth-keepalive] account {account_id}: failed to persist token: {err}");
-                return;
             }
 
             match snapshot_fetcher(&refreshed_token.access_token, account.proxy_url.as_deref())
@@ -225,28 +223,33 @@ async fn refresh_account(
     }
 }
 
-async fn credential_still_current(
-    db: &SqlitePool,
-    account_id: i64,
-    expected_refresh_token: &str,
-) -> Result<bool, sqlx::Error> {
-    Ok(get_account_by_id(db, account_id)
-        .await?
-        .and_then(|account| account.oauth_token)
-        .is_some_and(|token| token.refresh_token == expected_refresh_token))
-}
-
 async fn persist_refreshed_token(
     db: &SqlitePool,
     account_pool: &AccountPoolHandle,
     account_id: i64,
+    expected_refresh_token: &str,
     token: &TokenInfo,
-) -> Result<(), ClewdrError> {
-    upsert_account_oauth(db, account_id, Some(token), None).await?;
-    account_pool
-        .update_credential(account_id, Some(token.clone()))
-        .await;
-    Ok(())
+) -> Result<bool, ClewdrError> {
+    if !upsert_account_oauth(
+        db,
+        account_id,
+        Some(token),
+        None,
+        Some(expected_refresh_token),
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    if !account_pool
+        .update_credential_if_current(account_id, expected_refresh_token, Some(token.clone()))
+        .await?
+    {
+        info!(
+            "[oauth-keepalive] account {account_id}: pool credential rotated after DB persist; skipping stale pool update"
+        );
+    }
+    Ok(true)
 }
 
 async fn persist_snapshot(
@@ -330,56 +333,53 @@ async fn persist_failure(
         return;
     }
 
-    match credential_still_current(db, account_id, expected_refresh_token).await {
-        Ok(true) => {}
-        Ok(false) => {
-            info!(
-                "[oauth-keepalive] account {account_id}: credential rotated during failure; dropping stale keepalive verdict"
-            );
-            return;
-        }
-        Err(db_err) => {
-            warn!(
-                "[oauth-keepalive] account {account_id}: failed credential check before failure persist: {db_err}"
-            );
-            return;
-        }
-    }
-
     let persisted = AccountFailureContextPersisted::from(&context);
-    match context.action {
-        AccountFailureAction::TerminalAuth => {
-            if let Err(db_err) = set_account_auth_error(db, account_id, &msg).await {
-                warn!("[oauth-keepalive] account {account_id}: failed to set auth_error: {db_err}");
-                return;
-            }
-            if let Err(db_err) = set_account_last_failure(db, account_id, Some(&persisted)).await {
-                warn!(
-                    "[oauth-keepalive] account {account_id}: failed to persist last_failure: {db_err}"
-                );
-            }
-            account_pool.invalidate(account_id, Reason::Null).await;
-        }
+    let (status, invalid_reason, pool_reason) = match context.action {
+        AccountFailureAction::TerminalAuth => ("auth_error", None, Reason::Null),
         AccountFailureAction::TerminalDisabled => {
             let reason = context
                 .normalized_reason
                 .to_reason()
                 .unwrap_or(Reason::Disabled);
-            if let Err(db_err) = set_account_disabled(db, account_id, &reason.to_db_string()).await
-            {
-                warn!("[oauth-keepalive] account {account_id}: failed to set disabled: {db_err}");
-                return;
-            }
-            if let Err(db_err) = set_account_last_failure(db, account_id, Some(&persisted)).await {
-                warn!(
-                    "[oauth-keepalive] account {account_id}: failed to persist last_failure: {db_err}"
-                );
-            }
-            account_pool.invalidate(account_id, reason).await;
+            ("disabled", Some(reason.to_db_string()), reason)
         }
         AccountFailureAction::Cooldown { .. }
         | AccountFailureAction::TransientUpstream
-        | AccountFailureAction::InternalError => {}
+        | AccountFailureAction::InternalError => return,
+    };
+    match set_oauth_account_failure_if_current(
+        db,
+        account_id,
+        expected_refresh_token,
+        status,
+        invalid_reason.as_deref(),
+        &msg,
+        &persisted,
+    )
+    .await
+    {
+        Ok(true) => {
+            match account_pool
+                .invalidate_if_current(account_id, expected_refresh_token, pool_reason)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => info!(
+                    "[oauth-keepalive] account {account_id}: pool credential rotated after failure persist; skipping stale invalidation"
+                ),
+                Err(err) => warn!(
+                    "[oauth-keepalive] account {account_id}: failed to conditionally invalidate pool slot: {err}"
+                ),
+            }
+        }
+        Ok(false) => {
+            info!(
+                "[oauth-keepalive] account {account_id}: credential rotated during failure; dropping stale keepalive verdict"
+            );
+        }
+        Err(db_err) => {
+            warn!("[oauth-keepalive] account {account_id}: failed to persist failure: {db_err}");
+        }
     }
 }
 
@@ -640,6 +640,7 @@ mod tests {
                 "org-test".to_string(),
             )),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -872,6 +873,7 @@ mod tests {
                         "org-admin".to_string(),
                     )),
                     None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -895,6 +897,12 @@ mod tests {
         assert_eq!(row.get::<String, _>("status"), "active");
         assert_eq!(row.get::<String, _>("oauth_access_token"), "at-admin");
         assert_eq!(row.get::<String, _>("oauth_refresh_token"), "rt-admin");
+
+        let pool_token = handle.get_token(1).await.unwrap().unwrap();
+        assert_eq!(
+            pool_token.refresh_token, "rt-old",
+            "CAS miss must not push the stale refresh result into the pool"
+        );
     }
 
     #[tokio::test]
@@ -927,6 +935,7 @@ mod tests {
                         "org-admin".to_string(),
                     )),
                     None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -939,15 +948,18 @@ mod tests {
 
         refresh_account(&pool, &handle, 1, refresher, success_snapshot_fetcher()).await;
 
-        let row =
-            sqlx::query("SELECT status, oauth_access_token, oauth_refresh_token, last_error FROM accounts WHERE id = 1")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let row = sqlx::query(
+            "SELECT status, oauth_access_token, oauth_refresh_token, last_error, last_failure_json
+             FROM accounts WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(row.get::<String, _>("status"), "active");
         assert_eq!(row.get::<String, _>("oauth_access_token"), "at-admin");
         assert_eq!(row.get::<String, _>("oauth_refresh_token"), "rt-admin");
         assert!(row.get::<Option<String>, _>("last_error").is_none());
+        assert!(row.get::<Option<String>, _>("last_failure_json").is_none());
     }
 
     #[tokio::test]

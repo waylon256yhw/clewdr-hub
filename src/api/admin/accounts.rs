@@ -1377,45 +1377,79 @@ pub async fn test_account(
                 } else {
                     match refresh_oauth_token(&token, account.proxy_url.as_deref()).await {
                         Ok(refreshed) => {
-                            if let Err(db_err) =
-                                upsert_account_oauth(&state.db, id, Some(&refreshed.token), None)
-                                    .await
+                            let persisted = match upsert_account_oauth(
+                                &state.db,
+                                id,
+                                Some(&refreshed.token),
+                                None,
+                                Some(&token.refresh_token),
+                            )
+                            .await
                             {
-                                let error_msg =
-                                    format!("failed to persist refreshed token: {db_err}");
-                                let ctx = BillingContext {
-                                    db: state.db.clone(),
-                                    user_id: None,
-                                    api_key_id: None,
-                                    account_id: Some(id),
-                                    model_raw: TEST_ACCOUNT_MODEL.to_string(),
-                                    request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
-                                    started_at,
-                                    event_tx: state.event_tx.clone(),
-                                    audit: None,
-                                };
-                                persist_probe_log(
-                                    &ctx,
-                                    RequestType::Test,
-                                    "internal_error",
-                                    None,
-                                    "",
-                                    Some(&error_msg),
-                                )
-                                .await;
-                                return Ok(Json(TestAccountResponse {
-                                    success: false,
-                                    latency_ms: (chrono::Utc::now() - started_at)
-                                        .num_milliseconds(),
-                                    error: Some(error_msg),
-                                    http_status: None,
-                                }));
+                                Ok(persisted) => persisted,
+                                Err(db_err) => {
+                                    let error_msg =
+                                        format!("failed to persist refreshed token: {db_err}");
+                                    let ctx = BillingContext {
+                                        db: state.db.clone(),
+                                        user_id: None,
+                                        api_key_id: None,
+                                        account_id: Some(id),
+                                        model_raw: TEST_ACCOUNT_MODEL.to_string(),
+                                        request_id: format!("test-{}-{}", id, uuid::Uuid::new_v4()),
+                                        started_at,
+                                        event_tx: state.event_tx.clone(),
+                                        audit: None,
+                                    };
+                                    persist_probe_log(
+                                        &ctx,
+                                        RequestType::Test,
+                                        "internal_error",
+                                        None,
+                                        "",
+                                        Some(&error_msg),
+                                    )
+                                    .await;
+                                    return Ok(Json(TestAccountResponse {
+                                        success: false,
+                                        latency_ms: (chrono::Utc::now() - started_at)
+                                            .num_milliseconds(),
+                                        error: Some(error_msg),
+                                        http_status: None,
+                                    }));
+                                }
+                            };
+                            if !persisted {
+                                match get_account_by_id(&state.db, id).await {
+                                    Ok(Some(account)) => match account.oauth_token {
+                                        Some(current) => current.access_token,
+                                        None => {
+                                            return Err(ClewdrError::InvalidAuth);
+                                        }
+                                    },
+                                    _ => return Err(ClewdrError::InvalidAuth),
+                                }
+                            } else {
+                                let updated = state
+                                    .account_pool
+                                    .update_credential_if_current(
+                                        id,
+                                        &token.refresh_token,
+                                        Some(refreshed.token.clone()),
+                                    )
+                                    .await?;
+                                if updated {
+                                    refreshed.token.access_token
+                                } else {
+                                    match get_account_by_id(&state.db, id).await {
+                                        Ok(Some(account)) => match account.oauth_token {
+                                            Some(current) => current.access_token,
+                                            None => return Err(ClewdrError::InvalidAuth),
+                                        },
+                                        _ => return Err(ClewdrError::InvalidAuth),
+                                    }
+                                }
                             }
-                            state
-                                .account_pool
-                                .update_credential(id, Some(refreshed.token.clone()))
-                                .await;
-                            refreshed.token.access_token
                         }
                         Err(e) => {
                             let error_msg = e.to_string();

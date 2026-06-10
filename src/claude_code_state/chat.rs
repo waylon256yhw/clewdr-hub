@@ -479,7 +479,44 @@ impl ClaudeCodeState {
         }
 
         let refreshed = refresh_oauth_token(&current, self.proxy_url.as_deref()).await?;
-        upsert_account_oauth(&db, account_id, Some(&refreshed.token), None).await?;
+        if !upsert_account_oauth(
+            &db,
+            account_id,
+            Some(&refreshed.token),
+            None,
+            Some(&current.refresh_token),
+        )
+        .await?
+        {
+            if let Some(token) = crate::db::accounts::get_account_by_id(&db, account_id)
+                .await?
+                .and_then(|account| account.oauth_token)
+            {
+                self.organization_uuid = Some(token.organization.uuid.clone());
+                self.oauth_token = Some(token);
+                return Ok(());
+            }
+            return Err(ClewdrError::InvalidAuth);
+        }
+        if !self
+            .account_pool_handle
+            .update_credential_if_current(
+                account_id,
+                &current.refresh_token,
+                Some(refreshed.token.clone()),
+            )
+            .await?
+        {
+            if let Some(token) = crate::db::accounts::get_account_by_id(&db, account_id)
+                .await?
+                .and_then(|account| account.oauth_token)
+            {
+                self.organization_uuid = Some(token.organization.uuid.clone());
+                self.oauth_token = Some(token);
+                return Ok(());
+            }
+            return Err(ClewdrError::InvalidAuth);
+        }
         update_account_metadata_unchecked(
             &db,
             account_id,
@@ -494,11 +531,8 @@ impl ClaudeCodeState {
         )
         .await?;
         upsert_oauth_snapshot_runtime_fields(&db, account_id, &refreshed.snapshot.runtime).await?;
-        // Mirror the new token into the pool's in-memory slot so concurrent
-        // dispatches see the fresh credential without waiting for reload.
-        self.account_pool_handle
-            .update_credential(account_id, Some(refreshed.token.clone()))
-            .await;
+        // Merge the refreshed upstream snapshot without clobbering local
+        // counters or applying it to a concurrently rotated credential.
         self.account_pool_handle
             .release_oauth_snapshot_runtime(
                 account_id,
