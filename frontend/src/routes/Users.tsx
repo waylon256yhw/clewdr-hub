@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Title,
@@ -50,6 +50,16 @@ import { formatCost, formatDate } from "../lib/format";
 
 // ─── User Form Modal ───
 
+function getUserFormValues(editing: UserRow | null, policies: Policy[]) {
+  return {
+    username: editing?.username ?? "",
+    display_name: editing?.display_name ?? "",
+    password: "",
+    policy_id: String(editing?.policy_id ?? policies[0]?.id ?? 1),
+    notes: editing?.notes ?? "",
+  };
+}
+
 function UserFormModal({
   opened,
   onClose,
@@ -65,17 +75,19 @@ function UserFormModal({
   const isAdmin = editing?.role === "admin";
   const form = useForm({
     mode: "uncontrolled",
-    initialValues: {
-      username: editing?.username ?? "",
-      display_name: editing?.display_name ?? "",
-      password: "",
-      policy_id: String(editing?.policy_id ?? policies[0]?.id ?? 1),
-      notes: editing?.notes ?? "",
-    },
+    initialValues: getUserFormValues(editing, policies),
     validate: {
       username: (v) => (v.trim() ? null : "必填"),
     },
   });
+
+  // The modal component stays mounted between opens, so its form state would
+  // otherwise survive — re-sync on every open so consecutive "新建" sessions
+  // start blank instead of inheriting the previous input.
+  useEffect(() => {
+    if (!opened) return;
+    form.setValues(getUserFormValues(editing, policies));
+  }, [editing, opened]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const mutation = useMutation({
     mutationFn: async (values: typeof form.values) => {
@@ -195,6 +207,18 @@ function ResetUsageConfirm({
 
 // ─── Policy Form Modal ───
 
+const NANO = 1_000_000_000;
+
+function getPolicyFormValues(editing: Policy | null) {
+  return {
+    name: editing?.name ?? "",
+    max_concurrent: editing?.max_concurrent ?? 2,
+    rpm_limit: editing?.rpm_limit ?? 50,
+    weekly_budget: editing ? editing.weekly_budget_nanousd / NANO : 200,
+    monthly_budget: editing ? editing.monthly_budget_nanousd / NANO : 2000,
+  };
+}
+
 function PolicyFormModal({
   opened,
   onClose,
@@ -205,22 +229,21 @@ function PolicyFormModal({
   editing: Policy | null;
 }) {
   const queryClient = useQueryClient();
-  const NANO = 1_000_000_000;
   const form = useForm({
     mode: "uncontrolled",
-    initialValues: {
-      name: editing?.name ?? "",
-      max_concurrent: editing?.max_concurrent ?? 2,
-      rpm_limit: editing?.rpm_limit ?? 50,
-      weekly_budget: editing ? editing.weekly_budget_nanousd / NANO : 200,
-      monthly_budget: editing ? editing.monthly_budget_nanousd / NANO : 2000,
-    },
+    initialValues: getPolicyFormValues(editing),
     validate: {
       name: (v) => (v.trim() ? null : "必填"),
       max_concurrent: (v) => (v > 0 ? null : "必须大于 0"),
       rpm_limit: (v) => (v > 0 ? null : "必须大于 0"),
     },
   });
+
+  // Same re-sync as the user form: clear stale values on each open.
+  useEffect(() => {
+    if (!opened) return;
+    form.setValues(getPolicyFormValues(editing));
+  }, [editing, opened]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const mutation = useMutation({
     mutationFn: async (values: typeof form.values) => {
