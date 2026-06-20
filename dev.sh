@@ -142,6 +142,14 @@ if $DO_STOP; then
   exit 0
 fi
 
+# 构建前依赖预检：缺失时给出可操作提示，而不是 cmake/bindgen 的底层报错
+if [ -f scripts/setup-dev.sh ]; then
+  if ! bash scripts/setup-dev.sh --check >/dev/null; then
+    echo "==> 依赖检查未通过：系统依赖可运行 ./scripts/setup-dev.sh 自动安装；工具链按上面提示补齐。"
+    exit 1
+  fi
+fi
+
 if $DISABLE_TIMEOUT; then
   AUTO_STOP_SECONDS=0
 fi

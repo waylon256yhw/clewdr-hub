@@ -28,6 +28,21 @@
 - Rust (stable, edition 2024)
 - Node.js (LTS) + npm
 - SQLite 3（系统自带即可，代码通过 sqlx 内嵌驱动）
+- 系统构建库：编译 BoringSSL / bindgen 等原生依赖需要 `cmake`、`clang`、`libclang-dev`、`build-essential`、`perl`、`pkg-config`
+
+一键安装系统依赖（Ubuntu/Debian 自动；其他发行版会打印对应手动命令）：
+
+```bash
+./scripts/setup-dev.sh
+```
+
+手动安装（apt）：
+
+```bash
+sudo apt-get install -y build-essential cmake clang libclang-dev perl pkg-config
+```
+
+`dev.sh` 每次启动前会自动跑 `scripts/setup-dev.sh --check` 预检，缺依赖时给出明确提示，而不是 BoringSSL 的底层报错。语言工具链（Rust/Node）需自行安装，脚本只检测不代装。
 
 ### dev.sh
 

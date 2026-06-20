@@ -18,6 +18,7 @@ test
 scripts/*
 !scripts/install.sh
 !scripts/uninstall.sh
+!scripts/setup-dev.sh
 AGENTS.md
 docs/
 .serena/
