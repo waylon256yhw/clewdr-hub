@@ -9,6 +9,15 @@ fi
 
 TAG="v$VERSION"
 
+if ! cargo set-version --help >/dev/null 2>&1; then
+    echo "Missing release tool: cargo set-version (provided by cargo-edit)."
+    echo "Install it with:"
+    echo "  cargo install cargo-edit --locked"
+    echo "Or run:"
+    echo "  ./scripts/setup-dev.sh --release-tools"
+    exit 1
+fi
+
 if [ -n "$(git status --porcelain)" ]; then
     echo "Working tree is not clean. Commit or stash changes before releasing."
     exit 1

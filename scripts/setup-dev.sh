@@ -9,18 +9,23 @@
 #   ./scripts/setup-dev.sh            检测并安装缺失的系统依赖
 #                                     （apt 自动安装；其他包管理器仅打印手动命令）
 #   ./scripts/setup-dev.sh --check    仅检测、不安装；缺失则非零退出（dev.sh 预检复用）
+#   ./scripts/setup-dev.sh --release-tools
+#                                     额外安装发布所需的 cargo-edit/cargo set-version
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CHECK_ONLY=false
+RELEASE_TOOLS=false
 for arg in "$@"; do
   case "$arg" in
     --check) CHECK_ONLY=true ;;
+    --release-tools) RELEASE_TOOLS=true ;;
     -h|--help)
-      echo "用法: ./scripts/setup-dev.sh [--check]"
+      echo "用法: ./scripts/setup-dev.sh [--check] [--release-tools]"
       echo "  (无参数)  检测并安装缺失的系统依赖（apt 自动）"
       echo "  --check   仅检测，不安装；缺失则非零退出"
+      echo "  --release-tools  额外检查/安装发布工具 cargo-edit（提供 cargo set-version）"
       exit 0
       ;;
     *) echo "未知参数: $arg" >&2; exit 2 ;;
@@ -72,6 +77,24 @@ command -v cargo >/dev/null 2>&1 || toolchain+=("Rust 工具链 (cargo) —— �
 command -v node  >/dev/null 2>&1 || toolchain+=("Node.js LTS (node) —— 安装: https://nodejs.org 或 fnm")
 command -v npm   >/dev/null 2>&1 || toolchain+=("npm（随 Node.js 一同安装）")
 
+has_cargo_set_version() {
+  command -v cargo >/dev/null 2>&1 && cargo set-version --help >/dev/null 2>&1
+}
+
+install_release_tools() {
+  $RELEASE_TOOLS || return 0
+  if ! command -v cargo >/dev/null 2>&1; then
+    warn "缺少 cargo，无法安装发布工具 cargo-edit；请先安装 Rust 工具链"
+    return 1
+  fi
+  if has_cargo_set_version; then
+    note "发布工具已齐全: cargo set-version"
+    return 0
+  fi
+  note "安装发布工具: cargo-edit（提供 cargo set-version）"
+  cargo install cargo-edit --locked
+}
+
 print_toolchain() {
   [ ${#toolchain[@]} -eq 0 ] && return 0
   warn "缺少语言工具链（需手动安装）:"
@@ -89,6 +112,11 @@ if $CHECK_ONLY; then
   fi
   if [ ${#toolchain[@]} -gt 0 ]; then
     print_toolchain
+    rc=1
+  fi
+  if $RELEASE_TOOLS && ! has_cargo_set_version; then
+    err "缺少发布工具: cargo set-version（由 cargo-edit 提供）"
+    err "运行 ./scripts/setup-dev.sh --release-tools 自动安装"
     rc=1
   fi
   [ $rc -eq 0 ] && note "开发依赖齐全 ✓"
@@ -136,6 +164,8 @@ elif [ ${#missing[@]} -gt 0 ]; then
 else
   note "系统依赖已齐全（非 apt 系统，跳过自动安装）"
 fi
+
+install_release_tools
 
 # --- 安装后复检 ---
 recheck=()

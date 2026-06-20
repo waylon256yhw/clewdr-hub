@@ -523,12 +523,14 @@ cargo build --release --no-default-features --features embed-resource,portable  
 
 版本号遵循 semver（`MAJOR.MINOR.PATCH`）。Bug fix → patch，新功能 → minor，破坏性变更 → major。
 
-#### 前置：安装 cargo-edit
+#### 前置：安装发布工具
 
 `release.sh` 依赖 `cargo set-version`，由 `cargo-edit` 提供。首次在新节点发版前安装一次即可：
 
 ```bash
-cargo install cargo-edit
+./scripts/setup-dev.sh --release-tools
+# 或手动安装:
+cargo install cargo-edit --locked
 ```
 
 #### 发版步骤
@@ -544,6 +546,7 @@ cargo install cargo-edit
    脚本依次执行：
 
    - `cargo update`（刷新 `Cargo.lock` 里的依赖 patch 版本）
+   - 检查 `cargo set-version` 是否可用（缺失时提示安装 `cargo-edit`）
    - `cargo set-version X.Y.Z`（同步改 `Cargo.toml` 和 `Cargo.lock` 里的包版本）
    - `cargo test`
    - `cd frontend && npm ci && npm run build`（产物写到 `static/`）
