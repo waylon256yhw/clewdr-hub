@@ -180,7 +180,13 @@ if ! $DO_HMR && [ ! -f static/index.html ]; then
   npm --prefix frontend run build
 fi
 
-echo "==> 编译 + 启动后端..."
+echo "==> 编译后端（首次冷编译可能数分钟，进度见下方）..."
+if ! cargo build; then
+  echo "==> 后端编译失败，请检查上面的编译错误"
+  exit 1
+fi
+
+echo "==> 启动后端..."
 nohup env CLEWDR_IP="$BIND_IP" CLEWDR_PORT="$BIND_PORT" \
   cargo run -- --db "$DB_FILE" >"$BACKEND_LOG_FILE" 2>&1 &
 BACKEND_PID=$!

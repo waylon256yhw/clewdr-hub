@@ -63,7 +63,7 @@ sudo apt-get install -y build-essential cmake clang libclang-dev perl pkg-config
 1. 杀掉已有的 clewdr 进程
 2. 可选：删除 `clewdr.db` 重新初始化
 3. 可选：`cd frontend && npx vite build` 构建前端到 `static/`
-4. `cargo run -- --db clewdr.db` 后台启动后端（输出写入 `.dev-backend.log`）
+4. `cargo build` 前台编译后端（首次冷编译可能数分钟、进度可见、失败即退出），再 `cargo run -- --db clewdr.db` 后台启动（输出写入 `.dev-backend.log`）
 5. `hmr` 模式下启动 `npm --prefix frontend run dev`（输出写入 `.dev-frontend.log`）
 6. 轮询后端 `/api/version` 和（可选）前端首页等待就绪，超时 60 秒
 7. 默认启动自动停机 watchdog，3 小时后自动执行 `./dev.sh stop`
