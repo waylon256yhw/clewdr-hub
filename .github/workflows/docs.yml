@@ -1,11 +1,16 @@
 name: Deploy Docs to GitHub Pages
 
 # 文档站源码在 website/（Astro Starlight）。
-# 推到 master 且改动了 website/ 时构建并发布到 GitHub Pages。
+# PR 与推到 master 都会构建校验（坏链接 / frontmatter 错误 / 构建失败提前暴露）；
+# 仅 master（push 或手动触发）才发布到 GitHub Pages。
 # 首次使用需在仓库 Settings → Pages → Build and deployment → Source 选择 "GitHub Actions"。
 on:
   push:
     branches: [master]
+    paths:
+      - 'website/**'
+      - '.github/workflows/docs.yml'
+  pull_request:
     paths:
       - 'website/**'
       - '.github/workflows/docs.yml'
@@ -16,10 +21,11 @@ permissions:
   pages: write
   id-token: write
 
-# 同一时间只跑一个部署，但不取消进行中的（避免发布半成品）。
+# 按 ref 分组：PR 构建不会阻塞 master 发布。
+# PR 新提交取消同 PR 的旧构建；master 发布不取消进行中的（避免发布半成品）。
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: pages-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -41,6 +47,8 @@ jobs:
           path: website/dist
 
   deploy:
+    # 仅 master 发布；PR 只跑上面的 build 做校验。
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
     needs: build
     runs-on: ubuntu-latest
     environment:
