@@ -161,7 +161,7 @@ function EffortOverrideSection({
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: qk.settings });
-      notifications.show({ message: "Effort 覆盖设置已保存", color: "green" });
+      notifications.show({ message: "Effort 强制值已保存", color: "green" });
     },
     onError: (e) =>
       notifications.show({ message: e instanceof ApiError ? e.message : "保存失败", color: "red" }),
@@ -173,12 +173,12 @@ function EffortOverrideSection({
   return (
     <Paper shadow="xs" p="md" radius="md" withBorder>
       <Stack>
-        <Text fw={600}>Effort 覆盖</Text>
+        <Text fw={600}>推理 Effort 强制值</Text>
         <Text size="sm" c="dimmed">
-          开启后覆盖受支持推理模型的 `output_config.effort`。
+          对支持的推理模型强制写入 `output_config.effort`，覆盖客户端发送的值，并按各模型上限钳制。
         </Text>
         <Switch
-          label="启用推理模型 effort 覆盖"
+          label="覆盖客户端传入的 effort"
           checked={overrideEnabled}
           onChange={(e) => setOverrideEnabled(e.currentTarget.checked)}
         />
