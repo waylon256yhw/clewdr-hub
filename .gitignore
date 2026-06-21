@@ -20,7 +20,7 @@ scripts/*
 !scripts/uninstall.sh
 !scripts/setup-dev.sh
 AGENTS.md
-docs/
+/docs/
 .serena/
 clewdr-bin
 .dev-*

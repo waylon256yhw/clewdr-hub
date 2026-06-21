@@ -1,0 +1,57 @@
+---
+title: clewdr-hub
+description: 基于 clewdr 的多用户 Claude 共享网关——账号池轮询、并发槽隔离、per-user 限额、费用追踪，开箱即用。
+template: splash
+hero:
+  tagline: 把 Claude Pro/Max 订阅变成团队 API。单二进制 · SQLite · 无额外提示词 · 原生 Anthropic Messages API。
+  image:
+    file: ../../assets/hero.png
+  actions:
+    - text: 快速开始
+      link: start/quick-start/
+      icon: right-arrow
+    - text: 在 GitHub 上查看
+      link: https://github.com/waylon256yhw/clewdr-hub
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+## 它能做什么
+
+<CardGrid>
+	<Card title="零依赖部署" icon="rocket">
+		单个静态链接二进制，前端编译嵌入，SQLite WAL 自动建库。一条命令装好并注册开机自启。
+	</Card>
+	<Card title="透明代理" icon="random">
+		直接转发 `/v1/messages`，不注入系统提示词；仅为兼容 Anthropic 模型行为做最小参数归一化。
+	</Card>
+	<Card title="多账号调度" icon="seti:db">
+		Cookie / OAuth / API Key 账号池 + round-robin + 亲和性缓存 + per-account 并发槽，支持「优先消耗」。
+	</Card>
+	<Card title="团队隔离" icon="seti:lock">
+		用户 → 策略 → API Key，并发 / RPM / 周预算 / 月预算多重限额，超限直接拒绝。
+	</Card>
+	<Card title="OpenAI 兼容入口" icon="seti:json">
+		`POST /v1/chat/completions` + `/v1/models` 格式协商，零改造对接 OpenAI SDK 客户端。
+	</Card>
+	<Card title="内嵌管理后台" icon="laptop">
+		总览 / 运维 / 账号池 / 代理 / 用户 / Key / 日志 / 设置，SSE 实时推送。
+	</Card>
+</CardGrid>
+
+## 从这里开始
+
+<CardGrid>
+	<LinkCard title="这是什么 / 架构" href="start/what-is-clewdr-hub/" description="项目定位、与原版 clewdr 的区别、整体架构。" />
+	<LinkCard title="快速开始" href="start/quick-start/" description="一条命令装好，5 分钟发出第一个请求。" />
+	<LinkCard title="安装部署" href="start/installation/" description="一键脚本 / Docker Compose / 宝塔 / Hugging Face Space。" />
+	<LinkCard title="使用指南" href="guides/account-pool/" description="账号池、代理、团队、缓存、OpenAI 兼容入口、反向代理。" />
+	<LinkCard title="参考" href="reference/environment-variables/" description="环境变量、配置、参数兼容策略、后台页面。" />
+	<LinkCard title="开发文档" href="dev/environment/" description="架构、调度器、认证、数据库、构建发布——面向贡献者。" />
+</CardGrid>
+
+---
+
+fork 自 [clewdr](https://github.com/Xerxes-2/clewdr)，保留其核心代理能力（轻量伪装、cookie 认证、无提示词注入），重构为多用户网关。
