@@ -12,375 +12,74 @@
 
 把 Claude Pro/Max 订阅变成团队 API：账号池轮询、并发槽隔离、per-user 限额、费用追踪，开箱即用。
 
+> **📖 完整文档：<https://waylon256yhw.github.io/clewdr-hub/>**
+> 安装部署、使用指南、参考与开发文档都在文档站，本 README 只讲快速上手。
+
 ---
 
 ## 特性
 
 - **零依赖部署**：单个静态链接二进制，前端编译嵌入，SQLite WAL 自动建库
-- **透明代理**：直接转发 `/v1/messages`，不注入系统提示词；仅为兼容 Anthropic 模型行为做最小参数归一化
-- **OpenAI 兼容入口**：`POST /v1/chat/completions` + `/v1/models?format=` 协商，零改造对接 OpenAI SDK 客户端，复用同一套鉴权 / 配额 / 限流 / 计费链路
+- **透明代理**：直接转发 `/v1/messages`，不注入系统提示词；仅做最小参数归一化
+- **OpenAI 兼容入口**：`POST /v1/chat/completions` + `/v1/models?format=` 协商，零改造对接 OpenAI SDK 客户端
+- **多账号调度**：Cookie / OAuth / Custom Anthropic API Key 账号池 + round-robin + 亲和性缓存 + per-account 并发槽，支持「优先消耗」
+- **多代理管理**：维护多个备用代理，支持账号级绑定，不同账号走不同出口
+- **团队隔离**：用户 → 策略 → API Key，并发 / RPM / 周预算 / 月预算多重限额，超限直接拒绝
+- **管理后台**：总览 / 运维 / 账号池 / 代理 / 用户 / Key / 日志 / 设置，SSE 实时推送
 - **轻量伪装**：可配置 CLI/SDK 版本号和请求头，过上游客户端检测
-- **多账号调度**：Cookie / OAuth / Custom Anthropic API Key 账号池 + round-robin + 亲和性缓存 + per-account 并发槽（`max_slots`），支持标记账号「优先消耗」用于限量试用账号
-- **多代理管理**：可维护多个备用代理，支持账号级绑定，适合不同账号走不同出口
-- **团队隔离**：用户 → 策略 → API Key，并发/RPM/周预算/月预算多重限额
-- **Per-Key 绑定**：把特定 key 锁定到指定账号，隔离资源
-- **管理后台**：总览 / 运维 / 账号池 / 用户 / Key / 日志 / 设置，SSE 实时推送
-- **自适应探测**：自动识别 Pro/Max 账号类型，按实际用量窗口显示
-- **代理简易测试**：服务器侧测试代理基础连通性、延迟、出口 IP 与地区
 
-## 部署
+## 快速开始
 
-### 一键安装（推荐）
-
-Linux / macOS / Termux 一条命令装好，自动注册开机自启：
+一键安装（Linux / macOS / Termux），自动注册开机自启：
 
 ```bash
 curl -fL https://raw.githubusercontent.com/waylon256yhw/clewdr-hub/master/scripts/install.sh | bash
 ```
 
-装完直接打开管理菜单：
+装完打开交互式管理菜单（查看状态、改密码、导入导出配置都在里面）：
 
 ```bash
 clewdr menu
 ```
 
-按编号选择 — 查看状态、改密码、导入导出配置都在里面。
-
 管理后台地址 `http://你的IP:8484`，默认密码 `password`，首次登录强制改密。
 
-#### Termux 用户
-
-要在关掉 Termux 后服务仍在线，先到 F-Droid 装一次 [Termux:Boot](https://f-droid.org/packages/com.termux.boot/) 并打开它，再执行：
-
-```bash
-clewdr service install
-```
-
-### Docker Compose
-
-```bash
-mkdir clewdr-hub && cd clewdr-hub
-curl -O https://raw.githubusercontent.com/waylon256yhw/clewdr-hub/master/docker-compose.yml
-docker compose up -d
-```
-
-管理后台：`http://your-ip:8484`，默认密码 `password`，首次登录强制改密。数据持久化在 Docker volume `clewdr-data` 中，`docker compose down` 不会丢数据。
-
-### 手动安装
-
-到 [Releases](https://github.com/waylon256yhw/clewdr-hub/releases/latest) 下载对应平台的 zip，解压加可执行权限即可。要开机自启可以接着跑 `clewdr service install`。
-
-### 环境变量
-
-| 变量 | 默认 | 说明 |
-|------|------|------|
-| `CLEWDR_IP` | `0.0.0.0` | 监听地址 |
-| `CLEWDR_PORT` | `8484` | 监听端口 |
-| `ADMIN_PASSWORD` | `password` | 管理员密码（首次登录强制修改） |
-
-### 反代部署：让 clewdr-hub 拿到真实客户端 IP
-
-clewdr-hub 会把每次请求的"解析后客户端 IP"记录到 `api_keys.last_used_ip`（以及未来的请求审计字段）。**默认 nginx / Caddy 不会自动透传客户端 IP**，需要两边都配：反代设置 `X-Forwarded-For`，clewdr-hub 信任反代来源。
-
-`trusted_proxies` 默认值为 `["127.0.0.0/8", "::1/128", "172.16.0.0/12"]`，覆盖同机部署和 Docker Compose 桥接默认网段。其他场景需要在 `clewdr.toml` 显式追加你反代的来源 CIDR。
-
-#### 场景 1：同机 nginx，clewdr 监听 127.0.0.1
-
-nginx 站点配置：
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name api.example.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:8484;
-        proxy_http_version 1.1;
-
-        # 让 clewdr-hub 看到真实客户端 IP
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        # 流式响应
-        proxy_buffering    off;
-        proxy_read_timeout 600s;
-    }
-}
-```
-
-clewdr-hub 侧无需任何配置改动（loopback 默认在 `trusted_proxies` 内）。
-
-#### 场景 2：Docker Compose（nginx + clewdr 同网）
-
-```yaml
-services:
-  clewdr-hub:
-    image: clewdr-hub:latest
-    expose:
-      - "8484"            # 注意：用 expose 而不是 ports，避免绕过反代直连
-    networks: [web]
-    # Docker 桥接默认网段 172.16.0.0/12 已在 `trusted_proxies` 默认里，
-    # 不需要额外配置。如果你用了非默认网段，见下面"自定义 trusted_proxies"。
-
-  nginx:
-    image: nginx:alpine
-    ports: ["443:443"]
-    volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-    networks: [web]
-
-networks:
-  web:
-```
-
-`nginx.conf`：
-
-```nginx
-upstream clewdr { server clewdr-hub:8484; }
-
-server {
-    listen 443 ssl;
-    server_name api.example.com;
-
-    location / {
-        proxy_pass http://clewdr;
-        proxy_http_version 1.1;
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_buffering    off;
-        proxy_read_timeout 600s;
-    }
-}
-```
-
-Docker 默认 bridge 网段在 `172.16.0.0/12` 内，已被默认 `trusted_proxies` 覆盖。
-
-#### 场景 3：Caddy
-
-```caddyfile
-api.example.com {
-    reverse_proxy 127.0.0.1:8484
-}
-```
-
-Caddy 的 `reverse_proxy` 会自动注入 `X-Forwarded-For` / `X-Forwarded-Proto` / `X-Forwarded-Host`，clewdr-hub 侧零配置。
-
-#### 自定义 `trusted_proxies`
-
-默认值 `["127.0.0.0/8", "::1/128", "172.16.0.0/12"]` 覆盖了同机部署和 Docker Compose 默认 bridge 网段。如果你的反代在其他来源（例如 Kubernetes Pod CIDR、外部 LB、自定义 Docker 网络），需要显式追加。
-
-**通过 `clewdr.toml`（推荐）**：
-
-```toml
-trusted_proxies = ["127.0.0.0/8", "::1/128", "10.42.0.0/16", "192.168.1.0/24"]
-```
-
-**通过环境变量**：值必须是 **TOML 数组字面量**，整个串放进单引号；逗号分隔的裸字符串**不会**被解析为数组，会导致配置静默回退到默认值。
-
-```bash
-# 正确
-export CLEWDR_TRUSTED_PROXIES='["127.0.0.0/8", "::1/128", "10.42.0.0/16"]'
-
-# 错误：会被当成单个字符串，解析失败后回退默认
-# export CLEWDR_TRUSTED_PROXIES="127.0.0.0/8,::1/128,10.42.0.0/16"
-```
-
-Docker Compose 写法：
-
-```yaml
-environment:
-  CLEWDR_TRUSTED_PROXIES: '["127.0.0.0/8", "::1/128", "10.42.0.0/16"]'
-```
-
-#### 安全注意
-
-- 如果 clewdr-hub **直接暴露在公网**（没有任何反代），把 `trusted_proxies` 设为 `[]`，强制忽略所有转发头，避免直连攻击者伪造 IP。
-- `trusted_proxies` 列表中的来源**完整信任**其 `X-Forwarded-For`，请只填你自己控制的反代来源段。
-- 验证方法：管理后台请求详情里 `client_ip` 应该是你真实出口 IP，而不是 `127.0.0.1` 或 `172.x.x.x`。
-
-## 日常管理
-
-```bash
-clewdr menu       # 交互式管理菜单
-clewdr            # 一眼看运行状态
-clewdr update     # 升级到最新版
-```
-
-`clewdr menu` 里能做：查看状态、查看诊断、重置密码、导入/导出配置、安装/卸载服务、检查更新。
-
-## 卸载
-
-```bash
-curl -fL https://raw.githubusercontent.com/waylon256yhw/clewdr-hub/master/scripts/uninstall.sh | bash
-```
-
-默认只删二进制和服务注册，保留你的配置和数据。要把配置和数据库也删掉：
-
-```bash
-curl -fL https://raw.githubusercontent.com/waylon256yhw/clewdr-hub/master/scripts/uninstall.sh | bash -s -- --purge
-```
+> Docker Compose / 宝塔面板 / Hugging Face Space / 手动安装见 [安装部署文档](https://waylon256yhw.github.io/clewdr-hub/start/installation/)。
 
 ## 使用
 
+后台 **账号池** 加账号 → **API Keys** 建 key，然后配置客户端：
+
 ```bash
-export ANTHROPIC_BASE_URL=http://your-ip:8484
+export ANTHROPIC_BASE_URL=http://你的IP:8484
 export ANTHROPIC_API_KEY=sk-...    # 从后台创建
 ```
 
-流程：**后台登录 →（可选）先到代理页添加备用代理 → 账号池添加 Cookie / OAuth / API Key 账号并按需绑定代理 → 创建 API Key → 客户端配置上面两行**。单人到这里就够了。
-
-### 账号池与 Custom Anthropic API Key
-
-账号池支持三类上游账号：
-
-- **Cookie / OAuth**：面向 Claude Pro / Max 订阅账号，后台会探测账号类型、用量窗口和重置时间。
-- **API Key**：面向官方 Anthropic API key 或兼容 Anthropic Messages API 的自定义端点，例如需要 `ANTHROPIC_BASE_URL`、`ANTHROPIC_API_KEY` 和额外请求头的内部 / 云厂商代理。
-
-添加 API Key 账号时填写：
-
-- **基础 URL**：例如 `https://api.anthropic.com/` 或自定义 Anthropic-compatible endpoint；服务端会规范化后拼接 `/v1/messages`、`/v1/messages/count_tokens`。
-- **API 密钥**：通过 `x-api-key` 发送；编辑账号时留空表示保留原值。
-- **额外请求头**：用于工作区、租户或自定义路由信息，例如 `anthropic-workspace-id`。这些值会在管理员账号编辑页回显，方便维护；导出 `--no-secrets` 和运行日志仍会避免泄露 API key 与 header 值。
-
-API Key 账号不会显示 5h / 7d 订阅用量窗口，也不会参与全量订阅探测。请求日志、用户配额、计费统计、OpenAI 兼容入口仍走同一套链路。
-
-`优先消耗` 适合把临时额度、试用额度或希望先用掉的账号放在调度前面。不要给所有账号都打开，否则等同于没有优先级；也不要把高价值主力账号误标为优先消耗。
-
-### 请求参数兼容策略
-
-- 服务端会统一移除 `top_p` 和 `top_k`
-- 如果启用原生 `thinking`（`enabled` / `adaptive`），不符合 Anthropic 要求的 `temperature` 也会被移除
-- `claude-opus-4-7` / `claude-opus-4-8` / `claude-fable-5`：`thinking.type=enabled` + `budget_tokens` 会被重写为 `{type:"adaptive","display":"summarized"}`；如果请求里没带 `output_config.effort`，服务端会显式补成 `high`。这些模型不支持 extended thinking budgets，保持 enabled 在上游会被拒绝或忽略，客户拿不到思考链。
-- `claude-fable-5` 强制开启思考：未提供 `thinking` 或显式传入 `disabled` 时，也会规范为 `{type:"adaptive","display":"summarized"}` 并默认补 `effort=high`。
-- `claude-fable-5` 默认启用 Anthropic server-side fallback：所有 Messages 请求都会附带 `fallbacks=[{model:"claude-opus-4-8"}]` 和对应 beta 标记。Fable 的安全分类拒绝会在同一请求、同一条流中自动切换到 Opus 4.8；如果 fallback 仍未产生答案，原生入口保持 `stop_reason="refusal"`，OpenAI 兼容入口映射为 `finish_reason="content_filter"`。
-- 后台“设置”页的「推理 Effort 强制值」可强制覆盖受支持推理模型的 `output_config.effort`（覆盖客户端发送的值）；当前对 `claude-fable-5`、`claude-opus-4-5` / `4-6` / `4-7` / `4-8`（含 8 位日期后缀）写入所选 effort，其他模型完全透传客户端原始值。
-- 如果管理员选择了旧版 Opus 不支持的 effort，服务端会自动映射到兼容等级：`fable-5` / `opus-4.7` / `opus-4.8` 支持 `low/medium/high/xhigh/max` 全部五档；`opus-4.6` 会把 `xhigh` 映射到 `max`；`opus-4.5` 会把 `xhigh` / `max` 映射到 `high`。
-
-这是有意的兼容性取舍：对这个项目的目标场景，保留 `temperature` 作为主要采样旋钮已经足够，同时可以减少不同客户端和不同 Claude 模型之间的参数兼容问题。
-
-### Automatic Prompt Caching（per-key 开关）
-
-API Keys 页面每条 key 都有一个**自动缓存**开关：
-
-- **开启时**：服务端会在每个出口请求体顶层注入 `"cache_control": {"type": "ephemeral"}`。Anthropic 服务端会自动把缓存断点放在最后一个可缓存 block 上，并随多轮对话自动前移。命中后只对 prompt 收 0.1x 的 cache-read 价。
-- **关闭时**：不注入任何字段，请求按客户端原样透传，行为与之前一致。
-- **/v1/messages/count_tokens 路径不会注入**（缓存对它无意义），不用担心。
-- **生效阈值**：Sonnet ≥ 1024 token、Opus / Haiku 4.5 ≥ 4096 token 才会真正写入缓存，达不到只是没收益、不会报错。
-
-**适用场景**：上下文稳定增长的多轮对话（聊天、Agent 反复读同一份资料）。
-**不要开的场景**：客户端已经自己管理 cache 断点（比如官方 Claude Code，自己会塞 3~4 个，再加一个可能超出 4 个 slot 上限触发 400）；或者经常重写历史 / 插入中间消息的工作流，每改一次都会让 prefix hash 变化命中失败。
-
-第一版 TTL 锁死默认 5 分钟（每次命中重置倒计时），暂不暴露 1h 选项。
-
-### OpenAI 兼容端点
-
-`POST /v1/chat/completions` 接受标准 OpenAI Chat Completions 请求体，内部翻译成 Anthropic Messages 调用同一套上游链路。鉴权、配额、限流、计费、日志都和 `/v1/messages` 共享，所以 `RequestType` 仍记为 `messages`、`/api/admin/logs` 不需要新过滤项。
-
-最小客户端示例（`openai-python`）：
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://your-host:8484/v1", api_key="sk-...")
-resp = client.chat.completions.create(
-    model="claude-sonnet-4-6",
-    messages=[{"role": "user", "content": "Hi"}],
-)
-print(resp.choices[0].message.content)
-```
-
-实现要点：
-
-- **支持字段**：`messages`（含 `developer` 角色，自动并入 `system`）、`stream` + `stream_options.include_usage`、`tools` / `tool_choice`（含 `required` → Anthropic `any`，`none` 自动剥除工具）、`response_format`（`text` / `json_object` 静默接受，`json_schema` 映射到 `output_format`）、`reasoning_effort`（`low/medium/high`）、`max_tokens` / `max_completion_tokens`、`stop` 字符串或数组（自动截到 4 条）、`temperature`、`user`、字符串型 `metadata`。
-- **多模态**：`image_url` 内容部分支持 `data:image/{jpeg|png|gif|webp};base64,...` 数据 URL 和 `http(s)://` URL；其它 MIME / scheme 直接 400。
-- **思考链**：上游 `thinking` 内容块默认映射到 OpenAI/DeepSeek 约定的 `message.reasoning_content`；客户端发送 `x-include-reasoning: false`（或 `0` / `no`）可关闭。
-- **流式**：响应是 `text/event-stream`，每个 chunk 是 `chat.completion.chunk`。开启 `stream_options.include_usage` 后，`[DONE]` 之前会单独发一个 `choices=[], usage={...}` chunk（含 `prompt_tokens_details.cached_tokens`）。
-- **Usage 归并**：`prompt_tokens = input + cache_creation + cache_read`，`cache_read` 单独经 `prompt_tokens_details.cached_tokens` 透出。
-- **静默忽略**：`frequency_penalty` / `presence_penalty` / `logit_bias` / `seed` / `service_tier` / `store` / `top_logprobs`、非 string 的 `metadata` 字段、未识别字段；接收但不映射到上游。
-- **硬性拒绝**：`n > 1` 与 `logprobs: true` 显式 400（语义无法在 Anthropic 上等价实现，避免静默偏差）。
-- **错误体**：所有错误（鉴权失败、配额超限、上游池空、上游 4xx/5xx）都按 `{ "error": { "message", "type", "code", "param" } }` 返回；状态码与 `/v1/messages` 同一信号保持一致。
-- **CORS**：preflight 接受 `openai-beta` / `openai-organization` / `openai-project` 三个浏览器侧客户端常用 header。
-
-### `/v1/models` 格式协商
-
-| 查询字符串 | 形态 | 用途 |
-| -- | -- | -- |
-| 缺省 / `?format=` | 兼容超集（同时含 Anthropic `display_name/created_at/type/has_more/first_id/last_id` 和 OpenAI `object/created/owned_by`） | 老客户端无感升级，默认行为 |
-| `?format=openai` | 严格 OpenAI：顶层 `object="list"`，`data[].object="model"`，`created` 是 Unix 秒，`owned_by="anthropic"` | OpenAI SDK / LiteLLM / one-api 风中转 |
-| `?format=anthropic` | 当前 Anthropic 形态（无 `object` / `created` / `owned_by`） | 严格按 Anthropic models API 解析的客户端 |
-| 其他值 | 400 `invalid_request_error` | 阻止拼写错误静默走默认 |
-
-同一个查询字符串也作用于 `GET /v1/models/{id}` 单条接口。
-
-### Anthropic 1M Context 说明
-
-- 本项目不再支持 legacy `-1M` 伪模型名，请直接使用 Anthropic 官方标准模型名
-- 本项目不会主动添加 `context-1m-2025-08-07`，也会忽略客户端传入的这个 legacy beta header
-- 依赖 `context-1m-2025-08-07` 的过渡 1M beta 已在 `2026-04-30` 后退出支持范围；需要 1M context 时请使用已经原生支持该能力的官方模型名
-
-### 团队扩展
-
-在上面基础上：
-
-1. **策略**（用户页 → 策略标签）：定义并发/RPM/周月预算模板。周/月预算留空或填 0 表示该周期不限制，策略列表会显示 `∞`
-2. **用户**：为成员创建账号，分配策略（管理员账号内置，不可新建）
-3. **分发 Key**：每人一个 key，可选绑定到特定账号
-4. 超限请求直接拒绝，不消耗账号资源
-
-## 后台功能
-
-地址即服务根路径，管理员登录后可见：
-
-| 页面 | 用途 |
-|------|------|
-| **总览** | 账号/用户/Key 数量，请求量，当前伪装版本 |
-| **运维** | 累计请求/Token/金额，模型分布，用户用量趋势与日志下钻 |
-| **账号池** | 添加/管理 Cookie / OAuth / Custom Anthropic API Key 账号，给账号绑定代理，查看订阅账号用量窗口和重置倒计时 |
-| **代理** | 维护多个备用代理，测试基础连通性/延迟/出口 IP/地区 |
-| **用户** | 成员 CRUD + 策略管理（并发/RPM/预算） |
-| **API Keys** | 创建/绑定/管理 Key |
-| **日志** | 请求明细，按用户/状态/模型/时间筛选，点击展开详情 |
-| **设置** | CLI 版本伪装、模型列表管理、改密 |
-
-### 设置项说明
-
-- **CLI 版本伪装**：从 npm 拉取最新版本号，切换后立即生效。上游更新检测策略时用。
-- **模型列表**：控制 `/v1/models` 返回内容，可添加自定义模型 ID。禁用 ≠ 不可调用，只是不列出。
-
-### 代理页说明
-
-- **多个备用代理**：代理是独立资源，可同时保存多条，不做自动轮换；按需为账号绑定。
-- **账号级绑定**：每个账号可单独选择一个代理，也可以留空直连。
-- **简易测试**：测试在服务器侧执行，用于确认基础连通性；会展示延迟、出口 IP 和地区信息。
-- **适用范围**：这是通用代理测试，不代表一定适用于某个具体上游服务。
+官方 Claude Code、任意 Anthropic SDK、OpenAI SDK 都能直接接入。多人团队再加[用户与策略](https://waylon256yhw.github.io/clewdr-hub/guides/teams/)。完整流程与第一个请求示例见[第一个请求](https://waylon256yhw.github.io/clewdr-hub/start/first-request/)。
 
 ## 与同类项目对比
 
-|  | **clewdr-hub** | **Sub2API** | **CLIProxyAPI** | **clewdr** (原版) |
+|  | **clewdr-hub** | **Sub2API** | **CLIProxyAPI** | **clewdr**（原版） |
 |--|---------------|-------------|-----------------|------------------|
 | 定位 | 小团队自用网关 | 商业级中转/拼车平台 | 多 provider 代理 | 个人轻代理 |
 | 部署 | Rust 单二进制 + SQLite | Go + PostgreSQL + Redis | Go 单二进制 | Rust 单二进制 |
-| 支持 provider | Claude 专精 | Claude / OpenAI / Gemini / Antigravity | Gemini / OpenAI / Claude / Codex / Qwen | Claude |
-| 代理方式 | cookie → 原生 Messages API | OAuth + cookie | OAuth 包装 CLI | cookie |
+| 支持 provider | Claude 专精 | Claude / OpenAI / Gemini | Gemini / OpenAI / Claude / Codex | Claude |
 | 提示词注入 | **无**，透明转发 | 有平台层注入 | 有 | 无 |
 | 用户端 UA 校验 | **不做**，自由接入 | 有 | 有 | 无 |
-| 伪装 | 可配版本号 + 请求头 | 内置 | 内置 | 可配版本号 |
 | 多用户 | 用户/策略/Key/RBAC | 用户/Key/计费/支付 | 管理 API | 单 admin |
-| 管理后台 | 内嵌 7 页 React | Vue 全功能后台 | 社区 Dashboard | 配置页 |
 | 适合规模 | 3–10 人 | 10–1000+ 人 / 商用 | 个人–中小团队 | 个人 |
 | 资源占用 | ~20MB RAM | PG + Redis + Go | ~50MB RAM | ~15MB RAM |
 
 **如果你是 3–10 人团队共享 Claude 订阅，要轻、要透明、不想运维数据库——这个项目就是为你写的。**
 
-fork 自 [clewdr](https://github.com/Xerxes-2/clewdr)，保留其核心代理能力（轻量伪装、cookie 认证、无提示词注入），重构为多用户网关：
+## 关于本项目
 
-**新增**：用户/策略/RBAC、API Key 认证（blake3）、账号池并发槽调度、请求日志与费用追踪、运维统计与日志下钻、管理后台（7 页）、SSE 实时事件、审计字段
+fork 自 [clewdr](https://github.com/Xerxes-2/clewdr)，保留其核心代理能力（轻量伪装、cookie 认证、无提示词注入），重构为多用户网关。
 
-**移除**：`/code/v1/*` 路由。OpenAI 兼容入口已通过 `/v1/chat/completions` 完整重做，详见上方"OpenAI 兼容端点"一节。
+- **新增**：用户/策略/RBAC、API Key 认证（blake3）、账号池并发槽调度、请求日志与费用追踪、运维统计与日志下钻、管理后台（7 页）、SSE 实时事件、OpenAI 兼容入口
+- **移除**：原版 `/code/v1/*` 路由（OpenAI 兼容已通过 `/v1/chat/completions` 完整重做）
+
+贡献与二次开发见[开发文档](https://waylon256yhw.github.io/clewdr-hub/dev/environment/)。
 
 ## 致谢
 
