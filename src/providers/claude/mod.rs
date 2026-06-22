@@ -132,6 +132,7 @@ impl LLMProvider for ClaudeCodeProvider {
         state.usage = request.context.usage.to_owned();
         state.bound_account_ids = request.context.bound_account_ids.clone();
         state.selected_account_id = Some(request.context.selected_account_id.clone());
+        state.inbound_session_id = request.context.inbound_session_id.clone();
 
         // Set billing context for cost tracking. account_id is populated in the
         // retry loop once `acquire_account` picks a slot.

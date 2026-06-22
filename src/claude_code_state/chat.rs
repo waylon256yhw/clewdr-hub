@@ -956,7 +956,7 @@ impl ClaudeCodeState {
             .unwrap_or(0);
         let device_id = stealth::derive_device_id(&profile.billing_salt, api_key_id);
         let account_uuid = self.account_uuid().unwrap_or_default();
-        let seed = Self::session_seed_from_body(body);
+        let seed = self.session_seed(body);
         let session_id = stealth::derive_session_id(
             &profile.billing_salt,
             self.account_id,
@@ -1022,12 +1022,25 @@ impl ClaudeCodeState {
         })
     }
 
-    /// Pick the conversation seed for `session_id` derivation from the body, in
-    /// priority order: ① an inbound `metadata.user_id.session_id` (real CLI
-    /// client), ② a hash of `system` + first user message (2api multi-turn
-    /// stays stable while the first turn is unchanged), ③ key+time fallback.
-    fn session_seed_from_body(body: &CreateMessageParams) -> stealth::SessionSeed {
-        // ① inbound session id, if the caller already speaks Claude Code.
+    /// Pick the conversation seed for `session_id` derivation, in priority
+    /// order: ① the inbound `X-Claude-Code-Session-Id` header (the most direct
+    /// session signal, threaded from middleware), ② an inbound
+    /// `metadata.user_id.session_id` (real CLI client), ③ a hash of `system` +
+    /// first user message (2api multi-turn stays stable while the first turn is
+    /// unchanged), ④ key+time fallback.
+    fn session_seed(&self, body: &CreateMessageParams) -> stealth::SessionSeed {
+        // ① inbound session header (matches the affinity key used to pick the
+        // account, so the outbound session stays stable across same-session
+        // turns even when their prompts differ).
+        if let Some(sid) = self
+            .inbound_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return stealth::SessionSeed::InboundSession(sid.to_string());
+        }
+        // ② inbound metadata.user_id.session_id, if the caller speaks Claude Code.
         if let Some(uid) = body.metadata.as_ref().and_then(|m| m.fields.get("user_id"))
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(uid)
             && let Some(sid) = v
@@ -1037,7 +1050,7 @@ impl ClaudeCodeState {
         {
             return stealth::SessionSeed::InboundSession(sid.to_string());
         }
-        // ② content hash of system + first user message text.
+        // ③ content hash of system + first user message text.
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         use std::hash::{Hash, Hasher};
         if let Some(system) = body.system.as_ref() {
@@ -1050,7 +1063,7 @@ impl ClaudeCodeState {
                 .hash(&mut hasher);
             return stealth::SessionSeed::ContentHash(hasher.finish());
         }
-        // ③ no usable content → key + time window.
+        // ④ no usable content → key + time window.
         stealth::SessionSeed::KeyTimeWindow
     }
 

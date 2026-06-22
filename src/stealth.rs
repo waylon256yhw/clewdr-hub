@@ -123,33 +123,37 @@ pub async fn reload_stealth_profile(pool: &SqlitePool) {
     global_profile().store(Arc::new(profile));
 }
 
-/// Overwrite the `cch=00000;` placeholder in a fully-serialized request body
-/// with a self-consistent xxh64 checksum of those bytes, mirroring the real
-/// CLI's billing checksum shape. Returns whether a rewrite happened.
+/// Overwrite the billing-header `cch=00000;` placeholder in a fully-serialized
+/// request body with a self-consistent xxh64 checksum of those bytes, mirroring
+/// the real CLI's billing checksum shape. Returns whether a rewrite happened.
 ///
-/// Strict by design (it is a byte-level patch, not a loose string replace):
-/// - 0 placeholders: no-op, returns false (e.g. a body without a billing
-///   block, such as count_tokens).
-/// - exactly 1: rewrite in place, returns true.
-/// - 2 or more: refuse and return false; a body should carry exactly one
-///   billing block, so patching the first of several would be wrong.
+/// The placeholder is located relative to the billing-header marker
+/// (`x-anthropic-billing-header:`), NOT by scanning the whole body — arbitrary
+/// user/tool content may itself contain the literal `cch=00000;`, which must not
+/// be mistaken for the billing placeholder. Returns false (no-op) when the body
+/// carries no billing block (e.g. count_tokens) or the marker is malformed.
 ///
 /// Self-consistency: the hash is taken over the body that still carries the
 /// `00000` placeholder, then the five digits are replaced. A verifier that
 /// re-zeros the field and recomputes gets the same value. Must run on the FINAL
 /// bytes (after metadata/session injection) so the checksum covers them.
 pub fn cch_rewrite(body: &mut [u8]) -> bool {
-    let mut matches = body
-        .windows(CCH_PLACEHOLDER.len())
-        .enumerate()
-        .filter_map(|(i, w)| (w == CCH_PLACEHOLDER).then_some(i));
-    let Some(pos) = matches.next() else {
-        return false; // no billing block in this body (e.g. count_tokens)
+    const MARKER: &[u8] = b"x-anthropic-billing-header:";
+    // Find the billing block, then the `cch=00000;` placeholder that follows it
+    // within the same block. The block is a single JSON string value, so search
+    // only up to the next `"` after the marker (placeholder always precedes it).
+    let Some(marker_pos) = body.windows(MARKER.len()).position(|w| w == MARKER) else {
+        return false; // no billing block (e.g. count_tokens)
     };
-    if matches.next().is_some() {
-        // More than one placeholder is unexpected; refuse to guess which to patch.
-        return false;
-    }
+    let after = &body[marker_pos..];
+    let block_end = after.iter().position(|&b| b == b'"').unwrap_or(after.len());
+    let Some(rel) = after[..block_end]
+        .windows(CCH_PLACEHOLDER.len())
+        .position(|w| w == CCH_PLACEHOLDER)
+    else {
+        return false; // marker present but placeholder missing/already rewritten
+    };
+    let pos = marker_pos + rel;
     let cch = xxhash_rust::xxh64::xxh64(body, CCH_SEED) & 0xf_ffff;
     let hex = format!("{cch:05x}");
     // placeholder is `cch=00000;` → the five `0` digits start at +4.
@@ -275,9 +279,26 @@ mod tests {
     }
 
     #[test]
-    fn cch_rewrite_refuses_multiple_placeholders() {
-        // Defensive: a body with two billing blocks is unexpected; don't guess.
-        let mut body = b"cch=00000; ... cch=00000;".to_vec();
+    fn cch_rewrite_ignores_placeholder_in_user_content() {
+        // Arbitrary user/tool content may contain the literal cch=00000; — it
+        // must NOT be mistaken for the billing placeholder. Only the one inside
+        // the billing-header block is rewritten.
+        let mut body = br#"{"system":[{"text":"x-anthropic-billing-header: cc_version=2.1.181.abc; cc_entrypoint=cli; cch=00000;"}],"messages":[{"role":"user","content":"here is a literal cch=00000; in my prompt"}]}"#.to_vec();
+        assert!(cch_rewrite(&mut body));
+        let s = String::from_utf8(body).unwrap();
+        // billing block rewritten (the one right after the marker)...
+        let marker = s.find("x-anthropic-billing-header:").unwrap();
+        let billing_cch = s[marker..].find("cch=").unwrap() + marker + 4;
+        assert_ne!(&s[billing_cch..billing_cch + 5], "00000");
+        // ...but the user-content occurrence is untouched.
+        assert!(s.contains("literal cch=00000; in my prompt"));
+    }
+
+    #[test]
+    fn cch_rewrite_noop_without_billing_marker() {
+        // A stray cch=00000; with no billing-header marker is not the billing
+        // placeholder and must not be rewritten.
+        let mut body = br#"{"messages":[{"role":"user","content":"cch=00000;"}]}"#.to_vec();
         let before = body.clone();
         assert!(!cch_rewrite(&mut body));
         assert_eq!(body, before);

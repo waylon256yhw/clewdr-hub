@@ -630,6 +630,7 @@ pub(crate) fn build_claude_context(
         // from the snapshot auth stored in extensions. None here means
         // the request was not audited, or hasn't reached preprocess yet.
         audit: None,
+        inbound_session_id: inbound_session_id.map(str::to_owned),
     }
 }
 

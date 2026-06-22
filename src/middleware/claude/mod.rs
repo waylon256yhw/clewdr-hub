@@ -34,6 +34,12 @@ pub struct ClaudeContext {
     /// enabled. `None` for non-audited keys; presence is the trigger
     /// for the sidecar write in the terminal-log transaction.
     pub audit: Option<RequestAuditSnapshot>,
+    /// Inbound `X-Claude-Code-Session-Id` header, if a real Claude Code client
+    /// sent one. Carried through to send time as the highest-priority seed for
+    /// the outbound session id, so a client whose turns share a session (but
+    /// differ in prompt) keep one stable outbound session. `None` for
+    /// 2api/OpenAI-compat callers.
+    pub inbound_session_id: Option<String>,
 }
 
 impl ClaudeContext {

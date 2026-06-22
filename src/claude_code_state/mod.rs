@@ -138,6 +138,9 @@ pub struct ClaudeCodeState {
     /// attached on every ApiKey send after the reserved-name filter.
     /// `None` for non-ApiKey slots.
     pub api_key_extra_headers: Option<ApiKeyExtraHeaders>,
+    /// Inbound `X-Claude-Code-Session-Id` header (highest-priority seed for the
+    /// outbound session id). `None` for callers that didn't send one.
+    pub inbound_session_id: Option<String>,
 }
 
 impl ClaudeCodeState {
@@ -167,6 +170,7 @@ impl ClaudeCodeState {
             selected_account_id: None,
             api_key: None,
             api_key_extra_headers: None,
+            inbound_session_id: None,
         }
     }
 
