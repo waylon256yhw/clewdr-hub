@@ -25,3 +25,4 @@ AGENTS.md
 clewdr-bin
 .dev-*
 .local/
+.claude/
