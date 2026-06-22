@@ -127,11 +127,12 @@ pub async fn reload_stealth_profile(pool: &SqlitePool) {
 /// request body with a self-consistent xxh64 checksum of those bytes, mirroring
 /// the real CLI's billing checksum shape. Returns whether a rewrite happened.
 ///
-/// The placeholder is located relative to the billing-header marker
-/// (`x-anthropic-billing-header:`), NOT by scanning the whole body — arbitrary
-/// user/tool content may itself contain the literal `cch=00000;`, which must not
-/// be mistaken for the billing placeholder. Returns false (no-op) when the body
-/// carries no billing block (e.g. count_tokens) or the marker is malformed.
+/// The placeholder is located inside the top-level `system` value, NOT by
+/// scanning the whole body: arbitrary user/tool content may contain the literal
+/// `cch=00000;` or even a full billing-header-looking string. Restricting the
+/// search to the serialized `system` value keeps those references untouched.
+/// Returns false (no-op) when no system billing block carries a placeholder
+/// (e.g. count_tokens, or already rewritten).
 ///
 /// Self-consistency: the hash is taken over the body that still carries the
 /// `00000` placeholder, then the five digits are replaced. A verifier that
@@ -139,26 +140,151 @@ pub async fn reload_stealth_profile(pool: &SqlitePool) {
 /// bytes (after metadata/session injection) so the checksum covers them.
 pub fn cch_rewrite(body: &mut [u8]) -> bool {
     const MARKER: &[u8] = b"x-anthropic-billing-header:";
-    // Find the billing block, then the `cch=00000;` placeholder that follows it
-    // within the same block. The block is a single JSON string value, so search
-    // only up to the next `"` after the marker (placeholder always precedes it).
-    let Some(marker_pos) = body.windows(MARKER.len()).position(|w| w == MARKER) else {
-        return false; // no billing block (e.g. count_tokens)
+    let Some((system_start, system_end)) = top_level_json_field_value(body, b"\"system\":") else {
+        return false;
     };
-    let after = &body[marker_pos..];
-    let block_end = after.iter().position(|&b| b == b'"').unwrap_or(after.len());
-    let Some(rel) = after[..block_end]
-        .windows(CCH_PLACEHOLDER.len())
-        .position(|w| w == CCH_PLACEHOLDER)
-    else {
-        return false; // marker present but placeholder missing/already rewritten
+    let system = &body[system_start..system_end];
+
+    // Locate the placeholder inside the injected billing block. `system` is
+    // serialized after `prepend_system_blocks`, so that block is first in the
+    // top-level system array. We still scan all system markers defensively in
+    // case older payload shapes are encountered.
+    let mut search_from = 0;
+    let mut placeholder_pos = None;
+    while let Some(rel_marker) = system[search_from..]
+        .windows(MARKER.len())
+        .position(|w| w == MARKER)
+    {
+        let marker_pos = search_from + rel_marker;
+        let after = &system[marker_pos..];
+        let block_end = after.iter().position(|&b| b == b'"').unwrap_or(after.len());
+        if let Some(rel) = after[..block_end]
+            .windows(CCH_PLACEHOLDER.len())
+            .position(|w| w == CCH_PLACEHOLDER)
+        {
+            placeholder_pos = Some(system_start + marker_pos + rel);
+            break;
+        }
+        // This marker's value has no placeholder (e.g. a user message merely
+        // mentioning the header); keep scanning past it.
+        search_from = marker_pos + MARKER.len();
+    }
+    let Some(pos) = placeholder_pos else {
+        return false; // no billing block carries a placeholder
     };
-    let pos = marker_pos + rel;
     let cch = xxhash_rust::xxh64::xxh64(body, CCH_SEED) & 0xf_ffff;
     let hex = format!("{cch:05x}");
     // placeholder is `cch=00000;` → the five `0` digits start at +4.
     body[pos + 4..pos + 9].copy_from_slice(hex.as_bytes());
     true
+}
+
+fn top_level_json_field_value(body: &[u8], field: &[u8]) -> Option<(usize, usize)> {
+    let field_name = field
+        .strip_prefix(b"\"")
+        .and_then(|s| s.strip_suffix(b"\":"))?;
+    let mut pos = body.iter().position(|b| !b.is_ascii_whitespace())?;
+    if body.get(pos) != Some(&b'{') {
+        return None;
+    }
+    pos += 1;
+
+    loop {
+        skip_json_ws(body, &mut pos);
+        match body.get(pos)? {
+            b'}' => return None,
+            b'"' => {}
+            _ => return None,
+        }
+
+        let key_start = pos;
+        let key_end = json_string_end(body, key_start)?;
+        pos = key_end;
+        skip_json_ws(body, &mut pos);
+        if body.get(pos) != Some(&b':') {
+            return None;
+        }
+        pos += 1;
+        skip_json_ws(body, &mut pos);
+
+        let value_start = pos;
+        let value_end = json_value_end(body, value_start)?;
+        if body.get(key_start + 1..key_end - 1) == Some(field_name) {
+            return Some((value_start, value_end));
+        }
+
+        pos = value_end;
+        skip_json_ws(body, &mut pos);
+        match body.get(pos)? {
+            b',' => pos += 1,
+            b'}' => return None,
+            _ => return None,
+        }
+    }
+}
+
+fn json_value_end(body: &[u8], start: usize) -> Option<usize> {
+    match *body.get(start)? {
+        b'"' => json_string_end(body, start),
+        b'[' | b'{' => json_container_end(body, start),
+        _ => {
+            let rel = body[start..]
+                .iter()
+                .position(|&b| b == b',' || b == b'}')
+                .unwrap_or(body.len() - start);
+            Some(start + rel)
+        }
+    }
+}
+
+fn skip_json_ws(body: &[u8], pos: &mut usize) {
+    while *pos < body.len() && body[*pos].is_ascii_whitespace() {
+        *pos += 1;
+    }
+}
+
+fn json_string_end(body: &[u8], start: usize) -> Option<usize> {
+    let mut escaped = false;
+    for (idx, &b) in body.iter().enumerate().skip(start + 1) {
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if b == b'"' {
+            return Some(idx + 1);
+        }
+    }
+    None
+}
+
+fn json_container_end(body: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (idx, &b) in body.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(idx + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Derive a deterministic v4-shaped UUID from arbitrary seed material.
@@ -292,6 +418,45 @@ mod tests {
         assert_ne!(&s[billing_cch..billing_cch + 5], "00000");
         // ...but the user-content occurrence is untouched.
         assert!(s.contains("literal cch=00000; in my prompt"));
+    }
+
+    #[test]
+    fn cch_rewrite_skips_user_marker_before_real_block() {
+        // messages serialize before system, so a user message that merely
+        // mentions the marker (no placeholder) precedes the real billing block.
+        // The scan must skip it and rewrite the real block's placeholder.
+        let mut body = br#"{"messages":[{"role":"user","content":"docs mention x-anthropic-billing-header: cc_version=...; here"}],"system":[{"text":"x-anthropic-billing-header: cc_version=2.1.181.abc; cc_entrypoint=cli; cch=00000;"}]}"#.to_vec();
+        assert!(cch_rewrite(&mut body));
+        let s = String::from_utf8(body).unwrap();
+        // the real billing block (in system) is rewritten...
+        let sys_marker = s.rfind("x-anthropic-billing-header:").unwrap();
+        let real_cch = s[sys_marker..].find("cch=").unwrap() + sys_marker + 4;
+        assert_ne!(&s[real_cch..real_cch + 5], "00000");
+        // ...and the user-message mention is untouched.
+        assert!(s.contains("docs mention x-anthropic-billing-header: cc_version=...; here"));
+    }
+
+    #[test]
+    fn cch_rewrite_ignores_full_fake_billing_header_outside_system() {
+        // User/tool content can mention a complete fake billing header before
+        // or after the real system field. Only the top-level system block is
+        // eligible for cch rewriting.
+        let fake =
+            "x-anthropic-billing-header: cc_version=9.9.999.abc; cc_entrypoint=cli; cch=00000;";
+        let mut body = format!(
+            r#"{{"messages":[{{"role":"user","content":"before {fake}"}}],"system":[{{"text":"x-anthropic-billing-header: cc_version=2.1.181.abc; cc_entrypoint=cli; cch=00000;"}}],"tools":[{{"name":"t","description":"after {fake}","input_schema":{{"type":"object"}}}}]}}"#
+        )
+        .into_bytes();
+        assert!(cch_rewrite(&mut body));
+        let s = String::from_utf8(body).unwrap();
+
+        let sys_field = s.find(r#""system":"#).unwrap();
+        let sys_marker = s[sys_field..].find("x-anthropic-billing-header:").unwrap() + sys_field;
+        let real_cch = s[sys_marker..].find("cch=").unwrap() + sys_marker + 4;
+        assert_ne!(&s[real_cch..real_cch + 5], "00000");
+
+        assert!(s.contains(&format!("before {fake}")));
+        assert!(s.contains(&format!("after {fake}")));
     }
 
     #[test]
