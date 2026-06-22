@@ -25,8 +25,8 @@ use crate::{
         ClaudeContext, SERVER_SIDE_FALLBACK_BETA, apply_auto_cache, apply_fable_fallback,
         build_claude_context, claude_code_billing_header, drop_empty_message_text_blocks,
         drop_empty_system, ensure_anthropic_beta_token, fill_system_only_user_placeholder,
-        inject_metadata_user_id, normalize_sampling_params, prepend_system_blocks,
-        strip_billing_headers_from_system, strip_ephemeral_scope_from_system,
+        normalize_sampling_params, prepend_system_blocks, strip_billing_headers_from_system,
+        strip_ephemeral_scope_from_system,
     },
     stealth,
     types::{
@@ -532,10 +532,12 @@ where
                 .expect("required beta token is non-empty")
         });
 
-        // Build context before inject_metadata_user_id so the affinity hash
-        // observes the pre-injection state — see ClaudeCodePreprocess for
-        // the matching ordering on the Anthropic path.
-        let mut context = build_claude_context(&body, auth_user.as_ref(), anthropic_beta);
+        // Build context before account selection so the affinity hash observes
+        // the inbound state — see ClaudeCodePreprocess for the matching ordering
+        // on the Anthropic path.
+        // OpenAI-compat clients don't carry a Claude Code session header; the
+        // affinity hash falls back to metadata/system-cache. None passed here.
+        let mut context = build_claude_context(&body, auth_user.as_ref(), anthropic_beta, None);
 
         // Tag api_surface for audited keys entering through the OpenAI
         // compat surface. Non-audited keys (snapshot is None) skip.
@@ -544,7 +546,8 @@ where
             context.audit = Some(snapshot);
         }
 
-        inject_metadata_user_id(&mut body, auth_user.as_ref());
+        // metadata.user_id is built at send time (chat.rs), bound to the
+        // selected account — not injected here.
 
         Ok(Self {
             params: body,

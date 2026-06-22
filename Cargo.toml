@@ -95,6 +95,7 @@ semver = "1"
 ipnet = { version = "2", features = ["serde"] }
 aes-gcm = { version = "0.10", optional = true }
 inquire = { version = "0.7", default-features = false, features = ["crossterm"], optional = true }
+xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
 
 [target.'cfg(windows)'.dependencies]
 enable-ansi-support = "0.3"

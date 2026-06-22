@@ -86,12 +86,16 @@ pub(crate) fn claude_code_billing_header(messages: &[Message], profile: &Stealth
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "cli".to_string());
 
-    // cch = SHA256(full first user message text)[..5]
-    let cch = format!("{:x}", Sha256::digest(first_text));
-    let cch = &cch[..5.min(cch.len())];
-
+    // `cch` is emitted as the literal `00000` placeholder here; the real
+    // checksum is computed over the final serialized body bytes at send time
+    // (see `stealth::cch_rewrite`, invoked from `execute_claude_request`).
+    // The real CLI does the same: its builder writes `cch=00000;` and a lower
+    // serialization layer overwrites the five digits with a self-consistent
+    // xxh64 of the outbound body. Anthropic does not re-verify it against the
+    // received bytes (telemetry only), so we mirror the shape, not a forgeable
+    // content hash.
     format!(
-        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint={entrypoint}; cch={cch};",
+        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint={entrypoint}; cch=00000;",
         profile.cli_version,
         &version_hash[..3]
     )
@@ -340,41 +344,6 @@ pub(crate) fn apply_auto_cache(
     }
 }
 
-/// Inject `metadata.user_id` if missing (for non-CLI clients).
-/// Format: `user_{64hex}_account_{org_uuid}_session_{random_uuid}`
-pub(crate) fn inject_metadata_user_id(
-    body: &mut CreateMessageParams,
-    auth_user: Option<&crate::db::models::AuthenticatedUser>,
-) {
-    // Check if metadata.user_id already exists
-    if let Some(ref metadata) = body.metadata
-        && metadata
-            .fields
-            .get("user_id")
-            .is_some_and(|v| !v.is_empty())
-    {
-        return;
-    }
-
-    let Some(auth) = auth_user else {
-        return;
-    };
-
-    // Deterministic user hex: HMAC-SHA256(billing_salt, api_key_id)
-    let profile = stealth::global_profile().load();
-    let key_id = auth.api_key_id.unwrap_or(0);
-    let user_hex = format!(
-        "{:x}",
-        Sha256::digest(format!("{}{}", profile.billing_salt, key_id))
-    );
-    let session_uuid = uuid::Uuid::new_v4();
-    // account part left empty (like relay/中转 scenario)
-    let user_id = format!("user_{user_hex}_account__session_{session_uuid}");
-
-    let metadata = body.metadata.get_or_insert_with(Default::default);
-    metadata.fields.insert("user_id".to_string(), user_id);
-}
-
 fn cache_control_system_hash(body: &CreateMessageParams) -> Option<u64> {
     let cache_systems = body
         .system
@@ -395,18 +364,46 @@ fn cache_control_system_hash(body: &CreateMessageParams) -> Option<u64> {
     })
 }
 
+/// Extract a stable caller-session token for affinity, in priority order:
+/// ① the inbound `X-Claude-Code-Session-Id` header (the most direct session
+/// signal — a real CLI client always sends it), ② `metadata.user_id.session_id`
+/// (current shape) or the legacy flat `user_..._session_<uuid>` form. Returns
+/// `None` for clients (2api/anonymous) that carry neither — the caller then
+/// falls back to the system-cache hash.
+fn inbound_session_token(
+    body: &CreateMessageParams,
+    inbound_session_id: Option<&str>,
+) -> Option<String> {
+    // ① inbound header.
+    if let Some(sid) = inbound_session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(sid.to_string());
+    }
+    // ② metadata.user_id (JSON `session_id`, or legacy flat form).
+    let raw = body.metadata.as_ref()?.fields.get("user_id")?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(raw)
+        && let Some(sid) = v
+            .get("session_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    {
+        return Some(sid.to_string());
+    }
+    raw.contains("_session_").then(|| raw.to_string())
+}
+
 fn claude_code_session_affinity_hash(
     body: &CreateMessageParams,
     auth_user: Option<&crate::db::models::AuthenticatedUser>,
+    inbound_session_id: Option<&str>,
 ) -> Option<u64> {
-    let metadata_user_id = body.metadata.as_ref()?.fields.get("user_id")?.trim();
-    if metadata_user_id.is_empty() || !metadata_user_id.contains("_session_") {
-        return None;
-    }
+    let session_token = inbound_session_token(body, inbound_session_id)?;
 
     let mut hasher = DefaultHasher::new();
     "claude-code-session-affinity-v1".hash(&mut hasher);
-    metadata_user_id.hash(&mut hasher);
+    session_token.hash(&mut hasher);
     if let Some(auth) = auth_user {
         auth.user_id.hash(&mut hasher);
         auth.api_key_id.hash(&mut hasher);
@@ -417,11 +414,16 @@ fn claude_code_session_affinity_hash(
 pub(crate) fn request_affinity_hash(
     body: &CreateMessageParams,
     auth_user: Option<&crate::db::models::AuthenticatedUser>,
+    inbound_session_id: Option<&str>,
 ) -> Option<u64> {
-    // Claude Code emits a stable session id in metadata.user_id. Prefer it over
-    // system-cache blocks so helper-model requests (for example Haiku) stay on
-    // the same account even when their system prompt differs from the main turn.
-    claude_code_session_affinity_hash(body, auth_user).or_else(|| cache_control_system_hash(body))
+    // A real Claude Code client emits a stable session id (header + metadata).
+    // Prefer it over system-cache blocks so helper-model requests (for example
+    // Haiku) stay on the same account even when their system prompt differs
+    // from the main turn. The OUTBOUND session id (bound to the selected
+    // account) is derived separately at send time — this is purely the inbound
+    // affinity key.
+    claude_code_session_affinity_hash(body, auth_user, inbound_session_id)
+        .or_else(|| cache_control_system_hash(body))
 }
 
 /// Normalize sampling parameters to keep Anthropic-compatible behavior across clients.
@@ -595,9 +597,10 @@ pub(crate) fn build_claude_context(
     body: &CreateMessageParams,
     auth_user: Option<&crate::db::models::AuthenticatedUser>,
     anthropic_beta: Option<String>,
+    inbound_session_id: Option<&str>,
 ) -> ClaudeContext {
     let stream = body.stream.unwrap_or_default();
-    let system_prompt_hash = request_affinity_hash(body, auth_user);
+    let system_prompt_hash = request_affinity_hash(body, auth_user, inbound_session_id);
     let input_tokens = body.count_tokens();
 
     ClaudeContext {
@@ -650,6 +653,11 @@ where
             .get::<crate::db::models::RequestAuditSnapshot>()
             .cloned();
         let mut anthropic_beta = extract_anthropic_beta_header(req.headers());
+        let inbound_session_id = req
+            .headers()
+            .get("x-claude-code-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let is_count_tokens = is_count_tokens_path(req.uri().path());
         let Json(mut body) = Json::<CreateMessageParams>::from_request(req, &()).await?;
 
@@ -671,11 +679,17 @@ where
 
         strip_billing_headers_from_system(&mut body);
 
-        let system_prefixes = vec![ContentBlock::text(claude_code_billing_header(
-            &body.messages,
-            &profile,
-        ))];
-        prepend_system_blocks(&mut body, system_prefixes);
+        // The billing header block is a model-call concern. The real CLI's
+        // count_tokens request carries only {model, messages, tools, betas?,
+        // thinking?} — no system billing block, no metadata — so we skip the
+        // prepend on that path entirely (verified against 2.1.185 bundle).
+        if !is_count_tokens {
+            let system_prefixes = vec![ContentBlock::text(claude_code_billing_header(
+                &body.messages,
+                &profile,
+            ))];
+            prepend_system_blocks(&mut body, system_prefixes);
+        }
 
         if let Some(system) = body.system.as_mut() {
             strip_ephemeral_scope_from_system(system);
@@ -697,7 +711,12 @@ where
         // requests from the same client share an affinity slot. Injecting a
         // generated `metadata.user_id` first would make every anonymous
         // request hash uniquely and defeat caching.
-        let mut context = build_claude_context(&body, auth_user.as_ref(), anthropic_beta);
+        let mut context = build_claude_context(
+            &body,
+            auth_user.as_ref(),
+            anthropic_beta,
+            inbound_session_id.as_deref(),
+        );
 
         // If the API key has enhanced audit enabled, tag api_surface
         // for this entry point and attach the snapshot. Non-audited
@@ -708,9 +727,10 @@ where
             context.audit = Some(snapshot);
         }
 
-        // Inject metadata.user_id if missing (for non-CLI clients like 2API).
-        // The context above intentionally observes the pre-injection state.
-        inject_metadata_user_id(&mut body, auth_user.as_ref());
+        // metadata.user_id is no longer injected here. The outbound value is
+        // built at send time (chat.rs) bound to the selected account; the
+        // affinity hash above intentionally keys on the INBOUND session token
+        // (or system-cache hash), independent of the cloaked outbound value.
 
         Ok(Self(body, context))
     }
@@ -730,18 +750,14 @@ mod tests {
         assert!(header.starts_with("x-anthropic-billing-header: cc_version="));
         assert!(header.contains(&profile.cli_version));
         assert!(header.contains("cc_entrypoint=cli"));
-        // cch should NOT be 00000 anymore
-        assert!(!header.contains("cch=00000"));
-        // cch should be 5 hex chars
-        let cch_start = header.find("cch=").unwrap() + 4;
-        let cch_end = header[cch_start..].find(';').unwrap() + cch_start;
-        let cch = &header[cch_start..cch_end];
-        assert_eq!(cch.len(), 5);
-        assert!(cch.chars().all(|c| c.is_ascii_hexdigit()));
+        // cch is emitted as the literal `00000` placeholder; the real
+        // self-consistent checksum is written over the final body bytes at
+        // send time (see `stealth::cch_rewrite`).
+        assert!(header.contains("cch=00000;"));
     }
 
     #[test]
-    fn claude_code_billing_header_cch_is_deterministic() {
+    fn claude_code_billing_header_is_deterministic() {
         let profile = StealthProfile::default();
         let messages = vec![Message::new_text(Role::User, "hey")];
         let h1 = claude_code_billing_header(&messages, &profile);
@@ -750,19 +766,21 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_billing_header_cch_varies_with_content() {
+    fn claude_code_billing_header_version_suffix_varies_with_content() {
+        // The `cc_version` 3-hex suffix is sampled from the first user text, so
+        // it still varies by content even though `cch` is now a fixed
+        // placeholder (the per-request checksum lives in the body bytes).
         let profile = StealthProfile::default();
         let m1 = vec![Message::new_text(Role::User, "hello world")];
-        let m2 = vec![Message::new_text(Role::User, "goodbye world")];
+        let m2 = vec![Message::new_text(Role::User, "a-totally-different-prompt")];
         let h1 = claude_code_billing_header(&m1, &profile);
         let h2 = claude_code_billing_header(&m2, &profile);
-        // cch values should differ
-        let extract_cch = |h: &str| {
-            let start = h.find("cch=").unwrap() + 4;
+        let extract_version = |h: &str| {
+            let start = h.find("cc_version=").unwrap() + "cc_version=".len();
             let end = h[start..].find(';').unwrap() + start;
             h[start..end].to_string()
         };
-        assert_ne!(extract_cch(&h1), extract_cch(&h2));
+        assert_ne!(extract_version(&h1), extract_version(&h2));
     }
 
     #[test]
@@ -953,8 +971,8 @@ mod tests {
         let opus = body_with_session_and_system(session, "main opus prompt");
 
         assert_eq!(
-            request_affinity_hash(&haiku, None),
-            request_affinity_hash(&opus, None)
+            request_affinity_hash(&haiku, None, None),
+            request_affinity_hash(&opus, None, None)
         );
     }
 
@@ -995,8 +1013,8 @@ mod tests {
         // Pre-injection: two identical bodies must agree on affinity.
         let pre1 = fresh_body();
         let pre2 = fresh_body();
-        let pre_hash1 = build_claude_context(&pre1, None, None).system_prompt_hash;
-        let pre_hash2 = build_claude_context(&pre2, None, None).system_prompt_hash;
+        let pre_hash1 = build_claude_context(&pre1, None, None, None).system_prompt_hash;
+        let pre_hash2 = build_claude_context(&pre2, None, None, None).system_prompt_hash;
         assert!(pre_hash1.is_some());
         assert_eq!(pre_hash1, pre_hash2);
 
@@ -1008,8 +1026,8 @@ mod tests {
         inject_synthetic_session(&mut post1, "11111111-1111-1111-1111-111111111111");
         let mut post2 = fresh_body();
         inject_synthetic_session(&mut post2, "22222222-2222-2222-2222-222222222222");
-        let post_hash1 = build_claude_context(&post1, None, None).system_prompt_hash;
-        let post_hash2 = build_claude_context(&post2, None, None).system_prompt_hash;
+        let post_hash1 = build_claude_context(&post1, None, None, None).system_prompt_hash;
+        let post_hash2 = build_claude_context(&post2, None, None, None).system_prompt_hash;
         assert!(post_hash1.is_some());
         assert_ne!(post_hash1, post_hash2);
     }
@@ -1020,9 +1038,64 @@ mod tests {
         let second = body_with_session_and_system("user-without-session", "second prompt");
 
         assert_ne!(
-            request_affinity_hash(&first, None),
-            request_affinity_hash(&second, None)
+            request_affinity_hash(&first, None, None),
+            request_affinity_hash(&second, None, None)
         );
+    }
+
+    #[test]
+    fn json_shape_session_id_drives_affinity() {
+        // A real Claude Code client now sends metadata.user_id as a stringified
+        // JSON object; the affinity hash must key on its `session_id` (not the
+        // legacy `_session_` flat form), so helper-model turns with differing
+        // system prompts still co-locate on one account.
+        let uid = serde_json::json!({
+            "device_id": "dev",
+            "account_uuid": "",
+            "session_id": "9c37db4e-f0c3-44fd-9054-f182c7103381",
+        })
+        .to_string();
+        let haiku = body_with_session_and_system(&uid, "haiku helper prompt");
+        let opus = body_with_session_and_system(&uid, "main opus prompt");
+        assert_eq!(
+            request_affinity_hash(&haiku, None, None),
+            request_affinity_hash(&opus, None, None)
+        );
+
+        // A different session_id → different affinity slot.
+        let other = serde_json::json!({
+            "device_id": "dev",
+            "account_uuid": "",
+            "session_id": "11111111-1111-1111-1111-111111111111",
+        })
+        .to_string();
+        let other_body = body_with_session_and_system(&other, "haiku helper prompt");
+        assert_ne!(
+            request_affinity_hash(&haiku, None, None),
+            request_affinity_hash(&other_body, None, None)
+        );
+    }
+
+    #[test]
+    fn inbound_session_header_takes_priority_over_metadata() {
+        // The X-Claude-Code-Session-Id header is the most direct session signal;
+        // it must win over (and rescue affinity when) metadata is absent or
+        // differs. Two bodies with DIFFERENT metadata but the SAME header
+        // co-locate; the header value, not the metadata, drives the slot.
+        let body_a = body_with_session_and_system("metadata-a", "prompt one");
+        let body_b = body_with_session_and_system("metadata-b", "prompt two");
+        let hdr = Some("hdr-session-xyz");
+        assert_eq!(
+            request_affinity_hash(&body_a, None, hdr),
+            request_affinity_hash(&body_b, None, hdr)
+        );
+        // And a body with no metadata at all still gets affinity from the header.
+        let bare = CreateMessageParams {
+            model: "claude-sonnet-4-6".to_string(),
+            messages: vec![Message::new_text(Role::User, "hi")],
+            ..Default::default()
+        };
+        assert!(request_affinity_hash(&bare, None, hdr).is_some());
     }
 
     fn make_body(

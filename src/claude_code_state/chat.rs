@@ -34,7 +34,8 @@ use crate::{
         FailureSource, classify_account_failure,
     },
     services::account_pool::{AccountPoolHandle, CredentialFingerprint},
-    types::claude::{CountMessageTokensResponse, CreateMessageParams},
+    stealth,
+    types::claude::{CountMessageTokensResponse, CreateMessageParams, Role},
 };
 
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -44,6 +45,23 @@ const COUNT_TOKENS_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
 const CLAUDE_BETA_BASE: &str = "oauth-2025-04-20";
 const CLAUDE_BETA_CONTEXT_1M_TOKEN: &str = "context-1m-2025-08-07";
 const CLAUDE_API_VERSION: &str = "2023-06-01";
+
+/// Anthropic JS SDK (Stainless-generated) default header values the real
+/// Claude Code CLI sends on every `/v1/messages` request (observed in 2.1.185
+/// capture; package-version tracks `@anthropic-ai/sdk`). `runtime-version` is
+/// environment-derived on a real install; we pin a plausible recent Node value.
+/// These are fixed fingerprint headers, unrelated to body content, so both the
+/// messages and count_tokens paths send them.
+const STAINLESS_HEADERS: &[(&str, &str)] = &[
+    ("x-stainless-retry-count", "0"),
+    ("x-stainless-timeout", "600"),
+    ("x-stainless-lang", "js"),
+    ("x-stainless-package-version", "0.94.0"),
+    ("x-stainless-os", "Linux"),
+    ("x-stainless-arch", "x64"),
+    ("x-stainless-runtime", "node"),
+    ("x-stainless-runtime-version", "v24.3.0"),
+];
 
 /// Header names that MUST NOT come from per-account extra_headers on
 /// an ApiKey send: either we set them ourselves (`x-api-key`,
@@ -925,13 +943,63 @@ impl ClaudeCodeState {
         let beta_header = Self::merge_anthropic_beta_header(self.anthropic_beta_header.as_deref());
         let mut url = self.endpoint.join("v1/messages").expect("Url parse error");
         url.set_query(Some("beta=true"));
-        self.client
+
+        // Derive the outbound session identity, bound to the SELECTED account so
+        // a failover rotates it. metadata.user_id + X-Claude-Code-Session-Id
+        // share one value (mirrors the real CLI). Then serialize and overwrite
+        // the billing-header `cch=00000;` placeholder with a self-consistent
+        // checksum over the FINAL bytes (see stealth::cch_rewrite).
+        let api_key_id = self
+            .billing_ctx
+            .as_ref()
+            .and_then(|c| c.api_key_id)
+            .unwrap_or(0);
+        let device_id = stealth::derive_device_id(&profile.billing_salt, api_key_id);
+        let account_uuid = self.account_uuid().unwrap_or_default();
+        let seed = Self::session_seed_from_body(body);
+        let session_id = stealth::derive_session_id(
+            &profile.billing_salt,
+            self.account_id,
+            api_key_id,
+            &seed,
+            chrono::Utc::now(),
+        );
+
+        let mut send_body = body.clone();
+        send_body
+            .metadata
+            .get_or_insert_with(Default::default)
+            .fields
+            .insert(
+                "user_id".to_string(),
+                stealth::build_user_id_metadata(&device_id, &account_uuid, &session_id),
+            );
+        let mut bytes = serde_json::to_vec(&send_body)?;
+        // The messages body always carries exactly one billing block (prepended
+        // in middleware), so the placeholder must be present. A false return
+        // means an unexpected body shape — surface it rather than silently
+        // shipping a literal `cch=00000;`.
+        if !stealth::cch_rewrite(&mut bytes) {
+            warn!(
+                "cch placeholder not rewritten on messages body (unexpected billing-block shape)"
+            );
+        }
+
+        let mut req = self
+            .client
             .post(url.to_string())
             .bearer_auth(access_token)
+            .header("content-type", "application/json")
             .header(USER_AGENT, profile.user_agent())
             .header("anthropic-beta", beta_header)
             .header("anthropic-version", CLAUDE_API_VERSION)
-            .json(body)
+            .header("anthropic-dangerous-direct-browser-access", "true")
+            .header("x-app", "cli")
+            .header("x-claude-code-session-id", session_id.to_string());
+        for (name, value) in STAINLESS_HEADERS {
+            req = req.header(*name, *value);
+        }
+        req.body(bytes)
             .send()
             .await
             .context(WreqSnafu {
@@ -939,6 +1007,51 @@ impl ClaudeCodeState {
             })?
             .check_claude()
             .await
+    }
+
+    /// The selected account's real organization UUID, used for
+    /// `metadata.user_id.account_uuid`. Prefers the refreshed
+    /// `organization_uuid`, falling back to the credential's token org so a
+    /// freshly-loaded (non-refreshed) valid slot still carries it.
+    fn account_uuid(&self) -> Option<String> {
+        self.organization_uuid.clone().or_else(|| {
+            self.cookie
+                .as_ref()
+                .and_then(|c| c.token.as_ref())
+                .map(|t| t.organization.uuid.clone())
+        })
+    }
+
+    /// Pick the conversation seed for `session_id` derivation from the body, in
+    /// priority order: ① an inbound `metadata.user_id.session_id` (real CLI
+    /// client), ② a hash of `system` + first user message (2api multi-turn
+    /// stays stable while the first turn is unchanged), ③ key+time fallback.
+    fn session_seed_from_body(body: &CreateMessageParams) -> stealth::SessionSeed {
+        // ① inbound session id, if the caller already speaks Claude Code.
+        if let Some(uid) = body.metadata.as_ref().and_then(|m| m.fields.get("user_id"))
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(uid)
+            && let Some(sid) = v
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+        {
+            return stealth::SessionSeed::InboundSession(sid.to_string());
+        }
+        // ② content hash of system + first user message text.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        if let Some(system) = body.system.as_ref() {
+            system.to_string().hash(&mut hasher);
+        }
+        let first_user = body.messages.iter().find(|m| m.role == Role::User);
+        if let Some(msg) = first_user {
+            serde_json::to_string(&msg.content)
+                .unwrap_or_default()
+                .hash(&mut hasher);
+            return stealth::SessionSeed::ContentHash(hasher.finish());
+        }
+        // ③ no usable content → key + time window.
+        stealth::SessionSeed::KeyTimeWindow
     }
 
     async fn persist_count_tokens_allowed(&mut self, value: bool) {
@@ -1843,13 +1956,24 @@ impl ClaudeCodeState {
             .join("v1/messages/count_tokens")
             .expect("Url parse error");
         url.set_query(Some("beta=true"));
-        self.client
+        // count_tokens carries the fixed fingerprint HTTP headers but NO body
+        // cloak: the real CLI's count request is just {model, messages, tools,
+        // betas?, thinking?} — no billing block (skipped in middleware), no
+        // metadata (Anthropic rejects it: "Extra inputs are not permitted"), no
+        // session id. Body is sent as-is.
+        let mut req = self
+            .client
             .post(url.to_string())
             .bearer_auth(access_token)
             .header(USER_AGENT, profile.user_agent())
             .header("anthropic-beta", beta_header)
             .header("anthropic-version", CLAUDE_API_VERSION)
-            .json(body)
+            .header("anthropic-dangerous-direct-browser-access", "true")
+            .header("x-app", "cli");
+        for (name, value) in STAINLESS_HEADERS {
+            req = req.header(*name, *value);
+        }
+        req.json(body)
             .send()
             .await
             .context(WreqSnafu {
