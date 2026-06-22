@@ -71,9 +71,6 @@ impl StealthProfile {
             }
         }
 
-        if let Some(v) = non_empty(get_setting(pool, "cc_cli_version").await) {
-            profile.cli_version = v;
-        }
         if let Some(v) = non_empty(get_setting(pool, "cc_billing_salt").await) {
             profile.billing_salt = v;
         }
@@ -523,5 +520,31 @@ mod tests {
         let raw = build_user_id_metadata("dev", "", &sid);
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["account_uuid"], "");
+    }
+
+    #[tokio::test]
+    async fn load_from_db_ignores_deprecated_cli_version_setting() {
+        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO settings (key, value, updated_at)
+             VALUES ('cc_cli_version', '9.9.999', CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let profile = StealthProfile::load_from_db(&pool).await;
+
+        assert_eq!(profile.cli_version, DEFAULT_CLI_VERSION);
     }
 }

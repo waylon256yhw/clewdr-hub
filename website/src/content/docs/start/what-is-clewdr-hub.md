@@ -16,7 +16,7 @@ clewdr-hub 是基于 [clewdr](https://github.com/Xerxes-2/clewdr) 的**多用户
 - **零依赖部署**：单个静态链接二进制，前端编译嵌入，SQLite WAL 自动建库。
 - **透明代理**：直接转发 `/v1/messages`，不注入系统提示词；仅为兼容 Anthropic 模型行为做最小[参数归一化](../../reference/request-compat/)。
 - **[OpenAI 兼容入口](../../guides/openai-compat/)**：`POST /v1/chat/completions` + `/v1/models?format=` 协商，零改造对接 OpenAI SDK 客户端，复用同一套鉴权 / 配额 / 限流 / 计费链路。
-- **轻量伪装**：可配置 CLI/SDK 版本号和请求头，过上游客户端检测。
+- **标准化伪装**：内置 Claude Code 请求伪装与匹配 UA，减少可配置差异。
 - **[多账号调度](../../guides/account-pool/)**：Cookie / OAuth / Custom Anthropic API Key 账号池 + round-robin + 亲和性缓存 + per-account 并发槽（`max_slots`），支持标记账号「优先消耗」。
 - **[多代理管理](../../guides/proxies/)**：可维护多个备用代理，支持账号级绑定，适合不同账号走不同出口。
 - **[团队隔离](../../guides/teams/)**：用户 → 策略 → API Key，并发 / RPM / 周预算 / 月预算多重限额。
@@ -33,7 +33,7 @@ clewdr-hub 是基于 [clewdr](https://github.com/Xerxes-2/clewdr) 的**多用户
 | 代理方式 | cookie → 原生 Messages API | OAuth + cookie | OAuth 包装 CLI | cookie |
 | 提示词注入 | **无**，透明转发 | 有平台层注入 | 有 | 无 |
 | 用户端 UA 校验 | **不做**，自由接入 | 有 | 有 | 无 |
-| 伪装 | 可配版本号 + 请求头 | 内置 | 内置 | 可配版本号 |
+| 伪装 | 内置标准化 profile | 内置 | 内置 | 可配版本号 |
 | 多用户 | 用户/策略/Key/RBAC | 用户/Key/计费/支付 | 管理 API | 单 admin |
 | 管理后台 | 内嵌 7 页 React | Vue 全功能后台 | 社区 Dashboard | 配置页 |
 | 适合规模 | 3–10 人 | 10–1000+ 人 / 商用 | 个人–中小团队 | 个人 |

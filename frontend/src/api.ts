@@ -348,12 +348,6 @@ export interface LoginResponse {
   must_change_password: boolean;
 }
 
-export interface CliVersionsResponse {
-  versions: string[];
-  cached: boolean;
-  fetched_at: string | null;
-}
-
 export interface OpsUsageTotals {
   request_count: number;
   input_tokens: number;
@@ -638,8 +632,6 @@ export const updateKeyEnhancedAudit = (id: number, enabled: boolean) =>
 export const getSettings = () => apiFetch<Record<string, string>>("/api/admin/settings");
 export const updateSettings = (settings: Record<string, string>) =>
   apiFetch<Record<string, string>>("/api/admin/settings", { method: "POST", body: { settings } });
-export const getCliVersions = (force?: boolean) =>
-  apiFetch<CliVersionsResponse>(`/api/admin/cli-versions${force ? "?force=1" : ""}`);
 
 // Ops
 export const getOpsUsage = (

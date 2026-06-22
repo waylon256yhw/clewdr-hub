@@ -22,7 +22,7 @@ SQLite WAL 模式，通过 sqlx 的编译期 migration 自动建表。
 | `usage_rollups` | 费用汇总 | user_id + period_type(week/month) + period_start → cost_nanousd |
 | `usage_lifetime_totals` | 累计汇总 | user_id 维度累计 request/token/cost，独立于日志留存 |
 | `models` | 模型列表 | model_id, source(builtin/admin/discovered), enabled |
-| `settings` | KV 配置 | key → value（stealth 版本、session_secret 等） |
+| `settings` | KV 配置 | key → value（session_secret、模型和运行时管理项等） |
 
 ## 费用精度
 

@@ -8,7 +8,7 @@ sidebar:
 clewdr-hub 的配置分两层：
 
 - **进程级配置**：`clewdr.toml`（监听地址、更新策略、反代信任等）。
-- **运行时数据**：账号、用户、API Key、代理、模型列表、伪装版本等都存在 SQLite，通过[管理后台](../../guides/admin-console/)维护，**不写在 toml 里**。
+- **运行时数据**：账号、用户、API Key、代理、模型列表等都存在 SQLite，通过[管理后台](../../guides/admin-console/)维护，**不写在 toml 里**。
 
 ## 文件位置
 

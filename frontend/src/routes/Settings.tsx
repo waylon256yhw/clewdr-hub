@@ -23,14 +23,13 @@ import {
 import { useForm } from "@mantine/form";
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { IconRefresh, IconPlus, IconTrash } from "@tabler/icons-react";
+import { IconPlus, IconTrash } from "@tabler/icons-react";
 import {
-  getSettings, updateSettings, changePassword, getCliVersions,
+  getSettings, updateSettings, changePassword,
   listModelsAdmin, createModel, updateModel, deleteModel, resetDefaultModels,
   qk, ApiError,
   type ModelRow,
 } from "../api";
-import { formatDate } from "../lib/format";
 
 const EFFORT_OPTIONS = [
   { value: "low", label: "Low" },
@@ -52,86 +51,6 @@ function parseEffortLevel(value: string | undefined): string | null {
     return normalized;
   }
   return null;
-}
-
-function VersionSection({ currentVersion }: { currentVersion: string }) {
-  const queryClient = useQueryClient();
-  const [refreshing, setRefreshing] = useState(false);
-  const { data: versionsData, isLoading: versionsLoading } = useQuery({
-    queryKey: ["cli-versions"],
-    queryFn: () => getCliVersions(),
-    staleTime: 3600_000,
-  });
-
-  const versions = versionsData?.versions ?? [];
-  const fetchedAt = versionsData?.fetched_at ?? null;
-  const selectData = versions.map((v) => ({ value: v, label: v }));
-
-  if (currentVersion && !versions.includes(currentVersion)) {
-    selectData.unshift({ value: currentVersion, label: `${currentVersion} (当前)` });
-  }
-
-  const mutation = useMutation({
-    mutationFn: (version: string) => updateSettings({ cc_cli_version: version }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: qk.settings });
-      queryClient.invalidateQueries({ queryKey: qk.overview });
-      notifications.show({ message: "版本已更新", color: "green" });
-    },
-    onError: (e) =>
-      notifications.show({ message: e instanceof ApiError ? e.message : "保存失败", color: "red" }),
-  });
-
-  const handleRefresh = async () => {
-    setRefreshing(true);
-    try {
-      const fresh = await getCliVersions(true);
-      queryClient.setQueryData(["cli-versions"], fresh);
-      notifications.show({ message: "版本列表已刷新", color: "green" });
-    } catch {
-      notifications.show({ message: "刷新失败", color: "red" });
-    } finally {
-      setRefreshing(false);
-    }
-  };
-
-  return (
-    <Paper shadow="xs" p="md" radius="md" withBorder>
-      <Stack>
-        <Group justify="space-between">
-          <Text fw={600}>Claude Code 版本</Text>
-          <Group gap="xs">
-            {fetchedAt && (
-              <Text size="xs" c="dimmed">
-                {formatDate(fetchedAt)} 更新
-              </Text>
-            )}
-            <Tooltip label="刷新版本列表">
-              <ActionIcon
-                variant="subtle"
-                size="sm"
-                onClick={handleRefresh}
-                loading={refreshing}
-              >
-                <IconRefresh size={14} />
-              </ActionIcon>
-            </Tooltip>
-          </Group>
-        </Group>
-        <Text size="sm" c="dimmed">
-          选择要伪装的 Claude Code CLI 版本号。建议跟随官方最新版本。
-        </Text>
-        <Select
-          label="CLI 版本"
-          data={selectData}
-          value={currentVersion}
-          onChange={(v) => v && mutation.mutate(v)}
-          disabled={versionsLoading || mutation.isPending}
-          placeholder={versionsLoading ? "加载中..." : "选择版本"}
-        />
-      </Stack>
-    </Paper>
-  );
 }
 
 function EffortOverrideSection({
@@ -435,7 +354,6 @@ export default function Settings() {
     <>
       <Title order={3} mb="md">设置</Title>
       <Stack>
-        <VersionSection currentVersion={data["cc_cli_version"] ?? ""} />
         <EffortOverrideSection
           enabled={effortOverrideEnabled}
           level={effortOverrideLevel}
