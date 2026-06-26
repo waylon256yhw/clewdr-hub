@@ -19,6 +19,8 @@ scripts/*
 !scripts/install.sh
 !scripts/uninstall.sh
 !scripts/setup-dev.sh
+!scripts/release-docker.sh
+!scripts/Dockerfile.dist
 AGENTS.md
 /docs/
 .serena/
@@ -26,3 +28,5 @@ clewdr-bin
 .dev-*
 .local/
 .claude/
+dist/
+.cache/

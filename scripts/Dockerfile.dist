@@ -1,0 +1,33 @@
+# Dockerfile.dist — 瘦运行镜像：仅打包 release-docker.sh 预先交叉编译好的二进制。
+#
+# 与项目根 Dockerfile 的运行阶段一致（base/env/volume/cmd），但不在镜像内编译：
+# zig 交叉编译已在宿主原生产出各架构二进制，故 arm64 镜像无需在 QEMU 下模拟编译，
+# 仅这里的 apt 安装会走模拟（几秒级）。static/ 已在编译期由 include_dir! 嵌入二进制。
+#
+# 构建上下文 = dist/docker（仅含各架构二进制）。TARGETARCH 由 buildx 自动注入
+# （amd64 / arm64），用于挑选对应架构二进制。
+
+FROM debian:trixie-slim
+
+ARG TARGETARCH
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libgcc-s1 \
+    libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY ${TARGETARCH}/clewdr /usr/local/bin/clewdr
+RUN chmod +x /usr/local/bin/clewdr \
+    && mkdir -p /etc/clewdr/log \
+    && touch /etc/clewdr/clewdr.toml
+
+ENV CLEWDR_IP=0.0.0.0
+ENV CLEWDR_PORT=8484
+ENV CLEWDR_CHECK_UPDATE=FALSE
+ENV CLEWDR_AUTO_UPDATE=FALSE
+
+EXPOSE 8484
+
+VOLUME [ "/etc/clewdr" ]
+CMD ["/usr/local/bin/clewdr", "serve", "--config", "/etc/clewdr/clewdr.toml", "--log-dir", "/etc/clewdr/log", "--db", "/etc/clewdr/clewdr.db"]
