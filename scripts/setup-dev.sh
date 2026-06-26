@@ -5,8 +5,11 @@
 #   编译 BoringSSL(boring-sys2)/aws-lc-sys 需要 cmake + clang，
 #   bindgen 需要 libclang(+ 内建头)，多个 -sys crate 需要 C 编译器/perl/pkg-config。
 #
+# 除系统依赖外，还负责补齐前端 npm 依赖（frontend/node_modules）——dev.sh 构建
+# static/ 时会调用 tsc/vite，缺 node_modules 会在构建期才报错，故在此一并安装。
+#
 # 用法:
-#   ./scripts/setup-dev.sh            检测并安装缺失的系统依赖
+#   ./scripts/setup-dev.sh            检测并安装缺失的系统依赖 + 前端 npm 依赖
 #                                     （apt 自动安装；其他包管理器仅打印手动命令）
 #   ./scripts/setup-dev.sh --check    仅检测、不安装；缺失则非零退出（dev.sh 预检复用）
 #   ./scripts/setup-dev.sh --release-tools
@@ -77,6 +80,15 @@ command -v cargo >/dev/null 2>&1 || toolchain+=("Rust 工具链 (cargo) —— �
 command -v node  >/dev/null 2>&1 || toolchain+=("Node.js LTS (node) —— 安装: https://nodejs.org 或 fnm")
 command -v npm   >/dev/null 2>&1 || toolchain+=("npm（随 Node.js 一同安装）")
 
+# --- 检测前端 npm 依赖 ---
+# 仅在 npm 可用时才把缺失的 node_modules 视为可补齐的依赖；npm 不存在已由
+# toolchain 警告覆盖（没有 npm 也装不了）。无 frontend/package.json 则跳过。
+frontend_deps_missing() {
+  command -v npm >/dev/null 2>&1 || return 1
+  [ -f frontend/package.json ] || return 1
+  [ ! -d frontend/node_modules ]
+}
+
 has_cargo_set_version() {
   command -v cargo >/dev/null 2>&1 && cargo set-version --help >/dev/null 2>&1
 }
@@ -114,6 +126,11 @@ if $CHECK_ONLY; then
     print_toolchain
     rc=1
   fi
+  if frontend_deps_missing; then
+    err "缺少前端依赖: frontend/node_modules"
+    err "运行 ./scripts/setup-dev.sh 自动安装（npm --prefix frontend install）"
+    rc=1
+  fi
   if $RELEASE_TOOLS && ! has_cargo_set_version; then
     err "缺少发布工具: cargo set-version（由 cargo-edit 提供）"
     err "运行 ./scripts/setup-dev.sh --release-tools 自动安装"
@@ -142,6 +159,20 @@ install_apt() {
   $sudo apt-get install -y "${missing_pkgs[@]}"
 }
 
+install_frontend_deps() {
+  if ! command -v npm >/dev/null 2>&1; then
+    # npm 缺失已在 toolchain 警告中提示，这里不重复阻断
+    return 0
+  fi
+  [ -f frontend/package.json ] || return 0
+  if [ -d frontend/node_modules ]; then
+    note "前端依赖已齐全: frontend/node_modules"
+    return 0
+  fi
+  note "安装前端依赖: npm --prefix frontend install"
+  npm --prefix frontend install
+}
+
 print_manual_hint() {
   err "未检测到 apt，未自动安装。请用你的包管理器安装等价依赖:"
   err "  需要: cmake / clang+libclang(含头文件) / C++ 编译器(make) / perl / pkg-config"
@@ -166,6 +197,7 @@ else
 fi
 
 install_release_tools
+install_frontend_deps
 
 # --- 安装后复检 ---
 recheck=()
@@ -173,6 +205,7 @@ for c in "${REQUIRED_CMDS[@]}"; do
   command -v "$c" >/dev/null 2>&1 || recheck+=("$c")
 done
 has_libclang || recheck+=("libclang")
+frontend_deps_missing && recheck+=("frontend/node_modules")
 if [ ${#recheck[@]} -gt 0 ]; then
   err "安装后仍缺少: ${recheck[*]}（请检查上面的安装输出）"
   exit 1
