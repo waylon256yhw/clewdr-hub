@@ -995,7 +995,16 @@ impl ClaudeCodeState {
             .header("anthropic-version", CLAUDE_API_VERSION)
             .header("anthropic-dangerous-direct-browser-access", "true")
             .header("x-app", "cli")
-            .header("x-claude-code-session-id", session_id.to_string());
+            .header("x-claude-code-session-id", session_id.to_string())
+            // Client-generated per-attempt request id the real Claude Code CLI
+            // sends on every `/v1/messages` call (documented as the
+            // `client_request_id` telemetry attribute — a fresh value per retry
+            // attempt). Generated here so each send/retry of this function gets
+            // its own id, matching the CLI. Scoped to the OAuth/Cookie model
+            // path: ApiKey requests can target a third-party relay (handled in
+            // `execute_api_key_request`, which omits it) and count_tokens is not
+            // a model attempt.
+            .header("x-client-request-id", uuid::Uuid::new_v4().to_string());
         for (name, value) in STAINLESS_HEADERS {
             req = req.header(*name, *value);
         }
