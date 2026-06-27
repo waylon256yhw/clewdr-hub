@@ -1,2 +1,16 @@
 #!/bin/sh
-cargo fmt -- --check
+# Auto-apply rustfmt to staged Rust files, then re-stage them so the formatted
+# version is what actually gets committed (cargo fmt edits the working tree, not
+# the staged snapshot). Only files already staged are re-added, so unrelated
+# working-tree changes are never pulled into the commit.
+#
+# Note: if a staged .rs file also has *unstaged* edits, re-staging includes
+# them. Stage hunks deliberately if you rely on partial staging.
+
+staged=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')
+[ -z "$staged" ] && exit 0
+
+# Edition/config-aware (reads Cargo.toml); formats the whole crate in place.
+cargo fmt || exit 1
+
+printf '%s\n' "$staged" | xargs git add --
