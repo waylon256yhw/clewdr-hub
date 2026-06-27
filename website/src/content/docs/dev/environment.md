@@ -12,13 +12,25 @@ sidebar:
 - Rust（stable, edition 2024）
 - Node.js（LTS）+ npm
 - SQLite 3（系统自带即可，代码通过 sqlx 内嵌驱动）
-- 系统构建库：编译 BoringSSL / bindgen 等原生依赖需要 `cmake`、`clang`、`libclang-dev`、`build-essential`、`perl`、`pkg-config`
+- 系统构建库：编译 BoringSSL / bindgen 等原生依赖需要 `cmake`、`clang`、`libclang-dev`、`build-essential`、`perl`、`pkg-config`。这份清单与 `Dockerfile` 的 `backend-builder` 阶段保持同一事实源。
 
-一键安装系统依赖（Ubuntu/Debian 自动；其他发行版会打印对应手动命令）：
+## setup-dev.sh
+
+一键检测并补齐开发依赖，三种模式：
 
 ```bash
-./scripts/setup-dev.sh
+./scripts/setup-dev.sh                 # 检测并安装缺失的系统依赖 + 前端 npm 依赖
+./scripts/setup-dev.sh --check         # 仅检测、不安装；缺失则非零退出（dev.sh 预检复用）
+./scripts/setup-dev.sh --release-tools # 额外安装发布工具 cargo-edit（提供 cargo set-version）
 ```
+
+它做三件事：
+
+1. **系统构建依赖**：apt 系统自动 `apt-get install`；非 apt 系统（dnf/pacman/zypper/brew）只打印对应的手动安装命令，不代为执行。
+2. **前端 npm 依赖**：缺 `frontend/node_modules` 时自动 `npm --prefix frontend install`——`dev.sh` 构建 `static/` 会调用 tsc/vite，否则会拖到构建期才报错。
+3. **语言工具链（Rust/Node/npm）**：只检测并提示安装地址，不代装。
+
+检测是**功能性探针**而非比对包名：直接探 `cmake`、`cc`、`c++`、`make`、`perl`、`pkg-config` 这些构建真正会调用的命令，`libclang` 则按 clang-sys 的查找顺序 `LIBCLANG_PATH → llvm-config → ldconfig → clang` 逐级探测。所以 Nix / Homebrew / 自定义 LLVM 这类不在 `ldconfig` 缓存里的安装不会被误判为缺失。安装模式结束后还会复检一遍，仍缺则非零退出。
 
 手动安装（apt）：
 
@@ -26,7 +38,7 @@ sidebar:
 sudo apt-get install -y build-essential cmake clang libclang-dev perl pkg-config
 ```
 
-`dev.sh` 每次启动前会自动跑 `scripts/setup-dev.sh --check` 预检，缺依赖时给出明确提示，而不是 BoringSSL 的底层报错。语言工具链（Rust/Node）需自行安装，脚本只检测不代装。
+`dev.sh` 每次启动前会自动跑 `scripts/setup-dev.sh --check` 预检，缺依赖时给出明确提示，而不是 BoringSSL 的底层报错。
 
 ## dev.sh
 

@@ -65,7 +65,7 @@ cargo install cargo-edit --locked
    tag push 会触发两条 workflow：
 
    - **build.yml**：跨平台编译二进制 → `softprops/action-gh-release@v2` 自动创建 GitHub Release
-   - **docker-build.yml**：多架构 Docker 镜像 → `ghcr.io/waylon256yhw/clewdr-hub:vX.Y.Z`
+   - **docker-build.yml**：多架构 Docker 镜像 → `ghcr.io/waylon256yhw/clewdr-hub:vX.Y.Z`。需要在本地一次性出多架构镜像时，见下方[本地多架构 Docker 构建](#本地多架构-docker-构建)。
 
 ### 失败恢复
 
@@ -81,6 +81,54 @@ cargo install cargo-edit --locked
 - **脚本不自建 GitHub Release**：创建动作完全委托给 `build.yml` 里的 `softprops/action-gh-release@v2`，避免本地 `gh release create` 和 CI 并发创建导致冲突。
 - **Release body 由 git-cliff 自动生成**：CI 中通过 `orhun/git-cliff-action` 从上一个 tag 到当前 tag 之间的 conventional commits 生成 changelog，只包含当前版本的变更。配置见 `cliff.toml`。
 - **版本号同时写在 `Cargo.toml` 和 `Cargo.lock`**：`cargo set-version` 两处都改；手动 bump 时别漏了 `Cargo.lock` 第二处 `[[package]] name = "clewdr-hub"` 的 `version` 字段。
+
+## 本地多架构 Docker 构建
+
+`scripts/release-docker.sh` 是 `docker-build.yml` 的**本地替代**：经 buildx 一次性产出多架构（amd64 + arm64）manifest 并推送到 GHCR。
+
+> **定位**：日常发版仍走标准 CI（`release.sh` 打 tag → `docker-build.yml` 异步免费、并行构建）。本工具是需要在本地立刻出多架构镜像时的补充——冷构建甚至比 CI 更快（无仿真、无 CI 排队开销），代价是占用本机。
+
+### 两种引擎
+
+| 引擎 | 触发 | 原理 | arm64 冷构建（本机 3核/8GB） |
+|---|---|---|---|
+| **zig**（默认，快） | 缺省 | `cargo-zigbuild` 在宿主交叉编译各架构二进制（zig 自带现代 clang/llvm，能编 BoringSSL/aws-lc），再用 `scripts/Dockerfile.dist` 仅 `COPY` 二进制进 `debian:trixie-slim`。arm64 不经 QEMU 编译。 | ~3 分钟，峰值内存 ~1.3GB |
+| **qemu**（`--qemu`，稳） | 显式 | 直接用项目根 `Dockerfile` 经 buildx `--platform` 构建，arm64 在 QEMU 下编译——慢，但与 CI 镜像字节级一致。zig 引擎出问题时的回退。 | ~33 分钟 |
+
+### 前置依赖
+
+- `docker` + `buildx` 插件。
+- 推送 GHCR：已 `gh` 登录，且 token 含 `write:packages` 作用域（缺则 `gh auth refresh -s write:packages`）。脚本用 `gh auth token` 自动 `docker login ghcr.io`。
+- zig 引擎额外需 `cargo` + `rustup`（装交叉 std）；缺 `cargo-zigbuild` / `zig` 时脚本自动安装/下载到 `.cache/zig`。
+
+### 常用用法
+
+```bash
+./scripts/release-docker.sh                 # zig 交叉编译 amd64+arm64，打 vX.Y.Z + latest，推送 GHCR
+./scripts/release-docker.sh --load-amd64    # 只构建 amd64 并 docker load 到本地（冒烟，不推送）
+./scripts/release-docker.sh --no-push       # 构建多架构但不推送
+./scripts/release-docker.sh --qemu          # 回退到 QEMU + 根 Dockerfile
+```
+
+版本默认取 `Cargo.toml` 的 `[package] version`，镜像名默认从 `git remote origin` 推断为 `ghcr.io/<owner>/<repo>`（全小写）。
+
+| 选项 | 作用 |
+|---|---|
+| `--qemu` | 用 QEMU + 根 Dockerfile 构建（默认 zig 交叉编译） |
+| `--version X.Y.Z` | 覆盖版本标签 |
+| `--image NAME` | 覆盖镜像名 |
+| `--platforms LIST` | 覆盖平台（默认 `linux/amd64,linux/arm64`） |
+| `--no-latest` | 不附带 `latest` 标签 |
+| `--skip-frontend` | 复用现有 `static/`，跳过 npm 构建（仅 zig 引擎） |
+| `--skip-build` | 复用 `dist/docker/` 下已有二进制，跳过编译（仅 zig 引擎） |
+| `--load-amd64` | 只构建 amd64 并 `docker load` 到本地（冒烟，不推送） |
+| `--no-push` | 构建多架构但不推送 |
+
+推送后校验：
+
+```bash
+docker buildx imagetools inspect ghcr.io/waylon256yhw/clewdr-hub:vX.Y.Z
+```
 
 ## pre-commit hook
 
