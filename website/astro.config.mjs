@@ -17,6 +17,7 @@ export default defineConfig({
 				alt: 'clewdr-hub',
 			},
 			favicon: '/favicon.svg',
+			customCss: ['./src/styles/heritage.css'],
 			// 中文为主；将来加英文只需补 locales.en + src/content/docs/en/。
 			defaultLocale: 'root',
 			locales: {

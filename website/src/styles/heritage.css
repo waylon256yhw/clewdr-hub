@@ -1,0 +1,311 @@
+/*
+ * Heritage — clewdr-hub 文档站主题
+ * 风格：Architectural Minimalism meets Journalistic Gravitas（高端广报 / 画廊）。
+ * 参考 google-labs-code/design.md 的 Heritage 示例：
+ *   高对比中性色 + 单一陶土强调色、暖石灰底、Public Sans + Space Grotesk、
+ *   细发丝边框、克制圆角（4/8px）、几乎无阴影。
+ *
+ * 实现方式：仅映射 Starlight 暴露的 --sl-* 变量 + 少量组件级微调，不 fork 组件。
+ *
+ * Heritage token：
+ *   深墨 primary   #1A1C1E   石板 secondary #6C7278
+ *   陶土 tertiary  #B8422E   暖石灰 neutral #F7F5F2
+ */
+
+@import '@fontsource-variable/public-sans';
+@import '@fontsource-variable/space-grotesk';
+
+:root {
+	--font-display: 'Space Grotesk Variable', 'Public Sans Variable', ui-sans-serif,
+		system-ui, sans-serif;
+
+	/* 字体：正文 / UI 用 Public Sans，等宽保留系统栈 */
+	--sl-font: 'Public Sans Variable', ui-sans-serif, system-ui, -apple-system,
+		BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+		'PingFang SC', 'Microsoft YaHei', sans-serif;
+
+	/* 圆角收紧到 Heritage 的 4 / 8px */
+	--hr-radius-sm: 4px;
+	--hr-radius-md: 8px;
+
+	/* 正文加宽（默认 45rem 偏窄）：正文更舒展，右侧目录栏占地随之收敛 */
+	--sl-content-width: 50rem;
+
+	/* 几乎无阴影 —— 广报质感靠发丝边框而非投影 */
+	--sl-shadow-sm: none;
+	--sl-shadow-md: 0 1px 0 var(--sl-color-hairline-shade);
+	--sl-shadow-lg: 0 1px 0 var(--sl-color-hairline-shade);
+}
+
+/* ============================================================
+ * 暗色（深墨）—— Starlight 默认 :root 即暗色
+ * 深墨底 + 石灰字 + 陶土点缀
+ * ========================================================== */
+:root {
+	/* 暖中性灰阶：gray-1 最浅（近石灰，标题）→ gray-6 最深（边框/底） */
+	--sl-color-gray-1: #f4f1ec;
+	--sl-color-gray-2: #d8d4cc;
+	--sl-color-gray-3: #a8a39a;
+	--sl-color-gray-4: #74767b;
+	--sl-color-gray-5: #393c40;
+	--sl-color-gray-6: #26282b;
+
+	--sl-color-black: #16181a; /* 比正文底更深，用于内嵌区块 */
+	--sl-color-white: #f7f5f2; /* 暗色下「白」即石灰 */
+
+	--sl-color-bg: #1a1c1e; /* 深墨底 */
+	--sl-color-bg-nav: #1e2022;
+	--sl-color-bg-sidebar: #202325;
+	--sl-color-bg-inline-code: #26282b;
+
+	--sl-color-text: #e7e3db; /* 柔石灰，比纯白更耐看 */
+	--sl-color-text-invert: #1a1c1e; /* 陶土实色按钮上的字（见按钮处覆盖为石灰） */
+
+	/* 陶土强调（暗底略提亮以保对比） */
+	--sl-color-accent-low: #3a2520;
+	--sl-color-accent: #be4a34;
+	--sl-color-accent-high: #e07a5f;
+	--sl-color-text-accent: #e07a5f; /* 链接 / 强调文字，WCAG AA on 深墨 */
+	--sl-color-bg-accent: #e07a5f;
+
+	/* 发丝边框 */
+	--sl-color-hairline-light: #2a2d30;
+	--sl-color-hairline: #34373a;
+	--sl-color-hairline-shade: #404347;
+}
+
+/* ============================================================
+ * 亮色（Heritage 正典）—— 暖石灰广报
+ * 暖石灰底 + 深墨字 + 陶土点缀
+ * ========================================================== */
+:root[data-theme='light'],
+[data-theme='light'] ::backdrop {
+	/* 暖中性灰阶：gray-1 最深（深墨，标题）→ gray-7 最浅（表层底） */
+	--sl-color-gray-1: #1a1c1e;
+	--sl-color-gray-2: #3a3d40;
+	--sl-color-gray-3: #6c7278; /* 石板 —— 题注 / 元信息 */
+	--sl-color-gray-4: #9a958c;
+	--sl-color-gray-5: #d2cdc4;
+	--sl-color-gray-6: #e9e5df;
+	--sl-color-gray-7: #f1eee9;
+
+	--sl-color-black: #f7f5f2; /* 亮色下「黑」即石灰底 */
+	--sl-color-white: #1a1c1e; /* 亮色下「白」即深墨字 */
+
+	--sl-color-bg: #f7f5f2; /* 暖石灰底 */
+	--sl-color-bg-nav: #f2efe9;
+	--sl-color-bg-sidebar: #efece6;
+	--sl-color-bg-inline-code: #ece8e1;
+
+	--sl-color-text: #1a1c1e; /* 深墨正文 */
+	--sl-color-text-invert: #f7f5f2; /* 陶土按钮上的石灰字 */
+
+	/* 陶土强调 */
+	--sl-color-accent-low: #ecdcd6;
+	--sl-color-accent: #b8422e; /* Boston Clay */
+	--sl-color-accent-high: #8f2f1f;
+	--sl-color-text-accent: #b8422e; /* 链接 / 强调文字，WCAG AA on 石灰 */
+	--sl-color-bg-accent: #b8422e;
+
+	/* 发丝边框 */
+	--sl-color-hairline-light: #e6e2db;
+	--sl-color-hairline: #dad5cc;
+	--sl-color-hairline-shade: #cfc9bf;
+}
+
+/* ============================================================
+ * 排版细节
+ * ========================================================== */
+
+/* 大号标题略收紧字距（对 CJK 安全，不做正字距/大写） */
+.sl-markdown-content :is(h1, h2, h3),
+.hero h1 {
+	letter-spacing: -0.012em;
+	font-weight: 650;
+}
+
+/* 站名牌：Space Grotesk 大写宽字距 —— 广报报头质感（纯拉丁，安全） */
+.site-title {
+	font-family: var(--font-display);
+	font-weight: 600;
+	letter-spacing: 0.04em;
+}
+
+/* 拉丁小标签 / 徽章用 Space Grotesk */
+.sl-badge,
+starlight-tabs .tab > [role='tab'] {
+	font-family: var(--font-display);
+	letter-spacing: 0.02em;
+}
+
+/* 行内代码：发丝描边，去掉默认圆胖感 */
+.sl-markdown-content :not(pre) > code {
+	border: 1px solid var(--sl-color-hairline);
+	border-radius: var(--hr-radius-sm);
+}
+
+/* 代码块 / 表格 / 引用块：发丝边框 + 收紧圆角 + 去阴影 */
+.expressive-code .frame,
+.sl-markdown-content pre {
+	border-radius: var(--hr-radius-md);
+}
+.sl-markdown-content :is(.starlight-aside, blockquote) {
+	border-radius: var(--hr-radius-md);
+}
+/* 表格：外发丝框 + 收紧圆角（保留 Starlight 的 display:block + overflow:auto 横向滚动） */
+.sl-markdown-content table {
+	border: 1px solid var(--sl-color-hairline);
+	border-radius: var(--hr-radius-md);
+}
+.sl-markdown-content :is(th, td) {
+	border-color: var(--sl-color-hairline);
+}
+/* 有了外框，首/末列需恢复内边距，否则文字贴框线 */
+.sl-markdown-content :is(th:first-child, td:first-child) {
+	padding-inline-start: 1rem;
+}
+.sl-markdown-content :is(th:last-child, td:last-child) {
+	padding-inline-end: 1rem;
+}
+/* 表头：石灰分层底，广报式 */
+.sl-markdown-content thead th {
+	background: var(--sl-color-bg-sidebar);
+}
+
+/* 分隔线：纤细发丝 */
+.sl-markdown-content hr {
+	border: 0;
+	border-top: 1px solid var(--sl-color-hairline);
+}
+
+/* 底部「上一页 / 下一页」：默认过于硕大，收紧间距、字号、图标、去阴影 */
+.pagination-links a {
+	padding: 0.6rem 0.85rem;
+	gap: 0.4rem;
+	border-radius: var(--hr-radius-md);
+	border-color: var(--sl-color-hairline);
+	box-shadow: none;
+}
+.pagination-links a:hover {
+	border-color: var(--sl-color-accent);
+}
+.pagination-links .link-title {
+	font-size: var(--sl-text-base);
+	font-weight: 600;
+}
+.pagination-links svg {
+	font-size: 1rem;
+	width: 1rem;
+	height: 1rem;
+}
+
+/* 链接：陶土 + 细下划线，hover 加深 */
+.sl-markdown-content a:not(:where(.not-content *)) {
+	text-underline-offset: 0.2em;
+	text-decoration-thickness: 1px;
+	text-decoration-color: color-mix(in srgb, var(--sl-color-text-accent) 45%, transparent);
+}
+.sl-markdown-content a:not(:where(.not-content *)):hover {
+	color: var(--sl-color-accent-high);
+	text-decoration-color: currentColor;
+}
+
+/* ============================================================
+ * 左侧目录滚动条 —— 替换原生粗糙样式为纤细自定义条
+ * .sidebar-pane 是左栏滚动容器（overflow-y:auto）
+ * ========================================================== */
+.sidebar-pane {
+	scrollbar-width: thin; /* Firefox */
+	scrollbar-color: var(--sl-color-gray-4) transparent;
+}
+.sidebar-pane::-webkit-scrollbar {
+	width: 9px;
+}
+.sidebar-pane::-webkit-scrollbar-track {
+	background: transparent;
+}
+.sidebar-pane::-webkit-scrollbar-thumb {
+	background-color: var(--sl-color-gray-4);
+	border-radius: 999px;
+	/* 与侧栏底同色的内描边，让条更纤细、内嵌 */
+	border: 2px solid var(--sl-color-bg-sidebar);
+}
+.sidebar-pane:hover {
+	scrollbar-color: var(--sl-color-gray-3) transparent;
+}
+.sidebar-pane:hover::-webkit-scrollbar-thumb {
+	background-color: var(--sl-color-gray-3);
+}
+.sidebar-pane::-webkit-scrollbar-thumb:hover {
+	background-color: var(--sl-color-accent);
+}
+
+/* ============================================================
+ * 落地页（splash）—— 广报式 hero + 画廊卡片
+ * 仅 CSS 命中，不改 index.mdx 结构
+ * ========================================================== */
+
+/* hero 标题：略大、收紧字距 */
+.hero h1 {
+	font-weight: 700;
+}
+.hero .tagline {
+	color: var(--sl-color-gray-2);
+	max-width: 50ch;
+}
+
+/* 主 / 次按钮：陶土实心 vs 发丝描边，统一 4/8px 圆角、去阴影 */
+.hero .actions .sl-link-button {
+	border-radius: var(--hr-radius-md);
+	box-shadow: none;
+	font-weight: 600;
+}
+.hero .actions .sl-link-button.primary {
+	background: var(--sl-color-accent);
+	color: var(--sl-color-text-invert);
+	border: 1px solid var(--sl-color-accent);
+}
+.hero .actions .sl-link-button.primary:hover {
+	background: var(--sl-color-accent-high);
+	border-color: var(--sl-color-accent-high);
+}
+.hero .actions .sl-link-button.minimal {
+	border: 1px solid var(--sl-color-hairline);
+	background: transparent;
+	/* minimal 变体默认 padding-inline:0（无框文字链接）；加了框就得补内边距 */
+	padding-inline: 1.25rem;
+}
+.hero .actions .sl-link-button.minimal:hover {
+	border-color: var(--sl-color-accent);
+	color: var(--sl-color-text-accent);
+}
+
+/* 卡片 / LinkCard：发丝边框 + 分层底 + 收紧圆角 + 去阴影，hover 陶土边 */
+.card,
+.sl-link-card {
+	border: 1px solid var(--sl-color-hairline);
+	border-radius: var(--hr-radius-md);
+	background: var(--sl-color-bg-sidebar);
+	box-shadow: none;
+	transition: border-color 0.15s ease, background 0.15s ease;
+}
+.card:hover,
+.sl-link-card:hover {
+	border-color: var(--sl-color-accent);
+	background: var(--sl-color-bg-nav);
+}
+.sl-link-card:hover {
+	box-shadow: none;
+}
+
+/* 卡片图标：陶土点缀 */
+.card .icon {
+	color: var(--sl-color-accent);
+	border-radius: var(--hr-radius-sm);
+}
+.card .title {
+	font-weight: 650;
+}
+.sl-link-card .title {
+	color: var(--sl-color-accent);
+}
