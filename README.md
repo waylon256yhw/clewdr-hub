@@ -46,6 +46,8 @@ clewdr menu
 
 > Docker Compose / 宝塔面板 / Hugging Face Space / 手动安装见 [安装部署文档](https://waylon256yhw.github.io/clewdr-hub/start/installation/)。
 
+> **🤖 用 AI agent 部署？** 请先让它读 [AGENTS.md](AGENTS.md)。**生产环境不要从源码 `cargo build`**——优先用上面的一键脚本或 GHCR 预构建 Docker 镜像；从源码构建仅用于二次开发/调试。
+
 ## 使用
 
 后台 **账号池** 加账号 → **API Keys** 建 key，然后配置客户端：

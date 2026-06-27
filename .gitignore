@@ -21,7 +21,6 @@ scripts/*
 !scripts/setup-dev.sh
 !scripts/release-docker.sh
 !scripts/Dockerfile.dist
-AGENTS.md
 /docs/
 .serena/
 clewdr-bin
