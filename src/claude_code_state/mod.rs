@@ -1,5 +1,6 @@
 mod chat;
 mod exchange;
+mod fingerprint;
 mod organization;
 pub mod probe;
 pub(crate) use chat::is_reserved_api_key_extra_header;
@@ -12,7 +13,6 @@ use http::{
 use snafu::ResultExt;
 use tracing::error;
 use wreq::RequestBuilder;
-use wreq_util::Emulation;
 
 use crate::{
     billing::BillingContext,
@@ -223,21 +223,23 @@ impl ClaudeCodeState {
         };
 
         // Per-auth_method endpoint + wreq client + api_key plumbing.
-        // Cookie/OAuth keep the subscription-shaped client (Chrome TLS
-        // emulation + cookie store) and the default Anthropic endpoint.
-        // ApiKey overrides the endpoint from the slot's normalized
-        // base_url and uses a plain client — Chrome emulation is
-        // anti-detection for the subscription reverse-proxy path and is
-        // both meaningless and potentially trip-wire for strict
-        // corporate proxies on direct-API calls; the cookie store is
-        // similarly redundant since ApiKey never attaches Cookie.
+        // Cookie/OAuth keep the subscription-shaped client (Node/OpenSSL TLS
+        // emulation matching the real Claude Code CLI + cookie store) and the
+        // default Anthropic endpoint. The Node/OpenSSL handshake (JA4
+        // `t13d1714h1…`, see `fingerprint`) is load-bearing here: these slots
+        // authenticate as `claude-cli` with `x-stainless-runtime=node`, so a
+        // browser TLS fingerprint would contradict the headers on every send.
+        // ApiKey overrides the endpoint from the slot's normalized base_url and
+        // uses a plain client — TLS emulation is meaningless and potentially a
+        // trip-wire for strict corporate proxies on direct-API calls; the
+        // cookie store is similarly redundant since ApiKey never attaches Cookie.
         let mut client_builder = wreq::Client::builder();
         match auth_method {
             AuthMethod::Cookie | AuthMethod::OAuth => {
                 state.endpoint = crate::config::ENDPOINT_URL.to_owned();
                 client_builder = client_builder
                     .cookie_store(true)
-                    .emulation(Emulation::Chrome136);
+                    .emulation(fingerprint::claude_code_emulation());
             }
             AuthMethod::ApiKey => {
                 let raw_base =
@@ -373,7 +375,7 @@ impl ClaudeCodeState {
                 self.api_key_extra_headers = None;
                 client_builder = client_builder
                     .cookie_store(true)
-                    .emulation(Emulation::Chrome136);
+                    .emulation(fingerprint::claude_code_emulation());
             }
             AuthMethod::ApiKey => {
                 let raw_base =

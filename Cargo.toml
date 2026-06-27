@@ -34,7 +34,6 @@ wreq = { version = "6.0.0-rc.28", features = [
     "socks",
     "stream",
 ] }
-wreq-util = "3.0.0-rc.10"
 serde_json = "1"
 const_format = { version = "0.2", features = ["fmt"] }
 serde = { version = "1", features = ["derive"] }
