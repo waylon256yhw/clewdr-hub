@@ -10,6 +10,7 @@ on:
       - "deploy/**"
       - "docs/**"
       - "wiki/**"
+      - "website/**"
       - "docker-compose.yml"
       - "Dockerfile.huggingface"
       - ".github/**"
