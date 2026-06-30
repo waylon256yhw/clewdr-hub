@@ -27,5 +27,6 @@ clewdr-bin
 .dev-*
 .local/
 .claude/
+.react-doctor/
 dist/
 .cache/
