@@ -779,6 +779,10 @@ function AccountFormModal({
     },
   });
 
+  // The modal is keyed on `editing?.id`, so id changes already remount with
+  // fresh `initialValues`. This effect covers the residual case: reopening the
+  // SAME id after its data was refreshed (same key → no remount → re-sync
+  // here). Kept off the key so a background refresh can't wipe a mid-edit form.
   useEffect(() => {
     setTab(
       editing?.auth_source === "cookie"

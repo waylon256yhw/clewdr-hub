@@ -1,4 +1,4 @@
-import { createContext, use, useState, useEffect, useCallback, type ReactNode } from "react";
+import { createContext, use, useState, useEffect, useCallback, useMemo, type ReactNode } from "react";
 import { useNavigate, Navigate } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -126,11 +126,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     navigate("/login", { replace: true });
   }, [queryClient, navigate]);
 
-  return (
-    <AuthContext value={{ user, loading, mustChangePassword, setMustChangePassword, login, logout }}>
-      {children}
-    </AuthContext>
+  // Memoize the context value so consumers don't re-render on every
+  // AuthProvider render — only when an actual auth field changes.
+  // setMustChangePassword is a stable useState setter, so it's omitted from deps.
+  const value = useMemo(
+    () => ({ user, loading, mustChangePassword, setMustChangePassword, login, logout }),
+    [user, loading, mustChangePassword, login, logout],
   );
+
+  return <AuthContext value={value}>{children}</AuthContext>;
 }
 
 export function RequireAuth({ children }: { children: ReactNode }) {

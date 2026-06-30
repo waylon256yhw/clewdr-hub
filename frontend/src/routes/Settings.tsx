@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Title,
@@ -61,16 +61,11 @@ function EffortOverrideSection({
   level: string;
 }) {
   const queryClient = useQueryClient();
+  // `enabled`/`level` seed the editable draft. The parent keys this section
+  // on the saved values, so a save (which refetches settings and changes
+  // those props) remounts and reseeds the draft — no effect needed to sync.
   const [overrideEnabled, setOverrideEnabled] = useState(enabled);
   const [selectedLevel, setSelectedLevel] = useState(level);
-
-  useEffect(() => {
-    setOverrideEnabled(enabled);
-  }, [enabled]);
-
-  useEffect(() => {
-    setSelectedLevel(level);
-  }, [level]);
 
   const mutation = useMutation({
     mutationFn: (values: { enabled: boolean; level: string }) =>
@@ -355,6 +350,7 @@ export default function Settings() {
       <Title order={3} mb="md">设置</Title>
       <Stack>
         <EffortOverrideSection
+          key={`${effortOverrideEnabled}|${effortOverrideLevel}`}
           enabled={effortOverrideEnabled}
           level={effortOverrideLevel}
         />
