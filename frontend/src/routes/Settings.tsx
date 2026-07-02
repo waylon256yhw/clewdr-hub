@@ -39,6 +39,7 @@ const EFFORT_OPTIONS = [
   { value: "xhigh", label: "XHigh" },
   { value: "max", label: "Max" },
 ];
+const CLI_VERSION_RE = /^\d+\.\d+\.\d+$/;
 
 function parseSettingBool(value: string | undefined): boolean {
   const normalized = value?.trim().toLowerCase();
@@ -349,7 +350,7 @@ function TpVersionSection({ currentVersion }: { currentVersion: string }) {
   const trimmed = value.trim();
   // Empty is allowed: it clears the global default so the cloak falls back to
   // the built-in version. A non-empty value must look like x.y.z.
-  const looksValid = trimmed === "" || /^\d+\.\d+\.\d+/.test(trimmed);
+  const looksValid = trimmed === "" || CLI_VERSION_RE.test(trimmed);
   const dirty = trimmed !== currentVersion;
 
   const mutation = useMutation({

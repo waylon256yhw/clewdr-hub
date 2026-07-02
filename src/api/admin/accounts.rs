@@ -18,7 +18,10 @@ use crate::{
         ClaudeCodeState, build_api_client, is_reserved_api_key_extra_header,
         normalize_api_key_base_url,
     },
-    config::{AccountSlot, AuthMethod, CLAUDE_ENDPOINT, ClewdrCookie, ThirdPartyMimicryConfig},
+    config::{
+        AccountSlot, AuthMethod, CLAUDE_ENDPOINT, ClewdrCookie, ThirdPartyMimicryConfig,
+        is_valid_claude_cli_version,
+    },
     db::accounts::{
         AccountWithRuntime, batch_upsert_runtime_states, clear_account_cooldown,
         find_account_by_organization_uuid, get_account_by_id, load_all_accounts,
@@ -435,14 +438,13 @@ fn validate_third_party_config(cfg: &ThirdPartyMimicryConfig) -> Result<(), Clew
             msg: "mimicry_config.extra_beta tokens must be non-empty",
         });
     }
-    if cfg
-        .cli_version
-        .as_deref()
-        .is_some_and(|v| v.trim().is_empty())
-    {
-        return Err(ClewdrError::BadRequest {
-            msg: "mimicry_config.cli_version must be non-empty when provided",
-        });
+    if let Some(version) = cfg.cli_version.as_deref() {
+        let version = version.trim();
+        if version.is_empty() || !is_valid_claude_cli_version(version) {
+            return Err(ClewdrError::BadRequest {
+                msg: "mimicry_config.cli_version must be x.y.z when provided",
+            });
+        }
     }
     Ok(())
 }
@@ -1926,6 +1928,15 @@ mod tests {
         // Empty cli_version override.
         let cfg = ThirdPartyMimicryConfig {
             cli_version: Some("".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            resolve_mimicry("api_key", Some("third_party"), Some(&cfg)).unwrap_err(),
+            ClewdrError::BadRequest { .. }
+        ));
+        // Malformed cli_version override.
+        let cfg = ThirdPartyMimicryConfig {
+            cli_version: Some("2.1.198abc".into()),
             ..Default::default()
         };
         assert!(matches!(

@@ -49,6 +49,8 @@ import {
 } from "../api";
 import { formatCost, formatEpochSeconds } from "../lib/format";
 
+const CLI_VERSION_RE = /^\d+\.\d+\.\d+$/;
+
 /**
  * Step 3.5 C5-2: stable color hint for an
  * `AccountFailureContext.action` so the chip / badge color reflects
@@ -960,11 +962,20 @@ function AccountFormModal({
       // Two-tier mimicry (api_key tab only). `none` sends no config; a
       // `third_party` channel serializes the cloak knobs.
       const mimicryMode = tab === "api_key" ? values.mimicry_mode : undefined;
+      const mimicryCliVersion = values.mimicry_cli_version.trim();
+      if (
+        tab === "api_key" &&
+        values.mimicry_mode === "third_party" &&
+        mimicryCliVersion &&
+        !CLI_VERSION_RE.test(mimicryCliVersion)
+      ) {
+        throw new ApiError(400, "渠道覆盖 CLI 版本必须是 x.y.z，或留空继承全局默认");
+      }
       const mimicryConfig: MimicryConfig | undefined =
         tab === "api_key" && values.mimicry_mode === "third_party"
           ? {
               auth_header: values.mimicry_auth_header,
-              cli_version: values.mimicry_cli_version.trim() || null,
+              cli_version: mimicryCliVersion || null,
               strict_system: values.mimicry_strict_system,
               extra_beta: values.mimicry_extra_beta
                 .split(/[\n,]/)

@@ -1,5 +1,19 @@
 use serde::{Deserialize, Serialize};
 
+/// Strict Claude Code CLI version accepted by Claude-Cloak: `x.y.z`.
+/// Empty values are handled by callers when they mean "inherit/fallback".
+pub fn is_valid_claude_cli_version(value: &str) -> bool {
+    let mut parts = value.split('.');
+    let (Some(major), Some(minor), Some(patch), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    [major, minor, patch]
+        .iter()
+        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Which mimicry profile an API-key channel applies to its outbound requests.
 ///
 /// * `None` — clean passthrough (the historical API-key behavior): only
@@ -81,4 +95,19 @@ pub struct ThirdPartyMimicryConfig {
     /// Extra `anthropic-beta` tokens to append for relays that require them.
     #[serde(default)]
     pub extra_beta: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_claude_cli_version;
+
+    #[test]
+    fn claude_cli_version_requires_exact_x_y_z() {
+        for valid in ["0.0.1", "2.1.198", "12.34.56"] {
+            assert!(is_valid_claude_cli_version(valid), "{valid}");
+        }
+        for invalid in ["", "2.1", "2.1.198abc", "v2.1.198", "2.1.198-beta"] {
+            assert!(!is_valid_claude_cli_version(invalid), "{invalid}");
+        }
+    }
 }

@@ -7,6 +7,7 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tracing::info;
 
+use crate::config::is_valid_claude_cli_version;
 use crate::error::ClewdrError;
 use crate::stealth;
 
@@ -64,6 +65,14 @@ pub async fn update(
     for (key, value) in &req.settings {
         if HIDDEN_KEYS.contains(&key.as_str()) || DEPRECATED_KEYS.contains(&key.as_str()) {
             continue;
+        }
+        if key == "tp_cloak_cli_version" {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() && !is_valid_claude_cli_version(trimmed) {
+                return Err(ClewdrError::BadRequest {
+                    msg: "tp_cloak_cli_version must be x.y.z, or empty to use the built-in default",
+                });
+            }
         }
         sqlx::query(
             "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, CURRENT_TIMESTAMP)
