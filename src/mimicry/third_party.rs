@@ -23,8 +23,8 @@ use crate::{
     db::billing::get_setting,
     error::ClewdrError,
     middleware::claude::{
-        claude_code_billing_header_from_sample, prepend_system_blocks,
-        strip_billing_headers_from_system,
+        claude_code_billing_header_from_sample, fill_system_only_user_placeholder,
+        prepend_system_blocks, strip_billing_headers_from_system,
     },
     mimicry::{STAINLESS_HEADERS, is_reserved_api_key_extra_header},
     stealth::{DEFAULT_BILLING_SALT, DEFAULT_CLI_VERSION, StealthProfile},
@@ -212,6 +212,9 @@ pub(crate) fn build_cloak_request(
     };
     req = req
         .header("content-type", "application/json")
+        // Claude-Cloak sets an explicit Accept; the official path omits it, but
+        // the third-party cloak mirrors Claude-Cloak's proven relay header set.
+        .header("accept", "application/json")
         .header(USER_AGENT, user_agent)
         .header("anthropic-version", ANTHROPIC_VERSION)
         .header("anthropic-dangerous-direct-browser-access", "true")
@@ -251,6 +254,13 @@ pub(crate) fn cloak_messages_body(
     billing_salt: &str,
     strict_system: bool,
 ) -> Option<String> {
+    // Zero-input safety net (Claude-Cloak B4): a request that arrives with no
+    // messages but a non-empty system would otherwise ship empty `messages`,
+    // which relays (and Anthropic) reject. The middleware only injects this when
+    // messages were emptied during cleanup, not when they arrive empty, so the
+    // cloak re-applies it here before sampling the first user text.
+    fill_system_only_user_placeholder(body);
+
     let first_text = first_user_text(&body.messages);
 
     // Drop the billing block the middleware injected with the official pinned
@@ -319,22 +329,40 @@ fn ensure_user_id(body: &mut CreateMessageParams) -> Option<String> {
     Some(session_uuid.to_string())
 }
 
-/// Classify an inbound `user_id`. `Some(session)` = valid, keep it (session is
-/// the extractable `session_id`, if any); `None` = invalid, caller regenerates.
+/// Classify an inbound `user_id`, matching Claude-Cloak's `isValidUserId` /
+/// `extractSessionId` exactly (user.ts): `Some(session)` = valid, keep it
+/// (session is the non-empty `session_id`, if any); `None` = invalid, caller
+/// regenerates. A JSON object is valid only when it carries STRING `device_id`
+/// AND `session_id` fields — a bare `{}` or partial object is regenerated.
 fn classify_user_id(existing: &str) -> Option<Option<String>> {
-    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(existing) {
-        let session = map
-            .get("session_id")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        return Some(session);
+    if let Ok(value) = serde_json::from_str::<Value>(existing) {
+        let Value::Object(map) = value else {
+            return None;
+        };
+        let device_ok = map.get("device_id").and_then(Value::as_str).is_some();
+        let session = map.get("session_id").and_then(Value::as_str);
+        if device_ok && session.is_some() {
+            return Some(session.filter(|s| !s.is_empty()).map(str::to_string));
+        }
+        return None;
     }
-    // Legacy CLI shape (`user_...account_...`) carries no JSON session id.
-    if existing.contains("user_") && existing.contains("account_") {
+    // Legacy CLI shape: `^user_<64 hex>_account_`. Carries no JSON session id.
+    if is_legacy_user_id(existing) {
         return Some(None);
     }
     None
+}
+
+/// Matches Claude-Cloak's legacy regex `^user_[a-fA-F0-9]{64}_account_`.
+fn is_legacy_user_id(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("user_") else {
+        return false;
+    };
+    if rest.len() < 64 + "_account_".len() {
+        return false;
+    }
+    let (hex, tail) = rest.split_at(64);
+    hex.bytes().all(|b| b.is_ascii_hexdigit()) && tail.starts_with("_account_")
 }
 
 /// The first user message's text (mirrors `request.rs::first_user_message_text`,
@@ -530,17 +558,63 @@ mod tests {
     }
 
     #[test]
-    fn ensure_user_id_keeps_legacy_shape_without_session() {
+    fn ensure_user_id_keeps_strict_legacy_shape_without_session() {
+        // Exactly ^user_<64 hex>_account_...
+        let legacy = format!("user_{}_account_x", "a".repeat(64));
         let mut b = body(json!({
             "model": "claude-opus-4-8",
             "messages": [],
-            "metadata": {"user_id": "user_abc_account_def"},
+            "metadata": {"user_id": legacy},
         }));
         let session = ensure_user_id(&mut b);
         assert_eq!(session, None, "legacy shape carries no session id");
-        assert_eq!(
-            b.metadata.unwrap().fields["user_id"],
-            "user_abc_account_def"
-        );
+        assert_eq!(b.metadata.unwrap().fields["user_id"], legacy);
+    }
+
+    #[test]
+    fn ensure_user_id_regenerates_malformed_shapes() {
+        // Cases Claude-Cloak treats as INVALID -> must regenerate a fake
+        // {device_id, session_id} (session becomes Some).
+        for bad in [
+            "{}",                                  // empty object
+            "{\"session_id\":\"s\"}",              // missing device_id
+            "{\"device_id\":\"d\"}",               // missing session_id
+            "not json at all",                     // random string
+            "user_short_account_x",                // legacy but not 64 hex
+            "prefix user_ and account_ scattered", // loose substring (old bug)
+        ] {
+            let mut b = body(json!({
+                "model": "claude-opus-4-8",
+                "messages": [],
+                "metadata": {"user_id": bad},
+            }));
+            let session = ensure_user_id(&mut b).expect("regenerated -> has session");
+            let uid = b.metadata.unwrap().fields["user_id"].clone();
+            let parsed: Value = serde_json::from_str(&uid).unwrap();
+            assert_eq!(parsed["session_id"], session, "input {bad:?}");
+            assert_eq!(
+                parsed["device_id"].as_str().unwrap().len(),
+                64,
+                "input {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloak_injects_placeholder_for_system_only_request() {
+        // Non-strict: a request that arrives with empty messages + a system must
+        // get the "Continue." user turn (Claude-Cloak B4) so messages aren't
+        // shipped empty and the billing sample is that placeholder.
+        let mut b = body(json!({
+            "model": "claude-opus-4-8",
+            "messages": [],
+            "system": "some system",
+        }));
+        cloak_messages_body(&mut b, "2.1.198", "salt", false);
+        assert_eq!(b.messages.len(), 1);
+        match &b.messages[0].content {
+            MessageContent::Text { content } => assert_eq!(content, "Continue."),
+            _ => panic!("expected placeholder user turn"),
+        }
     }
 }

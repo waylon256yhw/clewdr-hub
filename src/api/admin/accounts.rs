@@ -279,8 +279,9 @@ pub struct UpdateAccountRequest {
     /// `None` keeps the existing mode; `Some("none"|"third_party")` sets it.
     #[serde(default)]
     pub mimicry_mode: Option<String>,
-    /// `None` keeps the existing config; `Some(cfg)` replaces it. When the
-    /// resulting mode is `none`, the config is cleared regardless.
+    /// `Some(cfg)` replaces the config under the effective mode (the request's
+    /// mode, or the existing mode when omitted). When the effective mode is
+    /// `none`, the config is cleared regardless.
     #[serde(default)]
     pub mimicry_config: Option<ThirdPartyMimicryConfig>,
 }
@@ -1070,9 +1071,16 @@ pub async fn update(
         } else {
             existing.auth_source.as_str()
         };
+        // A config-only update (no mode field) keeps the account's existing
+        // mode, so `{"mimicry_config": ...}` replaces the config in place rather
+        // than silently resetting the channel to `none`.
+        let effective_mode = req
+            .mimicry_mode
+            .as_deref()
+            .unwrap_or(&existing.mimicry_mode);
         let (mode_db, cfg_json) = resolve_mimicry(
             effective_auth,
-            req.mimicry_mode.as_deref(),
+            Some(effective_mode),
             req.mimicry_config.as_ref(),
         )?;
         sqlx::query(

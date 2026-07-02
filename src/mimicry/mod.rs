@@ -37,7 +37,7 @@ pub(crate) const STAINLESS_HEADERS: &[(&str, &str)] = &[
 
 /// Header names that MUST NOT come from per-account extra_headers on an ApiKey
 /// send: either we set them ourselves (`x-api-key`, `anthropic-version`,
-/// `anthropic-beta`, `content-type`) or they reintroduce subscription-shaped
+/// `anthropic-beta`, `content-type`, `accept`) or they reintroduce subscription-shaped
 /// behavior the ApiKey dispatch controls (`user-agent`) or they belong to the
 /// transport layer (`host`, `content-length`, `accept-encoding`) and overriding
 /// them breaks the request.
@@ -53,6 +53,7 @@ const API_KEY_RESERVED_EXTRA_HEADERS: &[&str] = &[
     "host",
     "content-length",
     "content-type",
+    "accept",
     "accept-encoding",
 ];
 

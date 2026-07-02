@@ -2557,6 +2557,7 @@ mod tests {
             "host",
             "content-length",
             "content-type",
+            "accept",
             "accept-encoding",
         ] {
             assert!(
@@ -2568,7 +2569,6 @@ mod tests {
             "anthropic-workspace-id",
             "x-request-id",
             "x-custom",
-            "accept",
             "cache-control",
             "",
         ] {
