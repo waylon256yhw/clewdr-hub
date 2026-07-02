@@ -171,10 +171,12 @@ pub(crate) fn synth_beta(
 /// count request. `extra_headers` are the per-account HTTP headers, applied after
 /// the reserved-name filter. `extra_body` is the per-account JSON object
 /// shallow-merged over the outbound body — only on `/v1/messages` (never
-/// count_tokens, which rejects extra top-level inputs). Because it can override
-/// `model`/`stream`, the beta header and the `x-stainless-helper-method` flag are
-/// derived from the effective (post-merge) values so headers never desync from
-/// the wire body.
+/// count_tokens, which rejects extra top-level inputs). Reserved keys
+/// (messages/system/stream/metadata) are skipped by the merge; the beta header
+/// and `x-stainless-helper-method` flag are derived from the MERGED body so an
+/// override of any known field (e.g. `model`, `output_format`) never desyncs
+/// from the wire.
+#[allow(clippy::too_many_arguments)] // assembles a full request from distinct, unrelated inputs
 pub(crate) fn build_cloak_request(
     client: &wreq::Client,
     url: &url::Url,
