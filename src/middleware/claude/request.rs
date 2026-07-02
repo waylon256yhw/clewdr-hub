@@ -523,6 +523,7 @@ fn default_output_config() -> OutputConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReasoningFamily {
     Fable5,
+    Sonnet5,
     V4_5,
     V4_6,
     V4_7,
@@ -533,6 +534,7 @@ impl ReasoningFamily {
     fn detect(model: &str) -> Option<Self> {
         const TABLE: &[(&str, ReasoningFamily)] = &[
             ("claude-fable-5", ReasoningFamily::Fable5),
+            ("claude-sonnet-5", ReasoningFamily::Sonnet5),
             ("claude-opus-4-8", ReasoningFamily::V4_8),
             ("claude-opus-4-7", ReasoningFamily::V4_7),
             ("claude-opus-4-6", ReasoningFamily::V4_6),
@@ -543,10 +545,10 @@ impl ReasoningFamily {
         })
     }
 
-    /// 4.7+ removed extended thinking budgets, so legacy `enabled` requests must
-    /// be rewritten to `adaptive` before going upstream.
+    /// 4.7+, Fable 5, and Sonnet 5 removed extended thinking budgets, so legacy
+    /// `enabled` requests must be rewritten to `adaptive` before going upstream.
     fn requires_adaptive_thinking_rewrite(self) -> bool {
-        matches!(self, Self::Fable5 | Self::V4_7 | Self::V4_8)
+        matches!(self, Self::Fable5 | Self::Sonnet5 | Self::V4_7 | Self::V4_8)
     }
 
     fn requires_thinking(self) -> bool {
@@ -568,7 +570,7 @@ impl ReasoningFamily {
                 OutputEffort::High => OutputEffort::High,
                 OutputEffort::XHigh | OutputEffort::Max => OutputEffort::Max,
             },
-            Self::Fable5 | Self::V4_7 | Self::V4_8 => effort.clone(),
+            Self::Fable5 | Self::Sonnet5 | Self::V4_7 | Self::V4_8 => effort.clone(),
         }
     }
 }
@@ -1457,6 +1459,14 @@ mod tests {
             Some(ReasoningFamily::Fable5)
         );
         assert_eq!(
+            ReasoningFamily::detect("claude-sonnet-5"),
+            Some(ReasoningFamily::Sonnet5)
+        );
+        assert_eq!(
+            ReasoningFamily::detect("claude-sonnet-5-20260930"),
+            Some(ReasoningFamily::Sonnet5)
+        );
+        assert_eq!(
             ReasoningFamily::detect("claude-opus-4-8"),
             Some(ReasoningFamily::V4_8)
         );
@@ -1474,7 +1484,54 @@ mod tests {
         );
         assert_eq!(ReasoningFamily::detect("claude-sonnet-4-6"), None);
         assert_eq!(ReasoningFamily::detect("claude-fable-5-preview1"), None);
+        assert_eq!(ReasoningFamily::detect("claude-sonnet-5-preview1"), None);
         assert_eq!(ReasoningFamily::detect("claude-opus-4-7-preview1"), None);
+    }
+
+    #[test]
+    fn normalize_sonnet_5_rewrites_legacy_thinking_and_pins_effort() {
+        // Sonnet 5 dropped extended thinking budgets: legacy `enabled` +
+        // `budget_tokens` must become adaptive, and a missing effort is pinned
+        // to high — same treatment as Opus 4.7/4.8.
+        let mut body = make_body(Some(Thinking::new(8000)), Some(0.7), None, None);
+        body.model = "claude-sonnet-5".to_string();
+        normalize_sampling_params(&mut body, &StealthProfile::default());
+        assert!(matches!(
+            body.thinking,
+            Some(Thinking::Adaptive {
+                display: Some(ThinkingDisplay::Summarized)
+            })
+        ));
+        assert!(matches!(
+            body.output_config,
+            Some(OutputConfig {
+                effort: Some(OutputEffort::High),
+                ..
+            })
+        ));
+        assert_eq!(body.temperature, None);
+    }
+
+    #[test]
+    fn normalize_sonnet_5_keeps_disabled_thinking() {
+        // Unlike Fable 5, Sonnet 5 permits disabled thinking, so it must not be
+        // forced on. Effort is honored via the admin override across all five
+        // levels (xhigh is supported on Sonnet 5).
+        let mut body = make_body(Some(Thinking::Disabled), Some(1.0), None, None);
+        body.model = "claude-sonnet-5".to_string();
+        let profile = StealthProfile {
+            force_output_effort: Some(OutputEffort::XHigh),
+            ..StealthProfile::default()
+        };
+        normalize_sampling_params(&mut body, &profile);
+        assert!(matches!(body.thinking, Some(Thinking::Disabled)));
+        assert!(matches!(
+            body.output_config,
+            Some(OutputConfig {
+                effort: Some(OutputEffort::XHigh),
+                ..
+            })
+        ));
     }
 
     fn auth_user_with_auto_cache(enabled: bool) -> crate::db::models::AuthenticatedUser {

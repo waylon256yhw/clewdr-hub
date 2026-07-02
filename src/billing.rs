@@ -113,6 +113,7 @@ static KNOWN_ALIASES: &[(&str, &str)] = &[
     ("claude-opus-4-5", "claude-opus-4-5"),
     ("claude-opus-4-1", "claude-opus-4-1"),
     ("claude-opus-4-0", "claude-opus-4-0"),
+    ("claude-sonnet-5", "claude-sonnet-5"),
     ("claude-sonnet-4-6", "claude-sonnet-4-6"),
     ("claude-sonnet-4-5", "claude-sonnet-4-5"),
     ("claude-sonnet-4-0", "claude-sonnet-4-0"),
@@ -553,6 +554,19 @@ mod tests {
             Some("claude-fable-5".into())
         );
         assert_eq!(normalize_model("claude-fable-5-preview1"), None);
+    }
+
+    #[test]
+    fn normalize_sonnet_5_bare_and_dated_ids() {
+        assert_eq!(
+            normalize_model("claude-sonnet-5"),
+            Some("claude-sonnet-5".into())
+        );
+        assert_eq!(
+            normalize_model("claude-sonnet-5-20260930"),
+            Some("claude-sonnet-5".into())
+        );
+        assert_eq!(normalize_model("claude-sonnet-5-preview1"), None);
     }
 
     #[test]

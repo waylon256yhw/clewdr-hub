@@ -18,8 +18,9 @@ sidebar:
 
 ## thinking 归一化
 
-- `claude-opus-4-7` / `claude-opus-4-8` / `claude-fable-5`：`thinking.type=enabled` + `budget_tokens` 会被重写为 `{type:"adaptive","display":"summarized"}`；如果请求里没带 `output_config.effort`，服务端会显式补成 `high`。这些模型不支持 extended thinking budgets，保持 `enabled` 在上游会被拒绝或忽略，客户拿不到思考链。
+- `claude-opus-4-7` / `claude-opus-4-8` / `claude-fable-5` / `claude-sonnet-5`：`thinking.type=enabled` + `budget_tokens` 会被重写为 `{type:"adaptive","display":"summarized"}`；如果请求里没带 `output_config.effort`，服务端会显式补成 `high`。这些模型不支持 extended thinking budgets，保持 `enabled` 在上游会被拒绝或忽略，客户拿不到思考链。
 - `claude-fable-5` **强制开启思考**：未提供 `thinking` 或显式传入 `disabled` 时，也会规范为 `{type:"adaptive","display":"summarized"}` 并默认补 `effort=high`。
+- `claude-sonnet-5` 与 Opus 4.7/4.8 的归一化一致，但**不强制开启思考**：显式传入 `thinking.type=disabled` 会原样透传（Sonnet 5 允许关闭思考），也不附带 Fable 5 的 server-side fallback。
 
 ## fable-5 server-side fallback
 
@@ -29,11 +30,11 @@ sidebar:
 
 后台「设置」页的「推理 Effort 强制值」可强制覆盖受支持推理模型的 `output_config.effort`（覆盖客户端发送的值）：
 
-- 当前对 `claude-fable-5`、`claude-opus-4-5` / `4-6` / `4-7` / `4-8`（含 8 位日期后缀）写入所选 effort，其他模型完全透传客户端原始值。
+- 当前对 `claude-fable-5`、`claude-sonnet-5`、`claude-opus-4-5` / `4-6` / `4-7` / `4-8`（含 8 位日期后缀）写入所选 effort，其他模型完全透传客户端原始值。
 - 如果管理员选择了旧版 Opus 不支持的 effort，服务端会自动映射到兼容等级：
 
   | 模型 | 支持档位 | 映射规则 |
   |------|----------|----------|
-  | `fable-5` / `opus-4.7` / `opus-4.8` | `low/medium/high/xhigh/max` 全五档 | 直接写入 |
+  | `fable-5` / `sonnet-5` / `opus-4.7` / `opus-4.8` | `low/medium/high/xhigh/max` 全五档 | 直接写入 |
   | `opus-4.6` | 缺 `xhigh` | `xhigh` → `max` |
   | `opus-4.5` | 缺 `xhigh` / `max` | `xhigh` / `max` → `high` |

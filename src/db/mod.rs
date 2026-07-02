@@ -242,6 +242,7 @@ const DEFAULT_MODELS: &[(&str, &str, i32)] = &[
     ("claude-opus-4-6", "Claude Opus 4.6", 10),
     ("claude-opus-4-5", "Claude Opus 4.5", 20),
     ("claude-opus-4-1", "Claude Opus 4.1", 30),
+    ("claude-sonnet-5", "Claude Sonnet 5", 40),
     ("claude-sonnet-4-6", "Claude Sonnet 4.6", 50),
     ("claude-sonnet-4-5", "Claude Sonnet 4.5", 60),
     ("claude-haiku-4-5", "Claude Haiku 4.5", 80),
