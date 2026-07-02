@@ -169,13 +169,19 @@ pub(crate) fn synth_beta(
 ///
 /// `is_count_tokens` skips the body cloak (headers only), matching the real CLI's
 /// count request. `extra_headers` are the per-account HTTP headers, applied after
-/// the reserved-name filter.
+/// the reserved-name filter. `extra_body` is the per-account JSON object
+/// shallow-merged over the outbound body — only on `/v1/messages` (never
+/// count_tokens, which rejects extra top-level inputs). Because it can override
+/// `model`/`stream`, the beta header and the `x-stainless-helper-method` flag are
+/// derived from the effective (post-merge) values so headers never desync from
+/// the wire body.
 pub(crate) fn build_cloak_request(
     client: &wreq::Client,
     url: &url::Url,
     secret: &str,
     cfg: &ThirdPartyMimicryConfig,
     extra_headers: &BTreeMap<String, String>,
+    extra_body: Option<&serde_json::Value>,
     body: &CreateMessageParams,
     is_count_tokens: bool,
 ) -> Result<wreq::RequestBuilder, ClewdrError> {
@@ -188,8 +194,20 @@ pub(crate) fn build_cloak_request(
         .map(str::to_string)
         .unwrap_or_else(|| profile.cli_version.clone());
     let user_agent = format!("claude-cli/{cli_version} (external, cli)");
-    let stream = body.stream.unwrap_or(false);
-    let beta = synth_beta(&body.model, body, &cfg.extra_beta);
+
+    // Extra body is applied only on the messages path; count_tokens leaves the
+    // body (and therefore the effective model/stream) untouched.
+    let applied_extra = extra_body.filter(|_| !is_count_tokens);
+    let eff_model = applied_extra
+        .and_then(|e| e.get("model"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(body.model.as_str());
+    let eff_stream = applied_extra
+        .and_then(|e| e.get("stream"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or_else(|| body.stream.unwrap_or(false));
+    let stream = eff_stream;
+    let beta = synth_beta(eff_model, body, &cfg.extra_beta);
 
     let mut send_body = body.clone();
     let session_id = if is_count_tokens {
@@ -203,7 +221,13 @@ pub(crate) fn build_cloak_request(
             cfg.strict_system,
         )
     };
-    let bytes = serde_json::to_vec(&send_body)?;
+    let bytes = if let Some(extra) = applied_extra {
+        let mut value = serde_json::to_value(&send_body)?;
+        crate::mimicry::merge_extra_body(&mut value, extra);
+        serde_json::to_vec(&value)?
+    } else {
+        serde_json::to_vec(&send_body)?
+    };
 
     let mut req = client.post(url.to_string());
     req = match cfg.auth_header {
@@ -405,6 +429,69 @@ mod tests {
 
     fn body(v: Value) -> CreateMessageParams {
         serde_json::from_value(v).expect("valid CreateMessageParams")
+    }
+
+    /// Initialize the global cloak profile idempotently so `build_cloak_request`
+    /// (which calls `global_profile()`) can run under test.
+    fn ensure_profile() {
+        GLOBAL_PROFILE
+            .get_or_init(|| Arc::new(ArcSwap::from_pointee(ThirdPartyCloakProfile::default())));
+    }
+
+    /// Build a cloak request and return its serialized JSON body.
+    fn cloak_body(extra: Option<&Value>, b: &CreateMessageParams, is_count_tokens: bool) -> Value {
+        ensure_profile();
+        let client = wreq::Client::new();
+        let url = url::Url::parse("https://relay.example/v1/messages?beta=true").unwrap();
+        let cfg = ThirdPartyMimicryConfig::default();
+        let headers = BTreeMap::new();
+        let req = build_cloak_request(
+            &client,
+            &url,
+            "sk",
+            &cfg,
+            &headers,
+            extra,
+            b,
+            is_count_tokens,
+        )
+        .expect("cloak request builds");
+        let built = req.build().expect("request finalizes");
+        let bytes = built
+            .body()
+            .and_then(|body| body.as_bytes())
+            .expect("in-memory body");
+        serde_json::from_slice(bytes).expect("body is JSON")
+    }
+
+    #[test]
+    fn build_cloak_request_merges_extra_body_on_messages() {
+        let b = body(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi there user text"}],
+        }));
+        let extra = json!({"models": ["claude-opus-4-7"], "model": "pioneer/auto"});
+        let v = cloak_body(Some(&extra), &b, false);
+        // Additive `models` array present; `model` overridden; conversation intact.
+        assert_eq!(v["models"], json!(["claude-opus-4-7"]));
+        assert_eq!(v["model"], json!("pioneer/auto"));
+        assert!(v["messages"].is_array());
+    }
+
+    #[test]
+    fn build_cloak_request_skips_extra_body_on_count_tokens() {
+        let b = body(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        let extra = json!({"models": ["claude-opus-4-7"]});
+        let v = cloak_body(Some(&extra), &b, true);
+        assert!(
+            v.get("models").is_none(),
+            "count_tokens must not carry the extra body"
+        );
     }
 
     fn system_texts(body: &CreateMessageParams) -> Vec<String> {

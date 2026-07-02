@@ -156,6 +156,10 @@ pub struct ClaudeCodeState {
     /// attached on every ApiKey send after the reserved-name filter.
     /// `None` for non-ApiKey slots.
     pub api_key_extra_headers: Option<ApiKeyExtraHeaders>,
+    /// Optional JSON object shallow-merged over the outbound body on every
+    /// ApiKey `/v1/messages` send (not count_tokens). `None` for non-ApiKey
+    /// slots. Reserved keys (`messages`/`system`) are rejected at write time.
+    pub api_key_extra_body: Option<serde_json::Value>,
     /// Two-tier mimicry mode for the dispatched slot. `None` for Cookie/OAuth
     /// and for clean-passthrough api_key slots; `ThirdParty` routes the ApiKey
     /// send through the relay cloak (see `crate::mimicry::third_party`).
@@ -194,6 +198,7 @@ impl ClaudeCodeState {
             selected_account_id: None,
             api_key: None,
             api_key_extra_headers: None,
+            api_key_extra_body: None,
             mimicry_mode: MimicryMode::None,
             mimicry_config: None,
             inbound_session_id: None,
@@ -281,6 +286,7 @@ impl ClaudeCodeState {
                 state.endpoint = normalize_api_key_base_url(raw_base)?;
                 state.api_key = slot.api_key_secret.as_ref().map(|s| s.as_str().to_string());
                 state.api_key_extra_headers = slot.api_key_extra_headers.clone();
+                state.api_key_extra_body = slot.api_key_extra_body.clone();
                 state.mimicry_mode = slot.mimicry_mode;
                 state.mimicry_config = slot.mimicry_config.clone();
                 // Third-party cloak impersonates the CLI's Node/OpenSSL TLS
@@ -408,6 +414,7 @@ impl ClaudeCodeState {
                 self.endpoint = crate::config::ENDPOINT_URL.to_owned();
                 self.api_key = None;
                 self.api_key_extra_headers = None;
+                self.api_key_extra_body = None;
                 self.mimicry_mode = MimicryMode::None;
                 self.mimicry_config = None;
                 client_builder = client_builder
@@ -424,6 +431,7 @@ impl ClaudeCodeState {
                 self.endpoint = normalize_api_key_base_url(raw_base)?;
                 self.api_key = res.api_key_secret.as_ref().map(|s| s.as_str().to_string());
                 self.api_key_extra_headers = res.api_key_extra_headers.clone();
+                self.api_key_extra_body = res.api_key_extra_body.clone();
                 self.mimicry_mode = res.mimicry_mode;
                 self.mimicry_config = res.mimicry_config.clone();
                 // See `from_credential`: third-party cloak needs the CLI TLS

@@ -98,6 +98,11 @@ pub struct AccountResponse {
     /// secret itself, so the admin API echoes them for edit forms.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_extra_headers: Option<BTreeMap<String, String>>,
+    /// Per-account JSON object shallow-merged over the outbound request body on
+    /// ApiKey `/v1/messages` sends (e.g. Pioneer's `models: [...]` pool). Not
+    /// secret; echoed for edit forms.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_extra_body: Option<serde_json::Value>,
     /// Two-tier mimicry mode for an api_key channel (`none` | `third_party`).
     /// Always `none` for cookie/oauth.
     pub mimicry_mode: String,
@@ -189,6 +194,12 @@ fn map_account(row: &AccountWithRuntime, health: Option<AccountHealth>) -> Accou
             .as_deref()
             .and_then(|s| serde_json::from_str::<BTreeMap<String, String>>(s).ok())
             .filter(|headers| !headers.is_empty()),
+        api_key_extra_body: row
+            .api_key_extra_body
+            .as_deref()
+            .filter(|_| row.auth_source == "api_key")
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .filter(|v| v.as_object().is_some_and(|o| !o.is_empty())),
         mimicry_mode: row.mimicry_mode.clone(),
         mimicry_config: row
             .mimicry_config
@@ -242,6 +253,11 @@ pub struct CreateAccountRequest {
     /// preserve. On update they differ (see UpdateAccountRequest).
     #[serde(default)]
     pub api_key_extra_headers: Option<BTreeMap<String, String>>,
+    /// Optional JSON object shallow-merged over the outbound body. Must be a
+    /// JSON object; reserved keys (`messages`/`system`) are rejected. `Some({})`
+    /// / `None` both mean "no injection" on create.
+    #[serde(default)]
+    pub api_key_extra_body: Option<serde_json::Value>,
     /// Two-tier mimicry for an api_key channel: `"none"` (default clean
     /// passthrough) or `"third_party"` (relay cloak). Ignored for cookie/oauth.
     #[serde(default)]
@@ -279,6 +295,12 @@ pub struct UpdateAccountRequest {
     ///   - `Some(map)` non-empty → replace existing headers
     #[serde(default)]
     pub api_key_extra_headers: Option<BTreeMap<String, String>>,
+    /// Tri-state, mirroring `api_key_extra_headers`:
+    ///   - `None` / omitted → keep existing body injection
+    ///   - `Some({})` → explicit clear (NULL the column)
+    ///   - `Some(object)` non-empty → replace. Must be a JSON object.
+    #[serde(default)]
+    pub api_key_extra_body: Option<serde_json::Value>,
     /// `None` keeps the existing mode; `Some("none"|"third_party")` sets it.
     #[serde(default)]
     pub mimicry_mode: Option<String>,
@@ -431,6 +453,49 @@ fn extra_headers_to_db(map: &BTreeMap<String, String>) -> Option<String> {
     }
 }
 
+/// Validate a caller-supplied `api_key_extra_body` value. It must be a JSON
+/// object whose top-level keys are neither empty nor reserved
+/// (`crate::mimicry::is_reserved_api_key_extra_body_key` — `messages`/`system`,
+/// shared with the send-side merge). An empty object is allowed (means "clear").
+///
+/// Primary user-facing guard; the send-time merge repeats the reserved-key skip
+/// as defense in depth for a manual DB edit that bypasses validation.
+fn validate_api_key_extra_body(value: &serde_json::Value) -> Result<(), ClewdrError> {
+    let Some(obj) = value.as_object() else {
+        return Err(ClewdrError::BadRequest {
+            msg: "api_key_extra_body must be a JSON object",
+        });
+    };
+    for key in obj.keys() {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            return Err(ClewdrError::BadRequest {
+                msg: "api_key_extra_body contains an empty key",
+            });
+        }
+        if crate::mimicry::is_reserved_api_key_extra_body_key(trimmed) {
+            return Err(ClewdrError::BadRequestMessage {
+                msg: format!(
+                    "api_key_extra_body key '{trimmed}' is reserved (it carries the conversation and is rewritten by the cloak; overriding it would corrupt the request)"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Serialize an extra-body value to the JSON string stored in the
+/// `accounts.api_key_extra_body` column. Returns `None` for a non-object or an
+/// empty object (column should be NULL, not `"{}"`, so the loader agrees).
+fn extra_body_to_db(value: &serde_json::Value) -> Option<String> {
+    match value.as_object() {
+        Some(obj) if !obj.is_empty() => {
+            Some(serde_json::to_string(value).expect("Value serialization is infallible"))
+        }
+        _ => None,
+    }
+}
+
 /// Validate a third-party cloak config supplied by the admin.
 fn validate_third_party_config(cfg: &ThirdPartyMimicryConfig) -> Result<(), ClewdrError> {
     if cfg.extra_beta.iter().any(|t| t.trim().is_empty()) {
@@ -531,9 +596,11 @@ pub async fn create(
     let raw_api_key_base_url = normalize_optional(req.api_key_base_url);
     let raw_api_key_secret = normalize_optional(req.api_key_secret);
     let api_key_extra_headers_payload = req.api_key_extra_headers;
+    let api_key_extra_body_payload = req.api_key_extra_body;
     let submitting_api_key = raw_api_key_base_url.is_some()
         || raw_api_key_secret.is_some()
-        || api_key_extra_headers_payload.is_some();
+        || api_key_extra_headers_payload.is_some()
+        || api_key_extra_body_payload.is_some();
 
     let api_key_base_url_normalized: Option<String> = match raw_api_key_base_url.as_deref() {
         Some(raw) => Some(normalize_api_key_base_url(raw)?.as_str().to_string()),
@@ -545,6 +612,12 @@ pub async fn create(
     let api_key_extra_headers_json: Option<String> = api_key_extra_headers_payload
         .as_ref()
         .and_then(extra_headers_to_db);
+    if let Some(ref value) = api_key_extra_body_payload {
+        validate_api_key_extra_body(value)?;
+    }
+    let api_key_extra_body_json: Option<String> = api_key_extra_body_payload
+        .as_ref()
+        .and_then(extra_body_to_db);
 
     let submitted_count = cookie_blob.is_some() as u8
         + oauth_callback_input.is_some() as u8
@@ -631,8 +704,8 @@ pub async fn create(
             rate_limit_tier, subscription_created_at, billing_type,
             drain_first,
             api_key_base_url, api_key_secret, api_key_extra_headers,
-            mimicry_mode, mimicry_config
-        ) VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+            mimicry_mode, mimicry_config, api_key_extra_body
+        ) VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
     )
     .bind(&req.name)
     .bind(rr_order)
@@ -677,6 +750,7 @@ pub async fn create(
     .bind(api_key_extra_headers_json.as_deref())
     .bind(mimicry_mode_db)
     .bind(mimicry_config_json.as_deref())
+    .bind(api_key_extra_body_json.as_deref())
     .execute(&mut *tx)
     .await
     .map_err(|e| {
@@ -747,6 +821,7 @@ pub async fn update(
     let raw_new_api_key_base_url = normalize_optional(req.api_key_base_url.clone());
     let raw_new_api_key_secret = normalize_optional(req.api_key_secret.clone());
     let api_key_extra_headers_payload = req.api_key_extra_headers.clone();
+    let api_key_extra_body_payload = req.api_key_extra_body.clone();
     let new_api_key_base_url_normalized: Option<String> = match raw_new_api_key_base_url.as_deref()
     {
         Some(raw) => Some(normalize_api_key_base_url(raw)?.as_str().to_string()),
@@ -755,9 +830,13 @@ pub async fn update(
     if let Some(ref map) = api_key_extra_headers_payload {
         validate_api_key_extra_headers(map)?;
     }
+    if let Some(ref value) = api_key_extra_body_payload {
+        validate_api_key_extra_body(value)?;
+    }
     let submitting_api_key = raw_new_api_key_base_url.is_some()
         || raw_new_api_key_secret.is_some()
-        || api_key_extra_headers_payload.is_some();
+        || api_key_extra_headers_payload.is_some()
+        || api_key_extra_body_payload.is_some();
 
     let submitted_count = new_cookie_blob.is_some() as u8
         + oauth_callback_input.is_some() as u8
@@ -906,6 +985,7 @@ pub async fn update(
                  api_key_base_url = NULL,
                  api_key_secret = NULL,
                  api_key_extra_headers = NULL,
+                 api_key_extra_body = NULL,
                  mimicry_mode = 'none',
                  mimicry_config = NULL,
                  auth_source = 'cookie',
@@ -936,6 +1016,7 @@ pub async fn update(
                  api_key_base_url = NULL,
                  api_key_secret = NULL,
                  api_key_extra_headers = NULL,
+                 api_key_extra_body = NULL,
                  mimicry_mode = 'none',
                  mimicry_config = NULL,
                  auth_source = 'oauth',
@@ -1003,6 +1084,15 @@ pub async fn update(
             Some(map) => extra_headers_to_db(&map),
         };
 
+        // extra_body tri-state, mirroring extra_headers:
+        //   - None / omitted → keep existing JSON column unchanged
+        //   - Some({}) / non-object → explicit clear (NULL the column)
+        //   - Some(object) non-empty → replace with serialized JSON
+        let final_extra_body_sql: Option<String> = match api_key_extra_body_payload {
+            None => existing.api_key_extra_body.clone(),
+            Some(value) => extra_body_to_db(&value),
+        };
+
         sqlx::query(
             "UPDATE accounts
              SET cookie_blob = NULL,
@@ -1019,17 +1109,19 @@ pub async fn update(
                  api_key_base_url = ?1,
                  api_key_secret = ?2,
                  api_key_extra_headers = ?3,
+                 api_key_extra_body = ?4,
                  auth_source = 'api_key',
                  status = 'active',
                  invalid_reason = NULL,
                  last_error = NULL,
                  last_failure_json = NULL,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?4",
+             WHERE id = ?5",
         )
         .bind(final_base_url)
         .bind(final_secret)
         .bind(final_extra_headers_sql)
+        .bind(final_extra_body_sql)
         .bind(id)
         .execute(&mut *tx)
         .await?;
@@ -1355,7 +1447,15 @@ async fn test_account_api_key(
         .and_then(|s| serde_json::from_str::<BTreeMap<String, String>>(s).ok())
         .unwrap_or_default();
 
-    let body = serde_json::json!({
+    // Parity: apply the account's per-account body injection to the probe too,
+    // so a `models: [...]`-style routing override is exercised byte-for-byte.
+    let extra_body: Option<serde_json::Value> = account
+        .api_key_extra_body
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .filter(|v| v.as_object().is_some_and(|o| !o.is_empty()));
+
+    let mut body = serde_json::json!({
         "model": TEST_ACCOUNT_MODEL,
         "max_tokens": 10,
         "messages": [{"role": "user", "content": "reply with ok only"}],
@@ -1385,6 +1485,7 @@ async fn test_account_api_key(
             secret,
             &cfg,
             &extras,
+            extra_body.as_ref(),
             &params,
             false,
         )?;
@@ -1402,6 +1503,9 @@ async fn test_account_api_key(
                 continue;
             }
             req = req.header(k.as_str(), v.as_str());
+        }
+        if let Some(extra) = extra_body.as_ref() {
+            crate::mimicry::merge_extra_body(&mut body, extra);
         }
         req.json(&body).send().await.context(WreqSnafu {
             msg: "test request failed",
@@ -2056,6 +2160,56 @@ mod tests {
         let serialized = extra_headers_to_db(&map).expect("non-empty map serializes");
         // BTreeMap iteration is key-sorted, so the JSON output is stable.
         assert_eq!(serialized, r#"{"a":"2","z":"1"}"#);
+    }
+
+    #[test]
+    fn validate_api_key_extra_body_accepts_object_and_routing_keys() {
+        // The Pioneer use case: add a `models` pool and override `model`.
+        let value = serde_json::json!({
+            "models": ["claude-opus-4-7"],
+            "model": "pioneer/auto",
+            "stream": true,
+        });
+        assert!(validate_api_key_extra_body(&value).is_ok());
+        // Empty object is fine (means "clear").
+        assert!(validate_api_key_extra_body(&serde_json::json!({})).is_ok());
+    }
+
+    #[test]
+    fn validate_api_key_extra_body_rejects_non_object() {
+        for value in [
+            serde_json::json!(["claude-opus-4-7"]),
+            serde_json::json!("model"),
+            serde_json::json!(42),
+            serde_json::json!(null),
+        ] {
+            let err = validate_api_key_extra_body(&value).unwrap_err();
+            assert!(matches!(err, ClewdrError::BadRequest { .. }));
+        }
+    }
+
+    #[test]
+    fn validate_api_key_extra_body_rejects_reserved_and_empty_keys() {
+        for reserved in ["messages", "system", "System", "MESSAGES"] {
+            let value = serde_json::json!({ reserved: "x" });
+            let err = validate_api_key_extra_body(&value).unwrap_err();
+            assert!(matches!(
+                err,
+                ClewdrError::BadRequestMessage { .. } | ClewdrError::BadRequest { .. }
+            ));
+        }
+        let err = validate_api_key_extra_body(&serde_json::json!({ "  ": "x" })).unwrap_err();
+        assert!(matches!(err, ClewdrError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn extra_body_to_db_returns_none_for_empty_or_non_object() {
+        assert_eq!(extra_body_to_db(&serde_json::json!({})), None);
+        assert_eq!(extra_body_to_db(&serde_json::json!([1, 2])), None);
+        assert_eq!(extra_body_to_db(&serde_json::json!("x")), None);
+        let out = extra_body_to_db(&serde_json::json!({"models": ["claude-opus-4-7"]}))
+            .expect("non-empty object serializes");
+        assert_eq!(out, r#"{"models":["claude-opus-4-7"]}"#);
     }
 
     #[test]

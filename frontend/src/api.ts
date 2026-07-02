@@ -215,6 +215,8 @@ export interface Account {
   api_key_base_url?: string | null;
   /** Admin-configured extra headers attached to ApiKey sends. */
   api_key_extra_headers?: Record<string, string> | null;
+  /** Admin-configured JSON object shallow-merged over the ApiKey request body. */
+  api_key_extra_body?: Record<string, unknown> | null;
   /** Two-tier mimicry mode (api_key only). `none` for cookie/oauth. */
   mimicry_mode: "none" | "third_party";
   /** Third-party cloak config; present only for a `third_party` channel. */
@@ -581,6 +583,7 @@ export const createAccount = (data: {
   api_key_base_url?: string;
   api_key_secret?: string;
   api_key_extra_headers?: Record<string, string>;
+  api_key_extra_body?: Record<string, unknown>;
   /** Two-tier mimicry (api_key only). */
   mimicry_mode?: "none" | "third_party";
   mimicry_config?: MimicryConfig;

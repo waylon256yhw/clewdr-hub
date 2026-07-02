@@ -62,3 +62,83 @@ pub(crate) fn is_reserved_api_key_extra_header(name: &str) -> bool {
         .iter()
         .any(|reserved| reserved.eq_ignore_ascii_case(name))
 }
+
+/// Top-level body keys that per-account `api_key_extra_body` MUST NOT override.
+/// `messages` and `system` carry the actual conversation and are rewritten in
+/// place by the third-party cloak (`cloak_messages_body`) — overriding them
+/// corrupts the request with no legitimate use. Every other key (incl. `model`,
+/// `models`, `stream`, `metadata`, sampling params) is allowed: model routing is
+/// exactly the intended use (e.g. Pioneer's `models: [...]` candidate pool).
+///
+/// Admin write-time validation is the primary guardrail; the send-time merge
+/// repeats the skip as defense in depth for a manual DB edit.
+const API_KEY_RESERVED_EXTRA_BODY_KEYS: &[&str] = &["messages", "system"];
+
+pub(crate) fn is_reserved_api_key_extra_body_key(name: &str) -> bool {
+    API_KEY_RESERVED_EXTRA_BODY_KEYS
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(name))
+}
+
+/// Shallow-merge the `extra` JSON object over `base` (also expected to be a JSON
+/// object), overwriting same-named top-level keys and adding new ones. Reserved
+/// keys (see [`is_reserved_api_key_extra_body_key`]) are skipped. No-op if either
+/// side is not a JSON object.
+pub(crate) fn merge_extra_body(base: &mut serde_json::Value, extra: &serde_json::Value) {
+    let (Some(base_obj), Some(extra_obj)) = (base.as_object_mut(), extra.as_object()) else {
+        return;
+    };
+    for (k, v) in extra_obj {
+        if is_reserved_api_key_extra_body_key(k) {
+            continue;
+        }
+        base_obj.insert(k.clone(), v.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn merge_extra_body_adds_and_overrides_non_reserved_keys() {
+        let mut base = json!({ "model": "pioneer/auto", "max_tokens": 10 });
+        let extra = json!({ "models": ["claude-opus-4-7"], "model": "override", "stream": true });
+        merge_extra_body(&mut base, &extra);
+        assert_eq!(base["models"], json!(["claude-opus-4-7"])); // additive
+        assert_eq!(base["model"], json!("override")); // overridden
+        assert_eq!(base["stream"], json!(true)); // added
+        assert_eq!(base["max_tokens"], json!(10)); // untouched
+    }
+
+    #[test]
+    fn merge_extra_body_skips_reserved_keys_case_insensitive() {
+        let mut base = json!({ "messages": ["real"], "system": "real" });
+        let extra = json!({ "messages": ["fake"], "System": "fake", "models": ["m"] });
+        merge_extra_body(&mut base, &extra);
+        assert_eq!(base["messages"], json!(["real"])); // reserved, not overridden
+        assert_eq!(base["system"], json!("real")); // reserved, not overridden
+        assert_eq!(base["models"], json!(["m"])); // non-reserved still merged
+    }
+
+    #[test]
+    fn merge_extra_body_noop_when_either_side_not_object() {
+        let mut base = json!(["not", "an", "object"]);
+        merge_extra_body(&mut base, &json!({ "models": ["m"] }));
+        assert_eq!(base, json!(["not", "an", "object"]));
+
+        let mut base = json!({ "model": "x" });
+        merge_extra_body(&mut base, &json!(["not", "an", "object"]));
+        assert_eq!(base, json!({ "model": "x" }));
+    }
+
+    #[test]
+    fn reserved_body_key_predicate_matches_only_messages_and_system() {
+        assert!(is_reserved_api_key_extra_body_key("messages"));
+        assert!(is_reserved_api_key_extra_body_key("SYSTEM"));
+        assert!(!is_reserved_api_key_extra_body_key("model"));
+        assert!(!is_reserved_api_key_extra_body_key("models"));
+        assert!(!is_reserved_api_key_extra_body_key("stream"));
+    }
+}

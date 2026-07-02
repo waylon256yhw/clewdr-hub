@@ -283,6 +283,12 @@ pub struct AccountSlot {
     pub api_key_secret: Option<ApiKeySecret>,
     #[serde(default, skip_serializing)]
     pub api_key_extra_headers: Option<ApiKeyExtraHeaders>,
+    // Optional JSON object shallow-merged over the outbound request body just
+    // before send (api_key channels, `/v1/messages` only). Not secret-bearing
+    // (values are routing params like `models: [...]`), so it is serialized
+    // normally; `#[serde(default)]` keeps pre-existing snapshots deserializing.
+    #[serde(default)]
+    pub api_key_extra_body: Option<serde_json::Value>,
     // Two-tier mimicry. `mimicry_mode` is always `None` for cookie/oauth slots
     // (CHECK-enforced); on API-key channels it selects the clean passthrough
     // (`None`) or the third-party relay cloak (`ThirdParty`). `mimicry_config`
@@ -352,6 +358,7 @@ impl AccountSlot {
             api_key_base_url: None,
             api_key_secret: None,
             api_key_extra_headers: None,
+            api_key_extra_body: None,
             mimicry_mode: MimicryMode::None,
             mimicry_config: None,
         })
@@ -404,6 +411,7 @@ impl AccountSlot {
         base_url: String,
         secret: ApiKeySecret,
         extra_headers: Option<ApiKeyExtraHeaders>,
+        extra_body: Option<serde_json::Value>,
         mimicry_mode: MimicryMode,
         mimicry_config: Option<ThirdPartyMimicryConfig>,
     ) -> Self {
@@ -414,6 +422,7 @@ impl AccountSlot {
             api_key_base_url: Some(base_url),
             api_key_secret: Some(secret),
             api_key_extra_headers: extra_headers,
+            api_key_extra_body: extra_body,
             mimicry_mode,
             mimicry_config,
             ..Self::default()
@@ -917,6 +926,7 @@ mod tests {
             "https://api.anthropic.com/".to_string(),
             ApiKeySecret::new("sk-ant-test-xyz"),
             None,
+            None,
             MimicryMode::None,
             None,
         );
@@ -997,6 +1007,7 @@ mod tests {
             "https://api.anthropic.com/".to_string(),
             ApiKeySecret::new("sk-ant-should-not-appear"),
             Some(ApiKeyExtraHeaders::new(headers)),
+            None,
             MimicryMode::None,
             None,
         );

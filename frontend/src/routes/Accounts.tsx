@@ -341,6 +341,39 @@ function apiKeyExtraHeaderRows(account: Account | null): Array<{ key: string; va
   return Object.entries(account?.api_key_extra_headers ?? {}).map(([key, value]) => ({ key, value }));
 }
 
+/** Seed the raw-JSON textarea from an account's stored extra body (pretty-printed). */
+function apiKeyExtraBodyText(account: Account | null): string {
+  const body = account?.api_key_extra_body;
+  if (!body || Object.keys(body).length === 0) return "";
+  return JSON.stringify(body, null, 2);
+}
+
+/**
+ * Parse the raw-JSON body textarea into an object, or throw a 400 ApiError.
+ * Empty text → `{}` (clear). Must be a JSON object (not array/primitive) and
+ * must not override the reserved keys the backend rejects.
+ */
+function parseApiKeyExtraBody(text: string): Record<string, unknown> {
+  const trimmed = text.trim();
+  if (!trimmed) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    throw new ApiError(400, "额外请求体必须是合法 JSON");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new ApiError(400, "额外请求体必须是 JSON 对象");
+  }
+  const reserved = ["messages", "system"];
+  for (const key of Object.keys(parsed)) {
+    if (reserved.includes(key.trim().toLowerCase())) {
+      throw new ApiError(400, `额外请求体不能覆盖保留字段 “${key}”`);
+    }
+  }
+  return parsed as Record<string, unknown>;
+}
+
 /** Seed the mimicry form fields from an account (defaults for a new channel). */
 function mimicryInitialValues(account: Account | null) {
   const cfg = account?.mimicry_config ?? null;
@@ -601,6 +634,12 @@ interface FormValues {
    * `Some({})` explicitly clears server-side extras.
    */
   api_key_extra_headers: Array<{ key: string; value: string }>;
+  /**
+   * Raw JSON object (as text) shallow-merged over the ApiKey request body,
+   * e.g. `{"models": ["claude-opus-4-7"]}`. Validated for JSON-object validity
+   * on submit only. Empty string means "no injection" / clear.
+   */
+  api_key_extra_body: string;
   /** Two-tier mimicry mode (api_key only). */
   mimicry_mode: "none" | "third_party";
   /** Auth header form for the third-party cloak. */
@@ -636,11 +675,14 @@ function ApiKeyTabPanel({
   form,
   editing,
   markExtrasDirty,
+  markBodyDirty,
 }: {
   form: UseFormReturnType<FormValues>;
   editing: Account | null;
   /** Marks the KV list as changed so edit submit can send replace/clear. */
   markExtrasDirty: () => void;
+  /** Marks the raw-JSON body as changed so edit submit can send replace/clear. */
+  markBodyDirty: () => void;
 }) {
   const rows = form.getValues().api_key_extra_headers;
   // Sealed view by default when editing an account that already has
@@ -657,6 +699,7 @@ function ApiKeyTabPanel({
   const [mVer, setMVer] = useState(initial.mimicry_cli_version);
   const [mStrict, setMStrict] = useState(initial.mimicry_strict_system);
   const [mBeta, setMBeta] = useState(initial.mimicry_extra_beta);
+  const [extraBodyText, setExtraBodyText] = useState(initial.api_key_extra_body);
   const addRow = () => {
     form.setFieldValue("api_key_extra_headers", [
       ...form.getValues().api_key_extra_headers,
@@ -771,6 +814,26 @@ function ApiKeyTabPanel({
         )}
       </Stack>
 
+      <Textarea
+        label="额外请求体 JSON（可选）"
+        description={
+          '浅合并进出站请求体（仅 /v1/messages）。必须是 JSON 对象；键 messages / system 不可覆盖。' +
+          '例：{"models": ["claude-opus-4-7"]}'
+        }
+        placeholder={'{\n  "models": ["claude-opus-4-7"]\n}'}
+        autosize
+        minRows={3}
+        maxRows={12}
+        styles={{ input: { fontFamily: "var(--mantine-font-family-monospace)" } }}
+        value={extraBodyText}
+        onChange={(e) => {
+          const v = e.currentTarget.value;
+          setExtraBodyText(v);
+          form.setFieldValue("api_key_extra_body", v);
+          markBodyDirty();
+        }}
+      />
+
       <Divider label="中转伪装 (Mimicry)" labelPosition="left" />
       <Stack gap="xs">
         <SegmentedControl
@@ -867,6 +930,8 @@ function AccountFormModal({
   // omitted = keep, {} = clear, map = replace. Track whether the
   // admin touched the KV list so ordinary edits don't rewrite it.
   const [extraHeadersDirty, setExtraHeadersDirty] = useState(false);
+  // Same tri-state contract as extra headers for the raw-JSON body field.
+  const [extraBodyDirty, setExtraBodyDirty] = useState(false);
   const form = useForm<FormValues>({
     mode: "uncontrolled",
     initialValues: {
@@ -880,6 +945,7 @@ function AccountFormModal({
       api_key_base_url: editing?.api_key_base_url ?? "",
       api_key_secret: "",
       api_key_extra_headers: apiKeyExtraHeaderRows(editing),
+      api_key_extra_body: apiKeyExtraBodyText(editing),
       ...mimicryInitialValues(editing),
     },
   });
@@ -899,6 +965,7 @@ function AccountFormModal({
     setAuthUrl("");
     setOauthState("");
     setExtraHeadersDirty(false);
+    setExtraBodyDirty(false);
     form.setValues({
       name: editing?.name ?? "",
       rr_order: editing?.rr_order ?? 0,
@@ -910,6 +977,7 @@ function AccountFormModal({
       api_key_base_url: editing?.api_key_base_url ?? "",
       api_key_secret: "",
       api_key_extra_headers: apiKeyExtraHeaderRows(editing),
+      api_key_extra_body: apiKeyExtraBodyText(editing),
       ...mimicryInitialValues(editing),
     });
   }, [editing]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -952,6 +1020,10 @@ function AccountFormModal({
                 .filter(([k]) => k.length > 0),
             )
           : undefined;
+      // Raw-JSON body injection. Validated for JSON-object validity here (throws
+      // a 400 on bad input); `{}` means "no injection" / clear.
+      const apiKeyExtraBodyObj: Record<string, unknown> | undefined =
+        tab === "api_key" ? parseApiKeyExtraBody(values.api_key_extra_body) : undefined;
 
       if (!name) throw new ApiError(400, "名称必填");
       if (!editing && tab === "cookie" && !cookieBlob) throw new ApiError(400, "新账号必须提供 Cookie");
@@ -1011,6 +1083,11 @@ function AccountFormModal({
           if (extraHeadersDirty && apiKeyExtraHeadersObj !== undefined) {
             body.api_key_extra_headers = apiKeyExtraHeadersObj;
           }
+          // Same tri-state as headers: forward only after the textarea was
+          // touched. Empty text → `{}` explicitly clears the stored body.
+          if (extraBodyDirty && apiKeyExtraBodyObj !== undefined) {
+            body.api_key_extra_body = apiKeyExtraBodyObj;
+          }
           // Always forward the mimicry mode on the api_key tab (backend runs
           // its mimicry update only when the field is present, and treats it
           // idempotently). Config rides along only for a third_party channel.
@@ -1033,6 +1110,10 @@ function AccountFormModal({
         api_key_extra_headers:
           apiKeyExtraHeadersObj && Object.keys(apiKeyExtraHeadersObj).length > 0
             ? apiKeyExtraHeadersObj
+            : undefined,
+        api_key_extra_body:
+          apiKeyExtraBodyObj && Object.keys(apiKeyExtraBodyObj).length > 0
+            ? apiKeyExtraBodyObj
             : undefined,
         mimicry_mode: mimicryMode,
         mimicry_config: mimicryConfig,
@@ -1096,6 +1177,8 @@ function AccountFormModal({
                 form.setFieldValue("api_key_secret", "");
                 form.setFieldValue("api_key_extra_headers", []);
                 setExtraHeadersDirty(false);
+                form.setFieldValue("api_key_extra_body", "");
+                setExtraBodyDirty(false);
               }
             }}
           >
@@ -1160,6 +1243,7 @@ function AccountFormModal({
                 form={form}
                 editing={editing}
                 markExtrasDirty={() => setExtraHeadersDirty(true)}
+                markBodyDirty={() => setExtraBodyDirty(true)}
               />
             </Tabs.Panel>
           </Tabs>

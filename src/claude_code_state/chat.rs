@@ -885,8 +885,25 @@ impl ClaudeCodeState {
             }
         }
 
-        req.json(&body)
-            .send()
+        // Per-account body injection (e.g. Pioneer's `models: [...]` pool),
+        // shallow-merged over the serialized body. Only on `/v1/messages` —
+        // the count_tokens endpoint rejects extra top-level inputs. Reserved
+        // keys (`messages`/`system`) are skipped by `merge_extra_body`.
+        let req = match self
+            .api_key_extra_body
+            .as_ref()
+            .filter(|_| !path.ends_with("count_tokens"))
+        {
+            Some(extra) => {
+                let mut value = serde_json::to_value(&body)?;
+                crate::mimicry::merge_extra_body(&mut value, extra);
+                req.header("content-type", "application/json")
+                    .body(serde_json::to_vec(&value)?)
+            }
+            None => req.json(&body),
+        };
+
+        req.send()
             .await
             .context(WreqSnafu { msg: error_context })?
             .check_claude()
@@ -922,6 +939,7 @@ impl ClaudeCodeState {
             self.api_key.as_deref().unwrap_or(""),
             &cfg,
             extra_headers,
+            self.api_key_extra_body.as_ref(),
             body,
             is_count_tokens,
         )?;
