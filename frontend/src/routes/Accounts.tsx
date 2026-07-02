@@ -781,12 +781,9 @@ function ApiKeyTabPanel({
           }}
           data={[
             { label: "关闭", value: "none" },
-            { label: "Claude Code 中转伪装", value: "third_party" },
+            { label: "Claude Cloak", value: "third_party" },
           ]}
         />
-        <Text size="xs" c="dimmed">
-          开启后本渠道请求会被塑造成 Claude Code CLI 形态（伪装 UA、system 身份、billing 头、动态 beta、stainless 头、TLS 指纹），用于通过中转站的请求校验。直连官方 / AWS 兼容端点无需开启。
-        </Text>
         {mMode === "third_party" && (
           <Stack gap="sm" pl="xs">
             <div>
