@@ -21,6 +21,7 @@ sidebar:
 - **基础 URL**：例如 `https://api.anthropic.com/` 或自定义 Anthropic-compatible endpoint；服务端会规范化后拼接 `/v1/messages`、`/v1/messages/count_tokens`。
 - **API 密钥**：通过 `x-api-key` 发送；编辑账号时留空表示保留原值。
 - **额外请求头**：用于工作区、租户或自定义路由信息，例如 `anthropic-workspace-id`。这些值会在管理员账号编辑页回显，方便维护；导出 `--no-secrets` 和运行日志仍会避免泄露 API key 与 header 值。
+- **中转伪装 (Mimicry)**：可选。指向**中转站**且对方会前置校验请求形态时，开启 [Claude Cloak](../claude-cloak/) 把请求塑造成 Claude Code CLI；直连官方 / 云厂商端点保持**关闭**。
 
 :::note
 API Key 账号不会显示 5h / 7d 订阅用量窗口，也不会参与全量订阅探测。请求日志、用户配额、计费统计、OpenAI 兼容入口仍走同一套链路。
