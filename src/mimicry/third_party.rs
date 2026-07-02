@@ -196,18 +196,8 @@ pub(crate) fn build_cloak_request(
     let user_agent = format!("claude-cli/{cli_version} (external, cli)");
 
     // Extra body is applied only on the messages path; count_tokens leaves the
-    // body (and therefore the effective model/stream) untouched.
+    // body untouched (the endpoint rejects extra top-level inputs).
     let applied_extra = extra_body.filter(|_| !is_count_tokens);
-    let eff_model = applied_extra
-        .and_then(|e| e.get("model"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(body.model.as_str());
-    let eff_stream = applied_extra
-        .and_then(|e| e.get("stream"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or_else(|| body.stream.unwrap_or(false));
-    let stream = eff_stream;
-    let beta = synth_beta(eff_model, body, &cfg.extra_beta);
 
     let mut send_body = body.clone();
     let session_id = if is_count_tokens {
@@ -221,12 +211,27 @@ pub(crate) fn build_cloak_request(
             cfg.strict_system,
         )
     };
-    let bytes = if let Some(extra) = applied_extra {
+
+    // Serialize the (cloaked) body, then shallow-merge the per-account extra
+    // body. Header-affecting values (model, stream, the beta feature gates) are
+    // re-derived from the MERGED body so a legitimate override of any known
+    // field stays in sync with the wire — unknown keys like `models` are dropped
+    // by this reparse but do not drive any header. Reserved keys
+    // (messages/system/stream/metadata) are skipped by `merge_extra_body`, so
+    // the cloak-owned conversation, streaming mode, and billing metadata survive.
+    let (bytes, stream, beta) = if let Some(extra) = applied_extra {
         let mut value = serde_json::to_value(&send_body)?;
         crate::mimicry::merge_extra_body(&mut value, extra);
-        serde_json::to_vec(&value)?
+        let bytes = serde_json::to_vec(&value)?;
+        let effective: CreateMessageParams =
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| send_body.clone());
+        let stream = effective.stream.unwrap_or(false);
+        let beta = synth_beta(&effective.model, &effective, &cfg.extra_beta);
+        (bytes, stream, beta)
     } else {
-        serde_json::to_vec(&send_body)?
+        let stream = send_body.stream.unwrap_or(false);
+        let beta = synth_beta(&send_body.model, &send_body, &cfg.extra_beta);
+        (serde_json::to_vec(&send_body)?, stream, beta)
     };
 
     let mut req = client.post(url.to_string());
@@ -438,8 +443,13 @@ mod tests {
             .get_or_init(|| Arc::new(ArcSwap::from_pointee(ThirdPartyCloakProfile::default())));
     }
 
-    /// Build a cloak request and return its serialized JSON body.
-    fn cloak_body(extra: Option<&Value>, b: &CreateMessageParams, is_count_tokens: bool) -> Value {
+    /// Build a cloak request and return its serialized JSON body plus the
+    /// `anthropic-beta` header value (empty string if absent).
+    fn cloak_parts(
+        extra: Option<&Value>,
+        b: &CreateMessageParams,
+        is_count_tokens: bool,
+    ) -> (Value, String) {
         ensure_profile();
         let client = wreq::Client::new();
         let url = url::Url::parse("https://relay.example/v1/messages?beta=true").unwrap();
@@ -457,11 +467,22 @@ mod tests {
         )
         .expect("cloak request builds");
         let built = req.build().expect("request finalizes");
+        let beta = built
+            .headers()
+            .get("anthropic-beta")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         let bytes = built
             .body()
             .and_then(|body| body.as_bytes())
             .expect("in-memory body");
-        serde_json::from_slice(bytes).expect("body is JSON")
+        (serde_json::from_slice(bytes).expect("body is JSON"), beta)
+    }
+
+    /// Build a cloak request and return its serialized JSON body.
+    fn cloak_body(extra: Option<&Value>, b: &CreateMessageParams, is_count_tokens: bool) -> Value {
+        cloak_parts(extra, b, is_count_tokens).0
     }
 
     #[test]
@@ -477,6 +498,54 @@ mod tests {
         assert_eq!(v["models"], json!(["claude-opus-4-7"]));
         assert_eq!(v["model"], json!("pioneer/auto"));
         assert!(v["messages"].is_array());
+    }
+
+    #[test]
+    fn build_cloak_request_beta_header_tracks_extra_body_override() {
+        // Overriding a beta-gating field via extra_body must be reflected in the
+        // synthesized anthropic-beta header (derived from the MERGED body), not
+        // silently dropped.
+        let b = body(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi there user text"}],
+        }));
+        // Baseline: no structured-outputs gate.
+        let (_, beta0) = cloak_parts(None, &b, false);
+        assert!(!beta0.contains("structured-outputs-2025-12-15"));
+        // Inject output_format via extra_body → the gate must appear in the header.
+        let extra = json!({"output_format": {"type": "json_schema", "schema": {}}});
+        let (v, beta1) = cloak_parts(Some(&extra), &b, false);
+        assert_eq!(v["output_format"]["type"], json!("json_schema"));
+        assert!(
+            beta1.contains("structured-outputs-2025-12-15"),
+            "beta header must reflect the merged output_format, got: {beta1}"
+        );
+    }
+
+    #[test]
+    fn build_cloak_request_reserved_keys_never_reach_wire() {
+        let b = body(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 10,
+            "stream": false,
+            "messages": [{"role": "user", "content": "hi there user text"}],
+        }));
+        // stream (response-decode driver) and metadata (cloak-owned) must be
+        // dropped from the merged body; models still merges.
+        let extra = json!({
+            "stream": true,
+            "metadata": {"user_id": "attacker"},
+            "models": ["claude-opus-4-7"],
+        });
+        let v = cloak_body(Some(&extra), &b, false);
+        assert_eq!(v["stream"], json!(false), "stream override must be dropped");
+        assert_ne!(
+            v["metadata"]["user_id"],
+            json!("attacker"),
+            "metadata override must not replace the cloak-set user_id"
+        );
+        assert_eq!(v["models"], json!(["claude-opus-4-7"]));
     }
 
     #[test]

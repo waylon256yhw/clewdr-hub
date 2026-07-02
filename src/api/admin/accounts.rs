@@ -2168,7 +2168,6 @@ mod tests {
         let value = serde_json::json!({
             "models": ["claude-opus-4-7"],
             "model": "pioneer/auto",
-            "stream": true,
         });
         assert!(validate_api_key_extra_body(&value).is_ok());
         // Empty object is fine (means "clear").
@@ -2190,7 +2189,9 @@ mod tests {
 
     #[test]
     fn validate_api_key_extra_body_rejects_reserved_and_empty_keys() {
-        for reserved in ["messages", "system", "System", "MESSAGES"] {
+        for reserved in [
+            "messages", "system", "System", "MESSAGES", "stream", "STREAM", "metadata", "Metadata",
+        ] {
             let value = serde_json::json!({ reserved: "x" });
             let err = validate_api_key_extra_body(&value).unwrap_err();
             assert!(matches!(

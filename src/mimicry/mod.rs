@@ -63,16 +63,24 @@ pub(crate) fn is_reserved_api_key_extra_header(name: &str) -> bool {
         .any(|reserved| reserved.eq_ignore_ascii_case(name))
 }
 
-/// Top-level body keys that per-account `api_key_extra_body` MUST NOT override.
-/// `messages` and `system` carry the actual conversation and are rewritten in
-/// place by the third-party cloak (`cloak_messages_body`) — overriding them
-/// corrupts the request with no legitimate use. Every other key (incl. `model`,
-/// `models`, `stream`, `metadata`, sampling params) is allowed: model routing is
-/// exactly the intended use (e.g. Pioneer's `models: [...]` candidate pool).
+/// Top-level body keys that per-account `api_key_extra_body` MUST NOT override:
+/// - `messages` / `system` carry the actual conversation and are rewritten in
+///   place by the third-party cloak (`cloak_messages_body`).
+/// - `stream` drives clewdr's own response decoding (`self.stream`, set from the
+///   inbound request); letting the wire diverge makes clewdr parse an SSE stream
+///   as a single JSON body (or vice-versa) → hung/garbled responses.
+/// - `metadata` is cloak-owned: `cloak_messages_body` writes `metadata.user_id`
+///   and derives the `x-claude-code-session-id` header from it, so an override
+///   would desync the session header / relay billing.
+///
+/// Everything else (incl. `model`, `models`, sampling params, `output_format`,
+/// `context_management`) is allowed — model routing is exactly the intended use
+/// (e.g. Pioneer's `models: [...]` pool). Header-affecting known fields are
+/// re-derived from the merged body so they never desync from the wire.
 ///
 /// Admin write-time validation is the primary guardrail; the send-time merge
 /// repeats the skip as defense in depth for a manual DB edit.
-const API_KEY_RESERVED_EXTRA_BODY_KEYS: &[&str] = &["messages", "system"];
+const API_KEY_RESERVED_EXTRA_BODY_KEYS: &[&str] = &["messages", "system", "stream", "metadata"];
 
 pub(crate) fn is_reserved_api_key_extra_body_key(name: &str) -> bool {
     API_KEY_RESERVED_EXTRA_BODY_KEYS
@@ -104,21 +112,29 @@ mod tests {
     #[test]
     fn merge_extra_body_adds_and_overrides_non_reserved_keys() {
         let mut base = json!({ "model": "pioneer/auto", "max_tokens": 10 });
-        let extra = json!({ "models": ["claude-opus-4-7"], "model": "override", "stream": true });
+        let extra = json!({ "models": ["claude-opus-4-7"], "model": "override", "top_p": 0.9 });
         merge_extra_body(&mut base, &extra);
         assert_eq!(base["models"], json!(["claude-opus-4-7"])); // additive
         assert_eq!(base["model"], json!("override")); // overridden
-        assert_eq!(base["stream"], json!(true)); // added
+        assert_eq!(base["top_p"], json!(0.9)); // added
         assert_eq!(base["max_tokens"], json!(10)); // untouched
     }
 
     #[test]
     fn merge_extra_body_skips_reserved_keys_case_insensitive() {
-        let mut base = json!({ "messages": ["real"], "system": "real" });
-        let extra = json!({ "messages": ["fake"], "System": "fake", "models": ["m"] });
+        let mut base = json!({
+            "messages": ["real"], "system": "real", "stream": false,
+            "metadata": {"user_id": "real"},
+        });
+        let extra = json!({
+            "messages": ["fake"], "System": "fake", "STREAM": true,
+            "Metadata": {"user_id": "fake"}, "models": ["m"],
+        });
         merge_extra_body(&mut base, &extra);
-        assert_eq!(base["messages"], json!(["real"])); // reserved, not overridden
-        assert_eq!(base["system"], json!("real")); // reserved, not overridden
+        assert_eq!(base["messages"], json!(["real"])); // reserved
+        assert_eq!(base["system"], json!("real")); // reserved
+        assert_eq!(base["stream"], json!(false)); // reserved (response-decode driver)
+        assert_eq!(base["metadata"], json!({"user_id": "real"})); // reserved (cloak-owned)
         assert_eq!(base["models"], json!(["m"])); // non-reserved still merged
     }
 
@@ -134,11 +150,13 @@ mod tests {
     }
 
     #[test]
-    fn reserved_body_key_predicate_matches_only_messages_and_system() {
+    fn reserved_body_key_predicate_matches_conversation_and_cloak_owned_keys() {
         assert!(is_reserved_api_key_extra_body_key("messages"));
         assert!(is_reserved_api_key_extra_body_key("SYSTEM"));
+        assert!(is_reserved_api_key_extra_body_key("stream")); // response-decode driver
+        assert!(is_reserved_api_key_extra_body_key("Metadata")); // cloak-owned
         assert!(!is_reserved_api_key_extra_body_key("model"));
         assert!(!is_reserved_api_key_extra_body_key("models"));
-        assert!(!is_reserved_api_key_extra_body_key("stream"));
+        assert!(!is_reserved_api_key_extra_body_key("output_format"));
     }
 }

@@ -365,9 +365,14 @@ function parseApiKeyExtraBody(text: string): Record<string, unknown> {
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new ApiError(400, "额外请求体必须是 JSON 对象");
   }
-  const reserved = ["messages", "system"];
+  // Keep in sync with API_KEY_RESERVED_EXTRA_BODY_KEYS in src/mimicry/mod.rs.
+  const reserved = ["messages", "system", "stream", "metadata"];
   for (const key of Object.keys(parsed)) {
-    if (reserved.includes(key.trim().toLowerCase())) {
+    const trimmed = key.trim();
+    if (trimmed.length === 0) {
+      throw new ApiError(400, "额外请求体不能包含空键");
+    }
+    if (reserved.includes(trimmed.toLowerCase())) {
       throw new ApiError(400, `额外请求体不能覆盖保留字段 “${key}”`);
     }
   }
@@ -817,7 +822,7 @@ function ApiKeyTabPanel({
       <Textarea
         label="额外请求体 JSON（可选）"
         description={
-          '浅合并进出站请求体（仅 /v1/messages）。必须是 JSON 对象；键 messages / system 不可覆盖。' +
+          '浅合并进出站请求体（仅 /v1/messages）。必须是 JSON 对象；保留键 messages / system / stream / metadata 不可覆盖。' +
           '例：{"models": ["claude-opus-4-7"]}'
         }
         placeholder={'{\n  "models": ["claude-opus-4-7"]\n}'}
