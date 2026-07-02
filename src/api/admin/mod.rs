@@ -65,6 +65,8 @@ pub fn admin_router() -> Router<AppState> {
         )
         // Settings
         .route("/settings", get(settings::get_all).post(settings::update))
+        // Third-party cloak CLI version list (npm registry, 1h cache)
+        .route("/cli-versions", get(settings::cli_versions))
         // Ops analytics
         .route("/ops/usage", get(ops::usage))
         // Request logs
