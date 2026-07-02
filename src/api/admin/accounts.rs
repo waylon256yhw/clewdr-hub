@@ -18,7 +18,7 @@ use crate::{
         ClaudeCodeState, build_api_client, is_reserved_api_key_extra_header,
         normalize_api_key_base_url,
     },
-    config::{AccountSlot, AuthMethod, CLAUDE_ENDPOINT, ClewdrCookie},
+    config::{AccountSlot, AuthMethod, CLAUDE_ENDPOINT, ClewdrCookie, ThirdPartyMimicryConfig},
     db::accounts::{
         AccountWithRuntime, batch_upsert_runtime_states, clear_account_cooldown,
         find_account_by_organization_uuid, get_account_by_id, load_all_accounts,
@@ -95,6 +95,13 @@ pub struct AccountResponse {
     /// secret itself, so the admin API echoes them for edit forms.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_extra_headers: Option<BTreeMap<String, String>>,
+    /// Two-tier mimicry mode for an api_key channel (`none` | `third_party`).
+    /// Always `none` for cookie/oauth.
+    pub mimicry_mode: String,
+    /// Third-party cloak config (non-secret: auth-header form, cli version,
+    /// strict-system, extra beta). `None` unless a `third_party` channel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mimicry_config: Option<ThirdPartyMimicryConfig>,
     /// All-time billable Messages spend attributed to this account.
     pub total_cost_nanousd: i64,
     pub oauth_expires_at: Option<String>,
@@ -179,6 +186,12 @@ fn map_account(row: &AccountWithRuntime, health: Option<AccountHealth>) -> Accou
             .as_deref()
             .and_then(|s| serde_json::from_str::<BTreeMap<String, String>>(s).ok())
             .filter(|headers| !headers.is_empty()),
+        mimicry_mode: row.mimicry_mode.clone(),
+        mimicry_config: row
+            .mimicry_config
+            .as_deref()
+            .filter(|_| row.mimicry_mode == "third_party")
+            .and_then(|s| serde_json::from_str::<ThirdPartyMimicryConfig>(s).ok()),
         total_cost_nanousd: row.total_cost_nanousd,
         oauth_expires_at: row.oauth_expires_at.clone(),
         last_refresh_at: row.last_refresh_at.clone(),
@@ -226,6 +239,14 @@ pub struct CreateAccountRequest {
     /// preserve. On update they differ (see UpdateAccountRequest).
     #[serde(default)]
     pub api_key_extra_headers: Option<BTreeMap<String, String>>,
+    /// Two-tier mimicry for an api_key channel: `"none"` (default clean
+    /// passthrough) or `"third_party"` (relay cloak). Ignored for cookie/oauth.
+    #[serde(default)]
+    pub mimicry_mode: Option<String>,
+    /// Third-party cloak config; only meaningful when `mimicry_mode` is
+    /// `"third_party"`.
+    #[serde(default)]
+    pub mimicry_config: Option<ThirdPartyMimicryConfig>,
 }
 
 #[derive(Deserialize)]
@@ -255,6 +276,13 @@ pub struct UpdateAccountRequest {
     ///   - `Some(map)` non-empty → replace existing headers
     #[serde(default)]
     pub api_key_extra_headers: Option<BTreeMap<String, String>>,
+    /// `None` keeps the existing mode; `Some("none"|"third_party")` sets it.
+    #[serde(default)]
+    pub mimicry_mode: Option<String>,
+    /// `None` keeps the existing config; `Some(cfg)` replaces it. When the
+    /// resulting mode is `none`, the config is cleared regardless.
+    #[serde(default)]
+    pub mimicry_config: Option<ThirdPartyMimicryConfig>,
 }
 
 #[derive(Deserialize)]
@@ -399,6 +427,54 @@ fn extra_headers_to_db(map: &BTreeMap<String, String>) -> Option<String> {
     }
 }
 
+/// Validate a third-party cloak config supplied by the admin.
+fn validate_third_party_config(cfg: &ThirdPartyMimicryConfig) -> Result<(), ClewdrError> {
+    if cfg.extra_beta.iter().any(|t| t.trim().is_empty()) {
+        return Err(ClewdrError::BadRequest {
+            msg: "mimicry_config.extra_beta tokens must be non-empty",
+        });
+    }
+    if cfg
+        .cli_version
+        .as_deref()
+        .is_some_and(|v| v.trim().is_empty())
+    {
+        return Err(ClewdrError::BadRequest {
+            msg: "mimicry_config.cli_version must be non-empty when provided",
+        });
+    }
+    Ok(())
+}
+
+/// Resolve the persisted `(mimicry_mode, mimicry_config_json)` from a request.
+/// `third_party` is only valid on an `api_key` account; a `none` (or absent)
+/// mode always clears the config so the schema CHECK's no-orphan rule holds.
+fn resolve_mimicry(
+    auth_source: &str,
+    mode: Option<&str>,
+    cfg: Option<&ThirdPartyMimicryConfig>,
+) -> Result<(&'static str, Option<String>), ClewdrError> {
+    match mode.map(str::trim).unwrap_or("none") {
+        "none" => Ok(("none", None)),
+        "third_party" => {
+            if auth_source != "api_key" {
+                return Err(ClewdrError::BadRequest {
+                    msg: "third_party mimicry requires an api_key account",
+                });
+            }
+            let cfg = cfg.cloned().unwrap_or_default();
+            validate_third_party_config(&cfg)?;
+            Ok((
+                "third_party",
+                Some(serde_json::to_string(&cfg).expect("config serialization is infallible")),
+            ))
+        }
+        _ => Err(ClewdrError::BadRequest {
+            msg: "mimicry_mode must be 'none' or 'third_party'",
+        }),
+    }
+}
+
 pub async fn list(
     State(db): State<SqlitePool>,
     State(actor): State<AccountPoolHandle>,
@@ -510,6 +586,12 @@ pub async fn create(
         }
     }
 
+    let (mimicry_mode_db, mimicry_config_json) = resolve_mimicry(
+        auth_source,
+        req.mimicry_mode.as_deref(),
+        req.mimicry_config.as_ref(),
+    )?;
+
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
 
     if let Some(ref cookie_blob) = cookie_blob {
@@ -545,8 +627,9 @@ pub async fn create(
             organization_uuid, last_refresh_at, last_error, email, account_type,
             rate_limit_tier, subscription_created_at, billing_type,
             drain_first,
-            api_key_base_url, api_key_secret, api_key_extra_headers
-        ) VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            api_key_base_url, api_key_secret, api_key_extra_headers,
+            mimicry_mode, mimicry_config
+        ) VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
     )
     .bind(&req.name)
     .bind(rr_order)
@@ -589,6 +672,8 @@ pub async fn create(
     .bind(api_key_base_url_normalized.as_deref())
     .bind(raw_api_key_secret.as_deref())
     .bind(api_key_extra_headers_json.as_deref())
+    .bind(mimicry_mode_db)
+    .bind(mimicry_config_json.as_deref())
     .execute(&mut *tx)
     .await
     .map_err(|e| {
@@ -818,6 +903,8 @@ pub async fn update(
                  api_key_base_url = NULL,
                  api_key_secret = NULL,
                  api_key_extra_headers = NULL,
+                 mimicry_mode = 'none',
+                 mimicry_config = NULL,
                  auth_source = 'cookie',
                  status = 'active',
                  invalid_reason = NULL,
@@ -846,6 +933,8 @@ pub async fn update(
                  api_key_base_url = NULL,
                  api_key_secret = NULL,
                  api_key_extra_headers = NULL,
+                 mimicry_mode = 'none',
+                 mimicry_config = NULL,
                  auth_source = 'oauth',
                  status = 'active',
                  last_error = NULL,
@@ -964,6 +1053,37 @@ pub async fn update(
                 .execute(&mut *tx)
                 .await?;
         }
+    }
+
+    // Mimicry update, applied independently of credential submission so an admin
+    // can toggle the third-party cloak on an existing api_key account without
+    // resubmitting the secret. Runs against the EFFECTIVE auth_source after any
+    // switch above. The cookie/oauth switch arms already reset mimicry to 'none';
+    // this only needs to act when the request carries an explicit mimicry field.
+    if req.mimicry_mode.is_some() || req.mimicry_config.is_some() {
+        let effective_auth = if new_cookie_blob.is_some() {
+            "cookie"
+        } else if oauth.is_some() {
+            "oauth"
+        } else if submitting_api_key {
+            "api_key"
+        } else {
+            existing.auth_source.as_str()
+        };
+        let (mode_db, cfg_json) = resolve_mimicry(
+            effective_auth,
+            req.mimicry_mode.as_deref(),
+            req.mimicry_config.as_ref(),
+        )?;
+        sqlx::query(
+            "UPDATE accounts SET mimicry_mode = ?1, mimicry_config = ?2, \
+             updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
+        )
+        .bind(mode_db)
+        .bind(cfg_json.as_deref())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     }
     if let Some(ref org) = req.organization_uuid {
         sqlx::query(
@@ -1232,20 +1352,51 @@ async fn test_account_api_key(
         "stream": false,
     });
 
-    let client = build_api_client(account.proxy_url.as_deref());
-    let mut req = client
-        .post(&request_url)
-        .header("x-api-key", secret)
-        .header("anthropic-version", "2023-06-01");
-    for (k, v) in extras.iter() {
-        if is_reserved_api_key_extra_header(k) {
-            continue;
+    // Parity: a `third_party` account must be tested with the SAME cloak the live
+    // send path emits (otherwise a test could pass/fail differently from real
+    // traffic). Both funnel through `third_party::build_cloak_request`. `none`
+    // keeps the minimal direct-API probe.
+    let mimicry_mode = crate::config::MimicryMode::from_db(&account.mimicry_mode);
+    let result = if mimicry_mode.is_third_party() {
+        let cfg = account
+            .mimicry_config
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<crate::config::ThirdPartyMimicryConfig>(s).ok())
+            .unwrap_or_default();
+        // Match the live client shape: third-party uses the Node/OpenSSL TLS
+        // emulation, not the plain client.
+        let client =
+            crate::claude_code_state::build_emulated_api_client(account.proxy_url.as_deref());
+        let params: crate::types::claude::CreateMessageParams =
+            serde_json::from_value(body).expect("probe body is a valid CreateMessageParams");
+        let req = crate::mimicry::third_party::build_cloak_request(
+            &client,
+            &url_with_query,
+            secret,
+            &cfg,
+            &extras,
+            &params,
+            false,
+        )?;
+        req.send().await.context(WreqSnafu {
+            msg: "test request failed",
+        })
+    } else {
+        let client = build_api_client(account.proxy_url.as_deref());
+        let mut req = client
+            .post(&request_url)
+            .header("x-api-key", secret)
+            .header("anthropic-version", "2023-06-01");
+        for (k, v) in extras.iter() {
+            if is_reserved_api_key_extra_header(k) {
+                continue;
+            }
+            req = req.header(k.as_str(), v.as_str());
         }
-        req = req.header(k.as_str(), v.as_str());
-    }
-    let result = req.json(&body).send().await.context(WreqSnafu {
-        msg: "test request failed",
-    });
+        req.json(&body).send().await.context(WreqSnafu {
+            msg: "test request failed",
+        })
+    };
     let latency_ms = (chrono::Utc::now() - started_at).num_milliseconds();
 
     let (success, http_status, error_msg, response_body) = match result {
@@ -1718,6 +1869,61 @@ mod tests {
         // must fail rather than silently preserve an invalid value.
         let err = derive_auth_source(None, false, false, false, Some("hybrid")).unwrap_err();
         assert!(matches!(err, ClewdrError::BadRequest { .. }));
+    }
+
+    #[test]
+    fn resolve_mimicry_none_clears_config() {
+        let cfg = ThirdPartyMimicryConfig {
+            strict_system: true,
+            ..Default::default()
+        };
+        // Absent mode => none, config dropped.
+        let (mode, json) = resolve_mimicry("api_key", None, Some(&cfg)).unwrap();
+        assert_eq!(mode, "none");
+        assert!(json.is_none());
+        // Explicit none likewise clears.
+        let (mode, json) = resolve_mimicry("api_key", Some("none"), Some(&cfg)).unwrap();
+        assert_eq!(mode, "none");
+        assert!(json.is_none());
+    }
+
+    #[test]
+    fn resolve_mimicry_third_party_requires_api_key() {
+        let cfg = ThirdPartyMimicryConfig::default();
+        for auth in ["cookie", "oauth"] {
+            let err = resolve_mimicry(auth, Some("third_party"), Some(&cfg)).unwrap_err();
+            assert!(matches!(err, ClewdrError::BadRequest { .. }));
+        }
+        let (mode, json) = resolve_mimicry("api_key", Some("third_party"), Some(&cfg)).unwrap();
+        assert_eq!(mode, "third_party");
+        assert!(json.is_some());
+    }
+
+    #[test]
+    fn resolve_mimicry_rejects_bad_input() {
+        // Unknown mode string.
+        assert!(matches!(
+            resolve_mimicry("api_key", Some("bogus"), None).unwrap_err(),
+            ClewdrError::BadRequest { .. }
+        ));
+        // Empty extra_beta token.
+        let cfg = ThirdPartyMimicryConfig {
+            extra_beta: vec!["  ".into()],
+            ..Default::default()
+        };
+        assert!(matches!(
+            resolve_mimicry("api_key", Some("third_party"), Some(&cfg)).unwrap_err(),
+            ClewdrError::BadRequest { .. }
+        ));
+        // Empty cli_version override.
+        let cfg = ThirdPartyMimicryConfig {
+            cli_version: Some("".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            resolve_mimicry("api_key", Some("third_party"), Some(&cfg)).unwrap_err(),
+            ClewdrError::BadRequest { .. }
+        ));
     }
 
     #[test]

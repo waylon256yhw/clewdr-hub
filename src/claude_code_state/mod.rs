@@ -50,6 +50,21 @@ pub(crate) fn build_api_client(proxy_url: Option<&str>) -> wreq::Client {
     })
 }
 
+/// Like [`build_api_client`] but with the Claude Code Node/OpenSSL TLS (JA4)
+/// emulation, matching the live third-party cloak client. Used by the admin
+/// `/test` probe so a third-party channel is tested with the same TLS shape it
+/// uses in production.
+pub(crate) fn build_emulated_api_client(proxy_url: Option<&str>) -> wreq::Client {
+    let mut builder = wreq::Client::builder().emulation(fingerprint::claude_code_emulation());
+    if let Some(proxy) = proxy_from_url(proxy_url) {
+        builder = builder.proxy(proxy);
+    }
+    builder.build().unwrap_or_else(|e| {
+        error!("Failed to build emulated API client: {e}");
+        SUPER_CLIENT.to_owned()
+    })
+}
+
 /// Normalize a user-supplied API-key base URL so `.join("v1/messages")`
 /// (and `.join("v1/messages/count_tokens")`) reliably produces
 /// `{origin}/v1/messages`. SQLite stores whatever the admin typed, so

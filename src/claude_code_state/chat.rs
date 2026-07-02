@@ -21,7 +21,7 @@ use wreq::Method;
 use crate::{
     billing::{RequestType, TerminalLogOptions},
     claude_code_state::{ClaudeCodeState, TokenStatus},
-    config::{AuthHeaderForm, AuthMethod, ModelFamily, Reason},
+    config::{AuthMethod, ModelFamily, Reason},
     db::accounts::{
         set_account_auth_error, set_account_disabled, set_account_last_failure,
         set_account_reset_time, update_account_metadata_unchecked, upsert_account_oauth,
@@ -909,72 +909,23 @@ impl ClaudeCodeState {
         is_count_tokens: bool,
         error_context: &'static str,
     ) -> Result<wreq::Response, ClewdrError> {
-        use crate::mimicry::third_party;
-
         let cfg = self.mimicry_config.clone().unwrap_or_default();
-        let profile = third_party::global_profile().load();
-        let cli_version = cfg
-            .cli_version
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| profile.cli_version.clone());
-        let user_agent = format!("claude-cli/{cli_version} (external, cli)");
-        let secret = self.api_key.as_deref().unwrap_or("");
-        let stream = body.stream.unwrap_or(false);
-        let beta = third_party::synth_beta(&body.model, body, &cfg.extra_beta);
-
-        // Body: full cloak on messages; headers-only (body as-is minus any
-        // billing block) on count_tokens.
-        let mut send_body = body.clone();
-        let session_id = if is_count_tokens {
-            crate::middleware::claude::strip_billing_headers_from_system(&mut send_body);
-            None
-        } else {
-            third_party::cloak_messages_body(
-                &mut send_body,
-                &cli_version,
-                &profile.billing_salt,
-                cfg.strict_system,
-            )
-        };
-        let bytes = serde_json::to_vec(&send_body)?;
-
-        let mut req = self.client.post(url.to_string());
-        req = match cfg.auth_header {
-            AuthHeaderForm::Bearer => req.bearer_auth(secret),
-            AuthHeaderForm::XApiKey => req.header("x-api-key", secret),
-        };
-        req = req
-            .header("content-type", "application/json")
-            .header(USER_AGENT, user_agent)
-            .header("anthropic-version", CLAUDE_API_VERSION)
-            .header("anthropic-dangerous-direct-browser-access", "true")
-            .header("x-app", "cli");
-        if let Some(beta) = beta {
-            req = req.header("anthropic-beta", beta);
-        }
-        if let Some(session_id) = session_id {
-            req = req.header("x-claude-code-session-id", session_id);
-        }
-        for (name, value) in STAINLESS_HEADERS {
-            req = req.header(*name, *value);
-        }
-        if stream {
-            req = req.header("x-stainless-helper-method", "stream");
-        }
-        if let Some(extras) = self.api_key_extra_headers.as_ref() {
-            for (k, v) in extras.iter() {
-                if is_reserved_api_key_extra_header(k) {
-                    continue;
-                }
-                req = req.header(k.as_str(), v.as_str());
-            }
-        }
-
-        req.body(bytes)
-            .send()
+        let empty_headers = std::collections::BTreeMap::new();
+        let extra_headers = self
+            .api_key_extra_headers
+            .as_ref()
+            .map(|h| h.as_map())
+            .unwrap_or(&empty_headers);
+        let req = crate::mimicry::third_party::build_cloak_request(
+            &self.client,
+            &url,
+            self.api_key.as_deref().unwrap_or(""),
+            &cfg,
+            extra_headers,
+            body,
+            is_count_tokens,
+        )?;
+        req.send()
             .await
             .context(WreqSnafu { msg: error_context })?
             .check_claude()

@@ -9,22 +9,30 @@
 //! and `metadata.user_id` follows Claude-Cloak (preserve valid inbound, else a
 //! fresh fake) rather than the account-bound deterministic derivation.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
+use http::header::USER_AGENT;
 use serde_json::Value;
 use sqlx::SqlitePool;
 use tracing::warn;
 
 use crate::{
+    config::{AuthHeaderForm, ThirdPartyMimicryConfig},
     db::billing::get_setting,
+    error::ClewdrError,
     middleware::claude::{
         claude_code_billing_header_from_sample, prepend_system_blocks,
         strip_billing_headers_from_system,
     },
+    mimicry::{STAINLESS_HEADERS, is_reserved_api_key_extra_header},
     stealth::{DEFAULT_BILLING_SALT, DEFAULT_CLI_VERSION, StealthProfile},
     types::claude::{ContentBlock, CreateMessageParams, Message, MessageContent, Role},
 };
+
+/// `anthropic-version` value sent on every cloak request.
+const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// The Claude Code identity system prompt the real CLI always sends. The
 /// official path relies on the inbound client (a real CLI) to send this; the
@@ -151,6 +159,83 @@ pub(crate) fn synth_beta(
     } else {
         Some(betas.join(","))
     }
+}
+
+/// Build a fully-assembled third-party cloak request (headers + body) on the
+/// given client and URL, WITHOUT sending it. This is the single source of truth
+/// for the third-party wire shape, shared by the live send path
+/// (`ClaudeCodeState::execute_third_party_request`) and the admin `/test` probe,
+/// so a test exercises byte-for-byte what a real request would send.
+///
+/// `is_count_tokens` skips the body cloak (headers only), matching the real CLI's
+/// count request. `extra_headers` are the per-account HTTP headers, applied after
+/// the reserved-name filter.
+pub(crate) fn build_cloak_request(
+    client: &wreq::Client,
+    url: &url::Url,
+    secret: &str,
+    cfg: &ThirdPartyMimicryConfig,
+    extra_headers: &BTreeMap<String, String>,
+    body: &CreateMessageParams,
+    is_count_tokens: bool,
+) -> Result<wreq::RequestBuilder, ClewdrError> {
+    let profile = global_profile().load();
+    let cli_version = cfg
+        .cli_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| profile.cli_version.clone());
+    let user_agent = format!("claude-cli/{cli_version} (external, cli)");
+    let stream = body.stream.unwrap_or(false);
+    let beta = synth_beta(&body.model, body, &cfg.extra_beta);
+
+    let mut send_body = body.clone();
+    let session_id = if is_count_tokens {
+        strip_billing_headers_from_system(&mut send_body);
+        None
+    } else {
+        cloak_messages_body(
+            &mut send_body,
+            &cli_version,
+            &profile.billing_salt,
+            cfg.strict_system,
+        )
+    };
+    let bytes = serde_json::to_vec(&send_body)?;
+
+    let mut req = client.post(url.to_string());
+    req = match cfg.auth_header {
+        AuthHeaderForm::Bearer => req.bearer_auth(secret),
+        AuthHeaderForm::XApiKey => req.header("x-api-key", secret),
+    };
+    req = req
+        .header("content-type", "application/json")
+        .header(USER_AGENT, user_agent)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header("anthropic-dangerous-direct-browser-access", "true")
+        .header("x-app", "cli");
+    if let Some(beta) = beta {
+        req = req.header("anthropic-beta", beta);
+    }
+    if let Some(session_id) = session_id {
+        req = req.header("x-claude-code-session-id", session_id);
+    }
+    for (name, value) in STAINLESS_HEADERS {
+        req = req.header(*name, *value);
+    }
+    if stream {
+        req = req.header("x-stainless-helper-method", "stream");
+    }
+    for (k, v) in extra_headers {
+        if is_reserved_api_key_extra_header(k) {
+            continue;
+        }
+        req = req.header(k.as_str(), v.as_str());
+    }
+
+    Ok(req.body(bytes))
 }
 
 /// Cloak a `/v1/messages` body in place, Claude-Cloak style. Returns the session
