@@ -807,8 +807,9 @@ function ApiKeyTabPanel({
               />
             </div>
             <TextInput
-              label="CLI 版本（留空继承全局设置）"
-              placeholder="继承全局"
+              label="渠道覆盖 CLI 版本"
+              description="留空继承全局默认"
+              placeholder="继承全局默认"
               value={mVer}
               onChange={(e) => {
                 setMVer(e.currentTarget.value);

@@ -347,7 +347,9 @@ function TpVersionSection({ currentVersion }: { currentVersion: string }) {
   const [value, setValue] = useState(currentVersion);
   useEffect(() => setValue(currentVersion), [currentVersion]);
   const trimmed = value.trim();
-  const looksValid = /^\d+\.\d+\.\d+/.test(trimmed);
+  // Empty is allowed: it clears the global default so the cloak falls back to
+  // the built-in version. A non-empty value must look like x.y.z.
+  const looksValid = trimmed === "" || /^\d+\.\d+\.\d+/.test(trimmed);
   const dirty = trimmed !== currentVersion;
 
   const mutation = useMutation({
@@ -377,7 +379,7 @@ function TpVersionSection({ currentVersion }: { currentVersion: string }) {
     <Paper shadow="xs" p="md" radius="md" withBorder>
       <Stack>
         <Group justify="space-between">
-          <Text fw={600}>第三方中转伪装 CLI 版本</Text>
+          <Text fw={600}>第三方中转伪装默认 CLI 版本</Text>
           <Group gap="xs">
             {fetchedAt && (
               <Text size="xs" c="dimmed">
@@ -392,11 +394,11 @@ function TpVersionSection({ currentVersion }: { currentVersion: string }) {
           </Group>
         </Group>
         <Text size="sm" c="dimmed">
-          第三方中转（API Key）渠道开启伪装时默认模拟的 Claude Code CLI 版本；渠道可单独覆盖。官方订阅路径的版本固定，不受此项影响。可从下拉选择最近版本，或手动输入以固定到某个旧版本（如中转要求）。
+          第三方中转（API Key）渠道开启伪装时模拟的 Claude Code CLI 版本。优先级：渠道覆盖 &gt; 全局默认 &gt; 内置默认。留空则使用内置默认版本。可从下拉选择最近版本，或手动输入以固定到某个旧版本。官方订阅路径的版本固定，不受此项影响。
         </Text>
         <Group align="flex-end" gap="xs">
           <Autocomplete
-            label="CLI 版本"
+            label="全局默认 CLI 版本"
             style={{ flex: 1 }}
             data={optionData}
             value={value}
@@ -411,8 +413,8 @@ function TpVersionSection({ currentVersion }: { currentVersion: string }) {
               }
             }}
             disabled={versionsLoading || mutation.isPending}
-            placeholder={versionsLoading ? "加载中..." : "选择或输入版本，如 2.0.55"}
-            error={trimmed && !looksValid ? "请输入 x.y.z 版本号" : undefined}
+            placeholder={versionsLoading ? "加载中..." : "留空使用内置默认版本"}
+            error={trimmed && !looksValid ? "请输入 x.y.z 版本号，或留空使用内置默认" : undefined}
           />
           <Button
             onClick={() => mutation.mutate(trimmed)}
