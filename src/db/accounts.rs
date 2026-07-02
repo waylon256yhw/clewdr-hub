@@ -43,6 +43,12 @@ pub struct AccountWithRuntime {
     /// `BTreeMap<String,String>` by the loader (`do_reload`) when
     /// constructing an `AccountSlot::api_key`.
     pub api_key_extra_headers: Option<String>,
+    /// Two-tier mimicry: `'none'` (clean passthrough) or `'third_party'`
+    /// (relay cloak). Always `'none'` for cookie/oauth rows (CHECK-enforced).
+    pub mimicry_mode: String,
+    /// Raw JSON string from the DB column (`ThirdPartyMimicryConfig`); parsed by
+    /// the loader (`do_reload`). Only present on `third_party` api_key rows.
+    pub mimicry_config: Option<String>,
     /// All-time billable Messages spend attributed to this account.
     pub total_cost_nanousd: i64,
     pub created_at: Option<String>,
@@ -148,6 +154,7 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
             a.last_failure_json,
             a.email, a.account_type, a.rate_limit_tier, a.subscription_created_at, a.billing_type,
             a.api_key_base_url, a.api_key_secret, a.api_key_extra_headers,
+            a.mimicry_mode, a.mimicry_config,
             COALESCE(cost.total_cost_nanousd, 0) AS total_cost_nanousd,
             a.created_at, a.updated_at,
             a.drain_first,
@@ -306,6 +313,8 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
             api_key_base_url: row.get("api_key_base_url"),
             api_key_secret: row.get("api_key_secret"),
             api_key_extra_headers: row.get("api_key_extra_headers"),
+            mimicry_mode: row.get("mimicry_mode"),
+            mimicry_config: row.get("mimicry_config"),
             total_cost_nanousd: row.get("total_cost_nanousd"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),

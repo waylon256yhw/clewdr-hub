@@ -12,7 +12,7 @@ use snafu::{GenerateImplicitData, Location};
 use tracing::info;
 
 use crate::{
-    config::{PLACEHOLDER_COOKIE, TokenInfo},
+    config::{MimicryMode, PLACEHOLDER_COOKIE, ThirdPartyMimicryConfig, TokenInfo},
     error::ClewdrError,
 };
 
@@ -283,6 +283,15 @@ pub struct AccountSlot {
     pub api_key_secret: Option<ApiKeySecret>,
     #[serde(default, skip_serializing)]
     pub api_key_extra_headers: Option<ApiKeyExtraHeaders>,
+    // Two-tier mimicry. `mimicry_mode` is always `None` for cookie/oauth slots
+    // (CHECK-enforced); on API-key channels it selects the clean passthrough
+    // (`None`) or the third-party relay cloak (`ThirdParty`). `mimicry_config`
+    // carries the per-channel cloak knobs and is `Some` only for a `ThirdParty`
+    // slot. Both `#[serde(default)]` so pre-existing snapshots deserialize.
+    #[serde(default)]
+    pub mimicry_mode: MimicryMode,
+    #[serde(default)]
+    pub mimicry_config: Option<ThirdPartyMimicryConfig>,
 }
 
 // `AccountSlot` deliberately does not implement `PartialEq` / `Eq` /
@@ -343,6 +352,8 @@ impl AccountSlot {
             api_key_base_url: None,
             api_key_secret: None,
             api_key_extra_headers: None,
+            mimicry_mode: MimicryMode::None,
+            mimicry_config: None,
         })
     }
 
@@ -393,6 +404,8 @@ impl AccountSlot {
         base_url: String,
         secret: ApiKeySecret,
         extra_headers: Option<ApiKeyExtraHeaders>,
+        mimicry_mode: MimicryMode,
+        mimicry_config: Option<ThirdPartyMimicryConfig>,
     ) -> Self {
         Self {
             cookie: None,
@@ -401,6 +414,8 @@ impl AccountSlot {
             api_key_base_url: Some(base_url),
             api_key_secret: Some(secret),
             api_key_extra_headers: extra_headers,
+            mimicry_mode,
+            mimicry_config,
             ..Self::default()
         }
     }
@@ -902,6 +917,8 @@ mod tests {
             "https://api.anthropic.com/".to_string(),
             ApiKeySecret::new("sk-ant-test-xyz"),
             None,
+            MimicryMode::None,
+            None,
         );
         assert_eq!(slot.auth_method, AuthMethod::ApiKey);
         assert_eq!(slot.account_id, Some(7));
@@ -980,6 +997,8 @@ mod tests {
             "https://api.anthropic.com/".to_string(),
             ApiKeySecret::new("sk-ant-should-not-appear"),
             Some(ApiKeyExtraHeaders::new(headers)),
+            MimicryMode::None,
+            None,
         );
         let json = serde_json::to_string(&slot).expect("AccountSlot serializes");
         // base_url is fine to expose (it's not secret) — make sure the

@@ -477,6 +477,8 @@ mod tests {
             api_key_base_url: None,
             api_key_secret: None,
             api_key_extra_headers: None,
+            mimicry_mode: "none".into(),
+            mimicry_config: None,
             total_cost_nanousd: 0,
             created_at: None,
             updated_at: None,

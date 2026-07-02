@@ -16,7 +16,10 @@ use wreq::RequestBuilder;
 
 use crate::{
     billing::BillingContext,
-    config::{AccountSlot, ApiKeyExtraHeaders, AuthMethod, CLAUDE_ENDPOINT, Reason, TokenInfo},
+    config::{
+        AccountSlot, ApiKeyExtraHeaders, AuthMethod, CLAUDE_ENDPOINT, MimicryMode, Reason,
+        ThirdPartyMimicryConfig, TokenInfo,
+    },
     error::{ClewdrError, WreqSnafu},
     services::account_pool::{AccountPoolHandle, CredentialFingerprint},
     stealth::SharedStealthProfile,
@@ -138,6 +141,12 @@ pub struct ClaudeCodeState {
     /// attached on every ApiKey send after the reserved-name filter.
     /// `None` for non-ApiKey slots.
     pub api_key_extra_headers: Option<ApiKeyExtraHeaders>,
+    /// Two-tier mimicry mode for the dispatched slot. `None` for Cookie/OAuth
+    /// and for clean-passthrough api_key slots; `ThirdParty` routes the ApiKey
+    /// send through the relay cloak (see `crate::mimicry::third_party`).
+    pub mimicry_mode: MimicryMode,
+    /// Third-party cloak config; `Some` only for a `ThirdParty` api_key slot.
+    pub mimicry_config: Option<ThirdPartyMimicryConfig>,
     /// Inbound `X-Claude-Code-Session-Id` header (highest-priority seed for the
     /// outbound session id). `None` for callers that didn't send one.
     pub inbound_session_id: Option<String>,
@@ -170,6 +179,8 @@ impl ClaudeCodeState {
             selected_account_id: None,
             api_key: None,
             api_key_extra_headers: None,
+            mimicry_mode: MimicryMode::None,
+            mimicry_config: None,
             inbound_session_id: None,
         }
     }
@@ -255,6 +266,8 @@ impl ClaudeCodeState {
                 state.endpoint = normalize_api_key_base_url(raw_base)?;
                 state.api_key = slot.api_key_secret.as_ref().map(|s| s.as_str().to_string());
                 state.api_key_extra_headers = slot.api_key_extra_headers.clone();
+                state.mimicry_mode = slot.mimicry_mode;
+                state.mimicry_config = slot.mimicry_config.clone();
             }
         }
         if let Some(ref proxy) = state.proxy {
@@ -373,6 +386,8 @@ impl ClaudeCodeState {
                 self.endpoint = crate::config::ENDPOINT_URL.to_owned();
                 self.api_key = None;
                 self.api_key_extra_headers = None;
+                self.mimicry_mode = MimicryMode::None;
+                self.mimicry_config = None;
                 client_builder = client_builder
                     .cookie_store(true)
                     .emulation(fingerprint::claude_code_emulation());
@@ -387,6 +402,8 @@ impl ClaudeCodeState {
                 self.endpoint = normalize_api_key_base_url(raw_base)?;
                 self.api_key = res.api_key_secret.as_ref().map(|s| s.as_str().to_string());
                 self.api_key_extra_headers = res.api_key_extra_headers.clone();
+                self.mimicry_mode = res.mimicry_mode;
+                self.mimicry_config = res.mimicry_config.clone();
             }
         }
         if let Some(ref proxy) = self.proxy {

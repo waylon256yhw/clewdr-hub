@@ -1259,11 +1259,32 @@ impl AccountPoolActor {
                             }
                         },
                     };
+                    let mimicry_mode = crate::config::MimicryMode::from_db(&row.mimicry_mode);
+                    let mimicry_config = match (mimicry_mode, row.mimicry_config.as_deref()) {
+                        (crate::config::MimicryMode::ThirdParty, Some(raw)) if !raw.is_empty() => {
+                            match serde_json::from_str::<crate::config::ThirdPartyMimicryConfig>(
+                                raw,
+                            ) {
+                                Ok(cfg) => Some(cfg),
+                                Err(e) => {
+                                    warn!(
+                                        "ApiKey row '{}' has unparseable mimicry_config JSON; \
+                                         falling back to defaults: {e}",
+                                        row.name
+                                    );
+                                    Some(crate::config::ThirdPartyMimicryConfig::default())
+                                }
+                            }
+                        }
+                        _ => None,
+                    };
                     AccountSlot::api_key(
                         row.id,
                         base_url,
                         crate::config::ApiKeySecret::new(secret),
                         extra_headers,
+                        mimicry_mode,
+                        mimicry_config,
                     )
                 }
                 AuthMethod::Cookie | AuthMethod::OAuth => {
@@ -3289,6 +3310,8 @@ mod tests {
             api_key_base_url: None,
             api_key_secret: None,
             api_key_extra_headers: None,
+            mimicry_mode: "none".into(),
+            mimicry_config: None,
             total_cost_nanousd: 0,
             created_at: None,
             updated_at: None,
@@ -3374,6 +3397,8 @@ mod tests {
             api_key_base_url: None,
             api_key_secret: None,
             api_key_extra_headers: None,
+            mimicry_mode: "none".into(),
+            mimicry_config: None,
             total_cost_nanousd: 0,
             created_at: None,
             updated_at: None,
@@ -3421,6 +3446,8 @@ mod tests {
             api_key_base_url: None,
             api_key_secret: None,
             api_key_extra_headers: None,
+            mimicry_mode: "none".into(),
+            mimicry_config: None,
             total_cost_nanousd: 0,
             created_at: None,
             updated_at: None,
@@ -3497,6 +3524,8 @@ mod tests {
             api_key_base_url: None,
             api_key_secret: None,
             api_key_extra_headers: None,
+            mimicry_mode: "none".into(),
+            mimicry_config: None,
             total_cost_nanousd: 0,
             created_at: None,
             updated_at: None,
