@@ -268,6 +268,13 @@ impl ClaudeCodeState {
                 state.api_key_extra_headers = slot.api_key_extra_headers.clone();
                 state.mimicry_mode = slot.mimicry_mode;
                 state.mimicry_config = slot.mimicry_config.clone();
+                // Third-party cloak impersonates the CLI's Node/OpenSSL TLS
+                // (JA4) so the handshake matches the claude-cli UA +
+                // x-stainless-runtime=node headers. Clean passthrough keeps the
+                // plain client (a relay-agnostic direct-API call).
+                if slot.mimicry_mode.is_third_party() {
+                    client_builder = client_builder.emulation(fingerprint::claude_code_emulation());
+                }
             }
         }
         if let Some(ref proxy) = state.proxy {
@@ -404,6 +411,11 @@ impl ClaudeCodeState {
                 self.api_key_extra_headers = res.api_key_extra_headers.clone();
                 self.mimicry_mode = res.mimicry_mode;
                 self.mimicry_config = res.mimicry_config.clone();
+                // See `from_credential`: third-party cloak needs the CLI TLS
+                // (JA4) emulation; clean passthrough uses the plain client.
+                if res.mimicry_mode.is_third_party() {
+                    client_builder = client_builder.emulation(fingerprint::claude_code_emulation());
+                }
             }
         }
         if let Some(ref proxy) = self.proxy {

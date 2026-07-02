@@ -24,6 +24,7 @@ pub struct RouterBuilder {
 impl RouterBuilder {
     pub async fn new(db_pool: SqlitePool) -> Self {
         let stealth_profile = stealth::init_stealth_profile(&db_pool).await;
+        crate::mimicry::third_party::init_profile(&db_pool).await;
         let (event_tx, _) = tokio::sync::broadcast::channel::<AdminEvent>(64);
         let pool_handle = AccountPoolHandle::start(db_pool.clone(), event_tx.clone())
             .await

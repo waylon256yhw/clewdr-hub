@@ -21,7 +21,7 @@ use wreq::Method;
 use crate::{
     billing::{RequestType, TerminalLogOptions},
     claude_code_state::{ClaudeCodeState, TokenStatus},
-    config::{AuthMethod, ModelFamily, Reason},
+    config::{AuthHeaderForm, AuthMethod, ModelFamily, Reason},
     db::accounts::{
         set_account_auth_error, set_account_disabled, set_account_last_failure,
         set_account_reset_time, update_account_metadata_unchecked, upsert_account_oauth,
@@ -854,6 +854,15 @@ impl ClaudeCodeState {
         let mut url = self.endpoint.join(path).expect("Url parse error");
         url.set_query(Some("beta=true"));
 
+        // Opt-in third-party relay cloak: dispatch to the Claude-Cloak-aligned
+        // wire profile instead of the clean passthrough below.
+        if self.mimicry_mode.is_third_party() {
+            let is_count_tokens = path.ends_with("count_tokens");
+            return self
+                .execute_third_party_request(url, body, is_count_tokens, error_context)
+                .await;
+        }
+
         let mut body = body.clone();
         crate::middleware::claude::strip_billing_headers_from_system(&mut body);
 
@@ -877,6 +886,94 @@ impl ClaudeCodeState {
         }
 
         req.json(&body)
+            .send()
+            .await
+            .context(WreqSnafu { msg: error_context })?
+            .check_claude()
+            .await
+    }
+
+    /// Third-party relay cloak send (`mimicry_mode == ThirdParty`). Applies the
+    /// Claude-Cloak-aligned wire profile: full Claude Code header set + body
+    /// identity/billing cloak on `/v1/messages`; headers-only on count_tokens
+    /// (the real CLI's count request carries no billing/metadata/session body).
+    ///
+    /// Distinct from the official path on purpose (see `mimicry::third_party`):
+    /// Bearer auth by default, synthesized `anthropic-beta` without
+    /// `oauth-2025-04-20`, and `cch` left as the literal `00000` (no xxh64
+    /// rewrite — relays whitelist/recompute it).
+    async fn execute_third_party_request(
+        &self,
+        url: url::Url,
+        body: &CreateMessageParams,
+        is_count_tokens: bool,
+        error_context: &'static str,
+    ) -> Result<wreq::Response, ClewdrError> {
+        use crate::mimicry::third_party;
+
+        let cfg = self.mimicry_config.clone().unwrap_or_default();
+        let profile = third_party::global_profile().load();
+        let cli_version = cfg
+            .cli_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| profile.cli_version.clone());
+        let user_agent = format!("claude-cli/{cli_version} (external, cli)");
+        let secret = self.api_key.as_deref().unwrap_or("");
+        let stream = body.stream.unwrap_or(false);
+        let beta = third_party::synth_beta(&body.model, body, &cfg.extra_beta);
+
+        // Body: full cloak on messages; headers-only (body as-is minus any
+        // billing block) on count_tokens.
+        let mut send_body = body.clone();
+        let session_id = if is_count_tokens {
+            crate::middleware::claude::strip_billing_headers_from_system(&mut send_body);
+            None
+        } else {
+            third_party::cloak_messages_body(
+                &mut send_body,
+                &cli_version,
+                &profile.billing_salt,
+                cfg.strict_system,
+            )
+        };
+        let bytes = serde_json::to_vec(&send_body)?;
+
+        let mut req = self.client.post(url.to_string());
+        req = match cfg.auth_header {
+            AuthHeaderForm::Bearer => req.bearer_auth(secret),
+            AuthHeaderForm::XApiKey => req.header("x-api-key", secret),
+        };
+        req = req
+            .header("content-type", "application/json")
+            .header(USER_AGENT, user_agent)
+            .header("anthropic-version", CLAUDE_API_VERSION)
+            .header("anthropic-dangerous-direct-browser-access", "true")
+            .header("x-app", "cli");
+        if let Some(beta) = beta {
+            req = req.header("anthropic-beta", beta);
+        }
+        if let Some(session_id) = session_id {
+            req = req.header("x-claude-code-session-id", session_id);
+        }
+        for (name, value) in STAINLESS_HEADERS {
+            req = req.header(*name, *value);
+        }
+        if stream {
+            req = req.header("x-stainless-helper-method", "stream");
+        }
+        if let Some(extras) = self.api_key_extra_headers.as_ref() {
+            for (k, v) in extras.iter() {
+                if is_reserved_api_key_extra_header(k) {
+                    continue;
+                }
+                req = req.header(k.as_str(), v.as_str());
+            }
+        }
+
+        req.body(bytes)
             .send()
             .await
             .context(WreqSnafu { msg: error_context })?

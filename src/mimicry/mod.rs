@@ -16,6 +16,8 @@
 //! block, the reserved extra-header guard); profile-specific logic lives in the
 //! send path ([`crate::claude_code_state`]) and in [`third_party`].
 
+pub mod third_party;
+
 /// Anthropic JS SDK (Stainless-generated) default header values the real
 /// Claude Code CLI sends on every `/v1/messages` request (observed in 2.1.185
 /// capture; package-version tracks `@anthropic-ai/sdk`). `runtime-version` is
