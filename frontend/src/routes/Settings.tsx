@@ -23,9 +23,9 @@ import {
 import { useForm } from "@mantine/form";
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { IconPlus, IconTrash } from "@tabler/icons-react";
+import { IconPlus, IconTrash, IconRefresh } from "@tabler/icons-react";
 import {
-  getSettings, updateSettings, changePassword,
+  getSettings, updateSettings, changePassword, getCliVersions,
   listModelsAdmin, createModel, updateModel, deleteModel, resetDefaultModels,
   qk, ApiError,
   type ModelRow,
@@ -325,6 +325,79 @@ function ModelsSection() {
   );
 }
 
+function TpVersionSection({ currentVersion }: { currentVersion: string }) {
+  const queryClient = useQueryClient();
+  const [refreshing, setRefreshing] = useState(false);
+  const { data: versionsData, isLoading: versionsLoading } = useQuery({
+    queryKey: ["cli-versions"],
+    queryFn: () => getCliVersions(),
+    staleTime: 3600_000,
+  });
+
+  const versions = versionsData?.versions ?? [];
+  const fetchedAt = versionsData?.fetched_at ?? null;
+  const selectData = versions.map((v) => ({ value: v, label: v }));
+  if (currentVersion && !versions.includes(currentVersion)) {
+    selectData.unshift({ value: currentVersion, label: `${currentVersion} (当前)` });
+  }
+
+  const mutation = useMutation({
+    mutationFn: (version: string) => updateSettings({ tp_cloak_cli_version: version }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: qk.settings });
+      notifications.show({ message: "版本已更新", color: "green" });
+    },
+    onError: (e) =>
+      notifications.show({ message: e instanceof ApiError ? e.message : "保存失败", color: "red" }),
+  });
+
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    try {
+      const fresh = await getCliVersions(true);
+      queryClient.setQueryData(["cli-versions"], fresh);
+      notifications.show({ message: "版本列表已刷新", color: "green" });
+    } catch {
+      notifications.show({ message: "刷新失败", color: "red" });
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  return (
+    <Paper shadow="xs" p="md" radius="md" withBorder>
+      <Stack>
+        <Group justify="space-between">
+          <Text fw={600}>第三方中转伪装 CLI 版本</Text>
+          <Group gap="xs">
+            {fetchedAt && (
+              <Text size="xs" c="dimmed">
+                {new Date(fetchedAt).toLocaleString()} 更新
+              </Text>
+            )}
+            <Tooltip label="刷新版本列表">
+              <ActionIcon variant="subtle" size="sm" onClick={handleRefresh} loading={refreshing}>
+                <IconRefresh size={14} />
+              </ActionIcon>
+            </Tooltip>
+          </Group>
+        </Group>
+        <Text size="sm" c="dimmed">
+          第三方中转（API Key）渠道开启伪装时默认模拟的 Claude Code CLI 版本；渠道可单独覆盖。官方订阅路径的版本固定，不受此项影响。
+        </Text>
+        <Select
+          label="CLI 版本"
+          data={selectData}
+          value={currentVersion || null}
+          onChange={(v) => v && mutation.mutate(v)}
+          disabled={versionsLoading || mutation.isPending}
+          placeholder={versionsLoading ? "加载中..." : "选择版本"}
+        />
+      </Stack>
+    </Paper>
+  );
+}
+
 export default function Settings() {
   const { data, isLoading, error } = useQuery({
     queryKey: qk.settings,
@@ -354,6 +427,7 @@ export default function Settings() {
           enabled={effortOverrideEnabled}
           level={effortOverrideLevel}
         />
+        <TpVersionSection currentVersion={data["tp_cloak_cli_version"] ?? ""} />
         <ModelsSection />
         <PasswordSection />
       </Stack>

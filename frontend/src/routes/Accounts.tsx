@@ -23,6 +23,8 @@ import {
   Divider,
   Tooltip,
   Tabs,
+  SegmentedControl,
+  Switch,
 } from "@mantine/core";
 import { useForm, type UseFormReturnType } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
@@ -39,6 +41,7 @@ import {
   qk,
   ApiError,
   type Account,
+  type MimicryConfig,
   type AccountsListResponse,
   type AccountFailureContext,
   type Proxy,
@@ -336,6 +339,19 @@ function apiKeyExtraHeaderRows(account: Account | null): Array<{ key: string; va
   return Object.entries(account?.api_key_extra_headers ?? {}).map(([key, value]) => ({ key, value }));
 }
 
+/** Seed the mimicry form fields from an account (defaults for a new channel). */
+function mimicryInitialValues(account: Account | null) {
+  const cfg = account?.mimicry_config ?? null;
+  return {
+    mimicry_mode: account?.mimicry_mode ?? ("none" as "none" | "third_party"),
+    mimicry_auth_header: cfg?.auth_header ?? ("bearer" as "bearer" | "x_api_key"),
+    mimicry_cli_version: cfg?.cli_version ?? "",
+    // Default strict-system ON for new channels; existing channels keep theirs.
+    mimicry_strict_system: cfg?.strict_system ?? true,
+    mimicry_extra_beta: (cfg?.extra_beta ?? []).join(", "),
+  };
+}
+
 function AccountCard({
   account,
   probing,
@@ -583,6 +599,15 @@ interface FormValues {
    * `Some({})` explicitly clears server-side extras.
    */
   api_key_extra_headers: Array<{ key: string; value: string }>;
+  /** Two-tier mimicry mode (api_key only). */
+  mimicry_mode: "none" | "third_party";
+  /** Auth header form for the third-party cloak. */
+  mimicry_auth_header: "bearer" | "x_api_key";
+  /** Empty = inherit the global tp_cloak_cli_version. */
+  mimicry_cli_version: string;
+  mimicry_strict_system: boolean;
+  /** Comma/newline-separated extra beta tokens. */
+  mimicry_extra_beta: string;
 }
 
 /**
@@ -621,6 +646,15 @@ function ApiKeyTabPanel({
   const [unlocked, setUnlocked] = useState(
     () => apiKeyExtraHeaderRows(editing).length === 0,
   );
+  // Local mirrors for the mimicry controls. The form is uncontrolled, so these
+  // drive display + the mode-based conditional rendering; each change also
+  // writes through to the form so submit reads the current values.
+  const initial = form.getValues();
+  const [mMode, setMMode] = useState<"none" | "third_party">(initial.mimicry_mode);
+  const [mAuth, setMAuth] = useState<"bearer" | "x_api_key">(initial.mimicry_auth_header);
+  const [mVer, setMVer] = useState(initial.mimicry_cli_version);
+  const [mStrict, setMStrict] = useState(initial.mimicry_strict_system);
+  const [mBeta, setMBeta] = useState(initial.mimicry_extra_beta);
   const addRow = () => {
     form.setFieldValue("api_key_extra_headers", [
       ...form.getValues().api_key_extra_headers,
@@ -734,6 +768,76 @@ function ApiKeyTabPanel({
           </Stack>
         )}
       </Stack>
+
+      <Divider label="中转伪装 (Mimicry)" labelPosition="left" />
+      <Stack gap="xs">
+        <SegmentedControl
+          fullWidth
+          value={mMode}
+          onChange={(v) => {
+            const m = v as "none" | "third_party";
+            setMMode(m);
+            form.setFieldValue("mimicry_mode", m);
+          }}
+          data={[
+            { label: "关闭", value: "none" },
+            { label: "Claude Code 中转伪装", value: "third_party" },
+          ]}
+        />
+        <Text size="xs" c="dimmed">
+          开启后本渠道请求会被塑造成 Claude Code CLI 形态（伪装 UA、system 身份、billing 头、动态 beta、stainless 头、TLS 指纹），用于通过中转站的请求校验。直连官方 / AWS 兼容端点无需开启。
+        </Text>
+        {mMode === "third_party" && (
+          <Stack gap="sm" pl="xs">
+            <div>
+              <Text size="sm" fw={500} mb={4}>
+                认证头
+              </Text>
+              <SegmentedControl
+                value={mAuth}
+                onChange={(v) => {
+                  const a = v as "bearer" | "x_api_key";
+                  setMAuth(a);
+                  form.setFieldValue("mimicry_auth_header", a);
+                }}
+                data={[
+                  { label: "Authorization: Bearer", value: "bearer" },
+                  { label: "x-api-key", value: "x_api_key" },
+                ]}
+              />
+            </div>
+            <TextInput
+              label="CLI 版本（留空继承全局设置）"
+              placeholder="继承全局"
+              value={mVer}
+              onChange={(e) => {
+                setMVer(e.currentTarget.value);
+                form.setFieldValue("mimicry_cli_version", e.currentTarget.value);
+              }}
+            />
+            <Switch
+              label="严格 system 模式"
+              description="将客户端 system 下沉为首条 user 消息，wire 上只保留 Claude Code 身份"
+              checked={mStrict}
+              onChange={(e) => {
+                setMStrict(e.currentTarget.checked);
+                form.setFieldValue("mimicry_strict_system", e.currentTarget.checked);
+              }}
+            />
+            <Textarea
+              label="额外 anthropic-beta（可选）"
+              description="逗号或换行分隔；用于中转站要求的额外 beta token"
+              autosize
+              minRows={1}
+              value={mBeta}
+              onChange={(e) => {
+                setMBeta(e.currentTarget.value);
+                form.setFieldValue("mimicry_extra_beta", e.currentTarget.value);
+              }}
+            />
+          </Stack>
+        )}
+      </Stack>
     </Stack>
   );
 }
@@ -776,6 +880,7 @@ function AccountFormModal({
       api_key_base_url: editing?.api_key_base_url ?? "",
       api_key_secret: "",
       api_key_extra_headers: apiKeyExtraHeaderRows(editing),
+      ...mimicryInitialValues(editing),
     },
   });
 
@@ -805,6 +910,7 @@ function AccountFormModal({
       api_key_base_url: editing?.api_key_base_url ?? "",
       api_key_secret: "",
       api_key_extra_headers: apiKeyExtraHeaderRows(editing),
+      ...mimicryInitialValues(editing),
     });
   }, [editing]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -852,6 +958,22 @@ function AccountFormModal({
       if (!editing && tab === "oauth" && !oauthInput) throw new ApiError(400, "请粘贴 Callback URL 或 Code");
       if (!editing && tab === "api_key" && !apiKeyBaseUrl) throw new ApiError(400, "新账号必须提供 API 基础 URL");
       if (!editing && tab === "api_key" && !apiKeySecret) throw new ApiError(400, "新账号必须提供 API 密钥");
+
+      // Two-tier mimicry (api_key tab only). `none` sends no config; a
+      // `third_party` channel serializes the cloak knobs.
+      const mimicryMode = tab === "api_key" ? values.mimicry_mode : undefined;
+      const mimicryConfig: MimicryConfig | undefined =
+        tab === "api_key" && values.mimicry_mode === "third_party"
+          ? {
+              auth_header: values.mimicry_auth_header,
+              cli_version: values.mimicry_cli_version.trim() || null,
+              strict_system: values.mimicry_strict_system,
+              extra_beta: values.mimicry_extra_beta
+                .split(/[\n,]/)
+                .map((s) => s.trim())
+                .filter(Boolean),
+            }
+          : undefined;
       // On edit within the api_key tab we let the user submit without
       // re-entering the secret (empty = keep existing, mirror of the
       // cookie/oauth flow). Switching INTO api_key from a different
@@ -880,6 +1002,11 @@ function AccountFormModal({
           if (extraHeadersDirty && apiKeyExtraHeadersObj !== undefined) {
             body.api_key_extra_headers = apiKeyExtraHeadersObj;
           }
+          // Always forward the mimicry mode on the api_key tab (backend runs
+          // its mimicry update only when the field is present, and treats it
+          // idempotently). Config rides along only for a third_party channel.
+          body.mimicry_mode = mimicryMode;
+          if (mimicryConfig) body.mimicry_config = mimicryConfig;
         }
         return updateAccount(editing.id, body);
       }
@@ -898,6 +1025,8 @@ function AccountFormModal({
           apiKeyExtraHeadersObj && Object.keys(apiKeyExtraHeadersObj).length > 0
             ? apiKeyExtraHeadersObj
             : undefined,
+        mimicry_mode: mimicryMode,
+        mimicry_config: mimicryConfig,
       });
     },
     onSuccess: () => {

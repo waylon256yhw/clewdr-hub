@@ -186,6 +186,18 @@ export type AccountHealth =
     }
   | { state: "unconfigured"; probing: boolean; last_probe_error?: string | null };
 
+/** Upstream auth header form for a third-party cloak channel. */
+export type AuthHeaderForm = "bearer" | "x_api_key";
+
+/** Per-channel third-party cloak config (mirrors Rust ThirdPartyMimicryConfig). */
+export interface MimicryConfig {
+  auth_header: AuthHeaderForm;
+  /** Impersonated CLI version; empty/omitted = inherit the global setting. */
+  cli_version?: string | null;
+  strict_system: boolean;
+  extra_beta: string[];
+}
+
 export interface Account {
   id: number;
   name: string;
@@ -203,6 +215,10 @@ export interface Account {
   api_key_base_url?: string | null;
   /** Admin-configured extra headers attached to ApiKey sends. */
   api_key_extra_headers?: Record<string, string> | null;
+  /** Two-tier mimicry mode (api_key only). `none` for cookie/oauth. */
+  mimicry_mode: "none" | "third_party";
+  /** Third-party cloak config; present only for a `third_party` channel. */
+  mimicry_config?: MimicryConfig | null;
   /** All-time billable Messages spend attributed to this account. */
   total_cost_nanousd: number;
   oauth_expires_at: string | null;
@@ -565,6 +581,9 @@ export const createAccount = (data: {
   api_key_base_url?: string;
   api_key_secret?: string;
   api_key_extra_headers?: Record<string, string>;
+  /** Two-tier mimicry (api_key only). */
+  mimicry_mode?: "none" | "third_party";
+  mimicry_config?: MimicryConfig;
 }) => apiFetch<Account>("/api/admin/accounts", { method: "POST", body: data });
 export const updateAccount = (id: number, data: Record<string, unknown>) =>
   apiFetch<Account>(`/api/admin/accounts/${id}`, { method: "PUT", body: data });
@@ -632,6 +651,15 @@ export const updateKeyEnhancedAudit = (id: number, enabled: boolean) =>
 export const getSettings = () => apiFetch<Record<string, string>>("/api/admin/settings");
 export const updateSettings = (settings: Record<string, string>) =>
   apiFetch<Record<string, string>>("/api/admin/settings", { method: "POST", body: { settings } });
+
+// Third-party cloak CLI version list (npm registry, 1h server cache).
+export interface CliVersionsResponse {
+  versions: string[];
+  cached: boolean;
+  fetched_at: string | null;
+}
+export const getCliVersions = (force?: boolean) =>
+  apiFetch<CliVersionsResponse>(`/api/admin/cli-versions${force ? "?force=1" : ""}`);
 
 // Ops
 export const getOpsUsage = (
