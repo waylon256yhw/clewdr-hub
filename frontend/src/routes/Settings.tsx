@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Title,
@@ -12,6 +12,7 @@ import {
   Skeleton,
   Alert,
   Select,
+  Autocomplete,
   ActionIcon,
   Tooltip,
   Table,
@@ -336,10 +337,18 @@ function TpVersionSection({ currentVersion }: { currentVersion: string }) {
 
   const versions = versionsData?.versions ?? [];
   const fetchedAt = versionsData?.fetched_at ?? null;
-  const selectData = versions.map((v) => ({ value: v, label: v }));
-  if (currentVersion && !versions.includes(currentVersion)) {
-    selectData.unshift({ value: currentVersion, label: `${currentVersion} (当前)` });
-  }
+  // Suggestions = current pinned version + latest 5 from npm, deduped, current
+  // first. Free text is still allowed so relays can pin an arbitrary old version.
+  const optionData = Array.from(
+    new Set([currentVersion, ...versions].map((v) => v.trim()).filter(Boolean)),
+  );
+
+  // Editable value; resync when the saved setting changes (e.g. after save).
+  const [value, setValue] = useState(currentVersion);
+  useEffect(() => setValue(currentVersion), [currentVersion]);
+  const trimmed = value.trim();
+  const looksValid = /^\d+\.\d+\.\d+/.test(trimmed);
+  const dirty = trimmed !== currentVersion;
 
   const mutation = useMutation({
     mutationFn: (version: string) => updateSettings({ tp_cloak_cli_version: version }),
@@ -383,16 +392,36 @@ function TpVersionSection({ currentVersion }: { currentVersion: string }) {
           </Group>
         </Group>
         <Text size="sm" c="dimmed">
-          第三方中转（API Key）渠道开启伪装时默认模拟的 Claude Code CLI 版本；渠道可单独覆盖。官方订阅路径的版本固定，不受此项影响。
+          第三方中转（API Key）渠道开启伪装时默认模拟的 Claude Code CLI 版本；渠道可单独覆盖。官方订阅路径的版本固定，不受此项影响。可从下拉选择最近版本，或手动输入以固定到某个旧版本（如中转要求）。
         </Text>
-        <Select
-          label="CLI 版本"
-          data={selectData}
-          value={currentVersion || null}
-          onChange={(v) => v && mutation.mutate(v)}
-          disabled={versionsLoading || mutation.isPending}
-          placeholder={versionsLoading ? "加载中..." : "选择版本"}
-        />
+        <Group align="flex-end" gap="xs">
+          <Autocomplete
+            label="CLI 版本"
+            style={{ flex: 1 }}
+            data={optionData}
+            value={value}
+            onChange={setValue}
+            onOptionSubmit={(v) => {
+              if (v !== currentVersion) mutation.mutate(v);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && looksValid && dirty) {
+                e.preventDefault();
+                mutation.mutate(trimmed);
+              }
+            }}
+            disabled={versionsLoading || mutation.isPending}
+            placeholder={versionsLoading ? "加载中..." : "选择或输入版本，如 2.0.55"}
+            error={trimmed && !looksValid ? "请输入 x.y.z 版本号" : undefined}
+          />
+          <Button
+            onClick={() => mutation.mutate(trimmed)}
+            disabled={!looksValid || !dirty || mutation.isPending}
+            loading={mutation.isPending}
+          >
+            保存
+          </Button>
+        </Group>
       </Stack>
     </Paper>
   );
