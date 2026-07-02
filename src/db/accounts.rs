@@ -1494,6 +1494,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accounts_check_rejects_non_api_key_row_with_mimicry() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        // cookie row with mimicry_mode = 'third_party'
+        let r = sqlx::query(
+            "INSERT INTO accounts (name, rr_order, auth_source, cookie_blob, mimicry_mode)
+             VALUES ('a', 1, 'cookie', 'ck', 'third_party')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(r.is_err(), "cookie row cannot carry third_party mimicry");
+        // cookie row with a non-null mimicry_config
+        let r = sqlx::query(
+            "INSERT INTO accounts (name, rr_order, auth_source, cookie_blob, mimicry_config)
+             VALUES ('b', 2, 'cookie', 'ck', '{}')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(r.is_err(), "cookie row cannot carry a mimicry_config");
+    }
+
+    #[tokio::test]
+    async fn accounts_check_api_key_mimicry_orphan_rules() {
+        let pool = init_pool(Path::new(":memory:")).await.unwrap();
+        // api_key 'none' with a config is an orphan — rejected.
+        let r = sqlx::query(
+            "INSERT INTO accounts (name, rr_order, auth_source, api_key_base_url, api_key_secret, mimicry_config)
+             VALUES ('a', 1, 'api_key', 'https://x/', 'sk', '{}')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(r.is_err(), "api_key none row cannot keep an orphan config");
+        // api_key 'none' with no config — accepted.
+        let r = sqlx::query(
+            "INSERT INTO accounts (name, rr_order, auth_source, api_key_base_url, api_key_secret)
+             VALUES ('b', 2, 'api_key', 'https://x/', 'sk')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(r.is_ok(), "api_key none with no config must be accepted");
+        // api_key 'third_party' with a config — accepted.
+        let r = sqlx::query(
+            "INSERT INTO accounts (name, rr_order, auth_source, api_key_base_url, api_key_secret, mimicry_mode, mimicry_config)
+             VALUES ('c', 3, 'api_key', 'https://x/', 'sk', 'third_party', '{}')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            r.is_ok(),
+            "api_key third_party with config must be accepted"
+        );
+    }
+
+    #[tokio::test]
     async fn accounts_check_rejects_cookie_row_with_oauth_tokens() {
         let pool = init_pool(Path::new(":memory:")).await.unwrap();
         let result = sqlx::query(
