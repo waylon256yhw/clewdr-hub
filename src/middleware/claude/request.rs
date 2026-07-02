@@ -70,6 +70,21 @@ fn sample_js_code_unit(text: &str, idx: usize) -> String {
 
 pub(crate) fn claude_code_billing_header(messages: &[Message], profile: &StealthProfile) -> String {
     let first_text = first_user_message_text(messages);
+    claude_code_billing_header_from_sample(first_text, profile)
+}
+
+/// Build the billing header from an explicit first-user-text sample.
+///
+/// Split out from [`claude_code_billing_header`] so callers that mutate the
+/// message list (notably the third-party cloak, which demotes the client's
+/// `system` into a leading user message under strict mode) can capture the
+/// ORIGINAL first-user-text sample up front and compute the header from it —
+/// otherwise the sample would be taken from the injected system text and the
+/// `cc_version` hash would drift from what the real CLI produces.
+pub(crate) fn claude_code_billing_header_from_sample(
+    first_text: &str,
+    profile: &StealthProfile,
+) -> String {
     let sampled = [4, 7, 20]
         .into_iter()
         .map(|idx| sample_js_code_unit(first_text, idx))

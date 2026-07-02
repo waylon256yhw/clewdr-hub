@@ -28,6 +28,7 @@ use crate::{
         upsert_oauth_snapshot_runtime_fields,
     },
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
+    mimicry::STAINLESS_HEADERS,
     oauth::refresh_oauth_token,
     services::account_error::{
         AccountFailureAction, AccountFailureContextPersisted, AccountNormalizedReason,
@@ -38,6 +39,11 @@ use crate::{
     types::claude::{CountMessageTokensResponse, CreateMessageParams, Role},
 };
 
+// Re-exported so existing call sites (`chat::is_reserved_api_key_extra_header`,
+// the `crate::claude_code_state` re-export, and this module's tests) keep
+// resolving after the definition moved to `crate::mimicry`.
+pub(crate) use crate::mimicry::is_reserved_api_key_extra_header;
+
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MAX_RETRIES: usize = 5;
 const MESSAGES_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -45,53 +51,6 @@ const COUNT_TOKENS_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
 const CLAUDE_BETA_BASE: &str = "oauth-2025-04-20";
 const CLAUDE_BETA_CONTEXT_1M_TOKEN: &str = "context-1m-2025-08-07";
 const CLAUDE_API_VERSION: &str = "2023-06-01";
-
-/// Anthropic JS SDK (Stainless-generated) default header values the real
-/// Claude Code CLI sends on every `/v1/messages` request (observed in 2.1.185
-/// capture; package-version tracks `@anthropic-ai/sdk`). `runtime-version` is
-/// environment-derived on a real install; we pin a plausible recent Node value.
-/// These are fixed fingerprint headers, unrelated to body content, so both the
-/// messages and count_tokens paths send them.
-const STAINLESS_HEADERS: &[(&str, &str)] = &[
-    ("x-stainless-retry-count", "0"),
-    ("x-stainless-timeout", "600"),
-    ("x-stainless-lang", "js"),
-    ("x-stainless-package-version", "0.94.0"),
-    ("x-stainless-os", "Linux"),
-    ("x-stainless-arch", "x64"),
-    ("x-stainless-runtime", "node"),
-    ("x-stainless-runtime-version", "v24.3.0"),
-];
-
-/// Header names that MUST NOT come from per-account extra_headers on
-/// an ApiKey send: either we set them ourselves (`x-api-key`,
-/// `anthropic-version`, `anthropic-beta`, `content-type`) or they
-/// reintroduce subscription-shaped behavior the ApiKey dispatch is
-/// designed to remove (`user-agent` would silently restore the CC
-/// stealth UA we deliberately omit) or they belong to the transport
-/// layer (`host`, `content-length`, `accept-encoding`) and overriding
-/// them breaks the request.
-///
-/// Admin write-time validation (C10) is the primary guardrail; this
-/// send-time filter is defense in depth for the case of a manual DB
-/// edit that bypasses validation.
-const API_KEY_RESERVED_EXTRA_HEADERS: &[&str] = &[
-    "x-api-key",
-    "authorization",
-    "anthropic-version",
-    "anthropic-beta",
-    "user-agent",
-    "host",
-    "content-length",
-    "content-type",
-    "accept-encoding",
-];
-
-pub(crate) fn is_reserved_api_key_extra_header(name: &str) -> bool {
-    API_KEY_RESERVED_EXTRA_HEADERS
-        .iter()
-        .any(|reserved| reserved.eq_ignore_ascii_case(name))
-}
 
 /// Compose the `anthropic-beta` header for an ApiKey send.
 ///
@@ -925,30 +884,23 @@ impl ClaudeCodeState {
             .await
     }
 
-    async fn execute_claude_request(
-        &mut self,
-        access_token: &str,
+    /// Build the OFFICIAL (Cookie/OAuth) outbound body: inject the deterministic
+    /// `metadata.user_id` bound to the selected account, serialize, and overwrite
+    /// the billing-header `cch=00000;` placeholder with a self-consistent xxh64
+    /// checksum over the FINAL bytes (`stealth::cch_rewrite`). Returns the wire
+    /// bytes plus the derived session id (also emitted as
+    /// `x-claude-code-session-id`, so metadata.user_id and the header carry one
+    /// value, mirroring the real CLI). Failover rotates the identity because it
+    /// is bound to the selected account.
+    ///
+    /// This is intentionally NOT reused by the third-party cloak: third-party
+    /// keeps `cch=00000` literal (no rewrite) and derives Claude-Cloak-style
+    /// metadata, so it reuses only the lower-level `stealth` helpers, not this.
+    fn build_official_identity_body(
+        &self,
         body: &CreateMessageParams,
-    ) -> Result<wreq::Response, ClewdrError> {
-        if self
-            .cookie
-            .as_ref()
-            .is_some_and(|s| s.auth_method == AuthMethod::ApiKey)
-        {
-            return self
-                .execute_api_key_request("v1/messages", body, "Failed to send chat message")
-                .await;
-        }
-        let profile = self.stealth_profile.load();
-        let beta_header = Self::merge_anthropic_beta_header(self.anthropic_beta_header.as_deref());
-        let mut url = self.endpoint.join("v1/messages").expect("Url parse error");
-        url.set_query(Some("beta=true"));
-
-        // Derive the outbound session identity, bound to the SELECTED account so
-        // a failover rotates it. metadata.user_id + X-Claude-Code-Session-Id
-        // share one value (mirrors the real CLI). Then serialize and overwrite
-        // the billing-header `cch=00000;` placeholder with a self-consistent
-        // checksum over the FINAL bytes (see stealth::cch_rewrite).
+        profile: &stealth::StealthProfile,
+    ) -> Result<(Vec<u8>, uuid::Uuid), ClewdrError> {
         let api_key_id = self
             .billing_ctx
             .as_ref()
@@ -984,6 +936,29 @@ impl ClaudeCodeState {
                 "cch placeholder not rewritten on messages body (unexpected billing-block shape)"
             );
         }
+        Ok((bytes, session_id))
+    }
+
+    async fn execute_claude_request(
+        &mut self,
+        access_token: &str,
+        body: &CreateMessageParams,
+    ) -> Result<wreq::Response, ClewdrError> {
+        if self
+            .cookie
+            .as_ref()
+            .is_some_and(|s| s.auth_method == AuthMethod::ApiKey)
+        {
+            return self
+                .execute_api_key_request("v1/messages", body, "Failed to send chat message")
+                .await;
+        }
+        let profile = self.stealth_profile.load();
+        let beta_header = Self::merge_anthropic_beta_header(self.anthropic_beta_header.as_deref());
+        let mut url = self.endpoint.join("v1/messages").expect("Url parse error");
+        url.set_query(Some("beta=true"));
+
+        let (bytes, session_id) = self.build_official_identity_body(body, &profile)?;
 
         let mut req = self
             .client
