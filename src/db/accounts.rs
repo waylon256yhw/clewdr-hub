@@ -597,6 +597,21 @@ pub async fn set_account_last_failure(
     Ok(())
 }
 
+/// Best-effort variant of [`set_account_last_failure`]: a DB error is
+/// logged and swallowed so a failed diagnostic write never blocks the
+/// surrounding account-state transition. Shared by the chat retry
+/// loops and the admin `/test` verdict paths, which all persist the
+/// context strictly as a side channel.
+pub async fn set_account_last_failure_logged(
+    pool: &SqlitePool,
+    account_id: i64,
+    failure: Option<&AccountFailureContextPersisted>,
+) {
+    if let Err(err) = set_account_last_failure(pool, account_id, failure).await {
+        tracing::warn!("Failed to persist last_failure for account {account_id}: {err}");
+    }
+}
+
 fn serialize_last_failure(
     account_id: i64,
     failure: Option<&AccountFailureContextPersisted>,

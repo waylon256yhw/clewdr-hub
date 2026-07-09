@@ -26,7 +26,8 @@ use crate::{
         AccountWithRuntime, batch_upsert_runtime_states, clear_account_cooldown,
         find_account_by_organization_uuid, get_account_by_id, load_all_accounts,
         set_account_active, set_account_auth_error, set_account_disabled, set_account_last_failure,
-        set_account_reset_time, update_account_metadata_unchecked, upsert_account_oauth,
+        set_account_last_failure_logged, set_account_reset_time, update_account_metadata_unchecked,
+        upsert_account_oauth,
     },
     db::proxies::{build_proxy_url, get_proxy_by_id},
     error::{
@@ -1339,9 +1340,7 @@ async fn persist_test_failure_verdict(
     }
 
     let persisted = AccountFailureContextPersisted::from(failure);
-    if let Err(err) = set_account_last_failure(&state.db, account_id, Some(&persisted)).await {
-        tracing::warn!("Failed to persist test failure for account {account_id}: {err}");
-    }
+    set_account_last_failure_logged(&state.db, account_id, Some(&persisted)).await;
     state.account_pool.invalidate(account_id, reason).await;
 }
 

@@ -23,7 +23,7 @@ use crate::{
     claude_code_state::{ClaudeCodeState, TokenStatus},
     config::{AuthMethod, ModelFamily, Reason},
     db::accounts::{
-        set_account_auth_error, set_account_disabled, set_account_last_failure,
+        set_account_auth_error, set_account_disabled, set_account_last_failure_logged,
         set_account_reset_time, update_account_metadata_unchecked, upsert_account_oauth,
         upsert_oauth_snapshot_runtime_fields,
     },
@@ -182,6 +182,22 @@ impl Drop for SelectedSlotGuard {
     }
 }
 
+/// One-shot verdict for a pure-OAuth slot failure, produced by
+/// [`ClaudeCodeState::classify_oauth_failure`]. Owned (no borrow of the
+/// `!Sync` `ClewdrError`) so the retry loops can hold it across `.await`.
+struct OAuthFailureVerdict {
+    /// Upstream says the organization is disabled → `disabled` transition.
+    disabled: bool,
+    /// Cooldown verdict with its reset time → `reset_time` transition and
+    /// an `UpstreamCoolingDown` surface error.
+    cooldown_until: Option<i64>,
+    /// Legacy `Reason` for the pool's release / invalidate API; `None`
+    /// for transient/internal classes (do not change account state).
+    pool_reason: Option<Reason>,
+    /// Structured context for `accounts.last_failure_json`.
+    persisted: AccountFailureContextPersisted,
+}
+
 impl ClaudeCodeState {
     async fn timeout_upstream<T, F>(
         timeout: Duration,
@@ -202,41 +218,46 @@ impl ClaudeCodeState {
 
     /// Step 3.5: routed through the unified classifier so every entry point
     /// (messages / count_tokens / probe / refresh / test) reaches the same
-    /// "this account is disabled" verdict. Behavior is preserved: only the
-    /// `OrganizationDisabled` normalized reason triggers the disabled
-    /// branch — `FreeTier` keeps a separate path even though it also maps
-    /// to `AccountFailureAction::TerminalDisabled`.
-    fn is_oauth_disabled_failure(err: &ClewdrError) -> bool {
-        let ctx = classify_account_failure(err, FailureSource::Messages, None, None);
-        matches!(
-            ctx.normalized_reason,
-            AccountNormalizedReason::OrganizationDisabled
-        )
-    }
-
-    /// Step 3.5: routed through the unified classifier. Equivalent to the
-    /// previous `InvalidCookie + Reason::TooManyRequest|Restricted` match —
-    /// any classifier path that produces `AccountFailureAction::Cooldown`
-    /// reports its `reset_time` here.
-    fn oauth_cooldown_until(err: &ClewdrError) -> Option<i64> {
-        match classify_account_failure(err, FailureSource::Messages, None, None).action {
-            AccountFailureAction::Cooldown { reset_time } => Some(reset_time),
-            _ => None,
-        }
-    }
-
-    /// Step 3.5: routed through the unified classifier. The classifier
-    /// produces a normalized reason for every terminal/cooldown error and
-    /// `to_reason()` bridges it back to the legacy `Reason` enum used by
-    /// the pool's invalidate / collect API. Transient and internal
-    /// classes return `None` so callers do not change account state.
-    fn oauth_pool_reason(err: &ClewdrError) -> Option<Reason> {
-        let ctx = classify_account_failure(err, FailureSource::Messages, None, None);
-        match ctx.action {
-            AccountFailureAction::TerminalAuth
-            | AccountFailureAction::TerminalDisabled
-            | AccountFailureAction::Cooldown { .. } => ctx.normalized_reason.to_reason(),
-            AccountFailureAction::TransientUpstream | AccountFailureAction::InternalError => None,
+    /// verdicts. Runs `classify_account_failure` exactly once per error and
+    /// derives every field the pure-OAuth failure arms need, instead of the
+    /// previous three helpers that each re-classified the same error.
+    ///
+    /// Behavior notes preserved from those helpers:
+    /// - `disabled`: only the `OrganizationDisabled` normalized reason —
+    ///   `FreeTier` keeps a separate path even though it also maps to
+    ///   `AccountFailureAction::TerminalDisabled`.
+    /// - `cooldown_until`: equivalent to the previous `InvalidCookie +
+    ///   Reason::TooManyRequest|Restricted` match — any classifier path
+    ///   that produces `AccountFailureAction::Cooldown` reports its
+    ///   `reset_time`.
+    /// - `pool_reason`: `to_reason()` bridges the normalized reason back to
+    ///   the legacy `Reason` enum used by the pool's invalidate / collect
+    ///   API; transient and internal classes yield `None` so callers do
+    ///   not change account state.
+    ///
+    /// Returns an owned struct (no borrow of the `!Sync` error) so the
+    /// caller can cross `.await` points with a Send future — same rule as
+    /// [`Self::classify_persisted`].
+    fn classify_oauth_failure(err: &ClewdrError, source: FailureSource) -> OAuthFailureVerdict {
+        let ctx = classify_account_failure(err, source, None, None);
+        OAuthFailureVerdict {
+            disabled: matches!(
+                ctx.normalized_reason,
+                AccountNormalizedReason::OrganizationDisabled
+            ),
+            cooldown_until: match ctx.action {
+                AccountFailureAction::Cooldown { reset_time } => Some(reset_time),
+                _ => None,
+            },
+            pool_reason: match ctx.action {
+                AccountFailureAction::TerminalAuth
+                | AccountFailureAction::TerminalDisabled
+                | AccountFailureAction::Cooldown { .. } => ctx.normalized_reason.to_reason(),
+                AccountFailureAction::TransientUpstream | AccountFailureAction::InternalError => {
+                    None
+                }
+            },
+            persisted: AccountFailureContextPersisted::from(&ctx),
         }
     }
 
@@ -276,9 +297,7 @@ impl ClaudeCodeState {
         let Some(db) = self.billing_ctx.as_ref().map(|ctx| ctx.db.clone()) else {
             return;
         };
-        if let Err(db_err) = set_account_last_failure(&db, account_id, Some(&persisted)).await {
-            warn!("Failed to persist last_failure for account {account_id}: {db_err}");
-        }
+        set_account_last_failure_logged(&db, account_id, Some(&persisted)).await;
     }
 
     /// Step 3.5 C4b: classify a borrowed `ClewdrError` to the owned
@@ -309,9 +328,7 @@ impl ClaudeCodeState {
         // legacy auth_error transition so AccountHealth.last_failure can
         // read source/stage/upstream_http_status without losing the
         // failure scene.
-        if let Err(db_err) = set_account_last_failure(&db, account_id, Some(&persisted)).await {
-            warn!("Failed to persist last_failure for account {account_id}: {db_err}");
-        }
+        set_account_last_failure_logged(&db, account_id, Some(&persisted)).await;
         // DB is authoritative; converge the pool's in-memory view so the
         // account stops being dispatched and any affinity pointing at it is
         // cleared.
@@ -334,9 +351,7 @@ impl ClaudeCodeState {
         }
         // Step 3.5 C4b: persist structured failure context alongside the
         // legacy disabled transition.
-        if let Err(db_err) = set_account_last_failure(&db, account_id, Some(&persisted)).await {
-            warn!("Failed to persist last_failure for account {account_id}: {db_err}");
-        }
+        set_account_last_failure_logged(&db, account_id, Some(&persisted)).await;
         self.account_pool_handle
             .invalidate(account_id, Reason::Disabled)
             .await;
@@ -374,9 +389,7 @@ impl ClaudeCodeState {
             warn!("Failed to set ApiKey auth_error for account {account_id}: {db_err}");
             return;
         }
-        if let Err(db_err) = set_account_last_failure(&db, account_id, Some(&persisted)).await {
-            warn!("Failed to persist ApiKey last_failure for account {account_id}: {db_err}");
-        }
+        set_account_last_failure_logged(&db, account_id, Some(&persisted)).await;
         self.account_pool_handle
             .invalidate(account_id, Reason::Null)
             .await;
@@ -398,9 +411,7 @@ impl ClaudeCodeState {
             warn!("Failed to set ApiKey account {account_id} disabled: {db_err}");
             return;
         }
-        if let Err(db_err) = set_account_last_failure(&db, account_id, Some(&persisted)).await {
-            warn!("Failed to persist ApiKey last_failure for account {account_id}: {db_err}");
-        }
+        set_account_last_failure_logged(&db, account_id, Some(&persisted)).await;
         self.account_pool_handle
             .invalidate(account_id, reason)
             .await;
@@ -670,28 +681,26 @@ impl ClaudeCodeState {
                 }
                 Err(e) => {
                     if is_pure_oauth_slot {
-                        let pool_reason = Self::oauth_pool_reason(&e);
+                        let verdict = Self::classify_oauth_failure(&e, FailureSource::Messages);
                         if let Some(aid) = account_id {
-                            if Self::is_oauth_disabled_failure(&e) {
-                                let persisted =
-                                    Self::classify_persisted(&e, FailureSource::Messages);
-                                state.mark_oauth_account_disabled(aid, persisted).await;
-                            } else if let Some(reset_time) = Self::oauth_cooldown_until(&e) {
+                            if verdict.disabled {
+                                state
+                                    .mark_oauth_account_disabled(aid, verdict.persisted)
+                                    .await;
+                            } else if let Some(reset_time) = verdict.cooldown_until {
                                 state.mark_oauth_account_cooldown(aid, reset_time).await;
                             } else if Self::is_oauth_auth_failure(&e) {
                                 let message = e.to_string();
-                                let persisted =
-                                    Self::classify_persisted(&e, FailureSource::Messages);
                                 state
-                                    .mark_oauth_account_auth_error(aid, message, persisted)
+                                    .mark_oauth_account_auth_error(aid, message, verdict.persisted)
                                     .await;
                             }
                         }
                         slot_guard.finish().await;
-                        if pool_reason.is_some() {
-                            state.release_account(pool_reason).await;
+                        if verdict.pool_reason.is_some() {
+                            state.release_account(verdict.pool_reason).await;
                         }
-                        if Self::oauth_cooldown_until(&e).is_some() {
+                        if verdict.cooldown_until.is_some() {
                             return Err(ClewdrError::UpstreamCoolingDown);
                         }
                         return Err(e);
@@ -1315,28 +1324,26 @@ impl ClaudeCodeState {
                 }
                 Err(e) => {
                     if is_pure_oauth_slot {
-                        let pool_reason = Self::oauth_pool_reason(&e);
+                        let verdict = Self::classify_oauth_failure(&e, FailureSource::CountTokens);
                         if let Some(aid) = account_id {
-                            if Self::is_oauth_disabled_failure(&e) {
-                                let persisted =
-                                    Self::classify_persisted(&e, FailureSource::CountTokens);
-                                state.mark_oauth_account_disabled(aid, persisted).await;
-                            } else if let Some(reset_time) = Self::oauth_cooldown_until(&e) {
+                            if verdict.disabled {
+                                state
+                                    .mark_oauth_account_disabled(aid, verdict.persisted)
+                                    .await;
+                            } else if let Some(reset_time) = verdict.cooldown_until {
                                 state.mark_oauth_account_cooldown(aid, reset_time).await;
                             } else if Self::is_oauth_auth_failure(&e) {
                                 let message = e.to_string();
-                                let persisted =
-                                    Self::classify_persisted(&e, FailureSource::CountTokens);
                                 state
-                                    .mark_oauth_account_auth_error(aid, message, persisted)
+                                    .mark_oauth_account_auth_error(aid, message, verdict.persisted)
                                     .await;
                             }
                         }
                         slot_guard.finish().await;
-                        if pool_reason.is_some() {
-                            state.release_account(pool_reason).await;
+                        if verdict.pool_reason.is_some() {
+                            state.release_account(verdict.pool_reason).await;
                         }
-                        if Self::oauth_cooldown_until(&e).is_some() {
+                        if verdict.cooldown_until.is_some() {
                             return Err(ClewdrError::UpstreamCoolingDown);
                         }
                         return Err(e);
@@ -2271,26 +2278,33 @@ impl ClaudeCodeState {
 #[cfg(test)]
 mod tests {
     use super::ClaudeCodeState;
-    use crate::{config::Reason, error::ClewdrError};
+    use crate::{config::Reason, error::ClewdrError, services::account_error::FailureSource};
+
+    fn classify(err: &ClewdrError) -> super::OAuthFailureVerdict {
+        ClaudeCodeState::classify_oauth_failure(err, FailureSource::Messages)
+    }
 
     #[test]
     fn oauth_cooldown_detects_temporary_invalid_cookie_reasons() {
         assert_eq!(
-            ClaudeCodeState::oauth_cooldown_until(&ClewdrError::InvalidCookie {
+            classify(&ClewdrError::InvalidCookie {
                 reason: Reason::TooManyRequest(123),
-            }),
+            })
+            .cooldown_until,
             Some(123)
         );
         assert_eq!(
-            ClaudeCodeState::oauth_cooldown_until(&ClewdrError::InvalidCookie {
+            classify(&ClewdrError::InvalidCookie {
                 reason: Reason::Restricted(456),
-            }),
+            })
+            .cooldown_until,
             Some(456)
         );
         assert_eq!(
-            ClaudeCodeState::oauth_cooldown_until(&ClewdrError::InvalidCookie {
+            classify(&ClewdrError::InvalidCookie {
                 reason: Reason::Null,
-            }),
+            })
+            .cooldown_until,
             None
         );
     }
@@ -2298,22 +2312,25 @@ mod tests {
     #[test]
     fn oauth_pool_reason_maps_auth_and_cooldown_errors_for_pool_eviction() {
         assert_eq!(
-            ClaudeCodeState::oauth_pool_reason(&ClewdrError::InvalidCookie {
+            classify(&ClewdrError::InvalidCookie {
                 reason: Reason::Restricted(456),
-            }),
+            })
+            .pool_reason,
             Some(Reason::Restricted(456))
         );
         assert_eq!(
-            ClaudeCodeState::oauth_pool_reason(&ClewdrError::InvalidCookie {
+            classify(&ClewdrError::InvalidCookie {
                 reason: Reason::Disabled,
-            }),
+            })
+            .pool_reason,
             Some(Reason::Disabled)
         );
         assert_eq!(
-            ClaudeCodeState::oauth_pool_reason(&ClewdrError::Whatever {
+            classify(&ClewdrError::Whatever {
                 message: "invalid_grant".to_string(),
                 source: None,
-            }),
+            })
+            .pool_reason,
             Some(Reason::Null)
         );
     }
@@ -2321,29 +2338,31 @@ mod tests {
     /// Step 3.5 C2 regression guards. The classifier rewrite must preserve
     /// these subtle edges:
     /// 1. `Reason::Free` is `TerminalDisabled` at the action level but is
-    ///    NOT `is_oauth_disabled_failure` — it goes through a separate
-    ///    Free-tier path that must not converge with the org-disabled
-    ///    branch.
+    ///    NOT a `disabled` verdict — it goes through a separate Free-tier
+    ///    path that must not converge with the org-disabled branch.
     /// 2. Bare 401/403 (no phrase) is auth-rejected and must produce
     ///    `Reason::Null` for pool eviction.
     /// 3. Transient / internal errors must not produce a pool reason.
     #[test]
     fn oauth_disabled_failure_distinguishes_free_from_org_disabled() {
-        assert!(ClaudeCodeState::is_oauth_disabled_failure(
-            &ClewdrError::InvalidCookie {
+        assert!(
+            classify(&ClewdrError::InvalidCookie {
                 reason: Reason::Disabled,
-            }
-        ));
-        assert!(!ClaudeCodeState::is_oauth_disabled_failure(
-            &ClewdrError::InvalidCookie {
+            })
+            .disabled
+        );
+        assert!(
+            !classify(&ClewdrError::InvalidCookie {
                 reason: Reason::Free,
-            }
-        ));
-        assert!(!ClaudeCodeState::is_oauth_disabled_failure(
-            &ClewdrError::InvalidCookie {
+            })
+            .disabled
+        );
+        assert!(
+            !classify(&ClewdrError::InvalidCookie {
                 reason: Reason::Banned,
-            }
-        ));
+            })
+            .disabled
+        );
     }
 
     #[test]
@@ -2361,24 +2380,48 @@ mod tests {
                 ..Default::default()
             }),
         };
-        assert_eq!(
-            ClaudeCodeState::oauth_pool_reason(&http(401)),
-            Some(Reason::Null)
-        );
-        assert_eq!(
-            ClaudeCodeState::oauth_pool_reason(&http(403)),
-            Some(Reason::Null)
-        );
+        assert_eq!(classify(&http(401)).pool_reason, Some(Reason::Null));
+        assert_eq!(classify(&http(403)).pool_reason, Some(Reason::Null));
         // 5xx is transient — must NOT evict.
-        assert_eq!(ClaudeCodeState::oauth_pool_reason(&http(500)), None);
+        assert_eq!(classify(&http(500)).pool_reason, None);
         // Local logic errors must not evict either.
         assert_eq!(
-            ClaudeCodeState::oauth_pool_reason(&ClewdrError::Whatever {
+            classify(&ClewdrError::Whatever {
                 message: "unrelated local failure".to_string(),
                 source: None,
-            }),
+            })
+            .pool_reason,
             None
         );
+    }
+
+    /// The count_tokens retry loop classifies with
+    /// `FailureSource::CountTokens` where the pre-consolidation helpers
+    /// hardcoded `Messages`. Pin that the scheduler-facing fields are
+    /// source-independent so the consolidation is behavior-preserving.
+    #[test]
+    fn oauth_verdict_scheduler_fields_are_source_independent() {
+        for err in [
+            ClewdrError::InvalidCookie {
+                reason: Reason::TooManyRequest(123),
+            },
+            ClewdrError::InvalidCookie {
+                reason: Reason::Disabled,
+            },
+            ClewdrError::InvalidCookie {
+                reason: Reason::Null,
+            },
+            ClewdrError::Whatever {
+                message: "invalid_grant".to_string(),
+                source: None,
+            },
+        ] {
+            let messages = ClaudeCodeState::classify_oauth_failure(&err, FailureSource::Messages);
+            let count = ClaudeCodeState::classify_oauth_failure(&err, FailureSource::CountTokens);
+            assert_eq!(messages.disabled, count.disabled);
+            assert_eq!(messages.cooldown_until, count.cooldown_until);
+            assert_eq!(messages.pool_reason, count.pool_reason);
+        }
     }
 
     #[test]
