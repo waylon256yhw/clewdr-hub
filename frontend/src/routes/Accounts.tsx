@@ -403,12 +403,20 @@ const AccountCard = memo(function AccountCard({
   probeError,
   onEdit,
   onDelete,
+  pollTick: _pollTick,
 }: {
   account: Account;
   probing: boolean;
   probeError?: string;
   onEdit: (account: Account) => void;
   onDelete: (account: Account) => void;
+  // Changes on every successful refetch. The card renders Date.now()-derived
+  // countdowns/status (formatCountdown, resolveDisplayStatus cooling flip), and
+  // structural sharing keeps an idle account's object referentially stable, so
+  // without a per-poll input memo would freeze those clocks. Threading the poll
+  // timestamp re-renders each card once per poll (fresh time, min-granularity
+  // so 30s cadence is ample) while still skipping unrelated parent re-renders.
+  pollTick: number;
 }) {
   const rt = account.runtime;
   const isApiKey = account.auth_source === "api_key";
@@ -1308,7 +1316,7 @@ function DeleteModal({
 
 export default function Accounts() {
   const queryClient = useQueryClient();
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, dataUpdatedAt } = useQuery({
     queryKey: qk.accounts,
     queryFn: listAccounts,
     refetchInterval: (query) => {
@@ -1419,6 +1427,7 @@ export default function Accounts() {
               probing={probingIds.has(a.id)}
               onEdit={openEdit}
               onDelete={openDelete}
+              pollTick={dataUpdatedAt}
             />
           ))}
         </SimpleGrid>

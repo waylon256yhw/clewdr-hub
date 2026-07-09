@@ -73,7 +73,7 @@ const Ops = lazy(() => retryImport(() => import("./routes/Ops")));
 // render errors (e.g. recharts choking on mobile viewport). Scope is broader
 // than just code-splitting failures.
 class RouteErrorBoundary extends Component<
-  { children: ReactNode },
+  { children: ReactNode; resetKey: string },
   { hasError: boolean }
 > {
   state = { hasError: false };
@@ -85,6 +85,16 @@ class RouteErrorBoundary extends Component<
   override componentDidCatch(error: Error, info: React.ErrorInfo) {
     // Log in production too — white-screen reports are useless without this.
     console.error("[RouteErrorBoundary] caught error:", error, info.componentStack);
+  }
+
+  override componentDidUpdate(prev: { resetKey: string }) {
+    // The boundary wraps the whole routed subtree, so without this a single
+    // route's render/chunk error would latch hasError=true and brick every
+    // page. Clear it when the user navigates (resetKey = pathname) so the
+    // destination route gets a fresh render attempt instead of the fallback.
+    if (this.state.hasError && prev.resetKey !== this.props.resetKey) {
+      this.setState({ hasError: false });
+    }
   }
 
   override render() {
@@ -347,7 +357,7 @@ function AdminShell() {
         ))}
       </AppShell.Navbar>
       <AppShell.Main>
-        <RouteErrorBoundary>
+        <RouteErrorBoundary resetKey={location.pathname}>
           <Suspense fallback={<PageSkeleton />}>
             <Routes>
               <Route path="/" element={<Dashboard />} />

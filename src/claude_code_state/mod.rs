@@ -132,7 +132,6 @@ pub struct ClaudeCodeState {
     pub cookie: Option<AccountSlot>,
     pub cookie_header_value: HeaderValue,
     pub proxy_url: Option<String>,
-    pub proxy: Option<wreq::Proxy>,
     pub endpoint: url::Url,
     pub client: wreq::Client,
     pub stream: bool,
@@ -187,7 +186,6 @@ impl ClaudeCodeState {
             // per-account client, so share the static one instead of
             // paying a client build per request.
             client: SUPER_CLIENT.to_owned(),
-            proxy: None,
             endpoint: crate::config::ENDPOINT_URL.to_owned(),
             stream: false,
             system_prompt_hash: None,
@@ -233,7 +231,6 @@ impl ClaudeCodeState {
         let mut state = Self::new(account_pool_handle, stealth_profile);
         let auth_method = slot.auth_method;
         state.proxy_url = slot.proxy_url.clone();
-        state.proxy = proxy_from_url(state.proxy_url.as_deref());
 
         state.cookie_header_value = match auth_method {
             AuthMethod::Cookie => {
@@ -293,7 +290,7 @@ impl ClaudeCodeState {
                 state.mimicry_config = slot.mimicry_config.clone();
             }
         }
-        state.client = client_cache::get_or_build(&slot)?;
+        state.client = client_cache::get_or_build(&slot);
 
         state.cookie = Some(slot);
         Ok(state)
@@ -387,7 +384,6 @@ impl ClaudeCodeState {
             AuthMethod::OAuth | AuthMethod::ApiKey => HeaderValue::from_static(""),
         };
         self.proxy_url = res.proxy_url.clone();
-        self.proxy = proxy_from_url(self.proxy_url.as_deref());
 
         // Per-auth_method endpoint + wreq client + api_key plumbing.
         // Mirror of the dispatch in `from_credential` so the hot-path
@@ -427,19 +423,13 @@ impl ClaudeCodeState {
         // TLS emulation, ApiKey gets plain or emulated iff third-party —
         // but retries and follow-up requests on the same account reuse the
         // upstream connection instead of paying a fresh TLS handshake.
-        self.client = client_cache::get_or_build(&res)?;
+        self.client = client_cache::get_or_build(&res);
         if let Some(selected_account_id) = &self.selected_account_id
             && let Ok(mut slot) = selected_account_id.lock()
         {
             *slot = res.account_id;
         }
         Ok(res)
-    }
-
-    pub fn set_proxy_url(&mut self, proxy_url: Option<&str>) {
-        self.proxy_url = proxy_url.map(|s| s.to_string());
-        self.proxy = proxy_from_url(proxy_url);
-        self.client = build_api_client(proxy_url);
     }
 
     pub fn check_token(&self) -> TokenStatus {
