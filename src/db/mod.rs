@@ -245,7 +245,7 @@ const DEFAULT_MODELS: &[(&str, &str, i32)] = &[
     ("claude-sonnet-5", "Claude Sonnet 5", 40),
     ("claude-sonnet-4-6", "Claude Sonnet 4.6", 50),
     ("claude-sonnet-4-5", "Claude Sonnet 4.5", 60),
-    ("claude-haiku-4-5", "Claude Haiku 4.5", 80),
+    ("claude-haiku-4-5-20251001", "Claude Haiku 4.5", 80),
 ];
 
 pub async fn seed_models(pool: &SqlitePool) -> Result<(), ClewdrError> {
