@@ -21,7 +21,10 @@ use url::{Url, form_urlencoded};
 
 use crate::{
     claude_code_state::proxy_from_url,
-    config::{CC_REDIRECT_URI, CC_TOKEN_URL, CLEWDR_CONFIG, RuntimeStateParams, TokenInfo},
+    config::{
+        CC_REDIRECT_URI, CC_TOKEN_URL, CLEWDR_CONFIG, RuntimeStateParams, TokenInfo,
+        parse_weekly_scoped_limits, scoped_legacy_backfill,
+    },
     error::{CheckClaudeErr, ClewdrError, UnexpectedNoneSnafu, WreqSnafu},
     stealth,
 };
@@ -475,8 +478,25 @@ pub async fn fetch_oauth_snapshot_raw(
 
     let (session_resets_at, session_utilization) = parse_window(usage.five_hour);
     let (weekly_resets_at, weekly_utilization) = parse_window(usage.seven_day);
-    let (weekly_sonnet_resets_at, weekly_sonnet_utilization) = parse_window(usage.seven_day_sonnet);
-    let (weekly_opus_resets_at, weekly_opus_utilization) = parse_window(usage.seven_day_opus);
+    let (mut weekly_sonnet_resets_at, mut weekly_sonnet_utilization) =
+        parse_window(usage.seven_day_sonnet);
+    let (mut weekly_opus_resets_at, mut weekly_opus_utilization) =
+        parse_window(usage.seven_day_opus);
+
+    // Anthropic replaced the fixed seven_day_opus/seven_day_sonnet fields
+    // (now always null) with a generic usage.limits[] array of
+    // kind == "weekly_scoped" entries, scoped to an arbitrary model name.
+    // Parse the full list, and backfill the legacy fields above when a
+    // scoped entry's name matches "opus"/"sonnet" for backward compat.
+    let weekly_scoped_limits = parse_weekly_scoped_limits(&usage_raw);
+    if let Some((r, u)) = scoped_legacy_backfill(&weekly_scoped_limits, "opus") {
+        weekly_opus_resets_at = weekly_opus_resets_at.or(r);
+        weekly_opus_utilization = weekly_opus_utilization.or(u);
+    }
+    if let Some((r, u)) = scoped_legacy_backfill(&weekly_scoped_limits, "sonnet") {
+        weekly_sonnet_resets_at = weekly_sonnet_resets_at.or(r);
+        weekly_sonnet_utilization = weekly_sonnet_utilization.or(u);
+    }
 
     let snapshot = OAuthAccountSnapshot {
         email: profile.account.email.clone(),
@@ -517,6 +537,7 @@ pub async fn fetch_oauth_snapshot_raw(
             weekly_sonnet_utilization,
             weekly_opus_utilization,
             buckets: Default::default(),
+            weekly_scoped_limits,
         },
     };
     Ok((snapshot, profile_raw, usage_raw))

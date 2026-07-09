@@ -1306,6 +1306,7 @@ fn build_cookie_probe_slot_preserves_runtime_state_from_db_row() {
         weekly_sonnet_utilization: None,
         weekly_opus_utilization: None,
         buckets: Default::default(),
+        weekly_scoped_limits: Vec::new(),
     };
     let account = AccountWithRuntime {
         id: 7,
@@ -1394,6 +1395,7 @@ fn build_cookie_probe_slot_normalizes_lapsed_reset_time() {
         weekly_sonnet_utilization: None,
         weekly_opus_utilization: None,
         buckets: Default::default(),
+        weekly_scoped_limits: Vec::new(),
     };
     let account = AccountWithRuntime {
         id: 8,
@@ -1523,6 +1525,7 @@ fn build_cookie_probe_slot_prefers_memory_runtime_over_db_row() {
         weekly_sonnet_utilization: None,
         weekly_opus_utilization: None,
         buckets: Default::default(),
+        weekly_scoped_limits: Vec::new(),
     };
     let account = AccountWithRuntime {
         id: 20,

@@ -105,6 +105,13 @@ export interface UsageWindow {
   utilization: number | null;
 }
 
+// One entry from the generalized weekly-scoped limits list — the model
+// name can be anything Anthropic reports (Opus, Sonnet, Fable, ...), not
+// just the two fixed windows below.
+export interface ScopedUsageWindow extends UsageWindow {
+  model_display_name: string;
+}
+
 export interface AccountRuntime {
   reset_time: number | null;
   resets_last_checked_at: number | null;
@@ -112,6 +119,7 @@ export interface AccountRuntime {
   weekly: UsageWindow | null;
   weekly_sonnet: UsageWindow | null;
   weekly_opus: UsageWindow | null;
+  weekly_scoped: ScopedUsageWindow[];
 }
 
 /**

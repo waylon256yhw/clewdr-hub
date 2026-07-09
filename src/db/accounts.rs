@@ -1,6 +1,6 @@
 use sqlx::{Executor, Row, Sqlite, SqlitePool};
 
-use crate::config::{RuntimeStateParams, TokenInfo, UsageBreakdown};
+use crate::config::{RuntimeStateParams, ScopedWeeklyLimit, TokenInfo, UsageBreakdown};
 use crate::services::account_error::AccountFailureContextPersisted;
 
 /// Joined result of accounts + account_runtime_state.
@@ -86,6 +86,7 @@ pub struct RuntimeStateRow {
     pub weekly_sonnet_utilization: Option<f64>,
     pub weekly_opus_utilization: Option<f64>,
     pub buckets: [UsageBreakdown; 5],
+    pub weekly_scoped_limits: Vec<ScopedWeeklyLimit>,
 }
 
 impl RuntimeStateRow {
@@ -109,6 +110,7 @@ impl RuntimeStateRow {
             weekly_sonnet_utilization: self.weekly_sonnet_utilization,
             weekly_opus_utilization: self.weekly_opus_utilization,
             buckets: self.buckets.clone(),
+            weekly_scoped_limits: self.weekly_scoped_limits.clone(),
         }
     }
 }
@@ -170,6 +172,7 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
             rs.resets_last_checked_at,
             rs.session_has_reset, rs.weekly_has_reset, rs.weekly_sonnet_has_reset, rs.weekly_opus_has_reset,
             rs.session_utilization, rs.weekly_utilization, rs.weekly_sonnet_utilization, rs.weekly_opus_utilization,
+            rs.weekly_scoped_limits_json,
             COALESCE(rs.session_total_input, 0) AS session_total_input,
             COALESCE(rs.session_total_output, 0) AS session_total_output,
             COALESCE(rs.session_sonnet_input, 0) AS session_sonnet_input,
@@ -242,6 +245,18 @@ pub async fn load_all_accounts(pool: &SqlitePool) -> Result<Vec<AccountWithRunti
                 make_bucket(row, "wo"),
                 make_bucket(row, "lifetime"),
             ],
+            weekly_scoped_limits: row
+                .get::<Option<String>, _>("weekly_scoped_limits_json")
+                .map(|s| {
+                    serde_json::from_str(&s).unwrap_or_else(|err| {
+                        let account_id: i64 = row.get("id");
+                        tracing::warn!(
+                            "account {account_id}: malformed weekly_scoped_limits_json, treating as empty: {err}"
+                        );
+                        Vec::new()
+                    })
+                })
+                .unwrap_or_default(),
         });
 
         let oauth_access_token: Option<String> = row.get("oauth_access_token");
@@ -357,6 +372,7 @@ pub async fn batch_upsert_runtime_states(
                 wo_total_input, wo_total_output, wo_sonnet_input, wo_sonnet_output, wo_opus_input, wo_opus_output,
                 lifetime_total_input, lifetime_total_output, lifetime_sonnet_input, lifetime_sonnet_output, lifetime_opus_input, lifetime_opus_output,
                 session_utilization, weekly_utilization, weekly_sonnet_utilization, weekly_opus_utilization,
+                weekly_scoped_limits_json,
                 updated_at
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
@@ -366,6 +382,7 @@ pub async fn batch_upsert_runtime_states(
                 ?33, ?34, ?35, ?36, ?37, ?38,
                 ?39, ?40, ?41, ?42, ?43, ?44,
                 ?45, ?46, ?47, ?48,
+                ?49,
                 CURRENT_TIMESTAMP
             ) ON CONFLICT(account_id) DO UPDATE SET
                 reset_time = excluded.reset_time,
@@ -415,6 +432,7 @@ pub async fn batch_upsert_runtime_states(
                 weekly_utilization = excluded.weekly_utilization,
                 weekly_sonnet_utilization = excluded.weekly_sonnet_utilization,
                 weekly_opus_utilization = excluded.weekly_opus_utilization,
+                weekly_scoped_limits_json = excluded.weekly_scoped_limits_json,
                 updated_at = CURRENT_TIMESTAMP"#,
         )
         .bind(account_id)
@@ -465,6 +483,7 @@ pub async fn batch_upsert_runtime_states(
         .bind(p.weekly_utilization)
         .bind(p.weekly_sonnet_utilization)
         .bind(p.weekly_opus_utilization)
+        .bind(serde_json::to_string(&p.weekly_scoped_limits).ok())
         .execute(&mut *tx)
         .await?;
     }
@@ -489,9 +508,10 @@ pub async fn upsert_oauth_snapshot_runtime_fields(
             resets_last_checked_at,
             session_has_reset, weekly_has_reset, weekly_sonnet_has_reset, weekly_opus_has_reset,
             session_utilization, weekly_utilization, weekly_sonnet_utilization, weekly_opus_utilization,
+            weekly_scoped_limits_json,
             updated_at
         ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
             CURRENT_TIMESTAMP
         ) ON CONFLICT(account_id) DO UPDATE SET
             reset_time = excluded.reset_time,
@@ -508,6 +528,7 @@ pub async fn upsert_oauth_snapshot_runtime_fields(
             weekly_utilization = excluded.weekly_utilization,
             weekly_sonnet_utilization = excluded.weekly_sonnet_utilization,
             weekly_opus_utilization = excluded.weekly_opus_utilization,
+            weekly_scoped_limits_json = excluded.weekly_scoped_limits_json,
             updated_at = CURRENT_TIMESTAMP"#,
     )
     .bind(account_id)
@@ -525,6 +546,7 @@ pub async fn upsert_oauth_snapshot_runtime_fields(
     .bind(p.weekly_utilization)
     .bind(p.weekly_sonnet_utilization)
     .bind(p.weekly_opus_utilization)
+    .bind(serde_json::to_string(&p.weekly_scoped_limits).ok())
     .execute(pool)
     .await?;
     Ok(())
@@ -1056,6 +1078,7 @@ mod tests {
             weekly_sonnet_utilization: None,
             weekly_opus_utilization: None,
             buckets: std::array::from_fn(|_| UsageBreakdown::default()),
+            weekly_scoped_limits: Vec::new(),
         }
     }
 

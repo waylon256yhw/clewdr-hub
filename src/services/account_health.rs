@@ -559,6 +559,7 @@ mod tests {
             weekly_sonnet_utilization: None,
             weekly_opus_utilization: None,
             buckets: std::array::from_fn(|_| UsageBreakdown::default()),
+            weekly_scoped_limits: Vec::new(),
         }
     }
 

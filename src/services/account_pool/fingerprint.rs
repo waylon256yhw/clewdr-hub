@@ -409,6 +409,7 @@ impl AccountPoolActor {
         dst.weekly_utilization = mem.weekly_utilization;
         dst.weekly_sonnet_utilization = mem.weekly_sonnet_utilization;
         dst.weekly_opus_utilization = mem.weekly_opus_utilization;
+        dst.weekly_scoped_limits = mem.weekly_scoped_limits;
         // Prefer memory email/account_type if DB is null but memory has it.
         if dst.email.is_none() {
             dst.email = mem.email;

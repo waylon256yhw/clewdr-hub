@@ -65,6 +65,17 @@ pub struct UsageWindowResponse {
     pub utilization: Option<f64>,
 }
 
+/// One entry from the generalized `usage.limits[]` weekly-scoped list —
+/// see `ScopedWeeklyLimit`. Unlike the fixed `weekly_sonnet`/`weekly_opus`
+/// windows, `model_display_name` can name any model Anthropic reports.
+#[derive(Serialize)]
+pub struct ScopedUsageWindowResponse {
+    pub model_display_name: String,
+    pub has_reset: Option<bool>,
+    pub resets_at: Option<i64>,
+    pub utilization: Option<f64>,
+}
+
 #[derive(Serialize)]
 pub struct AccountRuntimeResponse {
     pub reset_time: Option<i64>,
@@ -73,6 +84,7 @@ pub struct AccountRuntimeResponse {
     pub weekly: Option<UsageWindowResponse>,
     pub weekly_sonnet: Option<UsageWindowResponse>,
     pub weekly_opus: Option<UsageWindowResponse>,
+    pub weekly_scoped: Vec<ScopedUsageWindowResponse>,
 }
 
 #[derive(Serialize)]
@@ -164,6 +176,16 @@ fn map_account(row: &AccountWithRuntime, health: Option<AccountHealth>) -> Accou
             resets_at: rt.weekly_opus_resets_at,
             utilization: rt.weekly_opus_utilization,
         }),
+        weekly_scoped: rt
+            .weekly_scoped_limits
+            .iter()
+            .map(|e| ScopedUsageWindowResponse {
+                model_display_name: e.model_display_name.clone(),
+                has_reset: Some(true),
+                resets_at: e.resets_at,
+                utilization: e.utilization,
+            })
+            .collect(),
     });
 
     AccountResponse {

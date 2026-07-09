@@ -46,6 +46,7 @@ import {
   type AccountFailureContext,
   type Proxy,
   type UsageWindow,
+  type ScopedUsageWindow,
 } from "../api";
 import { formatCost, formatEpochSeconds } from "../lib/format";
 
@@ -334,6 +335,17 @@ function WindowRow({ label, window }: { label: string; window: UsageWindow | nul
       </Group>
       <Progress value={util} color={utilizationColor(util)} size="sm" radius="xl" />
     </Stack>
+  );
+}
+
+// Opus/Sonnet scoped entries are already shown via the fixed weekly_opus/
+// weekly_sonnet rows above (backfilled server-side from the same data) —
+// exclude them here so the same model's usage isn't rendered twice.
+function scopedWindowRows(
+  scoped: ScopedUsageWindow[] | null | undefined,
+): ScopedUsageWindow[] {
+  return (scoped ?? []).filter(
+    (w) => !["opus", "sonnet"].includes(w.model_display_name.toLowerCase()),
   );
 }
 
@@ -627,6 +639,13 @@ const AccountCard = memo(function AccountCard({
             <WindowRow label="7d 总量" window={rt?.weekly} />
             <WindowRow label="7d Sonnet" window={rt?.weekly_sonnet} />
             <WindowRow label="7d Opus" window={rt?.weekly_opus} />
+            {scopedWindowRows(rt?.weekly_scoped).map((w) => (
+              <WindowRow
+                key={w.model_display_name}
+                label={`7d ${w.model_display_name}`}
+                window={w}
+              />
+            ))}
           </Stack>
         </>
       )}

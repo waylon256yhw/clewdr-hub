@@ -262,6 +262,15 @@ pub struct AccountSlot {
     #[serde(default)]
     pub weekly_opus_utilization: Option<f64>,
 
+    /// Generalized replacement for the fixed opus/sonnet weekly buckets
+    /// above: Anthropic now reports per-model weekly restrictions as
+    /// `kind: "weekly_scoped"` entries in `usage.limits[]`, scoped to an
+    /// arbitrary model name (not just Opus/Sonnet). Populated from the
+    /// same probe response; entries matching "opus"/"sonnet" also
+    /// backfill the fixed fields above for backward compatibility.
+    #[serde(default)]
+    pub weekly_scoped_limits: Vec<ScopedWeeklyLimit>,
+
     // ---------- ApiKey credential fields (Step 5) ----------
     // Populated iff `auth_method == ApiKey`. `base_url` is the upstream
     // origin (e.g. `https://api.anthropic.com/`, already normalized by
@@ -355,6 +364,7 @@ impl AccountSlot {
             weekly_utilization: None,
             weekly_sonnet_utilization: None,
             weekly_opus_utilization: None,
+            weekly_scoped_limits: Vec::new(),
             api_key_base_url: None,
             api_key_secret: None,
             api_key_extra_headers: None,
@@ -612,6 +622,85 @@ impl AccountSlot {
     }
 }
 
+/// One entry from Anthropic's `usage.limits[]` array where `kind ==
+/// "weekly_scoped"`. Generalizes what used to be the fixed
+/// `seven_day_opus`/`seven_day_sonnet` top-level fields (now always null) —
+/// `model_display_name` can be any model Anthropic reports (e.g. "Opus",
+/// "Sonnet", "Fable"), and the array may hold 0, 1, or more entries.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ScopedWeeklyLimit {
+    pub model_display_name: String,
+    pub resets_at: Option<i64>,
+    pub utilization: Option<f64>,
+}
+
+/// Extract every `kind == "weekly_scoped"` entry from a raw usage-probe JSON
+/// body's `limits[]` array (same shape for the cookie-session usage endpoint
+/// and the OAuth `/api/oauth/usage` endpoint). Entries missing
+/// `scope.model.display_name`, with a blank display name, or carrying
+/// neither `resets_at` nor `percent` (nothing meaningful to show) are
+/// skipped rather than causing a failure. Duplicate display names (after
+/// trimming) are deduped, last-entry-wins — matching `scoped_legacy_backfill`'s
+/// last-match-wins semantics.
+pub fn parse_weekly_scoped_limits(usage_raw: &serde_json::Value) -> Vec<ScopedWeeklyLimit> {
+    let Some(limits) = usage_raw.get("limits").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut result: Vec<ScopedWeeklyLimit> = Vec::new();
+    for entry in limits {
+        if entry.get("kind").and_then(|v| v.as_str()) != Some("weekly_scoped") {
+            continue;
+        }
+        let Some(model_display_name) = entry
+            .get("scope")
+            .and_then(|v| v.get("model"))
+            .and_then(|v| v.get("display_name"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let resets_at = entry
+            .get("resets_at")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp());
+        let utilization = entry.get("percent").and_then(|v| v.as_f64());
+        if resets_at.is_none() && utilization.is_none() {
+            continue;
+        }
+        let scoped = ScopedWeeklyLimit {
+            model_display_name,
+            resets_at,
+            utilization,
+        };
+        if let Some(existing) = result.iter_mut().find(|e| {
+            e.model_display_name
+                .eq_ignore_ascii_case(&scoped.model_display_name)
+        }) {
+            *existing = scoped;
+        } else {
+            result.push(scoped);
+        }
+    }
+    result
+}
+
+/// Find a scoped entry whose display name case-insensitively equals `want`
+/// (e.g. "opus"/"sonnet"), used to backfill the legacy fixed fields for
+/// backward compatibility. Last match wins if duplicates exist.
+pub fn scoped_legacy_backfill(
+    entries: &[ScopedWeeklyLimit],
+    want: &str,
+) -> Option<(Option<i64>, Option<f64>)> {
+    entries
+        .iter()
+        .rfind(|e| e.model_display_name.eq_ignore_ascii_case(want))
+        .map(|e| (e.resets_at, e.utilization))
+}
+
 /// Parameters for upserting account_runtime_state to DB.
 #[derive(Debug, Clone)]
 pub struct RuntimeStateParams {
@@ -633,6 +722,7 @@ pub struct RuntimeStateParams {
     pub weekly_sonnet_utilization: Option<f64>,
     pub weekly_opus_utilization: Option<f64>,
     pub buckets: [UsageBreakdown; 5], // session, weekly, weekly_sonnet, weekly_opus, lifetime
+    pub weekly_scoped_limits: Vec<ScopedWeeklyLimit>,
 }
 
 impl AccountSlot {
@@ -663,6 +753,7 @@ impl AccountSlot {
                 self.weekly_opus_usage.clone(),
                 self.lifetime_usage.clone(),
             ],
+            weekly_scoped_limits: self.weekly_scoped_limits.clone(),
         }
     }
 
@@ -690,6 +781,7 @@ impl AccountSlot {
         self.weekly_sonnet_usage = p.buckets[2].clone();
         self.weekly_opus_usage = p.buckets[3].clone();
         self.lifetime_usage = p.buckets[4].clone();
+        self.weekly_scoped_limits = p.weekly_scoped_limits.clone();
     }
 
     /// Merge runtime fields owned by the OAuth profile/usage snapshot.
@@ -713,6 +805,7 @@ impl AccountSlot {
         self.weekly_utilization = p.weekly_utilization;
         self.weekly_sonnet_utilization = p.weekly_sonnet_utilization;
         self.weekly_opus_utilization = p.weekly_opus_utilization;
+        self.weekly_scoped_limits = p.weekly_scoped_limits.clone();
     }
 }
 
@@ -791,6 +884,88 @@ impl Debug for ClewdrCookie {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real sample captured from the OAuth usage-probe endpoint (2026-07-09):
+    /// seven_day_opus/seven_day_sonnet are always null now; the real
+    /// per-model weekly restriction lives in `limits[]` as a
+    /// `kind: "weekly_scoped"` entry naming an arbitrary model ("Fable"
+    /// here, not Opus/Sonnet).
+    const SAMPLE_USAGE_JSON: &str = r#"{
+        "limits": [
+            {"group": "session", "is_active": false, "kind": "session", "percent": 2,
+             "resets_at": "2026-07-09T15:50:00.048020+00:00", "scope": null, "severity": "normal"},
+            {"group": "weekly", "is_active": true, "kind": "weekly_all", "percent": 100,
+             "resets_at": "2026-07-10T02:00:00.048043+00:00", "scope": null, "severity": "critical"},
+            {"group": "weekly", "is_active": false, "kind": "weekly_scoped", "percent": 98,
+             "resets_at": "2026-07-10T02:00:00.048334+00:00",
+             "scope": {"model": {"display_name": "Fable", "id": null}, "surface": null},
+             "severity": "critical"}
+        ]
+    }"#;
+
+    #[test]
+    fn parse_weekly_scoped_limits_extracts_scoped_entries_only() {
+        let usage: serde_json::Value = serde_json::from_str(SAMPLE_USAGE_JSON).unwrap();
+        let entries = parse_weekly_scoped_limits(&usage);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model_display_name, "Fable");
+        assert_eq!(entries[0].utilization, Some(98.0));
+        let expected_ts = chrono::DateTime::parse_from_rfc3339("2026-07-10T02:00:00.048334+00:00")
+            .unwrap()
+            .timestamp();
+        assert_eq!(entries[0].resets_at, Some(expected_ts));
+    }
+
+    #[test]
+    fn parse_weekly_scoped_limits_skips_entries_missing_display_name() {
+        let usage: serde_json::Value = serde_json::from_str(
+            r#"{"limits": [{"kind": "weekly_scoped", "percent": 50, "resets_at": null, "scope": {"model": {"id": null}}}]}"#,
+        )
+        .unwrap();
+        assert!(parse_weekly_scoped_limits(&usage).is_empty());
+    }
+
+    #[test]
+    fn parse_weekly_scoped_limits_handles_missing_limits_array() {
+        let usage: serde_json::Value = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(parse_weekly_scoped_limits(&usage).is_empty());
+    }
+
+    #[test]
+    fn scoped_legacy_backfill_matches_case_insensitively() {
+        let entries = vec![ScopedWeeklyLimit {
+            model_display_name: "Opus".to_string(),
+            resets_at: Some(123),
+            utilization: Some(50.0),
+        }];
+        for want in ["opus", "OPUS", "Opus"] {
+            assert_eq!(
+                scoped_legacy_backfill(&entries, want),
+                Some((Some(123), Some(50.0)))
+            );
+        }
+        assert_eq!(scoped_legacy_backfill(&entries, "sonnet"), None);
+    }
+
+    #[test]
+    fn scoped_legacy_backfill_last_match_wins_on_duplicates() {
+        let entries = vec![
+            ScopedWeeklyLimit {
+                model_display_name: "Sonnet".to_string(),
+                resets_at: Some(1),
+                utilization: Some(10.0),
+            },
+            ScopedWeeklyLimit {
+                model_display_name: "Sonnet".to_string(),
+                resets_at: Some(2),
+                utilization: Some(20.0),
+            },
+        ];
+        assert_eq!(
+            scoped_legacy_backfill(&entries, "sonnet"),
+            Some((Some(2), Some(20.0)))
+        );
+    }
 
     fn make_base_cookie_with_len(prefix_len: usize) -> String {
         format!("{}-{}AA", "a".repeat(prefix_len), "b".repeat(6))

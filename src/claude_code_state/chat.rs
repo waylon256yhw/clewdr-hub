@@ -2252,8 +2252,24 @@ impl ClaudeCodeState {
 
         let (sess_ts, sess_util) = parse_window("five_hour");
         let (week_ts, week_util) = parse_window("seven_day");
-        let (opus_ts, opus_util) = parse_window("seven_day_opus");
-        let (sonnet_ts, sonnet_util) = parse_window("seven_day_sonnet");
+        let (mut opus_ts, mut opus_util) = parse_window("seven_day_opus");
+        let (mut sonnet_ts, mut sonnet_util) = parse_window("seven_day_sonnet");
+
+        // Anthropic replaced the fixed seven_day_opus/seven_day_sonnet fields
+        // (now always null) with a generic usage.limits[] array of
+        // kind == "weekly_scoped" entries, scoped to an arbitrary model name.
+        // Parse the full list, and backfill the legacy fields above when a
+        // scoped entry's name matches "opus"/"sonnet" for backward compat.
+        let scoped_limits = crate::config::parse_weekly_scoped_limits(&usage);
+        if let Some((r, u)) = crate::config::scoped_legacy_backfill(&scoped_limits, "opus") {
+            opus_ts = opus_ts.or(r);
+            opus_util = opus_util.or(u);
+        }
+        if let Some((r, u)) = crate::config::scoped_legacy_backfill(&scoped_limits, "sonnet") {
+            sonnet_ts = sonnet_ts.or(r);
+            sonnet_util = sonnet_util.or(u);
+        }
+        cookie.weekly_scoped_limits = scoped_limits;
 
         cookie.session_utilization = sess_util;
         cookie.weekly_utilization = week_util;
