@@ -47,13 +47,6 @@ import {
   reloadIfFrontendOutdated,
 } from "./auth";
 import Login from "./routes/Login";
-import Dashboard from "./routes/Dashboard";
-import Accounts from "./routes/Accounts";
-import Proxies from "./routes/Proxies";
-import Users from "./routes/Users";
-import Keys from "./routes/Keys";
-import Settings from "./routes/Settings";
-import Logs from "./routes/Logs";
 async function retryImport<T>(fn: () => Promise<T>, retries = 2): Promise<T> {
   try {
     return await fn();
@@ -64,12 +57,22 @@ async function retryImport<T>(fn: () => Promise<T>, retries = 2): Promise<T> {
   }
 }
 
+// Every admin route is lazy so the initial bundle carries only the shell +
+// Login. Route chunks load on first navigation; retryImport absorbs
+// transient chunk-load failures (e.g. a deploy swapping hashed assets).
+const Dashboard = lazy(() => retryImport(() => import("./routes/Dashboard")));
+const Accounts = lazy(() => retryImport(() => import("./routes/Accounts")));
+const Proxies = lazy(() => retryImport(() => import("./routes/Proxies")));
+const Users = lazy(() => retryImport(() => import("./routes/Users")));
+const Keys = lazy(() => retryImport(() => import("./routes/Keys")));
+const Settings = lazy(() => retryImport(() => import("./routes/Settings")));
+const Logs = lazy(() => retryImport(() => import("./routes/Logs")));
 const Ops = lazy(() => retryImport(() => import("./routes/Ops")));
 
-// Catches failures inside the Ops subtree — lazy chunk load errors AND render
-// errors (e.g. recharts choking on mobile viewport). Named "Ops" not "Chunk"
-// because the scope is broader than just code-splitting failures.
-class OpsErrorBoundary extends Component<
+// Catches failures inside the routed subtree — lazy chunk load errors AND
+// render errors (e.g. recharts choking on mobile viewport). Scope is broader
+// than just code-splitting failures.
+class RouteErrorBoundary extends Component<
   { children: ReactNode },
   { hasError: boolean }
 > {
@@ -81,7 +84,7 @@ class OpsErrorBoundary extends Component<
 
   override componentDidCatch(error: Error, info: React.ErrorInfo) {
     // Log in production too — white-screen reports are useless without this.
-    console.error("[OpsErrorBoundary] caught error:", error, info.componentStack);
+    console.error("[RouteErrorBoundary] caught error:", error, info.componentStack);
   }
 
   override render() {
@@ -99,6 +102,22 @@ class OpsErrorBoundary extends Component<
     }
     return this.props.children;
   }
+}
+
+// Generic fallback while a lazy route chunk loads. Deliberately sparse —
+// route chunks are small and cached after first navigation.
+function PageSkeleton() {
+  return (
+    <Stack gap="md">
+      <Skeleton height={28} width={160} radius="sm" />
+      <SimpleGrid cols={{ base: 1, sm: 2, xl: 4 }} spacing="md">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <Skeleton key={i} height={108} radius="md" />
+        ))}
+      </SimpleGrid>
+      <Skeleton height={320} radius="md" />
+    </Stack>
+  );
 }
 
 // NOTE: kept in sync manually with the in-component skeleton in Ops.tsx.
@@ -168,8 +187,8 @@ function useGlobalAdminEvents() {
         try {
           const payload = JSON.parse(event.data) as { topic?: string };
           if (!payload.topic || payload.topic === "request_logs") {
-            queryClient.invalidateQueries({ queryKey: ["requests"] });
-            queryClient.invalidateQueries({ queryKey: ["opsUsage"] });
+            queryClient.invalidateQueries({ queryKey: qk.requestsRoot });
+            queryClient.invalidateQueries({ queryKey: qk.opsUsageRoot });
             queryClient.invalidateQueries({ queryKey: qk.overview });
             queryClient.invalidateQueries({ queryKey: qk.accounts });
           }
@@ -182,8 +201,8 @@ function useGlobalAdminEvents() {
             queryClient.invalidateQueries({ queryKey: qk.overview });
           }
         } catch {
-          queryClient.invalidateQueries({ queryKey: ["requests"] });
-          queryClient.invalidateQueries({ queryKey: ["opsUsage"] });
+          queryClient.invalidateQueries({ queryKey: qk.requestsRoot });
+          queryClient.invalidateQueries({ queryKey: qk.opsUsageRoot });
           queryClient.invalidateQueries({ queryKey: qk.overview });
           queryClient.invalidateQueries({ queryKey: qk.accounts });
         }
@@ -295,26 +314,28 @@ function AdminShell() {
         ))}
       </AppShell.Navbar>
       <AppShell.Main>
-        <Routes>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/accounts" element={<Accounts />} />
-          <Route path="/proxies" element={<Proxies />} />
-          <Route path="/users" element={<Users />} />
-          <Route path="/keys" element={<Keys />} />
-          <Route path="/settings" element={<Settings />} />
-          <Route path="/logs" element={<Logs />} />
-          <Route
-            path="/ops"
-            element={(
-              <OpsErrorBoundary>
-                <Suspense fallback={<OpsSkeleton />}>
-                  <Ops />
-                </Suspense>
-              </OpsErrorBoundary>
-            )}
-          />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
+        <RouteErrorBoundary>
+          <Suspense fallback={<PageSkeleton />}>
+            <Routes>
+              <Route path="/" element={<Dashboard />} />
+              <Route path="/accounts" element={<Accounts />} />
+              <Route path="/proxies" element={<Proxies />} />
+              <Route path="/users" element={<Users />} />
+              <Route path="/keys" element={<Keys />} />
+              <Route path="/settings" element={<Settings />} />
+              <Route path="/logs" element={<Logs />} />
+              <Route
+                path="/ops"
+                element={(
+                  <Suspense fallback={<OpsSkeleton />}>
+                    <Ops />
+                  </Suspense>
+                )}
+              />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+          </Suspense>
+        </RouteErrorBoundary>
       </AppShell.Main>
       <ForceChangePasswordModal />
     </AppShell>

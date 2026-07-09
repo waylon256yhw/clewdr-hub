@@ -737,9 +737,14 @@ export const qk = {
   proxies: ["proxies"] as const,
   users: ["users"] as const,
   policies: ["policies"] as const,
-  keys: (userId?: number) => ["keys", userId] as const,
+  keys: ["keys"] as const,
   settings: ["settings"] as const,
   models: ["models"] as const,
+  cliVersions: ["cli-versions"] as const,
+  // Root keys match every parameterized instance below — use them for
+  // invalidation (`invalidateQueries` matches by prefix).
+  opsUsageRoot: ["opsUsage"] as const,
+  requestsRoot: ["requests"] as const,
   opsUsage: (range: OpsRange, metric: OpsMetric, topUsers: number, userId?: number) =>
     ["opsUsage", range, metric, topUsers, userId] as const,
   requests: (filters: RequestFilters) => ["requests", filters] as const,

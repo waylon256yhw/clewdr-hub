@@ -83,7 +83,7 @@ function CreateKeyModal({
     onSuccess: async (res) => {
       setNewKey(res.plaintext_key);
       setNewKeyCopied(false);
-      queryClient.invalidateQueries({ queryKey: ["keys"] });
+      queryClient.invalidateQueries({ queryKey: qk.keys });
       queryClient.invalidateQueries({ queryKey: qk.overview });
 
       try {
@@ -235,7 +235,7 @@ function BindingsModal({
   const mutation = useMutation({
     mutationFn: () => updateKeyBindings(keyItem!.id, selected.map(Number)),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["keys"] });
+      queryClient.invalidateQueries({ queryKey: qk.keys });
       notifications.show({ message: "绑定已更新", color: "green" });
       onClose();
     },
@@ -278,14 +278,14 @@ export default function Keys() {
   const revealedFieldRef = useRef<HTMLTextAreaElement | null>(null);
 
   const { data, isLoading, error } = useQuery({
-    queryKey: ["keys"],
+    queryKey: qk.keys,
     queryFn: () => listKeys(),
   });
 
   const deleteMut = useMutation({
     mutationFn: () => deleteKey(deleting!.id),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["keys"] });
+      queryClient.invalidateQueries({ queryKey: qk.keys });
       queryClient.invalidateQueries({ queryKey: qk.overview });
       notifications.show({ message: "Key 已删除", color: "green" });
       setDeleting(null);
@@ -298,7 +298,7 @@ export default function Keys() {
     mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
       updateKeyAutoCache(id, enabled),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["keys"] });
+      queryClient.invalidateQueries({ queryKey: qk.keys });
     },
     onError: (e) =>
       notifications.show({ message: e instanceof ApiError ? e.message : "切换失败", color: "red" }),
@@ -308,7 +308,7 @@ export default function Keys() {
     mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
       updateKeyEnhancedAudit(id, enabled),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["keys"] });
+      queryClient.invalidateQueries({ queryKey: qk.keys });
     },
     onError: (e) =>
       notifications.show({ message: e instanceof ApiError ? e.message : "切换失败", color: "red" }),

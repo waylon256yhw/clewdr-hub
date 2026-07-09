@@ -331,7 +331,7 @@ function TpVersionSection({ currentVersion }: { currentVersion: string }) {
   const queryClient = useQueryClient();
   const [refreshing, setRefreshing] = useState(false);
   const { data: versionsData, isLoading: versionsLoading } = useQuery({
-    queryKey: ["cli-versions"],
+    queryKey: qk.cliVersions,
     queryFn: () => getCliVersions(),
     staleTime: 3600_000,
   });
@@ -367,7 +367,7 @@ function TpVersionSection({ currentVersion }: { currentVersion: string }) {
     setRefreshing(true);
     try {
       const fresh = await getCliVersions(true);
-      queryClient.setQueryData(["cli-versions"], fresh);
+      queryClient.setQueryData(qk.cliVersions, fresh);
       notifications.show({ message: "版本列表已刷新", color: "green" });
     } catch {
       notifications.show({ message: "刷新失败", color: "red" });

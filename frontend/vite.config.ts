@@ -27,6 +27,13 @@ export default defineConfig({
           if (/\/node_modules\/react(?:-dom)?\//.test(id) || /\/node_modules\/react-router\//.test(id)) {
             return 'framework'
           }
+          // @mantine/charts must not join the eager 'mantine' chunk: it is
+          // only imported by the lazy Ops route, and grouping it with
+          // @mantine/core would drag it (and its recharts subtree) into the
+          // initial bundle, defeating the route-level code split.
+          if (id.includes('/node_modules/@mantine/charts/')) {
+            return 'charts'
+          }
           if (id.includes('/node_modules/@mantine/')) {
             return 'mantine'
           }

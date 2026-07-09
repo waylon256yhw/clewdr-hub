@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import {
   Title,
   Table,
@@ -294,6 +294,7 @@ export default function Logs() {
     queryKey: qk.requests(filters),
     queryFn: () => listRequests(filters),
     refetchInterval: 60_000,
+    placeholderData: keepPreviousData,
   });
 
   const offset = filters.offset ?? 0;
