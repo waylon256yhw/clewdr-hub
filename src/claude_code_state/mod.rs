@@ -1,4 +1,5 @@
 mod chat;
+mod client_cache;
 mod exchange;
 mod fingerprint;
 mod organization;
@@ -10,7 +11,6 @@ use http::{
     HeaderValue, Method,
     header::{COOKIE, ORIGIN, REFERER, USER_AGENT},
 };
-use snafu::ResultExt;
 use tracing::error;
 use wreq::RequestBuilder;
 
@@ -20,7 +20,7 @@ use crate::{
         AccountSlot, ApiKeyExtraHeaders, AuthMethod, CLAUDE_ENDPOINT, MimicryMode, Reason,
         ThirdPartyMimicryConfig, TokenInfo,
     },
-    error::{ClewdrError, WreqSnafu},
+    error::ClewdrError,
     services::account_pool::{AccountPoolHandle, CredentialFingerprint},
     stealth::SharedStealthProfile,
     types::claude::Usage,
@@ -182,7 +182,11 @@ impl ClaudeCodeState {
             cookie: None,
             cookie_header_value: HeaderValue::from_static(""),
             proxy_url: None,
-            client: build_api_client(None),
+            // Placeholder only — never talks upstream before
+            // `from_credential` / `acquire_account` installs the real
+            // per-account client, so share the static one instead of
+            // paying a client build per request.
+            client: SUPER_CLIENT.to_owned(),
             proxy: None,
             endpoint: crate::config::ENDPOINT_URL.to_owned(),
             stream: false,
@@ -264,13 +268,11 @@ impl ClaudeCodeState {
         // uses a plain client — TLS emulation is meaningless and potentially a
         // trip-wire for strict corporate proxies on direct-API calls; the
         // cookie store is similarly redundant since ApiKey never attaches Cookie.
-        let mut client_builder = wreq::Client::builder();
+        // The client itself comes from the per-account cache (see
+        // `client_cache`) so repeat requests reuse upstream connections.
         match auth_method {
             AuthMethod::Cookie | AuthMethod::OAuth => {
                 state.endpoint = crate::config::ENDPOINT_URL.to_owned();
-                client_builder = client_builder
-                    .cookie_store(true)
-                    .emulation(fingerprint::claude_code_emulation());
             }
             AuthMethod::ApiKey => {
                 let raw_base =
@@ -289,21 +291,9 @@ impl ClaudeCodeState {
                 state.api_key_extra_body = slot.api_key_extra_body.clone();
                 state.mimicry_mode = slot.mimicry_mode;
                 state.mimicry_config = slot.mimicry_config.clone();
-                // Third-party cloak impersonates the CLI's Node/OpenSSL TLS
-                // (JA4) so the handshake matches the claude-cli UA +
-                // x-stainless-runtime=node headers. Clean passthrough keeps the
-                // plain client (a relay-agnostic direct-API call).
-                if slot.mimicry_mode.is_third_party() {
-                    client_builder = client_builder.emulation(fingerprint::claude_code_emulation());
-                }
             }
         }
-        if let Some(ref proxy) = state.proxy {
-            client_builder = client_builder.proxy(proxy.to_owned());
-        }
-        state.client = client_builder.build().context(WreqSnafu {
-            msg: "Failed to build client for credential",
-        })?;
+        state.client = client_cache::get_or_build(&slot)?;
 
         state.cookie = Some(slot);
         Ok(state)
@@ -408,7 +398,6 @@ impl ClaudeCodeState {
         // retry, and a previous ApiKey acquisition followed by a
         // Cookie/OAuth slot would otherwise leak the prior key onto
         // a subscription send.
-        let mut client_builder = wreq::Client::builder();
         match res.auth_method {
             AuthMethod::Cookie | AuthMethod::OAuth => {
                 self.endpoint = crate::config::ENDPOINT_URL.to_owned();
@@ -417,9 +406,6 @@ impl ClaudeCodeState {
                 self.api_key_extra_body = None;
                 self.mimicry_mode = MimicryMode::None;
                 self.mimicry_config = None;
-                client_builder = client_builder
-                    .cookie_store(true)
-                    .emulation(fingerprint::claude_code_emulation());
             }
             AuthMethod::ApiKey => {
                 let raw_base =
@@ -434,19 +420,14 @@ impl ClaudeCodeState {
                 self.api_key_extra_body = res.api_key_extra_body.clone();
                 self.mimicry_mode = res.mimicry_mode;
                 self.mimicry_config = res.mimicry_config.clone();
-                // See `from_credential`: third-party cloak needs the CLI TLS
-                // (JA4) emulation; clean passthrough uses the plain client.
-                if res.mimicry_mode.is_third_party() {
-                    client_builder = client_builder.emulation(fingerprint::claude_code_emulation());
-                }
             }
         }
-        if let Some(ref proxy) = self.proxy {
-            client_builder = client_builder.proxy(proxy.to_owned());
-        }
-        self.client = client_builder.build().context(WreqSnafu {
-            msg: "Failed to build client with new cookie",
-        })?;
+        // Per-account cached client (see `client_cache`): same shape rules
+        // as the old inline builder — Cookie/OAuth get cookie_store + CLI
+        // TLS emulation, ApiKey gets plain or emulated iff third-party —
+        // but retries and follow-up requests on the same account reuse the
+        // upstream connection instead of paying a fresh TLS handshake.
+        self.client = client_cache::get_or_build(&res)?;
         if let Some(selected_account_id) = &self.selected_account_id
             && let Ok(mut slot) = selected_account_id.lock()
         {

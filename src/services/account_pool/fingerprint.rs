@@ -27,7 +27,7 @@ const CREDENTIAL_FINGERPRINT_LEN: usize = 20;
 /// ApiKey uses the api_key secret prefix. Admin rotation of the key
 /// itself is the only event that should invalidate runtime — there is
 /// no transparent rotation in the api-key model.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CredentialFingerprint {
     Cookie(String),
     OAuth(String),
