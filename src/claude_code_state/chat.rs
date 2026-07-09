@@ -1482,9 +1482,15 @@ impl ClaudeCodeState {
             }
             // Billing/request log writes are intentionally after slot release:
             // runtime state has already been queued, and accounting DB latency
-            // should not keep an account unavailable for dispatch.
-            if let Some(ref ctx) = self.billing_ctx {
-                crate::billing::persist_billing_to_db(ctx, bu, false).await;
+            // should not keep an account unavailable for dispatch. Spawned —
+            // mirroring the streaming path's message_stop persistence — so the
+            // client response also stops waiting on the SQLite rollup
+            // transaction (single-writer; the dominant tail latency under
+            // concurrent load).
+            if let Some(ctx) = self.billing_ctx.clone() {
+                tokio::spawn(async move {
+                    crate::billing::persist_billing_to_db(&ctx, bu, false).await;
+                });
             }
             Ok(resp)
         } else {
