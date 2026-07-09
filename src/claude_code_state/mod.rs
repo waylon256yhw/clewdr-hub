@@ -290,7 +290,7 @@ impl ClaudeCodeState {
                 state.mimicry_config = slot.mimicry_config.clone();
             }
         }
-        state.client = client_cache::get_or_build(&slot);
+        state.client = client_cache::get_or_build(&slot)?;
 
         state.cookie = Some(slot);
         Ok(state)
@@ -423,7 +423,7 @@ impl ClaudeCodeState {
         // TLS emulation, ApiKey gets plain or emulated iff third-party —
         // but retries and follow-up requests on the same account reuse the
         // upstream connection instead of paying a fresh TLS handshake.
-        self.client = client_cache::get_or_build(&res);
+        self.client = client_cache::get_or_build(&res)?;
         if let Some(selected_account_id) = &self.selected_account_id
             && let Ok(mut slot) = selected_account_id.lock()
         {

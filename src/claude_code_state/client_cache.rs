@@ -26,14 +26,15 @@
 use std::{sync::LazyLock, time::Duration};
 
 use moka::sync::Cache;
-use tracing::error;
+use snafu::ResultExt;
 
 use crate::{
     config::{AccountSlot, AuthMethod},
+    error::{ClewdrError, WreqSnafu},
     services::account_pool::CredentialFingerprint,
 };
 
-use super::{SUPER_CLIENT, fingerprint, proxy_from_url};
+use super::{fingerprint, proxy_from_url};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ClientShape {
@@ -76,12 +77,13 @@ fn shape_for(slot: &AccountSlot) -> ClientShape {
 
 /// Exactly the builder logic previously inlined in `from_credential` /
 /// `acquire_account` — kept in one place so a cache miss can never
-/// drift from the historical per-request construction. Infallible: a
-/// build failure (effectively unreachable — it configures, not
-/// connects) logs and falls back to `SUPER_CLIENT`, mirroring
-/// `build_api_client`, so the cache value type stays a plain client and
-/// `get_with` can coalesce concurrent misses.
-fn build(shape: ClientShape, proxy_url: Option<&str>) -> wreq::Client {
+/// drift from the historical per-request construction. Fallible on
+/// purpose: a build failure propagates rather than degrading to a
+/// plain client, because sending a credentialed (Cookie/OAuth) request
+/// through a client with no TLS emulation / no proxy would ship a
+/// contradictory fingerprint — better to fail the request than to
+/// silently break stealth.
+fn build(shape: ClientShape, proxy_url: Option<&str>) -> Result<wreq::Client, ClewdrError> {
     let mut builder = wreq::Client::builder();
     match shape {
         ClientShape::CookieOrOauth => {
@@ -97,18 +99,21 @@ fn build(shape: ClientShape, proxy_url: Option<&str>) -> wreq::Client {
     if let Some(proxy) = proxy_from_url(proxy_url) {
         builder = builder.proxy(proxy);
     }
-    builder.build().unwrap_or_else(|e| {
-        error!("Failed to build client for credential: {e}");
-        SUPER_CLIENT.to_owned()
+    builder.build().context(WreqSnafu {
+        msg: "Failed to build client for credential",
     })
 }
 
 /// Fetch (or build and cache) the client for a dispatched slot.
 /// `wreq::Client` is an `Arc` handle — cloning shares the underlying
-/// connection pool, which is the whole point. `get_with` coalesces
-/// concurrent cold-start misses on the same key so N simultaneous
-/// requests for one account build a single client, not N throwaways.
-pub(crate) fn get_or_build(slot: &AccountSlot) -> wreq::Client {
+/// connection pool, which is the whole point.
+///
+/// Build failures are NOT cached: on the (effectively unreachable)
+/// error path the entry is left empty so the next request retries a
+/// fresh build rather than being pinned to a broken client. Concurrent
+/// cold-start misses on the same key may each build once — accepted, a
+/// one-time startup cost — in exchange for never caching a failure.
+pub(crate) fn get_or_build(slot: &AccountSlot) -> Result<wreq::Client, ClewdrError> {
     let shape = shape_for(slot);
     let key = ClientKey {
         account_id: slot.account_id,
@@ -116,7 +121,12 @@ pub(crate) fn get_or_build(slot: &AccountSlot) -> wreq::Client {
         proxy_url: slot.proxy_url.clone(),
         credential_fp: CredentialFingerprint::from_slot(slot),
     };
-    CLIENT_CACHE.get_with(key, || build(shape, slot.proxy_url.as_deref()))
+    if let Some(client) = CLIENT_CACHE.get(&key) {
+        return Ok(client);
+    }
+    let client = build(shape, slot.proxy_url.as_deref())?;
+    CLIENT_CACHE.insert(key, client.clone());
+    Ok(client)
 }
 
 #[cfg(test)]
@@ -146,8 +156,8 @@ mod tests {
             CLIENT_CACHE.run_pending_tasks();
             CLIENT_CACHE.entry_count()
         };
-        let _a = get_or_build(&slot);
-        let _b = get_or_build(&slot);
+        let _a = get_or_build(&slot).unwrap();
+        let _b = get_or_build(&slot).unwrap();
         CLIENT_CACHE.run_pending_tasks();
         // Two gets, one entry — the second was a hit.
         assert_eq!(CLIENT_CACHE.entry_count(), before + 1);
@@ -155,7 +165,7 @@ mod tests {
         // Credential rotation → different fingerprint → different key →
         // a fresh client (and cookie jar) for the rotated credential.
         let rotated = oauth_slot(910_001, "rt-fingerprint-ROTATED-11111");
-        let _c = get_or_build(&rotated);
+        let _c = get_or_build(&rotated).unwrap();
         CLIENT_CACHE.run_pending_tasks();
         assert_eq!(CLIENT_CACHE.entry_count(), before + 2);
     }

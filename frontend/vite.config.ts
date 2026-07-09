@@ -24,24 +24,29 @@ export default defineConfig({
       output: {
         manualChunks(id) {
           if (!id.includes('/node_modules/')) return undefined
+          // Charts libs (@mantine/charts + its recharts subtree) are only
+          // reached through the lazy Ops route. Return undefined so rolldown
+          // places them in the lazy Ops chunk itself. Forcing them into ANY
+          // named chunk — even a dedicated 'charts' — makes an eager chunk
+          // (framework/mantine) import a shared submodule back out of it,
+          // which drags the whole ~400 kB charts graph into the initial load
+          // and defeats the route split. Verified: with undefined here,
+          // index.html carries no charts modulepreload and the entry has no
+          // static charts import.
+          if (
+            id.includes('/node_modules/@mantine/charts/') ||
+            id.includes('/node_modules/recharts/')
+          ) {
+            return undefined
+          }
           if (/\/node_modules\/react(?:-dom)?\//.test(id) || /\/node_modules\/react-router\//.test(id)) {
             return 'framework'
-          }
-          // @mantine/charts must not join the eager 'mantine' chunk: it is
-          // only imported by the lazy Ops route, and grouping it with
-          // @mantine/core would drag it (and its recharts subtree) into the
-          // initial bundle, defeating the route-level code split.
-          if (id.includes('/node_modules/@mantine/charts/')) {
-            return 'charts'
           }
           if (id.includes('/node_modules/@mantine/')) {
             return 'mantine'
           }
           if (id.includes('/node_modules/@tanstack/react-query/')) {
             return 'query'
-          }
-          if (id.includes('/node_modules/recharts/')) {
-            return 'charts'
           }
           if (id.includes('/node_modules/@tabler/icons-react/')) {
             return 'icons'

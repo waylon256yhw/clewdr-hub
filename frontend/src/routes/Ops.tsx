@@ -1,3 +1,6 @@
+// Charts styles live with the only route that renders charts so they load
+// with the lazy Ops chunk instead of the initial bundle.
+import "@mantine/charts/styles.css";
 import { useMemo, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { DonutChart, LineChart } from "@mantine/charts";
