@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { DonutChart, LineChart } from "@mantine/charts";
 import {
@@ -210,6 +210,37 @@ export default function Ops() {
     placeholderData: keepPreviousData,
   });
 
+  // Chart inputs are memoized so DonutChart / LineChart receive stable
+  // array/object identities between polls — recharts re-animates and
+  // re-layouts when fed fresh identities every render. Hooks live above
+  // the early returns; `data` can be undefined here.
+  const donutData = useMemo(
+    () =>
+      (data?.distribution ?? []).map((item, index) => ({
+        name: item.label,
+        value: metricValueFromItem(item, metric),
+        color: CHART_COLORS[index % CHART_COLORS.length],
+      })),
+    [data, metric],
+  );
+  const distributionLookup = useMemo(
+    () => new Map((data?.distribution ?? []).map((item) => [item.label, item])),
+    [data],
+  );
+  const lineData = useMemo(() => (data ? buildLineData(data, metric) : []), [data, metric]);
+  const lineSeries = useMemo(
+    () =>
+      (data?.series ?? []).map((item, index) => ({
+        name: item.label,
+        color: CHART_COLORS[index % CHART_COLORS.length],
+      })),
+    [data],
+  );
+  const labelToSubject = useMemo(
+    () => new Map<string, OpsSeries>((data?.series ?? []).map((item) => [item.label, item])),
+    [data],
+  );
+
   if (isLoading) {
     return (
       <>
@@ -271,24 +302,6 @@ export default function Ops() {
   const comparisonHint = data.comparison.complete
     ? `对比上一${range === "24h" ? "24 小时" : range === "7d" ? "7 天" : "30 天"}（完整桶）`
     : "数据积累中";
-  const donutData = data.distribution.map((item, index) => ({
-    name: item.label,
-    value: metricValueFromItem(item, metric),
-    color: CHART_COLORS[index % CHART_COLORS.length],
-  }));
-  const distributionLookup = new Map(
-    data.distribution.map((item) => [item.label, item]),
-  );
-
-  const lineData = buildLineData(data, metric);
-  const lineSeries = data.series.map((item, index) => ({
-    name: item.label,
-    color: CHART_COLORS[index % CHART_COLORS.length],
-  }));
-  const labelToSubject = new Map<string, OpsSeries>(
-    data.series.map((item) => [item.label, item]),
-  );
-
   // Reference line at the first partial bucket, if any — Recharts draws
   // a vertical line at that x value so the eye can tell "everything to
   // the right is still accumulating".

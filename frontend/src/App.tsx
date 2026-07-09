@@ -171,40 +171,70 @@ function ColorSchemeToggle({ size = "lg", iconSize = 18 }: { size?: "md" | "lg";
  * active across page navigations. Per-page hooks would tear down on unmount and
  * lose any events broadcast while the user was on a different tab — which was
  * the cause of "manual probe didn't show up in logs" reports.
+ *
+ * Invalidation is coalesced: on a busy proxy, `request_logs` events arrive
+ * for essentially every forwarded request, and invalidating per event made
+ * `overview` / `requests` / `opsUsage` refetch in a storm. Events only mark
+ * query families dirty; a trailing-edge timer flushes the accumulated set at
+ * most once per second.
  */
+const SSE_FLUSH_MS = 1000;
+
 function useGlobalAdminEvents() {
   const queryClient = useQueryClient();
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const dirty = useRef<Set<"requests" | "opsUsage" | "overview" | "accounts" | "users">>(new Set());
 
   useEffect(() => {
     let disposed = false;
     let es: EventSource | null = null;
 
+    const KEY_BY_FAMILY = {
+      requests: qk.requestsRoot,
+      opsUsage: qk.opsUsageRoot,
+      overview: qk.overview,
+      accounts: qk.accounts,
+      users: qk.users,
+    } as const;
+
+    function flush() {
+      flushTimer.current = null;
+      const families = [...dirty.current];
+      dirty.current.clear();
+      for (const family of families) {
+        queryClient.invalidateQueries({ queryKey: KEY_BY_FAMILY[family] });
+      }
+    }
+
+    function markDirty(...families: Array<keyof typeof KEY_BY_FAMILY>) {
+      for (const family of families) dirty.current.add(family);
+      flushTimer.current ??= setTimeout(flush, SSE_FLUSH_MS);
+    }
+
     function connect() {
       if (disposed) return;
       es = new EventSource("/api/admin/events");
       es.onmessage = (event) => {
+        let payload: { topic?: string };
         try {
-          const payload = JSON.parse(event.data) as { topic?: string };
-          if (!payload.topic || payload.topic === "request_logs") {
-            queryClient.invalidateQueries({ queryKey: qk.requestsRoot });
-            queryClient.invalidateQueries({ queryKey: qk.opsUsageRoot });
-            queryClient.invalidateQueries({ queryKey: qk.overview });
-            queryClient.invalidateQueries({ queryKey: qk.accounts });
-          }
-          if (payload.topic === "accounts") {
-            queryClient.invalidateQueries({ queryKey: qk.accounts });
-            queryClient.invalidateQueries({ queryKey: qk.overview });
-          }
-          if (payload.topic === "users") {
-            queryClient.invalidateQueries({ queryKey: qk.users });
-            queryClient.invalidateQueries({ queryKey: qk.overview });
-          }
+          payload = JSON.parse(event.data) as { topic?: string };
         } catch {
-          queryClient.invalidateQueries({ queryKey: qk.requestsRoot });
-          queryClient.invalidateQueries({ queryKey: qk.opsUsageRoot });
-          queryClient.invalidateQueries({ queryKey: qk.overview });
-          queryClient.invalidateQueries({ queryKey: qk.accounts });
+          // An unparseable event carries no topic to act on; invalidating
+          // everything for it just amplified the refetch storm.
+          console.warn("[useGlobalAdminEvents] unparseable SSE event:", event.data);
+          return;
+        }
+        if (!payload.topic || payload.topic === "request_logs") {
+          // Deliberately NOT `accounts`: request traffic doesn't change the
+          // account list, and Accounts has its own topic + 30s poll.
+          markDirty("requests", "opsUsage", "overview");
+        }
+        if (payload.topic === "accounts") {
+          markDirty("accounts", "overview");
+        }
+        if (payload.topic === "users") {
+          markDirty("users", "overview");
         }
       };
       es.onerror = () => {
@@ -219,6 +249,9 @@ function useGlobalAdminEvents() {
       disposed = true;
       es?.close();
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+      if (flushTimer.current) clearTimeout(flushTimer.current);
+      flushTimer.current = null;
+      dirty.current.clear();
     };
   }, [queryClient]);
 }

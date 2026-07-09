@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Title,
@@ -392,7 +392,12 @@ function mimicryInitialValues(account: Account | null) {
   };
 }
 
-function AccountCard({
+// Memoized: the grid re-renders every 3s while any account is probing, and
+// TanStack Query's structural sharing keeps unchanged `account` items
+// referentially stable across refetches — so unchanged cards skip their
+// whole subtree (per-card date/tier/countdown work included). Handlers take
+// the account as an argument so the parent can pass stable callbacks.
+const AccountCard = memo(function AccountCard({
   account,
   probing,
   probeError,
@@ -402,8 +407,8 @@ function AccountCard({
   account: Account;
   probing: boolean;
   probeError?: string;
-  onEdit: () => void;
-  onDelete: () => void;
+  onEdit: (account: Account) => void;
+  onDelete: (account: Account) => void;
 }) {
   const rt = account.runtime;
   const isApiKey = account.auth_source === "api_key";
@@ -464,10 +469,10 @@ function AccountCard({
               <IconFlask size={14} />
             </ActionIcon>
           </Tooltip>
-          <ActionIcon variant="subtle" size="sm" onClick={onEdit}>
+          <ActionIcon variant="subtle" size="sm" onClick={() => onEdit(account)}>
             <IconEdit size={14} />
           </ActionIcon>
-          <ActionIcon variant="subtle" size="sm" color="red" onClick={onDelete}>
+          <ActionIcon variant="subtle" size="sm" color="red" onClick={() => onDelete(account)}>
             <IconTrash size={14} />
           </ActionIcon>
         </Group>
@@ -619,7 +624,7 @@ function AccountCard({
       )}
     </Paper>
   );
-}
+});
 
 interface FormValues {
   name: string;
@@ -1349,6 +1354,22 @@ export default function Accounts() {
       notifications.show({ message: e instanceof ApiError ? e.message : "探测失败", color: "red" }),
   });
 
+  const accounts = useMemo(() => data?.items ?? [], [data]);
+  const probingIds = useMemo(
+    () =>
+      new Set(
+        accounts.filter((a) => a.auth_source !== "api_key" && a.health?.probing).map((a) => a.id),
+      ),
+    [accounts],
+  );
+  // Stable identities so the memoized AccountCard skips unchanged cards
+  // during the 3s probing refetch cycle.
+  const openEdit = useCallback((a: Account) => {
+    setEditing(a);
+    setFormOpened(true);
+  }, []);
+  const openDelete = useCallback((a: Account) => setDeleting(a), []);
+
   if (isLoading) return <Skeleton height={300} radius="md" />;
   if (error) {
     return (
@@ -1358,18 +1379,10 @@ export default function Accounts() {
     );
   }
 
-  const accounts = data?.items ?? [];
   const proxies = proxiesData?.items ?? [];
-  const probingIds = new Set(
-    accounts.filter((a) => a.auth_source !== "api_key" && a.health?.probing).map((a) => a.id),
-  );
 
   const openCreate = () => {
     setEditing(null);
-    setFormOpened(true);
-  };
-  const openEdit = (a: Account) => {
-    setEditing(a);
     setFormOpened(true);
   };
 
@@ -1404,8 +1417,8 @@ export default function Accounts() {
               key={a.id}
               account={a}
               probing={probingIds.has(a.id)}
-              onEdit={() => openEdit(a)}
-              onDelete={() => setDeleting(a)}
+              onEdit={openEdit}
+              onDelete={openDelete}
             />
           ))}
         </SimpleGrid>
