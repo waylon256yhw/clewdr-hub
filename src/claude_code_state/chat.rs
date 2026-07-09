@@ -1965,9 +1965,12 @@ impl ClaudeCodeState {
     }
 
     fn extract_usage_from_bytes(bytes: &[u8]) -> Option<crate::billing::BillingUsage> {
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes)
-            && let Some(usage) = value.get("usage")
-        {
+        // Parse the body once. The typed fallback below reuses the parsed
+        // tree via `from_value` instead of re-lexing the whole body; a body
+        // that fails the `Value` parse could never satisfy the typed parse
+        // either, so bailing out early is behavior-preserving.
+        let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+        if let Some(usage) = value.get("usage") {
             let get_u64 = |key: &str| {
                 usage
                     .get(key)
@@ -1986,19 +1989,15 @@ impl ClaudeCodeState {
         }
 
         // Fallback: estimate output tokens from the Claude response content
-        if let Ok(parsed) =
-            serde_json::from_slice::<crate::types::claude::CreateMessageResponse>(bytes)
-        {
-            let output_tokens = parsed.count_tokens() as u64;
-            return Some(crate::billing::BillingUsage {
-                input_tokens: 0,
-                output_tokens,
-                cache_creation_tokens: 0,
-                cache_read_tokens: 0,
-                ttft_ms: None,
-            });
-        }
-        None
+        let parsed =
+            serde_json::from_value::<crate::types::claude::CreateMessageResponse>(value).ok()?;
+        Some(crate::billing::BillingUsage {
+            input_tokens: 0,
+            output_tokens: parsed.count_tokens() as u64,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            ttft_ms: None,
+        })
     }
 
     async fn execute_claude_count_tokens_request(

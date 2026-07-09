@@ -2,7 +2,7 @@ use serde::de;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::{DefaultOnError, serde_as};
-use tiktoken_rs::o200k_base;
+use tiktoken_rs::o200k_base_singleton;
 
 #[derive(Debug)]
 pub struct RequiredMessageParams {
@@ -150,7 +150,10 @@ pub struct CreateMessageParams {
 
 impl CreateMessageParams {
     pub fn count_tokens(&self) -> u32 {
-        let bpe = o200k_base().expect("Failed to get encoding");
+        // Singleton: `o200k_base()` re-parses the ~200k-entry BPE vocab on
+        // every call, which dwarfed the actual encode cost on the request
+        // hot path. Token counts are identical.
+        let bpe = o200k_base_singleton();
         let systems = match self.system {
             Some(Value::String(ref s)) => s.to_string(),
             Some(Value::Array(ref arr)) => arr.iter().filter_map(|v| v["text"].as_str()).collect(),
@@ -817,7 +820,7 @@ pub struct CreateMessageResponse {
 
 impl CreateMessageResponse {
     pub fn count_tokens(&self) -> u32 {
-        let bpe = o200k_base().expect("Failed to get encoding");
+        let bpe = o200k_base_singleton();
         let content = self
             .content
             .iter()
