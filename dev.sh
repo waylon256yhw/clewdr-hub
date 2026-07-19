@@ -101,17 +101,17 @@ start_watchdog() {
   echo "$expected_token" > "$WATCHDOG_TOKEN_FILE"
 
   nohup bash -c "
-    date -Is
+    date +%Y-%m-%dT%H:%M:%S%z
     echo 'watchdog started: timeout=${timeout}s token=${expected_token}'
     sleep $timeout
     cd '$PWD'
     current_token=\$(cat '$WATCHDOG_TOKEN_FILE' 2>/dev/null || true)
     if [ \"\$current_token\" = '$expected_token' ]; then
-      date -Is
+      date +%Y-%m-%dT%H:%M:%S%z
       echo 'watchdog timeout reached, stopping dev stack'
       ./dev.sh stop || true
     else
-      date -Is
+      date +%Y-%m-%dT%H:%M:%S%z
       echo 'watchdog token changed, skip stop'
       echo \"current_token=\$current_token\"
     fi
@@ -155,16 +155,25 @@ if $DISABLE_TIMEOUT; then
 fi
 
 if [ "$AUTO_STOP_SECONDS" != "0" ] && ! is_positive_int "$AUTO_STOP_SECONDS"; then
-  echo "自动停机参数无效: $AUTO_STOP_SECONDS（应为正整数秒，或使用 no-timeout / DEV_AUTO_STOP_SECONDS=0 关闭）"
+  echo "自动停机参数无效: ${AUTO_STOP_SECONDS}（应为正整数秒，或使用 no-timeout / DEV_AUTO_STOP_SECONDS=0 关闭）"
   exit 1
 fi
 
 if $DO_RESET; then
-  echo "==> 删除 $DB_FILE（重新初始化）..."
+  echo "==> 删除 ${DB_FILE}（重新初始化）..."
   rm -f "$DB_FILE" "${DB_FILE}-wal" "${DB_FILE}-shm"
   if [ -f "$DB_FILE" ]; then
     echo "==> 警告: $DB_FILE 仍存在，可能有进程占用"
-    fuser -k "$DB_FILE" 2>/dev/null || true
+    # 杀掉占用 DB 的进程。Linux 用 fuser -k；macOS 自带的 fuser 不支持 -k
+    # （报 "Unknown option: k" 并以非零退出），因此在 fuser -k 失败或缺失时
+    # 回退到所有平台都可用的 lsof。
+    db_unlocked=false
+    if command -v fuser >/dev/null 2>&1 && fuser -k "$DB_FILE" 2>/dev/null; then
+      db_unlocked=true
+    fi
+    if ! $db_unlocked && command -v lsof >/dev/null 2>&1; then
+      lsof -t "$DB_FILE" 2>/dev/null | xargs kill -9 2>/dev/null || true
+    fi
     sleep 1
     rm -f "$DB_FILE" "${DB_FILE}-wal" "${DB_FILE}-shm"
   fi
