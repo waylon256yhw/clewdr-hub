@@ -1,17 +1,23 @@
 use axum::{
     Json,
+    body::{Body, Bytes},
     response::{IntoResponse, Sse, sse::Event as SseEvent},
 };
 use colored::Colorize;
 use eventsource_stream::Eventsource;
 use futures::{StreamExt, TryStreamExt};
-use http::header::{ACCEPT, USER_AGENT};
+use http::header::{
+    ACCEPT, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING,
+    USER_AGENT,
+};
 use snafu::{GenerateImplicitData, ResultExt};
 use std::{
+    collections::HashMap,
+    convert::Infallible,
     future::Future,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -144,6 +150,325 @@ impl SelectedSlotHandle {
         {
             self.state.handle.release_slot(account_id).await;
         }
+    }
+}
+
+/// Rebuild a regular Messages JSON response from an upstream SSE sequence.
+///
+/// Values are accumulated as JSON rather than through the typed content-block
+/// enum so new upstream block fields survive the bridge unchanged. Only the
+/// delta-bearing fields need explicit merge behavior.
+#[derive(Default)]
+struct NonStreamMessageAccumulator {
+    message: Option<serde_json::Value>,
+    partial_json: HashMap<usize, String>,
+}
+
+impl NonStreamMessageAccumulator {
+    fn apply(&mut self, data: &str) -> Result<bool, String> {
+        let event: serde_json::Value = serde_json::from_str(data)
+            .map_err(|err| format!("invalid upstream SSE JSON: {err}"))?;
+        let event_type = event
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+
+        match event_type {
+            "message_start" => {
+                self.message = event.get("message").cloned();
+                if self.message.is_none() {
+                    return Err("upstream message_start omitted message".to_string());
+                }
+            }
+            "content_block_start" => {
+                let index = event
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| "content_block_start omitted index".to_string())?
+                    as usize;
+                let block = event
+                    .get("content_block")
+                    .cloned()
+                    .ok_or_else(|| "content_block_start omitted content_block".to_string())?;
+                self.set_content_block(index, block)?;
+            }
+            "content_block_delta" => {
+                let index = event
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| "content_block_delta omitted index".to_string())?
+                    as usize;
+                let delta = event
+                    .get("delta")
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| "content_block_delta omitted delta".to_string())?;
+                let delta_type = delta
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                match delta_type {
+                    "text_delta" => self.append_block_string(index, "text", delta, "text")?,
+                    "thinking_delta" => {
+                        self.append_block_string(index, "thinking", delta, "thinking")?
+                    }
+                    "signature_delta" => {
+                        self.append_block_string(index, "signature", delta, "signature")?
+                    }
+                    "input_json_delta" => {
+                        if let Some(fragment) = delta
+                            .get("partial_json")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            self.partial_json
+                                .entry(index)
+                                .or_default()
+                                .push_str(fragment);
+                        }
+                    }
+                    "citations_delta" => {
+                        if let Some(citation) = delta.get("citation") {
+                            let block = self
+                                .content_mut()?
+                                .get_mut(index)
+                                .and_then(serde_json::Value::as_object_mut)
+                                .ok_or_else(|| format!("content block {index} was missing"))?;
+                            let citations = block
+                                .entry("citations")
+                                .or_insert_with(|| serde_json::json!([]))
+                                .as_array_mut()
+                                .ok_or_else(|| {
+                                    format!("content block {index}.citations was not an array")
+                                })?;
+                            citations.push(citation.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "content_block_stop" => {
+                if let Some(index) = event.get("index").and_then(serde_json::Value::as_u64) {
+                    self.finish_partial_json(index as usize)?;
+                }
+            }
+            "message_delta" => {
+                let message = self
+                    .message
+                    .as_mut()
+                    .and_then(serde_json::Value::as_object_mut)
+                    .ok_or_else(|| "message_delta arrived before message_start".to_string())?;
+                if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_object) {
+                    for key in ["stop_reason", "stop_sequence"] {
+                        if let Some(value) = delta.get(key) {
+                            message.insert(key.to_string(), value.clone());
+                        }
+                    }
+                }
+                if let Some(usage) = event.get("usage").and_then(serde_json::Value::as_object) {
+                    let target = message
+                        .entry("usage")
+                        .or_insert_with(|| serde_json::json!({}));
+                    let target = target
+                        .as_object_mut()
+                        .ok_or_else(|| "message usage was not an object".to_string())?;
+                    for (key, value) in usage {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            "message_stop" => {
+                let remaining = self.partial_json.keys().copied().collect::<Vec<_>>();
+                for index in remaining {
+                    self.finish_partial_json(index)?;
+                }
+                return Ok(true);
+            }
+            "error" => {
+                let error = event.get("error").unwrap_or(&event);
+                let message = error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("upstream stream returned an error");
+                return Err(message.to_string());
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn set_content_block(&mut self, index: usize, block: serde_json::Value) -> Result<(), String> {
+        let content = self.content_mut()?;
+        if index > content.len() {
+            return Err(format!(
+                "upstream content block index {index} skipped index {}",
+                content.len()
+            ));
+        }
+        if index == content.len() {
+            content.push(block);
+        } else {
+            content[index] = block;
+        }
+        Ok(())
+    }
+
+    fn content_mut(&mut self) -> Result<&mut Vec<serde_json::Value>, String> {
+        self.message
+            .as_mut()
+            .and_then(|message| message.get_mut("content"))
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or_else(|| "upstream message_start omitted content array".to_string())
+    }
+
+    fn append_block_string(
+        &mut self,
+        index: usize,
+        target_key: &str,
+        delta: &serde_json::Map<String, serde_json::Value>,
+        delta_key: &str,
+    ) -> Result<(), String> {
+        let Some(fragment) = delta.get(delta_key).and_then(serde_json::Value::as_str) else {
+            return Ok(());
+        };
+        let block = self
+            .content_mut()?
+            .get_mut(index)
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| format!("content block {index} was missing"))?;
+        let target = block
+            .entry(target_key)
+            .or_insert_with(|| serde_json::Value::String(String::new()));
+        let target = target
+            .as_str()
+            .ok_or_else(|| format!("content block {index}.{target_key} was not a string"))?;
+        let mut merged = String::with_capacity(target.len() + fragment.len());
+        merged.push_str(target);
+        merged.push_str(fragment);
+        block.insert(target_key.to_string(), serde_json::Value::String(merged));
+        Ok(())
+    }
+
+    fn finish_partial_json(&mut self, index: usize) -> Result<(), String> {
+        let Some(raw) = self.partial_json.remove(&index) else {
+            return Ok(());
+        };
+        let input = serde_json::from_str(&raw)
+            .map_err(|err| format!("invalid tool input JSON in block {index}: {err}"))?;
+        let block = self
+            .content_mut()?
+            .get_mut(index)
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| format!("tool content block {index} was missing"))?;
+        block.insert("input".to_string(), input);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Vec<u8>, String> {
+        let message = self
+            .message
+            .ok_or_else(|| "upstream stream ended before message_start".to_string())?;
+        serde_json::to_vec(&message).map_err(|err| format!("failed to serialize response: {err}"))
+    }
+}
+
+struct BridgedNonStreamDropGuard {
+    slot: Option<SelectedSlotHandle>,
+    completed: Arc<AtomicBool>,
+    upstream_failed: Arc<AtomicBool>,
+    error_message: Arc<Mutex<Option<String>>>,
+    billing_ctx: Option<crate::billing::BillingContext>,
+    cookie: Option<crate::config::AccountSlot>,
+    family: ModelFamily,
+    input_tokens: Arc<AtomicU64>,
+    output_tokens: Arc<AtomicU64>,
+    cache_creation_tokens: Arc<AtomicU64>,
+    cache_read_tokens: Arc<AtomicU64>,
+    ttft_ms: Arc<AtomicI64>,
+    saw_upstream_usage: Arc<AtomicBool>,
+}
+
+impl Drop for BridgedNonStreamDropGuard {
+    fn drop(&mut self) {
+        if self.completed.load(Ordering::Relaxed) {
+            return;
+        }
+        let slot = self.slot.clone();
+        let upstream_failed = self.upstream_failed.load(Ordering::Relaxed);
+        let error_message = self
+            .error_message
+            .lock()
+            .ok()
+            .and_then(|message| message.clone())
+            .unwrap_or_else(|| {
+                if upstream_failed {
+                    "upstream stream ended before message_stop".to_string()
+                } else {
+                    "non-stream keepalive response dropped before completion".to_string()
+                }
+            });
+        let billing_ctx = self.billing_ctx.clone();
+        let cookie = self.cookie.clone();
+        let family = self.family;
+        let input = self.input_tokens.load(Ordering::Relaxed);
+        let output = self.output_tokens.load(Ordering::Relaxed);
+        let cache_creation = self.cache_creation_tokens.load(Ordering::Relaxed);
+        let cache_read = self.cache_read_tokens.load(Ordering::Relaxed);
+        let ttft = self.ttft_ms.load(Ordering::Relaxed);
+        let has_usage = self.saw_upstream_usage.load(Ordering::Relaxed)
+            || output > 0
+            || cache_creation > 0
+            || cache_read > 0;
+
+        tokio::spawn(async move {
+            if let (Some(mut cookie), Some(slot)) = (cookie, slot.as_ref())
+                && cookie.auth_method != AuthMethod::ApiKey
+                && has_usage
+            {
+                ClaudeCodeState::update_cookie_boundaries_if_due(&mut cookie, &slot.state.handle)
+                    .await;
+                cookie.add_and_bucket_usage(input, output, family);
+                if let Some(account_id) = cookie.account_id {
+                    let update = cookie.to_runtime_params();
+                    let fingerprint = CredentialFingerprint::from_slot(&cookie);
+                    let _ = slot
+                        .state
+                        .handle
+                        .release_runtime(account_id, update, None, fingerprint)
+                        .await;
+                }
+            }
+            if let Some(ctx) = billing_ctx {
+                let usage = has_usage.then_some(crate::billing::BillingUsage {
+                    input_tokens: input,
+                    output_tokens: output,
+                    cache_creation_tokens: cache_creation,
+                    cache_read_tokens: cache_read,
+                    ttft_ms: (ttft >= 0).then_some(ttft),
+                });
+                let status = if upstream_failed {
+                    "upstream_error"
+                } else {
+                    "client_abort"
+                };
+                crate::billing::persist_terminal_request_log(
+                    &ctx,
+                    TerminalLogOptions {
+                        request_type: RequestType::Messages,
+                        stream: false,
+                        status,
+                        http_status: Some(if upstream_failed { 502 } else { 499 }),
+                        usage,
+                        error_code: Some(status),
+                        error_message: Some(&error_message),
+                        update_rollups: has_usage,
+                        response_body: None,
+                    },
+                )
+                .await;
+            }
+            if let Some(slot) = slot {
+                slot.release_slot_only().await;
+            }
+        });
     }
 }
 
@@ -670,9 +995,10 @@ impl ClaudeCodeState {
             .await;
             match retry_result {
                 Ok(res) => {
-                    if self.stream {
-                        // Streaming uses its own SlotDropGuard on the response body;
-                        // this acquire-time guard only covers failures before handoff.
+                    if self.stream || self.non_stream_keepalive {
+                        // Streaming and bridged non-stream responses use their
+                        // own body drop guards; this acquire-time guard only
+                        // covers failures before response handoff.
                         slot_guard.disarm();
                     } else {
                         slot_guard.finish().await;
@@ -817,10 +1143,17 @@ impl ClaudeCodeState {
     async fn send_chat(
         &mut self,
         access_token: String,
-        p: CreateMessageParams,
+        mut p: CreateMessageParams,
         slot_guard: Option<SelectedSlotHandle>,
     ) -> Result<axum::response::Response, ClewdrError> {
         let model_family = Self::classify_model(&p.model);
+        if !self.stream && self.non_stream_keepalive {
+            info!(
+                "[NON_STREAM_KEEPALIVE] forcing upstream SSE; interval={}ms",
+                self.non_stream_keepalive_interval_ms
+            );
+            p.stream = Some(true);
+        }
         let response = self.execute_claude_request(&access_token, &p).await?;
         self.handle_success_response(response, model_family, slot_guard)
             .await
@@ -1466,7 +1799,17 @@ impl ClaudeCodeState {
         model_family: ModelFamily,
         slot_guard: Option<SelectedSlotHandle>,
     ) -> Result<axum::response::Response, ClewdrError> {
-        if !self.stream {
+        let upstream_is_sse = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+
+        if !self.stream && self.non_stream_keepalive && upstream_is_sse {
+            self.forward_stream_as_non_stream(response, model_family, slot_guard)
+                .await
+        } else if !self.stream {
             let (resp, billing_usage) = Self::materialize_non_stream_response(response).await?;
             let bu = billing_usage.unwrap_or(crate::billing::BillingUsage {
                 input_tokens: self.usage.input_tokens as u64,
@@ -1495,6 +1838,290 @@ impl ClaudeCodeState {
             Ok(resp)
         } else {
             return self.forward_stream_with_usage(response, model_family).await;
+        }
+    }
+
+    /// Convert an upstream Messages SSE response into one final Messages JSON
+    /// document while emitting JSON whitespace often enough to reset a
+    /// downstream per-read idle timeout.
+    async fn forward_stream_as_non_stream(
+        &mut self,
+        response: wreq::Response,
+        family: ModelFamily,
+        slot: Option<SelectedSlotHandle>,
+    ) -> Result<axum::response::Response, ClewdrError> {
+        let status = response.status();
+        let mut headers = response.headers().clone();
+        headers.remove(CONTENT_LENGTH);
+        headers.remove(TRANSFER_ENCODING);
+        headers.insert(
+            CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        // tower-http never recompresses a response that already carries this
+        // header. Compressing one-byte whitespace frames would buffer them and
+        // defeat the keepalive.
+        headers.insert(CONTENT_ENCODING, http::HeaderValue::from_static("identity"));
+        headers.insert(
+            CACHE_CONTROL,
+            http::HeaderValue::from_static("no-cache, no-transform"),
+        );
+        headers.insert(
+            http::HeaderName::from_static("x-accel-buffering"),
+            http::HeaderValue::from_static("no"),
+        );
+
+        let input_tokens = Arc::new(AtomicU64::new(self.usage.input_tokens as u64));
+        let output_tokens = Arc::new(AtomicU64::new(0));
+        let cache_creation_tokens = Arc::new(AtomicU64::new(0));
+        let cache_read_tokens = Arc::new(AtomicU64::new(0));
+        let ttft_ms = Arc::new(AtomicI64::new(-1));
+        let saw_upstream_usage = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicBool::new(false));
+        let upstream_failed = Arc::new(AtomicBool::new(false));
+        let error_message = Arc::new(Mutex::new(None::<String>));
+        let billing_ctx = self.billing_ctx.clone();
+        let cookie = self.cookie.clone();
+        let ttft_started_at = billing_ctx.as_ref().map(|ctx| ctx.started_at);
+        let keepalive_interval =
+            Duration::from_millis(self.non_stream_keepalive_interval_ms.max(1));
+
+        let guard = BridgedNonStreamDropGuard {
+            slot: slot.clone(),
+            completed: completed.clone(),
+            upstream_failed: upstream_failed.clone(),
+            error_message: error_message.clone(),
+            billing_ctx: billing_ctx.clone(),
+            cookie: cookie.clone(),
+            family,
+            input_tokens: input_tokens.clone(),
+            output_tokens: output_tokens.clone(),
+            cache_creation_tokens: cache_creation_tokens.clone(),
+            cache_read_tokens: cache_read_tokens.clone(),
+            ttft_ms: ttft_ms.clone(),
+            saw_upstream_usage: saw_upstream_usage.clone(),
+        };
+
+        let mut upstream = response.bytes_stream().eventsource();
+        let pool_handle = self.account_pool_handle.clone();
+        let body_stream = async_stream::stream! {
+            let _guard = guard;
+            let mut accumulator = NonStreamMessageAccumulator::default();
+            let mut heartbeat = tokio::time::interval(keepalive_interval);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Consume interval's immediate first tick. The explicit initial
+            // whitespace below commits headers/body without waiting six seconds.
+            heartbeat.tick().await;
+            yield Ok::<Bytes, Infallible>(Bytes::from_static(b" "));
+
+            loop {
+                tokio::select! {
+                    _ = heartbeat.tick() => {
+                        yield Ok(Bytes::from_static(b" "));
+                    }
+                    next = upstream.next() => {
+                        let Some(next) = next else {
+                            upstream_failed.store(true, Ordering::Relaxed);
+                            if let Ok(mut target) = error_message.lock() {
+                                *target = Some("upstream stream ended before message_stop".to_string());
+                            }
+                            let error = serde_json::json!({
+                                "type": "error",
+                                "error": {
+                                    "type": "api_error",
+                                    "message": "upstream stream ended before message_stop"
+                                }
+                            });
+                            yield Ok(Bytes::from(serde_json::to_vec(&error).unwrap_or_default()));
+                            break;
+                        };
+                        let event = match next {
+                            Ok(event) => event,
+                            Err(err) => {
+                                let message = format!("failed to read upstream SSE: {err}");
+                                upstream_failed.store(true, Ordering::Relaxed);
+                                if let Ok(mut target) = error_message.lock() {
+                                    *target = Some(message.clone());
+                                }
+                                let error = serde_json::json!({
+                                    "type": "error",
+                                    "error": { "type": "api_error", "message": message }
+                                });
+                                yield Ok(Bytes::from(serde_json::to_vec(&error).unwrap_or_default()));
+                                break;
+                            }
+                        };
+
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&event.data) {
+                            Self::update_bridge_usage(
+                                &value,
+                                &input_tokens,
+                                &output_tokens,
+                                &cache_creation_tokens,
+                                &cache_read_tokens,
+                                &saw_upstream_usage,
+                            );
+                            if value.get("type").and_then(serde_json::Value::as_str)
+                                == Some("content_block_delta")
+                                && let Some(started) = ttft_started_at
+                            {
+                                let elapsed = (chrono::Utc::now() - started).num_milliseconds();
+                                if elapsed >= 0 {
+                                    let _ = ttft_ms.compare_exchange(
+                                        -1,
+                                        elapsed,
+                                        Ordering::Relaxed,
+                                        Ordering::Relaxed,
+                                    );
+                                }
+                            }
+                        }
+
+                        match accumulator.apply(&event.data) {
+                            Ok(false) => {}
+                            Ok(true) => {
+                                let bytes = match accumulator.finish() {
+                                    Ok(bytes) => bytes,
+                                    Err(message) => {
+                                        upstream_failed.store(true, Ordering::Relaxed);
+                                        if let Ok(mut target) = error_message.lock() {
+                                            *target = Some(message.clone());
+                                        }
+                                        let error = serde_json::json!({
+                                            "type": "error",
+                                            "error": { "type": "api_error", "message": message }
+                                        });
+                                        yield Ok(Bytes::from(serde_json::to_vec(&error).unwrap_or_default()));
+                                        break;
+                                    }
+                                };
+                                let measured_ttft = {
+                                    let value = ttft_ms.load(Ordering::Relaxed);
+                                    (value >= 0).then_some(value)
+                                };
+                                let mut usage = Self::extract_usage_from_bytes(&bytes).unwrap_or(
+                                    crate::billing::BillingUsage {
+                                        input_tokens: input_tokens.load(Ordering::Relaxed),
+                                        output_tokens: output_tokens.load(Ordering::Relaxed),
+                                        cache_creation_tokens: cache_creation_tokens.load(Ordering::Relaxed),
+                                        cache_read_tokens: cache_read_tokens.load(Ordering::Relaxed),
+                                        ttft_ms: measured_ttft,
+                                    },
+                                );
+                                usage.ttft_ms = usage.ttft_ms.or(measured_ttft);
+
+                                let cookie_for_finish = cookie.clone();
+                                let pool_for_finish = pool_handle.clone();
+                                let slot_for_finish = slot.clone();
+                                let usage_for_runtime = usage.clone();
+                                tokio::spawn(async move {
+                                    if let Some(mut cookie) = cookie_for_finish
+                                        && cookie.auth_method != AuthMethod::ApiKey
+                                    {
+                                        Self::update_cookie_boundaries_if_due(
+                                            &mut cookie,
+                                            &pool_for_finish,
+                                        )
+                                        .await;
+                                        cookie.add_and_bucket_usage(
+                                            usage_for_runtime.input_tokens,
+                                            usage_for_runtime.output_tokens,
+                                            family,
+                                        );
+                                        if let Some(account_id) = cookie.account_id {
+                                            let update = cookie.to_runtime_params();
+                                            let fingerprint = CredentialFingerprint::from_slot(&cookie);
+                                            let _ = pool_for_finish
+                                                .release_runtime(
+                                                    account_id,
+                                                    update,
+                                                    None,
+                                                    fingerprint,
+                                                )
+                                                .await;
+                                        }
+                                    }
+                                    if let Some(slot) = slot_for_finish {
+                                        slot.release_slot_only().await;
+                                    }
+                                });
+                                if let Some(ctx) = billing_ctx.clone() {
+                                    tokio::spawn(async move {
+                                        crate::billing::persist_billing_to_db(&ctx, usage, false).await;
+                                    });
+                                }
+                                completed.store(true, Ordering::Relaxed);
+                                yield Ok(Bytes::from(bytes));
+                                break;
+                            }
+                            Err(message) => {
+                                upstream_failed.store(true, Ordering::Relaxed);
+                                if let Ok(mut target) = error_message.lock() {
+                                    *target = Some(message.clone());
+                                }
+                                let error = serde_json::json!({
+                                    "type": "error",
+                                    "error": { "type": "api_error", "message": message }
+                                });
+                                yield Ok(Bytes::from(serde_json::to_vec(&error).unwrap_or_default()));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        let mut builder = http::Response::builder().status(status);
+        *builder.headers_mut().expect("response builder headers") = headers;
+        builder
+            .body(Body::from_stream(body_stream))
+            .map_err(|source| ClewdrError::HttpError {
+                loc: snafu::Location::generate(),
+                source,
+            })
+    }
+
+    fn update_bridge_usage(
+        event: &serde_json::Value,
+        input: &AtomicU64,
+        output: &AtomicU64,
+        cache_creation: &AtomicU64,
+        cache_read: &AtomicU64,
+        saw_upstream_usage: &AtomicBool,
+    ) {
+        let usage = match event.get("type").and_then(serde_json::Value::as_str) {
+            Some("message_start") => event
+                .get("message")
+                .and_then(|message| message.get("usage")),
+            Some("message_delta") => event.get("usage"),
+            _ => None,
+        };
+        let Some(usage) = usage else { return };
+        saw_upstream_usage.store(true, Ordering::Relaxed);
+        if let Some(value) = usage
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64)
+        {
+            input.store(value, Ordering::Relaxed);
+        }
+        if let Some(value) = usage
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64)
+        {
+            output.store(value, Ordering::Relaxed);
+        }
+        if let Some(value) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(serde_json::Value::as_u64)
+        {
+            cache_creation.store(value, Ordering::Relaxed);
+        }
+        if let Some(value) = usage
+            .get("cache_read_input_tokens")
+            .and_then(serde_json::Value::as_u64)
+        {
+            cache_read.store(value, Ordering::Relaxed);
         }
     }
 
@@ -2298,11 +2925,44 @@ impl ClaudeCodeState {
 
 #[cfg(test)]
 mod tests {
-    use super::ClaudeCodeState;
+    use super::{ClaudeCodeState, NonStreamMessageAccumulator};
     use crate::{config::Reason, error::ClewdrError, services::account_error::FailureSource};
 
     fn classify(err: &ClewdrError) -> super::OAuthFailureVerdict {
         ClaudeCodeState::classify_oauth_failure(err, FailureSource::Messages)
+    }
+
+    #[test]
+    fn non_stream_accumulator_rebuilds_text_thinking_tool_and_usage() {
+        let events = [
+            r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":0}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"plan"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hello"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"tool_1","name":"calc","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"x\":"}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"1}"}}"#,
+            r#"{"type":"content_block_stop","index":2}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":9}}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        let mut accumulator = NonStreamMessageAccumulator::default();
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(accumulator.apply(event).unwrap(), index + 1 == events.len());
+        }
+        let response: serde_json::Value =
+            serde_json::from_slice(&accumulator.finish().unwrap()).unwrap();
+        assert_eq!(response["content"][0]["thinking"], "plan");
+        assert_eq!(response["content"][0]["signature"], "sig");
+        assert_eq!(response["content"][1]["text"], "hello");
+        assert_eq!(response["content"][2]["input"], serde_json::json!({"x": 1}));
+        assert_eq!(response["stop_reason"], "tool_use");
+        assert_eq!(response["usage"]["input_tokens"], 12);
+        assert_eq!(response["usage"]["output_tokens"], 9);
     }
 
     #[test]

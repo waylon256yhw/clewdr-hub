@@ -33,6 +33,14 @@ fn default_trusted_proxies() -> Vec<IpNet> {
         .collect()
 }
 
+fn default_non_stream_keepalive_interval_ms() -> u64 {
+    6_000
+}
+
+fn default_non_stream_keepalive() -> bool {
+    true
+}
+
 /// A struct representing the configuration of the application
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClewdrConfig {
@@ -53,6 +61,18 @@ pub struct ClewdrConfig {
     pub log_to_file: bool,
     #[serde(default)]
     pub debug_cookie: bool,
+    /// Bridge non-stream message requests through an upstream SSE response and
+    /// periodically write JSON whitespace downstream. This keeps clients with
+    /// per-read idle timeouts alive while preserving a final non-stream JSON
+    /// document. May be overridden per request with
+    /// `x-clewdr-non-stream-keepalive`.
+    #[serde(default = "default_non_stream_keepalive")]
+    pub non_stream_keepalive: bool,
+    /// Whitespace heartbeat cadence for the non-stream bridge. Clamped to
+    /// 250..=60_000 ms; `x-clewdr-non-stream-keepalive-interval-ms` can
+    /// override it for one authenticated request.
+    #[serde(default = "default_non_stream_keepalive_interval_ms")]
+    pub non_stream_keepalive_interval_ms: u64,
 
     // Network settings
     #[serde(default)]
@@ -86,6 +106,8 @@ impl Default for ClewdrConfig {
             no_fs: false,
             log_to_file: false,
             debug_cookie: false,
+            non_stream_keepalive: default_non_stream_keepalive(),
+            non_stream_keepalive_interval_ms: default_non_stream_keepalive_interval_ms(),
             proxy: None,
             trusted_proxies: default_trusted_proxies(),
             claude_code_client_id: None,
@@ -159,6 +181,8 @@ impl ClewdrConfig {
     }
 
     pub fn validate(mut self) -> Self {
+        self.non_stream_keepalive_interval_ms =
+            self.non_stream_keepalive_interval_ms.clamp(250, 60_000);
         self.wreq_proxy = self.proxy.to_owned().and_then(|p| {
             Proxy::all(p)
                 .inspect_err(|e| {
@@ -168,5 +192,23 @@ impl ClewdrConfig {
                 .ok()
         });
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClewdrConfig;
+
+    #[test]
+    fn non_stream_keepalive_defaults_on_when_config_omits_it() {
+        let config: ClewdrConfig = toml::from_str("").unwrap();
+        assert!(config.non_stream_keepalive);
+        assert_eq!(config.non_stream_keepalive_interval_ms, 6_000);
+    }
+
+    #[test]
+    fn non_stream_keepalive_can_be_disabled_explicitly() {
+        let config: ClewdrConfig = toml::from_str("non_stream_keepalive = false").unwrap();
+        assert!(!config.non_stream_keepalive);
     }
 }

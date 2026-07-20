@@ -11,6 +11,11 @@ use crate::types::claude::Usage;
 #[derive(Debug, Clone)]
 pub struct ClaudeContext {
     pub stream: bool,
+    /// Client requested a non-stream response, but the response body should
+    /// use the whitespace keepalive bridge while clewdr aggregates upstream
+    /// SSE events.
+    pub non_stream_keepalive: bool,
+    pub non_stream_keepalive_interval_ms: u64,
     pub system_prompt_hash: Option<u64>,
     pub anthropic_beta: Option<String>,
     pub usage: Usage,

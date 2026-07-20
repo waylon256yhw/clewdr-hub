@@ -25,6 +25,7 @@ use crate::{
         ClaudeContext, SERVER_SIDE_FALLBACK_BETA, apply_auto_cache, apply_fable_fallback,
         build_claude_context, claude_code_billing_header, drop_empty_message_text_blocks,
         drop_empty_system, ensure_anthropic_beta_token, fill_system_only_user_placeholder,
+        non_stream_keepalive_interval_ms, non_stream_keepalive_requested,
         normalize_sampling_params, prepend_system_blocks, strip_billing_headers_from_system,
         strip_ephemeral_scope_from_system,
     },
@@ -499,6 +500,8 @@ where
             .get::<crate::db::models::RequestAuditSnapshot>()
             .cloned();
         let include_reasoning = parse_include_reasoning(req.headers());
+        let non_stream_keepalive = non_stream_keepalive_requested(req.headers());
+        let non_stream_keepalive_interval_ms = non_stream_keepalive_interval_ms(req.headers());
         let Json(oai) = Json::<ChatCompletionRequest>::from_request(req, &()).await?;
         let include_usage = oai
             .stream_options
@@ -538,6 +541,8 @@ where
         // OpenAI-compat clients don't carry a Claude Code session header; the
         // affinity hash falls back to metadata/system-cache. None passed here.
         let mut context = build_claude_context(&body, auth_user.as_ref(), anthropic_beta, None);
+        context.non_stream_keepalive = !context.stream && non_stream_keepalive;
+        context.non_stream_keepalive_interval_ms = non_stream_keepalive_interval_ms;
 
         // Tag api_surface for audited keys entering through the OpenAI
         // compat surface. Non-audited keys (snapshot is None) skip.

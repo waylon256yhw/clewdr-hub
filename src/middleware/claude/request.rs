@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    config::CLEWDR_CONFIG,
     error::ClewdrError,
     middleware::claude::ClaudeContext,
     stealth::{self, StealthProfile},
@@ -25,6 +26,40 @@ use crate::{
 };
 
 const CLAUDE_CODE_ENTRYPOINT_ENV: &str = "CLAUDE_CODE_ENTRYPOINT";
+pub(crate) const NON_STREAM_KEEPALIVE_HEADER: &str = "x-clewdr-non-stream-keepalive";
+pub(crate) const NON_STREAM_KEEPALIVE_INTERVAL_HEADER: &str =
+    "x-clewdr-non-stream-keepalive-interval-ms";
+
+/// Resolve the non-stream keepalive bridge for one request. An explicit
+/// header wins over the process-wide config, which lets one harness opt in or
+/// out without changing behavior for other API consumers.
+pub(crate) fn non_stream_keepalive_requested(headers: &HeaderMap) -> bool {
+    headers
+        .get(NON_STREAM_KEEPALIVE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or_else(|| CLEWDR_CONFIG.load().non_stream_keepalive)
+}
+
+pub(crate) fn non_stream_keepalive_interval_ms(headers: &HeaderMap) -> u64 {
+    headers
+        .get(NON_STREAM_KEEPALIVE_INTERVAL_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.clamp(250, 60_000))
+        .unwrap_or_else(|| {
+            CLEWDR_CONFIG
+                .load()
+                .non_stream_keepalive_interval_ms
+                .clamp(250, 60_000)
+        })
+}
+
 pub(crate) fn prepend_system_blocks(body: &mut CreateMessageParams, blocks: Vec<ContentBlock>) {
     if blocks.is_empty() {
         return;
@@ -622,6 +657,8 @@ pub(crate) fn build_claude_context(
 
     ClaudeContext {
         stream,
+        non_stream_keepalive: false,
+        non_stream_keepalive_interval_ms: 6_000,
         system_prompt_hash,
         anthropic_beta,
         usage: Usage {
@@ -676,6 +713,8 @@ where
             .get("x-claude-code-session-id")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
+        let non_stream_keepalive = non_stream_keepalive_requested(req.headers());
+        let non_stream_keepalive_interval_ms = non_stream_keepalive_interval_ms(req.headers());
         let is_count_tokens = is_count_tokens_path(req.uri().path());
         let Json(mut body) = Json::<CreateMessageParams>::from_request(req, &()).await?;
 
@@ -735,6 +774,8 @@ where
             anthropic_beta,
             inbound_session_id.as_deref(),
         );
+        context.non_stream_keepalive = !is_count_tokens && !context.stream && non_stream_keepalive;
+        context.non_stream_keepalive_interval_ms = non_stream_keepalive_interval_ms;
 
         // If the API key has enhanced audit enabled, tag api_surface
         // for this entry point and attach the snapshot. Non-audited
@@ -757,6 +798,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_stream_keepalive_headers_override_and_bound_request_settings() {
+        let mut headers = HeaderMap::new();
+        headers.insert(NON_STREAM_KEEPALIVE_HEADER, "true".parse().unwrap());
+        headers.insert(NON_STREAM_KEEPALIVE_INTERVAL_HEADER, "50".parse().unwrap());
+        assert!(non_stream_keepalive_requested(&headers));
+        assert_eq!(non_stream_keepalive_interval_ms(&headers), 250);
+
+        headers.insert(NON_STREAM_KEEPALIVE_HEADER, "false".parse().unwrap());
+        headers.insert(
+            NON_STREAM_KEEPALIVE_INTERVAL_HEADER,
+            "120000".parse().unwrap(),
+        );
+        assert!(!non_stream_keepalive_requested(&headers));
+        assert_eq!(non_stream_keepalive_interval_ms(&headers), 60_000);
+    }
 
     #[test]
     fn claude_code_billing_header_format() {

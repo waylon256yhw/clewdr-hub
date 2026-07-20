@@ -22,7 +22,8 @@ use crate::{
     middleware::{
         claude::ClaudeContext,
         openai::{
-            OpenAIChatPreprocess, anthropic_type_to_oai, to_openai_non_stream, to_openai_stream,
+            OpenAIChatPreprocess, anthropic_type_to_oai, to_openai_non_stream,
+            to_openai_non_stream_keepalive, to_openai_stream,
         },
     },
     providers::{
@@ -164,6 +165,8 @@ pub async fn api_openai_chat_completions(
                     include_usage,
                     context.model_raw.clone(),
                 )
+            } else if context.non_stream_keepalive {
+                to_openai_non_stream_keepalive(response, include_reasoning)
             } else {
                 to_openai_non_stream(response, include_reasoning).await
             };

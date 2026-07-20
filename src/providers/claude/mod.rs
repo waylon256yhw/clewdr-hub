@@ -127,6 +127,8 @@ impl LLMProvider for ClaudeCodeProvider {
             self.shared.stealth_profile.clone(),
         );
         state.stream = request.context.stream;
+        state.non_stream_keepalive = request.context.non_stream_keepalive;
+        state.non_stream_keepalive_interval_ms = request.context.non_stream_keepalive_interval_ms;
         state.system_prompt_hash = request.context.system_prompt_hash;
         state.anthropic_beta_header = request.context.anthropic_beta.clone();
         state.usage = request.context.usage.to_owned();

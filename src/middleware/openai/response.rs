@@ -5,8 +5,18 @@
 //! (failure) and emits an axum response shaped like an OpenAI
 //! [`ChatCompletion`] or [`crate::types::openai::OpenAIErrorBody`].
 
-use axum::{Json, response::IntoResponse};
-use http::StatusCode;
+use std::convert::Infallible;
+
+use axum::{
+    Json,
+    body::{Body, Bytes},
+    response::IntoResponse,
+};
+use futures::StreamExt;
+use http::{
+    StatusCode,
+    header::{CONTENT_LENGTH, TRANSFER_ENCODING},
+};
 use serde_json::{Value, json};
 
 use crate::types::{
@@ -66,6 +76,95 @@ pub async fn to_openai_non_stream(
 
     let chat = build_chat_completion(upstream, include_reasoning);
     Json(chat).into_response()
+}
+
+/// Preserve the whitespace heartbeat frames from the Anthropic non-stream
+/// bridge, then translate its final Messages JSON document into the OpenAI
+/// Chat Completions shape. The response headers have already been committed by
+/// the bridge, so translation failures are represented as a JSON error body.
+pub fn to_openai_non_stream_keepalive(
+    resp: axum::response::Response,
+    include_reasoning: bool,
+) -> axum::response::Response {
+    let (mut parts, body) = resp.into_parts();
+    // A relay that ignores the forced `stream: true` request can return a
+    // regular JSON response with its original Content-Length. The translated
+    // OpenAI body has a different size, so it must be framed afresh.
+    parts.headers.remove(CONTENT_LENGTH);
+    parts.headers.remove(TRANSFER_ENCODING);
+    let mut source = body.into_data_stream();
+    let stream = async_stream::stream! {
+        let mut final_body = Vec::new();
+        while let Some(frame) = source.next().await {
+            match frame {
+                Ok(bytes) if final_body.is_empty() && bytes.iter().all(u8::is_ascii_whitespace) => {
+                    yield Ok::<Bytes, Infallible>(bytes);
+                }
+                Ok(bytes) => {
+                    if final_body.len().saturating_add(bytes.len()) > RESPONSE_BODY_LIMIT {
+                        let body = serde_json::to_vec(&json!({
+                            "error": OpenAIErrorBody {
+                                message: format!(
+                                    "upstream response exceeded {RESPONSE_BODY_LIMIT} byte limit"
+                                ),
+                                kind: "api_error".to_string(),
+                                code: None,
+                                param: None,
+                            }
+                        }))
+                        .unwrap_or_default();
+                        yield Ok(Bytes::from(body));
+                        return;
+                    }
+                    final_body.extend_from_slice(&bytes);
+                }
+                Err(err) => {
+                    let body = serde_json::to_vec(&json!({
+                        "error": OpenAIErrorBody {
+                            message: format!("failed to read upstream body: {err}"),
+                            kind: "api_error".to_string(),
+                            code: None,
+                            param: None,
+                        }
+                    }))
+                    .unwrap_or_default();
+                    yield Ok(Bytes::from(body));
+                    return;
+                }
+            }
+        }
+
+        let body = match serde_json::from_slice::<CreateMessageResponse>(&final_body) {
+            Ok(upstream) => serde_json::to_vec(&build_chat_completion(upstream, include_reasoning))
+                .unwrap_or_else(|err| {
+                    serde_json::to_vec(&json!({
+                        "error": OpenAIErrorBody {
+                            message: format!("failed to serialize response: {err}"),
+                            kind: "api_error".to_string(),
+                            code: None,
+                            param: None,
+                        }
+                    }))
+                    .unwrap_or_default()
+                }),
+            Err(err) => {
+                let translated = translate_upstream_error_body(&final_body);
+                let error = if translated.message.trim().is_empty() {
+                    OpenAIErrorBody {
+                        message: format!("failed to parse upstream response: {err}"),
+                        kind: "api_error".to_string(),
+                        code: None,
+                        param: None,
+                    }
+                } else {
+                    translated
+                };
+                serde_json::to_vec(&json!({ "error": error })).unwrap_or_default()
+            }
+        };
+        yield Ok(Bytes::from(body));
+    };
+    axum::response::Response::from_parts(parts, Body::from_stream(stream))
 }
 
 /// Build an [`OpenAIErrorBody`] from raw Anthropic error JSON bytes. Falls
@@ -225,6 +324,8 @@ pub(crate) fn map_usage(usage: Option<&Usage>) -> UsageOut {
 mod tests {
     use super::*;
     use crate::types::claude::Role;
+    use futures::StreamExt;
+    use http::header::{CONTENT_ENCODING, CONTENT_TYPE};
     use serde_json::json;
 
     fn make_response(
@@ -242,6 +343,46 @@ mod tests {
             type_: "message".to_string(),
             usage,
         }
+    }
+
+    #[tokio::test]
+    async fn keepalive_translation_forwards_whitespace_before_final_openai_json() {
+        let upstream = make_response(
+            vec![ContentBlock::text("hello")],
+            Some(StopReason::EndTurn),
+            Some(Usage {
+                input_tokens: 3,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+        );
+        let final_json = serde_json::to_vec(&upstream).unwrap();
+        let source = async_stream::stream! {
+            yield Ok::<Bytes, Infallible>(Bytes::from_static(b" "));
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            yield Ok(Bytes::from(final_json));
+        };
+        let response = http::Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .header(CONTENT_ENCODING, "identity")
+            .body(Body::from_stream(source))
+            .unwrap();
+
+        let translated = to_openai_non_stream_keepalive(response, true);
+        assert_eq!(translated.headers()[CONTENT_ENCODING], "identity");
+        let mut body = translated.into_body().into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_millis(20), body.next())
+            .await
+            .expect("whitespace heartbeat should not wait for final JSON")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&first[..], b" ");
+
+        let final_bytes = body.next().await.unwrap().unwrap();
+        let completion: serde_json::Value = serde_json::from_slice(&final_bytes).unwrap();
+        assert_eq!(completion["choices"][0]["message"]["content"], "hello");
     }
 
     #[test]
