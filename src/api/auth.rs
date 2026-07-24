@@ -63,9 +63,7 @@ pub struct SessionResponse {
 
 async fn login_retry_after(client_ip: &str) -> Option<u64> {
     let mut failures = LOGIN_FAILURES.lock().await;
-    let Some(entry) = failures.get(client_ip).copied() else {
-        return None;
-    };
+    let entry = failures.get(client_ip).copied()?;
     let elapsed = entry.window_started.elapsed();
     if elapsed >= LOGIN_WINDOW {
         failures.remove(client_ip);

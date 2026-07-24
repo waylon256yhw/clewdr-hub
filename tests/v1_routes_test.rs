@@ -411,7 +411,13 @@ async fn v1_models_list_is_public_and_seeded() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = response_json(response).await;
-    assert!(body["data"].as_array().unwrap().len() >= 3);
+    let models = body["data"].as_array().unwrap();
+    assert!(models.len() >= 3);
+    assert!(
+        models
+            .iter()
+            .any(|model| model["id"].as_str() == Some("claude-opus-5"))
+    );
     assert_eq!(body["first_id"], "claude-fable-5");
 }
 

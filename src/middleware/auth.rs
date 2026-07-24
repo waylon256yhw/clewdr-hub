@@ -359,6 +359,17 @@ pub struct AdminSessionInfo {
     pub must_change_password: bool,
 }
 
+#[derive(sqlx::FromRow)]
+struct AdminSessionRow {
+    id: i64,
+    username: String,
+    role: String,
+    session_version: i32,
+    disabled_at: Option<String>,
+    policy_id: i64,
+    must_change_password: i32,
+}
+
 /// Validate an admin cookie and attach the authenticated user/session
 /// extensions. This deliberately permits a first-login session whose initial
 /// password still needs changing; only the password/session endpoints use it.
@@ -386,7 +397,7 @@ where
         let claims = session::validate_session_cookie(&auth_state.session_secret, cookie_value)
             .ok_or(ClewdrError::InvalidAuth)?;
 
-        let row: Option<(i64, String, String, i32, Option<String>, i64, i32)> = sqlx::query_as(
+        let row: Option<AdminSessionRow> = sqlx::query_as(
             "SELECT u.id, u.username, u.role, u.session_version, u.disabled_at, u.policy_id,
                     u.must_change_password
              FROM users u WHERE u.id = ?1",
@@ -399,15 +410,15 @@ where
             ClewdrError::InvalidAuth
         })?;
 
-        let Some((
-            user_id,
+        let Some(AdminSessionRow {
+            id: user_id,
             username,
             role,
             session_version,
             disabled_at,
             policy_id,
             must_change_password,
-        )) = row
+        }) = row
         else {
             return Err(ClewdrError::InvalidAuth);
         };

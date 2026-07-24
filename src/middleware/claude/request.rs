@@ -482,8 +482,10 @@ pub(crate) fn request_affinity_hash(
 /// add little value for the target deployment model, while some clients/models send
 /// combinations that Anthropic rejects.
 ///
-/// When thinking is active (enabled or adaptive):
-///   - `temperature` must be 1 or unset
+/// Models released after Opus 4.6 reject non-default sampling values. We always
+/// remove `top_p` / `top_k`, and remove a non-default `temperature` for those
+/// families. Older models retain `temperature` unless thinking is active, where
+/// it must be 1 or unset.
 ///
 /// For model families that dropped extended thinking budgets, legacy
 /// `thinking.type=enabled` + `budget_tokens` is removed upstream: the OAuth
@@ -495,7 +497,9 @@ pub(crate) fn request_affinity_hash(
 /// `output_config.effort="high"` when the legacy request did not set one.
 ///
 /// Fable 5 requires thinking, so missing or explicitly disabled thinking is
-/// normalized to adaptive thinking with a summarized display.
+/// normalized to adaptive thinking with a summarized display. Opus 5 permits
+/// disabled thinking only through `high` effort; a disabled request at `xhigh`
+/// or `max` is normalized back to adaptive thinking.
 ///
 /// Operators can also enable an effort override from the admin settings page;
 /// when enabled it overwrites `output_config.effort` on supported reasoning
@@ -531,14 +535,6 @@ pub(crate) fn normalize_sampling_params(body: &mut CreateMessageParams, profile:
         body.thinking = Some(Thinking::adaptive_with_display(ThinkingDisplay::Summarized));
     }
 
-    let thinking_active = matches!(
-        body.thinking,
-        Some(Thinking::Adaptive { .. }) | Some(Thinking::Enabled { .. })
-    );
-    if thinking_active && body.temperature != Some(1.0) {
-        body.temperature = None;
-    }
-
     if rewrote_legacy_thinking || forced_thinking {
         body.output_config
             .get_or_insert_with(default_output_config)
@@ -554,6 +550,26 @@ pub(crate) fn normalize_sampling_params(body: &mut CreateMessageParams, profile:
         body.output_config
             .get_or_insert_with(default_output_config)
             .effort = Some(force_output_effort);
+    }
+
+    let effective_effort = body
+        .output_config
+        .as_ref()
+        .and_then(|config| config.effort.as_ref());
+    if family.is_some_and(|f| f.disabled_thinking_requires_rewrite(effective_effort))
+        && matches!(body.thinking, Some(Thinking::Disabled))
+    {
+        body.thinking = Some(Thinking::adaptive_with_display(ThinkingDisplay::Summarized));
+    }
+
+    let thinking_active = matches!(
+        body.thinking,
+        Some(Thinking::Adaptive { .. }) | Some(Thinking::Enabled { .. })
+    );
+    if (thinking_active || family.is_some_and(ReasoningFamily::rejects_sampling_parameters))
+        && body.temperature != Some(1.0)
+    {
+        body.temperature = None;
     }
 }
 
@@ -573,6 +589,7 @@ fn default_output_config() -> OutputConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReasoningFamily {
     Fable5,
+    Opus5,
     Sonnet5,
     V4_5,
     V4_6,
@@ -584,6 +601,7 @@ impl ReasoningFamily {
     fn detect(model: &str) -> Option<Self> {
         const TABLE: &[(&str, ReasoningFamily)] = &[
             ("claude-fable-5", ReasoningFamily::Fable5),
+            ("claude-opus-5", ReasoningFamily::Opus5),
             ("claude-sonnet-5", ReasoningFamily::Sonnet5),
             ("claude-opus-4-8", ReasoningFamily::V4_8),
             ("claude-opus-4-7", ReasoningFamily::V4_7),
@@ -595,14 +613,29 @@ impl ReasoningFamily {
         })
     }
 
-    /// 4.7+, Fable 5, and Sonnet 5 removed extended thinking budgets, so legacy
+    /// 4.7+ and Claude 5 families removed extended thinking budgets, so legacy
     /// `enabled` requests must be rewritten to `adaptive` before going upstream.
     fn requires_adaptive_thinking_rewrite(self) -> bool {
-        matches!(self, Self::Fable5 | Self::Sonnet5 | Self::V4_7 | Self::V4_8)
+        matches!(
+            self,
+            Self::Fable5 | Self::Opus5 | Self::Sonnet5 | Self::V4_7 | Self::V4_8
+        )
     }
 
     fn requires_thinking(self) -> bool {
         matches!(self, Self::Fable5)
+    }
+
+    fn rejects_sampling_parameters(self) -> bool {
+        matches!(
+            self,
+            Self::Fable5 | Self::Opus5 | Self::Sonnet5 | Self::V4_7 | Self::V4_8
+        )
+    }
+
+    fn disabled_thinking_requires_rewrite(self, effort: Option<&OutputEffort>) -> bool {
+        matches!(self, Self::Opus5)
+            && matches!(effort, Some(OutputEffort::XHigh | OutputEffort::Max))
     }
 
     /// Map an admin-forced effort level onto the highest level this family
@@ -620,7 +653,7 @@ impl ReasoningFamily {
                 OutputEffort::High => OutputEffort::High,
                 OutputEffort::XHigh | OutputEffort::Max => OutputEffort::Max,
             },
-            Self::Fable5 | Self::Sonnet5 | Self::V4_7 | Self::V4_8 => effort.clone(),
+            Self::Fable5 | Self::Opus5 | Self::Sonnet5 | Self::V4_7 | Self::V4_8 => effort.clone(),
         }
     }
 }
@@ -1462,6 +1495,74 @@ mod tests {
     }
 
     #[test]
+    fn normalize_opus_5_rewrites_legacy_thinking_and_sampling() {
+        let mut body = make_body(Some(Thinking::new(8000)), Some(0.7), Some(0.9), Some(40));
+        body.model = "claude-opus-5".to_string();
+        normalize_sampling_params(&mut body, &StealthProfile::default());
+        assert!(matches!(
+            body.thinking,
+            Some(Thinking::Adaptive {
+                display: Some(ThinkingDisplay::Summarized)
+            })
+        ));
+        assert!(matches!(
+            body.output_config,
+            Some(OutputConfig {
+                effort: Some(OutputEffort::High),
+                ..
+            })
+        ));
+        assert_eq!(body.temperature, None);
+        assert_eq!(body.top_p, None);
+        assert_eq!(body.top_k, None);
+    }
+
+    #[test]
+    fn normalize_opus_5_strips_non_default_temperature_with_implicit_thinking() {
+        let mut body = make_body(None, Some(0.7), None, None);
+        body.model = "claude-opus-5-20260724".to_string();
+        normalize_sampling_params(&mut body, &StealthProfile::default());
+        assert!(body.thinking.is_none());
+        assert_eq!(body.temperature, None);
+    }
+
+    #[test]
+    fn normalize_opus_5_keeps_disabled_thinking_through_high_effort() {
+        let mut body = make_body(Some(Thinking::Disabled), Some(1.0), None, None);
+        body.model = "claude-opus-5".to_string();
+        body.output_config = Some(OutputConfig {
+            effort: Some(OutputEffort::High),
+            format: None,
+        });
+        normalize_sampling_params(&mut body, &StealthProfile::default());
+        assert!(matches!(body.thinking, Some(Thinking::Disabled)));
+    }
+
+    #[test]
+    fn normalize_opus_5_enables_thinking_for_xhigh_override() {
+        let mut body = make_body(Some(Thinking::Disabled), Some(1.0), None, None);
+        body.model = "claude-opus-5".to_string();
+        let profile = StealthProfile {
+            force_output_effort: Some(OutputEffort::XHigh),
+            ..StealthProfile::default()
+        };
+        normalize_sampling_params(&mut body, &profile);
+        assert!(matches!(
+            body.thinking,
+            Some(Thinking::Adaptive {
+                display: Some(ThinkingDisplay::Summarized)
+            })
+        ));
+        assert!(matches!(
+            body.output_config,
+            Some(OutputConfig {
+                effort: Some(OutputEffort::XHigh),
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn normalize_fable_5_forces_missing_thinking_on() {
         let mut body = make_body(None, Some(0.7), None, None);
         body.model = "claude-fable-5".to_string();
@@ -1532,6 +1633,14 @@ mod tests {
             Some(ReasoningFamily::Fable5)
         );
         assert_eq!(
+            ReasoningFamily::detect("claude-opus-5"),
+            Some(ReasoningFamily::Opus5)
+        );
+        assert_eq!(
+            ReasoningFamily::detect("claude-opus-5-20260724"),
+            Some(ReasoningFamily::Opus5)
+        );
+        assert_eq!(
             ReasoningFamily::detect("claude-sonnet-5"),
             Some(ReasoningFamily::Sonnet5)
         );
@@ -1557,6 +1666,7 @@ mod tests {
         );
         assert_eq!(ReasoningFamily::detect("claude-sonnet-4-6"), None);
         assert_eq!(ReasoningFamily::detect("claude-fable-5-preview1"), None);
+        assert_eq!(ReasoningFamily::detect("claude-opus-5-preview1"), None);
         assert_eq!(ReasoningFamily::detect("claude-sonnet-5-preview1"), None);
         assert_eq!(ReasoningFamily::detect("claude-opus-4-7-preview1"), None);
     }

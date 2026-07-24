@@ -266,10 +266,7 @@ fn read_cell(row: &sqlx::sqlite::SqliteRow, name: &str) -> Result<CellValue, Cle
         // Unknown affinity: try string, fall back to blob.
         _ => match row.try_get::<String, _>(name) {
             Ok(s) => CellValue::Text(s),
-            Err(_) => match row.try_get::<Vec<u8>, _>(name) {
-                Ok(b) => CellValue::Blob(b),
-                Err(e) => return Err(e.into()),
-            },
+            Err(_) => CellValue::Blob(row.try_get::<Vec<u8>, _>(name)?),
         },
     };
     Ok(cell)
