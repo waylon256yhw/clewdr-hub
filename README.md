@@ -42,7 +42,7 @@ curl -fL https://raw.githubusercontent.com/waylon256yhw/clewdr-hub/master/script
 clewdr menu
 ```
 
-管理后台地址 `http://你的IP:8484`，默认密码 `password`，首次登录强制改密。
+管理后台地址 `http://你的IP:8484`。Release 首次启动会在服务日志中打印随机初始密码，并要求首次登录后立即改密；开发构建仍使用 `password`。
 
 > Docker Compose / 宝塔面板 / Hugging Face Space / 手动安装见 [安装部署文档](https://waylon256yhw.github.io/clewdr-hub/start/installation/)。
 

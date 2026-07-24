@@ -4,21 +4,21 @@ use sha2::Sha256;
 type HmacSha256 = Hmac<Sha256>;
 
 const COOKIE_NAME: &str = "clewdr_session";
-const DEFAULT_TTL: u64 = 86400; // 24h
 
+#[derive(Clone, Copy, Debug)]
 pub struct SessionClaims {
     pub user_id: i64,
     pub session_version: i32,
+    pub expires_at: u64,
 }
 
 pub fn create_session_cookie(
     secret: &[u8; 32],
     user_id: i64,
     session_version: i32,
-    ttl_secs: Option<u64>,
+    ttl_secs: u64,
 ) -> String {
-    let ttl = ttl_secs.unwrap_or(DEFAULT_TTL);
-    let expires = now_unix() + ttl;
+    let expires = now_unix().saturating_add(ttl_secs);
     let payload = format!("{user_id}.{session_version}.{expires}");
     let sig = sign(secret, &payload);
     format!("{payload}.{sig}")
@@ -51,15 +51,20 @@ pub fn validate_session_cookie(secret: &[u8; 32], value: &str) -> Option<Session
     Some(SessionClaims {
         user_id,
         session_version,
+        expires_at: expires,
     })
 }
 
-pub fn set_cookie_header(cookie_value: &str, max_age: u64) -> String {
-    format!("{COOKIE_NAME}={cookie_value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}")
+pub fn set_cookie_header(cookie_value: &str, max_age: u64, secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!(
+        "{COOKIE_NAME}={cookie_value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}{secure_attr}"
+    )
 }
 
-pub fn clear_cookie_header() -> String {
-    format!("{COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
+pub fn clear_cookie_header(secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!("{COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure_attr}")
 }
 
 pub fn extract_session_cookie(cookie_header: &str) -> Option<&str> {

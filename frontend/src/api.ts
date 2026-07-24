@@ -372,6 +372,10 @@ export interface LoginResponse {
   username: string;
   role: string;
   must_change_password: boolean;
+  expires_at: number;
+}
+
+export interface SessionResponse extends LoginResponse {
 }
 
 export interface OpsUsageTotals {
@@ -530,8 +534,11 @@ export interface OpsUsageResponse {
 // Auth
 export const login = (data: { username: string; password: string }) =>
   apiFetch<LoginResponse>("/auth/login", { method: "POST", body: data });
+export const getSession = () => apiFetch<SessionResponse>("/auth/session");
 export const logout = () =>
   apiFetch<void>("/auth/logout", { method: "POST" }).catch(() => {});
+export const logoutAll = () =>
+  apiFetch<void>("/auth/logout-all", { method: "POST" });
 
 // Overview
 export const getOverview = () => apiFetch<OverviewResponse>("/api/admin/overview");
@@ -713,7 +720,10 @@ export const getRequestAudit = (id: number) =>
 
 // Me
 export const changePassword = (data: { current_password: string; new_password: string }) =>
-  apiFetch<{ message: string }>("/api/admin/me/password", { method: "PUT", body: data });
+  apiFetch<{ message: string; reauth_required: boolean }>("/api/admin/me/password", {
+    method: "PUT",
+    body: data,
+  });
 
 // Models
 export interface ModelRow {

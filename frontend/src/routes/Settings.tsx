@@ -24,13 +24,14 @@ import {
 import { useForm } from "@mantine/form";
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { IconPlus, IconTrash, IconRefresh } from "@tabler/icons-react";
+import { IconLogout, IconPlus, IconTrash, IconRefresh } from "@tabler/icons-react";
 import {
-  getSettings, updateSettings, changePassword, getCliVersions,
+  getSettings, updateSettings, changePassword, logoutAll, getCliVersions,
   listModelsAdmin, createModel, updateModel, deleteModel, resetDefaultModels,
   qk, ApiError,
   type ModelRow,
 } from "../api";
+import { useAuth } from "../auth";
 
 const EFFORT_OPTIONS = [
   { value: "low", label: "Low" },
@@ -136,7 +137,9 @@ function PasswordSection() {
       changePassword(values),
     onSuccess: () => {
       form.reset();
-      notifications.show({ message: "密码已修改", color: "green" });
+      window.dispatchEvent(new CustomEvent("auth:logout", {
+        detail: { message: "密码已修改，所有设备均已退出，请使用新密码重新登录" },
+      }));
     },
     onError: (e) =>
       notifications.show({
@@ -174,6 +177,64 @@ function PasswordSection() {
           </Group>
         </Stack>
       </form>
+    </Paper>
+  );
+}
+
+function SessionSection() {
+  const { expiresAt } = useAuth();
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const mutation = useMutation({
+    mutationFn: logoutAll,
+    onSuccess: () => {
+      window.dispatchEvent(new CustomEvent("auth:logout", {
+        detail: { message: "已退出所有设备" },
+      }));
+    },
+    onError: (e) =>
+      notifications.show({
+        message: e instanceof ApiError ? e.message : "操作失败",
+        color: "red",
+      }),
+  });
+
+  return (
+    <Paper shadow="xs" p="md" radius="md" withBorder>
+      <Stack>
+        <Text fw={600}>登录状态</Text>
+        <Text size="sm" c="dimmed">
+          登录态不会自动续期，到期后需要重新登录。
+          {expiresAt ? ` 当前登录将在 ${new Date(expiresAt * 1000).toLocaleString()} 到期。` : ""}
+        </Text>
+        <Group justify="flex-end">
+          <Button
+            color="red"
+            variant="light"
+            leftSection={<IconLogout size={16} />}
+            onClick={() => setConfirmOpen(true)}
+          >
+            退出所有设备
+          </Button>
+        </Group>
+      </Stack>
+      <Modal
+        opened={confirmOpen}
+        onClose={() => setConfirmOpen(false)}
+        title="退出所有设备"
+        centered
+      >
+        <Stack>
+          <Text size="sm">
+            包括当前浏览器在内的所有管理后台登录都会失效，需要重新登录。
+          </Text>
+          <Group justify="flex-end">
+            <Button variant="default" onClick={() => setConfirmOpen(false)}>取消</Button>
+            <Button color="red" loading={mutation.isPending} onClick={() => mutation.mutate()}>
+              确认退出
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
     </Paper>
   );
 }
@@ -461,6 +522,7 @@ export default function Settings() {
         />
         <TpVersionSection currentVersion={data["tp_cloak_cli_version"] ?? ""} />
         <ModelsSection />
+        <SessionSection />
         <PasswordSection />
       </Stack>
     </>

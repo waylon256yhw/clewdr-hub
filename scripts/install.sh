@@ -468,7 +468,7 @@ echo
 case "$service_state" in
     running|starting|boot_registered)
         printf "  %-10s %s\n" "访问后台" "${BOLD}http://${server_ip}:8484${RESET}"
-        printf "  %-10s %s\n" "默认密码" "${BOLD}password${RESET}（首次登录强制改密）"
+        printf "  %-10s %s\n" "初始密码" "首次启动随机生成，请查看服务日志（首次登录强制改密）"
         ;;
 esac
 printf "  %-10s %s\n" "管理菜单" "${BOLD}${clewdr_cmd} menu${RESET}"

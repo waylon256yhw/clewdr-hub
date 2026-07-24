@@ -18,7 +18,9 @@ Key 格式：`sk-{lookup_prefix}_{random_part}`
 - admin 密码用 argon2 哈希存储
 - 登录成功后签发 HMAC-SHA256 签名 cookie（`clewdr_session`）
 - payload：`{user_id}.{session_version}.{expires}`
-- TTL 24h，`session_version` 递增即可踢掉所有会话
+- 默认 TTL 24h（可通过 `admin_session_ttl_hours` 调整），不会自动续期
+- `session_version` 递增即可踢掉所有会话；修改密码和“退出所有设备”都会执行此操作
+- Release 首次启动生成随机初始密码；`must_change_password` 在后端限制管理 API，而不只依赖前端弹窗
 
 ## 关于 plaintext_key
 

@@ -17,7 +17,7 @@ curl -fL https://raw.githubusercontent.com/waylon256yhw/clewdr-hub/master/script
 
 ## 2. 打开管理后台
 
-浏览器访问 `http://你的IP:8484`，默认密码 `password`，**首次登录强制改密**。
+浏览器访问 `http://你的IP:8484`。首次启动的随机初始密码会打印在服务日志中，**首次登录强制改密**。
 
 命令行也能随时查看状态、改密、导入导出配置：
 

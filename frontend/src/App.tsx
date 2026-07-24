@@ -189,13 +189,15 @@ function ColorSchemeToggle({ size = "lg", iconSize = 18 }: { size?: "md" | "lg";
  */
 const SSE_FLUSH_MS = 1000;
 
-function useGlobalAdminEvents() {
+function useGlobalAdminEvents(enabled: boolean) {
   const queryClient = useQueryClient();
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dirty = useRef<Set<"requests" | "opsUsage" | "overview" | "accounts" | "users">>(new Set());
 
   useEffect(() => {
+    if (!enabled) return;
+
     let disposed = false;
     let es: EventSource | null = null;
 
@@ -225,13 +227,20 @@ function useGlobalAdminEvents() {
       if (disposed) return;
       es = new EventSource("/api/admin/events");
       es.onmessage = (event) => {
-        let payload: { topic?: string };
+        let payload: { topic?: string; status?: string };
         try {
-          payload = JSON.parse(event.data) as { topic?: string };
+          payload = JSON.parse(event.data) as { topic?: string; status?: string };
         } catch {
           // An unparseable event carries no topic to act on; invalidating
           // everything for it just amplified the refetch storm.
           console.warn("[useGlobalAdminEvents] unparseable SSE event:", event.data);
+          return;
+        }
+        if (payload.topic === "auth") {
+          const message = payload.status === "password_changed"
+            ? "管理员密码已修改，所有设备均已退出"
+            : "管理员已执行退出所有设备";
+          window.dispatchEvent(new CustomEvent("auth:logout", { detail: { message } }));
           return;
         }
         if (!payload.topic || payload.topic === "request_logs") {
@@ -262,13 +271,14 @@ function useGlobalAdminEvents() {
       flushTimer.current = null;
       dirty.current.clear();
     };
-  }, [queryClient]);
+  }, [enabled, queryClient]);
 }
 
-function useFrontendVersionSync() {
+function useFrontendVersionSync(enabled: boolean) {
   const { data } = useQuery({
     queryKey: qk.overview,
     queryFn: getOverview,
+    enabled,
     staleTime: 30_000,
     refetchInterval: 30_000,
     refetchOnWindowFocus: true,
@@ -285,9 +295,9 @@ function useFrontendVersionSync() {
 function AdminShell() {
   const location = useLocation();
   const [opened, { toggle, close }] = useDisclosure();
-  const { logout } = useAuth();
-  useGlobalAdminEvents();
-  const version = useFrontendVersionSync();
+  const { logout, mustChangePassword } = useAuth();
+  useGlobalAdminEvents(!mustChangePassword);
+  const version = useFrontendVersionSync(!mustChangePassword);
   const compactHeader = useMediaQuery("(max-width: 36em)");
   const headerActionSize = compactHeader ? "md" : "lg";
   const headerIconSize = compactHeader ? 17 : 18;
@@ -336,7 +346,7 @@ function AdminShell() {
             >
               <IconBrandGithub size={headerIconSize} />
             </ActionIcon>
-            <ActionIcon variant="default" size={headerActionSize} onClick={logout} aria-label="退出登录">
+            <ActionIcon variant="default" size={headerActionSize} onClick={logout} aria-label="退出此浏览器">
               <IconLogout size={headerIconSize} />
             </ActionIcon>
           </Group>

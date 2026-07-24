@@ -41,6 +41,10 @@ fn default_non_stream_keepalive() -> bool {
     true
 }
 
+fn default_admin_session_ttl_hours() -> u64 {
+    24
+}
+
 /// A struct representing the configuration of the application
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClewdrConfig {
@@ -61,6 +65,15 @@ pub struct ClewdrConfig {
     pub log_to_file: bool,
     #[serde(default)]
     pub debug_cookie: bool,
+    /// Absolute lifetime of an admin login. Sessions are deliberately not
+    /// renewed on activity, so this is also the maximum lifetime of a copied
+    /// admin cookie.
+    #[serde(default = "default_admin_session_ttl_hours")]
+    pub admin_session_ttl_hours: u64,
+    /// Add the Secure attribute to admin cookies. Keep this opt-in because
+    /// local/LAN deployments commonly serve the panel over plain HTTP.
+    #[serde(default)]
+    pub admin_cookie_secure: bool,
     /// Bridge non-stream message requests through an upstream SSE response and
     /// periodically write JSON whitespace downstream. This keeps clients with
     /// per-read idle timeouts alive while preserving a final non-stream JSON
@@ -106,6 +119,8 @@ impl Default for ClewdrConfig {
             no_fs: false,
             log_to_file: false,
             debug_cookie: false,
+            admin_session_ttl_hours: default_admin_session_ttl_hours(),
+            admin_cookie_secure: false,
             non_stream_keepalive: default_non_stream_keepalive(),
             non_stream_keepalive_interval_ms: default_non_stream_keepalive_interval_ms(),
             proxy: None,
@@ -181,6 +196,7 @@ impl ClewdrConfig {
     }
 
     pub fn validate(mut self) -> Self {
+        self.admin_session_ttl_hours = self.admin_session_ttl_hours.clamp(1, 168);
         self.non_stream_keepalive_interval_ms =
             self.non_stream_keepalive_interval_ms.clamp(250, 60_000);
         self.wreq_proxy = self.proxy.to_owned().and_then(|p| {

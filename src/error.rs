@@ -167,6 +167,10 @@ pub enum ClewdrError {
     TimestampError { timestamp: i64 },
     #[snafu(display("Key/Password Invalid"))]
     InvalidAuth,
+    #[snafu(display("Initial admin password must be changed before using the admin API"))]
+    PasswordChangeRequired,
+    #[snafu(display("Too many login attempts; try again in {} seconds", retry_after_secs))]
+    LoginRateLimited { retry_after_secs: u64 },
     #[snafu(display("User concurrency limit exceeded"))]
     UserConcurrencyExceeded,
     #[snafu(display("Request rate limit exceeded"))]
@@ -319,6 +323,25 @@ impl IntoResponse for ClewdrError {
             }
             ClewdrError::PathNotFound { .. } => (StatusCode::NOT_FOUND, json!(self.to_string())),
             ClewdrError::InvalidAuth => (StatusCode::UNAUTHORIZED, json!(self.to_string())),
+            ClewdrError::PasswordChangeRequired => (StatusCode::FORBIDDEN, json!(self.to_string())),
+            ClewdrError::LoginRateLimited { retry_after_secs } => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(
+                        axum::http::header::RETRY_AFTER,
+                        retry_after_secs.to_string(),
+                    )],
+                    Json(ClaudeError {
+                        error: ClaudeErrorBody {
+                            message: json!(self.to_string()),
+                            r#type: "login_rate_limited".to_string(),
+                            code: Some(StatusCode::TOO_MANY_REQUESTS.as_u16()),
+                            ..Default::default()
+                        },
+                    }),
+                )
+                    .into_response();
+            }
             ClewdrError::UpstreamCoolingDown
             | ClewdrError::UserConcurrencyExceeded
             | ClewdrError::RpmExceeded

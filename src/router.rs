@@ -3,14 +3,16 @@ use axum::{
     extract::DefaultBodyLimit,
     http::Method,
     middleware::from_extractor_with_state,
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use sqlx::SqlitePool;
 use tower_http::{compression::CompressionLayer, cors::CorsLayer};
 
 use crate::{
     api::*,
-    middleware::{RequireAdminAuth, RequireFlexibleAuth, RequireFlexibleAuthOpenAI},
+    middleware::{
+        RequireAdminAuth, RequireAdminSession, RequireFlexibleAuth, RequireFlexibleAuthOpenAI,
+    },
     services::{account_pool::AccountPoolHandle, user_limiter::UserLimiterMap},
     state::{AdminEvent, AppState, AuthState},
     stealth,
@@ -118,11 +120,35 @@ impl RouterBuilder {
             .route("/api/version", get(api_version))
             .route("/auth/login", post(crate::api::auth::login))
             .route(
+                "/auth/session",
+                get(crate::api::auth::current_session).route_layer(from_extractor_with_state::<
+                    RequireAdminSession,
+                    _,
+                >(
+                    self.state.clone()
+                )),
+            )
+            .route(
                 "/auth/logout",
                 post(crate::api::auth::logout)
-                    .route_layer(from_extractor_with_state::<RequireAdminAuth, _>(
+                    .route_layer(from_extractor_with_state::<RequireAdminSession, _>(
                         self.state.clone(),
                     )),
+            )
+            .route(
+                "/auth/logout-all",
+                post(crate::api::auth::logout_all).route_layer(from_extractor_with_state::<
+                    RequireAdminSession,
+                    _,
+                >(
+                    self.state.clone()
+                )),
+            )
+            .route(
+                "/api/admin/me/password",
+                put(crate::api::admin::me::change_password).route_layer(
+                    from_extractor_with_state::<RequireAdminSession, _>(self.state.clone()),
+                ),
             )
             .with_state(self.state.clone());
         self.inner = self.inner.merge(router);

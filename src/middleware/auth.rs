@@ -3,8 +3,8 @@ use std::net::{IpAddr, SocketAddr};
 use axum::extract::ConnectInfo;
 use axum::extract::FromRef;
 use axum::extract::FromRequestParts;
-use axum::http::StatusCode;
 use axum::http::request::Parts;
+use axum::http::{HeaderMap, StatusCode};
 use ipnet::IpNet;
 use tracing::warn;
 
@@ -147,8 +147,17 @@ pub fn resolve_client_ip(parts: &Parts, trusted: &[IpNet]) -> ResolvedClientIp {
         .map(|ci| ci.0.ip().to_string())
         .unwrap_or_else(|| "0.0.0.0".to_string());
 
-    let forwarded_chain_raw = parts
-        .headers
+    resolve_client_ip_from(&parts.headers, peer_ip, trusted)
+}
+
+/// Header/peer form of [`resolve_client_ip`] for handlers such as the public
+/// login endpoint, which receive normal axum extractors rather than raw Parts.
+pub fn resolve_client_ip_from(
+    headers: &HeaderMap,
+    peer_ip: String,
+    trusted: &[IpNet],
+) -> ResolvedClientIp {
+    let forwarded_chain_raw = headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.trim().is_empty())
@@ -208,8 +217,7 @@ pub fn resolve_client_ip(parts: &Parts, trusted: &[IpNet]) -> ResolvedClientIp {
     }
 
     // No untrusted hop in XFF — try X-Real-IP next.
-    if let Some(xri) = parts
-        .headers
+    if let Some(xri) = headers
         .get("x-real-ip")
         .and_then(|v| v.to_str().ok())
         .map(truncate_token)
@@ -346,9 +354,17 @@ where
     }
 }
 
-pub struct RequireAdminAuth;
+#[derive(Clone, Copy, Debug)]
+pub struct AdminSessionInfo {
+    pub must_change_password: bool,
+}
 
-impl<S> FromRequestParts<S> for RequireAdminAuth
+/// Validate an admin cookie and attach the authenticated user/session
+/// extensions. This deliberately permits a first-login session whose initial
+/// password still needs changing; only the password/session endpoints use it.
+pub struct RequireAdminSession;
+
+impl<S> FromRequestParts<S> for RequireAdminSession
 where
     AuthState: FromRef<S>,
     S: Sync + Send,
@@ -370,8 +386,9 @@ where
         let claims = session::validate_session_cookie(&auth_state.session_secret, cookie_value)
             .ok_or(ClewdrError::InvalidAuth)?;
 
-        let row: Option<(i64, String, String, i32, Option<String>, i64)> = sqlx::query_as(
-            "SELECT u.id, u.username, u.role, u.session_version, u.disabled_at, u.policy_id
+        let row: Option<(i64, String, String, i32, Option<String>, i64, i32)> = sqlx::query_as(
+            "SELECT u.id, u.username, u.role, u.session_version, u.disabled_at, u.policy_id,
+                    u.must_change_password
              FROM users u WHERE u.id = ?1",
         )
         .bind(claims.user_id)
@@ -382,7 +399,16 @@ where
             ClewdrError::InvalidAuth
         })?;
 
-        let Some((user_id, username, role, session_version, disabled_at, policy_id)) = row else {
+        let Some((
+            user_id,
+            username,
+            role,
+            session_version,
+            disabled_at,
+            policy_id,
+            must_change_password,
+        )) = row
+        else {
             return Err(ClewdrError::InvalidAuth);
         };
 
@@ -403,6 +429,10 @@ where
             return Err(ClewdrError::InvalidAuth);
         };
 
+        parts.extensions.insert(claims);
+        parts.extensions.insert(AdminSessionInfo {
+            must_change_password: must_change_password != 0,
+        });
         parts
             .extensions
             .insert(crate::db::models::AuthenticatedUser {
@@ -423,6 +453,31 @@ where
                 enhanced_audit_enabled: false,
             });
 
+        Ok(Self)
+    }
+}
+
+/// Full admin authorization. Initial-password sessions are rejected here at
+/// the backend boundary, so bypassing the frontend modal cannot expose admin
+/// data or mutations.
+pub struct RequireAdminAuth;
+
+impl<S> FromRequestParts<S> for RequireAdminAuth
+where
+    AuthState: FromRef<S>,
+    S: Sync + Send,
+{
+    type Rejection = ClewdrError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        RequireAdminSession::from_request_parts(parts, state).await?;
+        let info = parts
+            .extensions
+            .get::<AdminSessionInfo>()
+            .ok_or(ClewdrError::InvalidAuth)?;
+        if info.must_change_password {
+            return Err(ClewdrError::PasswordChangeRequired);
+        }
         Ok(Self)
     }
 }

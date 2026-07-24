@@ -1,4 +1,13 @@
-import { createContext, use, useState, useEffect, useCallback, useMemo, type ReactNode } from "react";
+import {
+  createContext,
+  use,
+  useState,
+  useEffect,
+  useCallback,
+  useMemo,
+  useRef,
+  type ReactNode,
+} from "react";
 import { useNavigate, Navigate } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -14,6 +23,7 @@ import {
   login as apiLogin,
   logout as apiLogout,
   changePassword,
+  getSession,
   getOverview,
   qk,
   ApiError,
@@ -55,6 +65,7 @@ interface AuthUser {
 interface AuthContextValue {
   user: AuthUser | null;
   loading: boolean;
+  expiresAt: number | null;
   mustChangePassword: boolean;
   setMustChangePassword: (v: boolean) => void;
   login: (username: string, password: string) => Promise<LoginResponse>;
@@ -72,18 +83,29 @@ export function useAuth() {
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [loading, setLoading] = useState(true);
+  const [expiresAt, setExpiresAt] = useState<number | null>(null);
   const [mustChangePassword, setMustChangePassword] = useState(false);
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const lastLogoutNoticeAt = useRef(0);
 
   useEffect(() => {
-    getOverview()
-      .then((data) => {
-        if (reloadIfFrontendOutdated(data.version)) return;
-        queryClient.setQueryData(qk.overview, data);
-        setUser({ user_id: 0, username: "admin", role: "admin" });
-        if (data.must_change_password) {
-          setMustChangePassword(true);
+    getSession()
+      .then(async (session) => {
+        setUser({
+          user_id: session.user_id,
+          username: session.username,
+          role: session.role,
+        });
+        setExpiresAt(session.expires_at);
+        setMustChangePassword(session.must_change_password);
+        if (!session.must_change_password) {
+          const data = await queryClient.fetchQuery({
+            queryKey: qk.overview,
+            queryFn: getOverview,
+            staleTime: 30_000,
+          });
+          reloadIfFrontendOutdated(data.version);
         }
       })
       .catch(() => {
@@ -93,10 +115,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [queryClient]);
 
   useEffect(() => {
-    const handler = () => {
+    const handler = (event: Event) => {
       setUser(null);
+      setExpiresAt(null);
       setMustChangePassword(false);
       queryClient.clear();
+      const message = (event as CustomEvent<{ message?: string }>).detail?.message;
+      const now = Date.now();
+      if (message && now - lastLogoutNoticeAt.current > 1_000) {
+        lastLogoutNoticeAt.current = now;
+        notifications.show({ message, color: "blue" });
+      }
       navigate("/login", { replace: true });
     };
     window.addEventListener("auth:logout", handler);
@@ -106,21 +135,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const login = useCallback(async (username: string, password: string) => {
     const res = await apiLogin({ username, password });
     setUser({ user_id: res.user_id, username: res.username, role: res.role });
-    if (res.must_change_password) {
-      setMustChangePassword(true);
+    setExpiresAt(res.expires_at);
+    setMustChangePassword(res.must_change_password);
+    if (!res.must_change_password) {
+      const overview = await queryClient.fetchQuery({
+        queryKey: qk.overview,
+        queryFn: getOverview,
+        staleTime: 30_000,
+      });
+      reloadIfFrontendOutdated(overview.version);
     }
-    const overview = await queryClient.fetchQuery({
-      queryKey: qk.overview,
-      queryFn: getOverview,
-      staleTime: 30_000,
-    });
-    reloadIfFrontendOutdated(overview.version);
     return res;
   }, [queryClient]);
 
   const logout = useCallback(() => {
     apiLogout();
     setUser(null);
+    setExpiresAt(null);
     setMustChangePassword(false);
     queryClient.clear();
     navigate("/login", { replace: true });
@@ -130,8 +161,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // AuthProvider render — only when an actual auth field changes.
   // setMustChangePassword is a stable useState setter, so it's omitted from deps.
   const value = useMemo(
-    () => ({ user, loading, mustChangePassword, setMustChangePassword, login, logout }),
-    [user, loading, mustChangePassword, login, logout],
+    () => ({
+      user,
+      loading,
+      expiresAt,
+      mustChangePassword,
+      setMustChangePassword,
+      login,
+      logout,
+    }),
+    [user, loading, expiresAt, mustChangePassword, login, logout],
   );
 
   return <AuthContext value={value}>{children}</AuthContext>;
@@ -145,7 +184,7 @@ export function RequireAuth({ children }: { children: ReactNode }) {
 }
 
 export function ForceChangePasswordModal() {
-  const { mustChangePassword, setMustChangePassword } = useAuth();
+  const { mustChangePassword } = useAuth();
   const [open, setOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
@@ -155,7 +194,7 @@ export function ForceChangePasswordModal() {
 
   const form = useForm({
     mode: "uncontrolled",
-    initialValues: { current_password: "password", new_password: "", confirm: "" },
+    initialValues: { current_password: "", new_password: "", confirm: "" },
     validate: {
       new_password: (v) => (v.length < 6 ? "密码至少 6 个字符" : null),
       confirm: (v, values) => (v !== values.new_password ? "两次输入不一致" : null),
@@ -166,9 +205,9 @@ export function ForceChangePasswordModal() {
     setSubmitting(true);
     try {
       await changePassword({ current_password, new_password });
-      setMustChangePassword(false);
-      notifications.show({ message: "密码已修改，请牢记新密码", color: "green" });
-      setOpen(false);
+      window.dispatchEvent(new CustomEvent("auth:logout", {
+        detail: { message: "密码已修改，所有设备均已退出，请使用新密码重新登录" },
+      }));
     } catch (err) {
       notifications.show({
         message: err instanceof ApiError ? err.message : "修改失败",

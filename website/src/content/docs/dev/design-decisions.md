@@ -11,7 +11,7 @@ sidebar:
 
 ## 默认 admin 密码
 
-未设 `ADMIN_PASSWORD` 时初始密码为 `password`，配合 `must_change_password` 标志强制首次改密。适合本地/内网快速启动，**不要在公网裸露时使用默认密码**。
+未设 `ADMIN_PASSWORD` 时，Release 首次启动生成随机初始密码并打印到服务日志；开发构建仍使用 `password` 方便本地调试。`must_change_password` 由后端限制管理 API，在完成首次改密前只能访问会话、改密和退出端点。
 
 ## 流式 slot 泄漏的边界情况
 

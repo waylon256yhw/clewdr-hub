@@ -1,11 +1,14 @@
 use axum::{Extension, Json, extract::State, response::IntoResponse};
 use serde::Deserialize;
+use tokio::sync::broadcast;
+use tracing::info;
 
+use crate::config::CLEWDR_CONFIG;
 use crate::db::hash_password_public;
 use crate::db::models::AuthenticatedUser;
 use crate::error::ClewdrError;
 use crate::session;
-use crate::state::AuthState;
+use crate::state::{AdminEvent, AuthState};
 
 #[derive(Deserialize)]
 pub struct ChangePasswordRequest {
@@ -15,6 +18,7 @@ pub struct ChangePasswordRequest {
 
 pub async fn change_password(
     State(auth): State<AuthState>,
+    State(event_tx): State<broadcast::Sender<AdminEvent>>,
     Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<impl IntoResponse, ClewdrError> {
@@ -71,7 +75,7 @@ pub async fn change_password(
         result?
     };
 
-    let new_version: (i32,) = sqlx::query_as(
+    let _new_version: (i32,) = sqlx::query_as(
         "UPDATE users SET password_hash = ?1, must_change_password = 0, session_version = session_version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2 AND password_hash = ?3 RETURNING session_version"
     )
     .bind(&new_hash)
@@ -80,12 +84,18 @@ pub async fn change_password(
     .fetch_one(&auth.db)
     .await?;
 
-    let cookie_value =
-        session::create_session_cookie(&auth.session_secret, user.user_id, new_version.0, None);
-    let set_cookie = session::set_cookie_header(&cookie_value, 86400);
+    let _ = event_tx.send(AdminEvent::auth_revoked("password_changed"));
+    info!(
+        user_id = user.user_id,
+        "admin password changed; all sessions revoked"
+    );
+    let clear_cookie = session::clear_cookie_header(CLEWDR_CONFIG.load().admin_cookie_secure);
 
     Ok((
-        [(axum::http::header::SET_COOKIE, set_cookie)],
-        Json(serde_json::json!({ "message": "password updated" })),
+        [(axum::http::header::SET_COOKIE, clear_cookie)],
+        Json(serde_json::json!({
+            "message": "password updated; all sessions revoked",
+            "reauth_required": true
+        })),
     ))
 }

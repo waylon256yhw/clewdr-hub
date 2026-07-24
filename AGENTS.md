@@ -22,7 +22,9 @@ docker run -d --name clewdr-hub -p 8484:8484 \
   -v clewdr-data:/etc/clewdr ghcr.io/waylon256yhw/clewdr-hub:latest
 ```
 
-Admin console at `http://<host>:8484`, default password `password` (or preset `ADMIN_PASSWORD`).
+Admin console at `http://<host>:8484`. Release builds print a random initial
+password on first startup (or preset `ADMIN_PASSWORD`); debug builds use
+`password`.
 
 Other methods (BT panel, Hugging Face Space): <https://waylon256yhw.github.io/clewdr-hub/start/installation/>
 

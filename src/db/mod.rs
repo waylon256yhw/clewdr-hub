@@ -122,6 +122,18 @@ pub async fn open_existing_pool(db_path: &Path) -> Result<SqlitePool, ClewdrErro
 
 const DEFAULT_PASSWORD_HASH: &str = "$argon2id$v=19$m=65536,t=3,p=1$Li5+S+9BeUmy3TFviGbZ9Q$tI+ZLpzW3LhrR5OA8izKSR+mw4APjT6m4rQTicuXNsE";
 
+fn generated_initial_admin_password() -> String {
+    use rand::RngExt;
+
+    let mut bytes = [0u8; 12];
+    rand::rng().fill(&mut bytes);
+    bytes.iter().fold(String::with_capacity(24), |mut out, b| {
+        use std::fmt::Write;
+        write!(out, "{b:02x}").expect("writing to String cannot fail");
+        out
+    })
+}
+
 pub async fn seed_admin(pool: &SqlitePool) -> Result<(), ClewdrError> {
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE role = 'admin'")
         .fetch_one(pool)
@@ -140,13 +152,32 @@ pub async fn seed_admin(pool: &SqlitePool) -> Result<(), ClewdrError> {
                 (hash, 0i32)
             }
             _ => {
+                // Keep the familiar password in debug builds for contributor
+                // workflows and existing integration harnesses. Release
+                // deployments get a unique bootstrap password instead of a
+                // project-wide public default.
+                let password = if cfg!(debug_assertions) {
+                    "password".to_string()
+                } else {
+                    generated_initial_admin_password()
+                };
                 println!(
                     "{}\n  {} {}",
                     "Admin panel initial password:".green().bold(),
                     "Password:".bold(),
-                    "password".yellow().bold(),
+                    password.as_str().yellow().bold(),
                 );
-                (DEFAULT_PASSWORD_HASH.to_string(), 1i32)
+                let password_hash = if cfg!(debug_assertions) {
+                    DEFAULT_PASSWORD_HASH.to_string()
+                } else {
+                    let pw = password;
+                    tokio::task::spawn_blocking(move || hash_password(&pw))
+                        .await
+                        .map_err(|e| ClewdrError::UnexpectedNone {
+                            msg: Box::leak(format!("argon2 task panicked: {e}").into_boxed_str()),
+                        })??
+                };
+                (password_hash, 1i32)
             }
         };
 

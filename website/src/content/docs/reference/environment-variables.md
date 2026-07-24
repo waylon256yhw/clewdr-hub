@@ -11,7 +11,9 @@ sidebar:
 |------|------|------|
 | `CLEWDR_IP` | `0.0.0.0` | 监听地址 |
 | `CLEWDR_PORT` | `8484` | 监听端口 |
-| `ADMIN_PASSWORD` | `password` | 管理员密码（首次登录强制修改） |
+| `ADMIN_PASSWORD` | 首次启动随机生成 | 预设管理员初始密码；未设置时 Release 构建会将随机初始密码打印到服务日志 |
+| `CLEWDR_ADMIN_SESSION_TTL_HOURS` | `24` | 管理后台登录的绝对有效期，范围 1–168 小时 |
+| `CLEWDR_ADMIN_COOKIE_SECURE` | `false` | 后台始终使用 HTTPS 时设为 `true` |
 | `CLEWDR_TRUSTED_PROXIES` | `["127.0.0.0/8", "::1/128", "172.16.0.0/12"]` | 信任的反代来源 CIDR，见[反向代理与真实 IP](../../guides/reverse-proxy/) |
 | `CLEWDR_NO_FS` | `false` | 无文件系统模式（内存 SQLite，重启丢数据），仅用于 Hugging Face Space 等场景 |
 | `CLEWDR_DEBUG_COOKIE` | `false` | 临时排障：手动 probe 时 dump 原始上游 JSON，见[开发 · 调试配置](../../dev/environment/) |

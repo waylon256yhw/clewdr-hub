@@ -57,6 +57,15 @@ impl AdminEvent {
             user_id: Some(user_id),
         }
     }
+
+    pub fn auth_revoked(reason: &str) -> Self {
+        Self {
+            topic: "auth".to_string(),
+            request_type: None,
+            status: Some(reason.to_string()),
+            user_id: None,
+        }
+    }
 }
 
 #[derive(Clone)]

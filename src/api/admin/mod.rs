@@ -2,7 +2,7 @@ pub mod accounts;
 pub mod common;
 pub mod events;
 pub mod keys;
-mod me;
+pub(crate) mod me;
 pub mod models;
 pub mod ops;
 pub mod overview;
@@ -80,6 +80,4 @@ pub fn admin_router() -> Router<AppState> {
         .route("/events", get(events::events))
         // Overview
         .route("/overview", get(overview::overview))
-        // Change own password
-        .route("/me/password", put(me::change_password))
 }

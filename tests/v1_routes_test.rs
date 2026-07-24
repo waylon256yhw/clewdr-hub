@@ -131,6 +131,15 @@ async fn setup_app(policy: PolicyConfig) -> TestApp {
     let db_path = tempdir.path().join("clewdr-test.db");
     let pool = db::init_pool(&db_path).await.unwrap();
     db::seed_admin(&pool).await.unwrap();
+    // These route tests exercise a fully initialized admin console. The
+    // bootstrap-password restriction itself is enforced separately by the
+    // auth middleware; keeping must_change_password set here would make every
+    // ordinary admin route correctly return 403 before reaching the behavior
+    // each test is intended to cover.
+    sqlx::query("UPDATE users SET must_change_password = 0 WHERE username = 'admin'")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let policy_name = format!("test-policy-{}", uuid::Uuid::new_v4());
     let policy_result = sqlx::query(

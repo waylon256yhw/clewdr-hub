@@ -27,6 +27,8 @@ auto_update = false
 no_fs = false
 log_to_file = false
 debug_cookie = false
+admin_session_ttl_hours = 24
+admin_cookie_secure = false
 trusted_proxies = ["127.0.0.0/8", "::1/128", "172.16.0.0/12"]
 ```
 
@@ -39,6 +41,8 @@ trusted_proxies = ["127.0.0.0/8", "::1/128", "172.16.0.0/12"]
 | `no_fs` | `false` | 无文件系统模式（内存 SQLite，关闭一切文件写入）。仅用于 HF Space 等场景，日常勿开 |
 | `log_to_file` | `false` | 是否写文件日志 |
 | `debug_cookie` | `false` | 手动 probe 时 dump 原始上游 JSON 到 `log/probe-dumps/`，仅临时排障用 |
+| `admin_session_ttl_hours` | `24` | 管理后台登录的绝对有效期，范围 1–168 小时，不会随操作自动续期 |
+| `admin_cookie_secure` | `false` | 为管理 Cookie 添加 `Secure`；仅在后台始终通过 HTTPS 访问时开启 |
 | `trusted_proxies` | 见上 | 信任的反代来源 CIDR，详见[反向代理与真实 IP](../../guides/reverse-proxy/) |
 
 `debug_cookie` / `no_fs` 的语义和排障用法见[开发 · 调试配置](../../dev/environment/)。
