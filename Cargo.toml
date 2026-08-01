@@ -72,7 +72,6 @@ arc-swap = "1"
 url = { version = "2", features = ["serde"] }
 strum = { version = "0.27", features = ["derive"] }
 moka = { version = "0.12", features = ["sync"] }
-tower = "0.5"
 async-stream = "0.3"
 console-subscriber = { version = "0.5", optional = true }
 http = "1"
@@ -103,7 +102,6 @@ enable-ansi-support = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-aws-lc-rs = "1"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 
 
@@ -120,3 +118,6 @@ dhat-heap = ["dep:dhat"]
 encrypt = ["dep:aes-gcm"]
 # Interactive TUI menu (commit #11 — inquire-based, default-on).
 tui = ["dep:inquire"]
+
+[dev-dependencies]
+tower = "0.5"
